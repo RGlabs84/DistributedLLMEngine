@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from engine import gguf
-from engine.config import get_base_dir, get_worker_limits
+from engine.config import SPEC_DEFAULTS, get_base_dir, get_worker_limits
 from engine.downloader import download_and_extract_engine
 from engine.logger import log_coordinator, log_error, log_warning
 
@@ -333,6 +333,35 @@ def _is_draft_companion(filename: str) -> bool:
     is simply a bad model, presented as a choice.
     """
     return filename.lower().endswith(DRAFT_COMPANION_SUFFIX)
+
+
+def speculative_args(limits: dict, draft_path: Optional[str]) -> List[str]:
+    """
+    The llama-server arguments for speculative decoding, from the operator's ``spec_*`` limits.
+
+    ``draft_path`` is the model's draft companion, or None when it has none. Draft types
+    (``draft-*``) are dropped without a companion; ngram types need no second model. The
+    companion is only passed to llama-server when a draft type survives - loading it under
+    ``--spec-type none`` costs VRAM and does nothing, which is how every release before
+    2.1.1 ran. Device pinning for RPC pipelines is the caller's business.
+    """
+    spec = str(limits.get("spec_type", SPEC_DEFAULTS["spec_type"]))
+    types = [t for t in spec.split(",") if t and t != "none"]
+    if not draft_path:
+        types = [t for t in types if not t.startswith("draft-")]
+    if not types:
+        return []
+
+    args = []
+    if any(t.startswith("draft-") for t in types):
+        args += [
+            "--model-draft", draft_path,
+            "-ngld", "99",
+            "--spec-draft-n-max", str(limits.get("spec_draft_n_max", SPEC_DEFAULTS["spec_draft_n_max"])),
+            "--spec-draft-n-min", str(limits.get("spec_draft_n_min", SPEC_DEFAULTS["spec_draft_n_min"])),
+            "--spec-draft-p-min", str(limits.get("spec_draft_p_min", SPEC_DEFAULTS["spec_draft_p_min"])),
+        ]
+    return args + ["--spec-type", ",".join(types)]
 
 
 def _endpoint_is_remote(endpoint: str) -> bool:
@@ -1709,37 +1738,29 @@ class InferenceManager:
                     f"(bypassing loopback TCP RPC for {requested_endpoints})."
                 )
 
-            # Check for DFlash companion model
+            # Speculative decoding, with the model's draft companion when it has one.
             dflash_path = resolved_path.replace(".gguf", "_dflash.gguf")
-            if os.path.exists(dflash_path):
-                log_coordinator(f"⚡ DFlash active for {os.path.basename(model_path)}! Accelerating inference via diffusion draft.")
-                cmd.extend(["--model-draft", dflash_path])
+            limits = get_worker_limits()
+            spec = speculative_args(limits, dflash_path if os.path.exists(dflash_path) else None)
+            if spec:
+                cmd.extend(spec)
+                log_coordinator(f"Speculative decoding for {os.path.basename(model_path)}: {' '.join(spec[spec.index('--spec-type'):])}.")
 
+            if "--model-draft" in spec:
                 # Pin draft model strictly to the local GPU (e.g. Vulkan0 or CUDA0) so it NEVER shards
                 # across network RPC, but offloads 100% to local GPU hardware for instant proposals.
                 remote = [e for e in (requested_endpoints or [])
                           if _endpoint_is_remote(e)]
-                if remote and not get_worker_limits().get("draft_on_rpc", False):
+                if remote and not limits.get("draft_on_rpc", False):
                     from engine.hardware import get_gpu_type
                     gpu_type = get_gpu_type().lower()
                     default_dev = "CUDA0" if gpu_type == "cuda" else "Vulkan0"
-                    draft_dev = get_worker_limits().get("draft_device") or default_dev
-                    cmd.extend([
-                        "-devd", draft_dev,
-                        "-ngld", "99",
-                        "--spec-draft-n-max", "5",
-                        "--spec-draft-n-min", "2"
-                    ])
+                    draft_dev = limits.get("draft_device") or default_dev
+                    cmd.extend(["-devd", draft_dev])
                     log_coordinator(
-                        f"Draft model pinned to local GPU ({draft_dev}) with ngld=99, spec-draft-n-max=5, spec-draft-n-min=2 "
+                        f"Draft model pinned to local GPU ({draft_dev}) "
                         f"({len(remote)} remote backend(s) in this pipeline)."
                     )
-                else:
-                    cmd.extend([
-                        "-ngld", "99",
-                        "--spec-draft-n-max", "5",
-                        "--spec-draft-n-min", "2"
-                    ])
 
             # Cheap pre-check: if a shutdown already ran while we were fetching the binary
             # there is no point spawning a process only to kill it a millisecond later.

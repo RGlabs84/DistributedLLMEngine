@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as http from 'http';
 import * as https from 'https';
+import { resolveServerUrl } from '../serverUrl';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -128,8 +129,7 @@ export class DlneClient {
   }
 
   public getServerUrl(): string {
-    const config = vscode.workspace.getConfiguration('dlne');
-    return config.get<string>('serverUrl', 'http://73.215.216.195:11435').replace(/\/$/, '');
+    return resolveServerUrl(vscode.workspace.getConfiguration('dlne'));
   }
 
   public getLocalWorkerToken(): string {

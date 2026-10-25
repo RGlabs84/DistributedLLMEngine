@@ -110,6 +110,7 @@ class FakeAsyncClient:
     """
 
     status_code = 200
+    is_closed = False
     chunks = [
         b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n',
         b"data: [DONE]\n\n",
@@ -174,6 +175,7 @@ def fake_httpx_module():
     return types.SimpleNamespace(
         AsyncClient=FakeAsyncClient,
         Timeout=lambda *args, **kwargs: None,
+        Limits=lambda *args, **kwargs: None,
     )
 
 
@@ -197,6 +199,8 @@ def counter_env(monkeypatch):
     monkeypatch.setattr(coordinator, "is_swapping_models", False)
     monkeypatch.setattr(coordinator, "is_recalculating_queue", False)
     monkeypatch.setattr(coordinator, "httpx", fake_httpx_module())
+    # The pooled engine client is per event loop; never inherit another test's fake.
+    monkeypatch.setattr(coordinator, "_engine_http", None)
 
     # No real llama-server exists, so the table holds one *simulated* engine for the model
     # every test in this file asks for. It has to be present: since finding R3-9 the handler
@@ -452,7 +456,8 @@ def test_counter_returns_to_baseline_when_the_engine_drops_mid_stream(counter_en
     monkeypatch.setattr(
         coordinator, "httpx",
         types.SimpleNamespace(AsyncClient=ExplodingClient,
-                              Timeout=lambda *args, **kwargs: None),
+                              Timeout=lambda *args, **kwargs: None,
+                              Limits=lambda *args, **kwargs: None),
     )
 
     async def scenario():
@@ -483,7 +488,8 @@ def test_counter_returns_to_baseline_when_the_engine_returns_an_error_status(cou
     monkeypatch.setattr(
         coordinator, "httpx",
         types.SimpleNamespace(AsyncClient=FailingClient,
-                              Timeout=lambda *args, **kwargs: None),
+                              Timeout=lambda *args, **kwargs: None,
+                              Limits=lambda *args, **kwargs: None),
     )
 
     async def scenario():
@@ -519,7 +525,8 @@ def test_a_loading_engine_is_a_retry_nudge_and_not_an_alert(counter_env, monkeyp
     monkeypatch.setattr(
         coordinator, "httpx",
         types.SimpleNamespace(AsyncClient=LoadingClient,
-                              Timeout=lambda *args, **kwargs: None),
+                              Timeout=lambda *args, **kwargs: None,
+                              Limits=lambda *args, **kwargs: None),
     )
 
     async def scenario():
@@ -1046,6 +1053,27 @@ def test_forwarded_for_takes_the_rightmost_entry(monkeypatch):
     assert coordinator.get_client_ip(request) == "198.51.100.9"
 
 
+def test_a_direct_internet_caller_cannot_choose_its_address(monkeypatch):
+    """
+    The coordinator stays open on its own port beside the HTTPS proxy. A caller reaching it
+    straight from the internet must be identified by its socket, whatever it forwards.
+    """
+    monkeypatch.setattr(coordinator, "get_worker_limits", trusting_limits)
+    monkeypatch.setattr(coordinator, "get_config", lambda: {})
+
+    request = FakeRequest(headers={"X-Forwarded-For": "100.64.1.2"}, client_host="1.1.1.1")
+    assert coordinator.get_client_ip(request) == "1.1.1.1"
+
+
+@pytest.mark.parametrize("proxy", ["127.0.0.1", "::1", "192.168.40.23", "10.13.13.1"])
+def test_a_proxy_on_this_host_or_the_lan_is_believed(monkeypatch, proxy):
+    monkeypatch.setattr(coordinator, "get_worker_limits", trusting_limits)
+    monkeypatch.setattr(coordinator, "get_config", lambda: {})
+
+    request = FakeRequest(headers={"X-Forwarded-For": "1.1.1.1"}, client_host=proxy)
+    assert coordinator.get_client_ip(request) == "1.1.1.1"
+
+
 def test_forwarded_for_honours_the_configured_hop_count(monkeypatch):
     """
     Two trusted proxies means the address we want is the second from the right; everything
@@ -1365,7 +1393,8 @@ def test_a_vanished_engine_is_answered_with_a_nudge_not_a_dead_proxy(counter_env
     monkeypatch.setattr(coordinator, "httpx",
                         types.SimpleNamespace(RecordingClient=RecordingClient,
                                               AsyncClient=RecordingClient,
-                                              Timeout=lambda *a, **k: None))
+                                              Timeout=lambda *a, **k: None,
+                                              Limits=lambda *a, **k: None))
     baseline = coordinator.active_inference_requests
 
     async def scenario():
@@ -1404,7 +1433,8 @@ def test_context_sizing_uses_the_engines_real_values(counter_env, monkeypatch):
 
     monkeypatch.setattr(coordinator, "httpx",
                         types.SimpleNamespace(AsyncClient=RecordingClient,
-                                              Timeout=lambda *a, **k: None))
+                                              Timeout=lambda *a, **k: None,
+                                              Limits=lambda *a, **k: None))
 
     # With slot_context = 8192 // 2 = 4096 the allowance is 3584 tokens (~10752 chars), so a
     # 9000-character message fits untouched. Under the 8192 // 4 = 2048 fallback the allowance

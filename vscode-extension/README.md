@@ -42,7 +42,7 @@ The agent's slash commands: `/code`, `/fix`, `/status`, `/model`, `/contribute`,
 ## Privacy: what to know
 
 - **Your prompts, and the code the agent reads, go to the coordinator.** The public coordinator is run by the DLNE maintainer, so treat it like any hosted AI service. Do not send secrets.
-- **The connection is plain HTTP, not encrypted.** Use it on networks you trust, or run your own coordinator (below).
+- **The connection to the public swarm is encrypted (HTTPS)**, so nobody between you and the coordinator can read it. For anything sensitive, run your own coordinator (below).
 - When the model is split across several contributors' GPUs, those machines process the model's intermediate numbers for your request, not your text.
 - As a contributor, your machine runs DLNE's worker and `ggml-rpc-server`, and accepts connections from the coordinator on port 50052.
 
@@ -86,7 +86,7 @@ Then in VS Code settings:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `dlne.serverUrl` | `http://73.215.216.195:11435` | The coordinator: the public swarm, or your own. |
+| `dlne.serverUrl` | `https://73-215-216-195.sslip.io` | The coordinator: the public swarm (over HTTPS), or your own. |
 | `dlne.apiKey` | `""` | Optional API key. Leave blank to use the free trial or your contribution. |
 | `dlne.worker.networkKey` | public swarm key | The swarm's shared worker key. Change it only for a private coordinator. |
 | `dlne.worker.allowedGpus` | `""` | GPU indices to lend (e.g. `0,1`). Blank lends all detected GPUs. |

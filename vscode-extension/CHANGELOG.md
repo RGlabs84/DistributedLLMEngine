@@ -7,11 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [1.2.0] - 2026-10-25
 
-Pairs with DLNE coordinator **2.1.0**.
+Pairs with DLNE coordinator **2.1.2**.
 
 ### Added
+- **Encrypted connection.** The public swarm is now reached over HTTPS (`https://73-215-216-195.sslip.io`), so prompts and code no longer cross the internet in plain text. If your settings still hold the old `http://73.215.216.195:11435` address, it is upgraded to HTTPS for you. A coordinator of your own is used exactly as you set it.
 - **Linux and macOS (Apple Silicon) can contribute compute.** Until now only Windows could download the GPU engine, so contributing failed elsewhere. Each platform now gets an official llama.cpp `ggml-rpc-server` build (b11838), signed into the release and verified before it is installed.
 - **Workers follow llama.cpp upgrades.** When a release names a new GPU engine build, it is installed on the next start. The coordinator only uses workers on its own llama.cpp RPC protocol, so an upgrade can never crash the cluster's engine.
 
@@ -21,7 +22,11 @@ Pairs with DLNE coordinator **2.1.0**.
 - The engine and its Python are never taken from the open workspace, and the retired, unverified standalone `DLNE-Node` executables are no longer run.
 - The agent's instructions no longer contain the maintainer's own folders or tell the model to go anywhere on your disk; it works in your workspace.
 
+### Fixed
+- Contributing to a coordinator with an `https://` address sent the worker to plain HTTP on port 80, where it was redirected and could not register. The worker now gets the full address.
+
 ### Faster
+- **Answers come faster.** The coordinator now uses its small draft model to guess ahead (measured 45 vs 39 tokens per second on the public swarm).
 - **Autocomplete**: smaller prompts (50 lines before the cursor, 10 after), the `dlne.inlineCompletionDelay` setting is actually used (it was forced to at least 450 ms), a new keystroke cancels a stale request instead of being ignored, completions inside a line stop at the line end, and connections are reused.
 - **Agent**: the conversation is no longer rewritten on every turn, so the server reuses what it has already read instead of re-reading the whole conversation; and a chat turn no longer makes an extra status request first.
 

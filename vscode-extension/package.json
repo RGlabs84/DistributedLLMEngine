@@ -2,7 +2,7 @@
   "name": "dlne-code-assistant",
   "displayName": "DLNE Coding Assistant: Free AI Agent",
   "description": "A free AI coding agent and autocomplete, running on GPUs its users share. 200 free chats, no account or API key.",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "publisher": "dlne",
   "license": "MIT",
   "repository": {
@@ -123,8 +123,8 @@
       "properties": {
         "dlne.serverUrl": {
           "type": "string",
-          "default": "http://73.215.216.195:11435",
-          "description": "DLNE Coordinator URL. Pre-configured out of the box to the official Public Test Swarm (http://73.215.216.195:11435). Only modify this if connecting to your own private self-hosted cluster."
+          "default": "https://73-215-216-195.sslip.io",
+          "description": "DLNE coordinator URL. The default is the public swarm over HTTPS. Change it only to use your own coordinator. The old address http://73.215.216.195:11435 is upgraded to HTTPS automatically."
         },
         "dlne.apiKey": {
           "type": "string",

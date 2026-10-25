@@ -199,6 +199,25 @@ def _as_bool(raw: str) -> bool:
     return raw.strip().lower() == "true"
 
 
+# The --spec-type values llama.cpp b11838 accepts.
+SPEC_TYPES = frozenset({
+    "none", "draft-simple", "draft-eagle3", "draft-mtp", "draft-dflash", "draft-dspark",
+    "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache",
+})
+
+# Off unless the operator turns it on: on the production host (two 8 GB Navi12 cards, 14B
+# coder, 0.5B draft) draft-simple with these settings measured 36.3 tok/s against 39.2 tok/s
+# without it, despite 80-90% acceptance. Whether drafting pays depends on the hardware, so
+# it is measured per host and set with SPEC_* in config.txt. The draft settings below are
+# llama.cpp's long-standing server defaults, used once a draft type is switched on.
+SPEC_DEFAULTS = {
+    "spec_type": "none",
+    "spec_draft_n_max": 16,
+    "spec_draft_n_min": 0,
+    "spec_draft_p_min": 0.75,
+}
+
+
 def get_worker_limits() -> dict:
     """
     Returns the typed operational limits, with defaults for every key.
@@ -279,6 +298,12 @@ def get_worker_limits() -> dict:
         # "Vulkan0" or "CUDA0"). Empty means "pick for this machine": CUDA0 on NVIDIA, else
         # Vulkan0. Resolved at the point of use because it depends on the detected GPU.
         "draft_device": "",
+        # Speculative decoding, passed to llama-server as --spec-type and --spec-draft-*.
+        # llama.cpp defaults --spec-type to "none", so a draft model given without it is
+        # loaded into VRAM and never consulted - which is how DLNE ran until 2.1.1. Draft
+        # types (draft-*) only apply when the model has a "_dflash" companion; the ngram
+        # types need no second model. See SPEC_DEFAULTS for why it ships switched off.
+        **SPEC_DEFAULTS,
     }
 
     config = get_config()
@@ -382,6 +407,37 @@ def get_worker_limits() -> dict:
 
     if "DRAFT_DEVICE" in config:
         limits["draft_device"] = config["DRAFT_DEVICE"].strip()
+
+    if "SPEC_TYPE" in config:
+        types = [t.strip().lower() for t in config["SPEC_TYPE"].split(",") if t.strip()]
+        # Everything or nothing: llama-server refuses to start on an unknown type, so a typo
+        # keeps the default rather than taking the engine down.
+        if types and all(t in SPEC_TYPES for t in types):
+            limits["spec_type"] = "none" if "none" in types else ",".join(types)
+
+    if "SPEC_DRAFT_N_MAX" in config:
+        try:
+            n_max = int(config["SPEC_DRAFT_N_MAX"])
+        except ValueError:
+            n_max = 0
+        if 1 <= n_max <= 64:
+            limits["spec_draft_n_max"] = n_max
+
+    if "SPEC_DRAFT_N_MIN" in config:
+        try:
+            n_min = int(config["SPEC_DRAFT_N_MIN"])
+        except ValueError:
+            n_min = -1
+        if 0 <= n_min <= limits["spec_draft_n_max"]:
+            limits["spec_draft_n_min"] = n_min
+
+    if "SPEC_DRAFT_P_MIN" in config:
+        try:
+            p_min = float(config["SPEC_DRAFT_P_MIN"])
+        except ValueError:
+            p_min = -1.0
+        if 0.0 <= p_min <= 1.0:
+            limits["spec_draft_p_min"] = p_min
 
     if "REBALANCE_ON_JOIN" in config:
         limits["rebalance_on_join"] = _as_bool(config["REBALANCE_ON_JOIN"])

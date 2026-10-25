@@ -359,6 +359,99 @@ def test_engine_is_spawned_with_the_models_own_chat_template(engine_env):
     assert "--jinja" in engine_env.spawned[0].cmd
 
 
+def _after(cmd, flag):
+    return cmd[cmd.index(flag) + 1]
+
+
+def test_a_draft_companion_is_actually_used_for_speculation(engine_env, make_worker_limits, monkeypatch):
+    """
+    llama.cpp defaults --spec-type to none. Before 2.1.1 the companion was passed with
+    --model-draft and nothing else, so production loaded a 0.5B draft into VRAM and never
+    drafted a token with it.
+    """
+    monkeypatch.setattr(inference_manager, "get_worker_limits",
+                        lambda: make_worker_limits(spec_type="draft-simple"))
+    manager = engine_env.manager
+    engine_env.add_model("model-a")
+    engine_env.add_model("model-a_dflash")
+
+    ok, _port, msg = manager.start_model("model-a", [], BIG_VRAM, BIG_SYSRAM)
+    assert ok is True, msg
+
+    cmd = engine_env.spawned[0].cmd
+    assert _after(cmd, "--model-draft") == str(engine_env.models_dir / "model-a_dflash.gguf")
+    assert _after(cmd, "--spec-type") == "draft-simple"
+    assert _after(cmd, "--spec-draft-n-max") == "16"
+    assert _after(cmd, "--spec-draft-n-min") == "0"
+    assert _after(cmd, "--spec-draft-p-min") == "0.75"
+
+
+def test_no_speculation_flags_without_a_companion(engine_env):
+    manager = engine_env.manager
+    engine_env.add_model("model-a")
+
+    ok, _port, msg = manager.start_model("model-a", [], BIG_VRAM, BIG_SYSRAM)
+    assert ok is True, msg
+
+    cmd = engine_env.spawned[0].cmd
+    assert "--model-draft" not in cmd
+    assert "--spec-type" not in cmd
+
+
+def test_speculation_switched_off_does_not_load_the_draft(engine_env, make_worker_limits, monkeypatch):
+    """A draft loaded under --spec-type none is VRAM spent on nothing."""
+    monkeypatch.setattr(inference_manager, "get_worker_limits",
+                        lambda: make_worker_limits(spec_type="none"))
+    manager = engine_env.manager
+    engine_env.add_model("model-a")
+    engine_env.add_model("model-a_dflash")
+
+    ok, _port, msg = manager.start_model("model-a", [], BIG_VRAM, BIG_SYSRAM)
+    assert ok is True, msg
+
+    cmd = engine_env.spawned[0].cmd
+    assert "--model-draft" not in cmd
+    assert "--spec-type" not in cmd
+
+
+def test_operator_spec_settings_reach_the_engine(engine_env, make_worker_limits, monkeypatch):
+    monkeypatch.setattr(inference_manager, "get_worker_limits", lambda: make_worker_limits(
+        spec_type="draft-simple,ngram-mod", spec_draft_n_max=8, spec_draft_n_min=2, spec_draft_p_min=0.5))
+    manager = engine_env.manager
+    engine_env.add_model("model-a")
+    engine_env.add_model("model-a_dflash")
+
+    ok, _port, msg = manager.start_model("model-a", [], BIG_VRAM, BIG_SYSRAM)
+    assert ok is True, msg
+
+    cmd = engine_env.spawned[0].cmd
+    assert _after(cmd, "--spec-type") == "draft-simple,ngram-mod"
+    assert _after(cmd, "--spec-draft-n-max") == "8"
+    assert _after(cmd, "--spec-draft-n-min") == "2"
+    assert _after(cmd, "--spec-draft-p-min") == "0.5"
+
+
+def test_speculative_args_keeps_ngram_types_without_a_draft():
+    """ngram speculation needs no second model, so a missing companion only drops draft-*."""
+    args = inference_manager.speculative_args({"spec_type": "draft-simple,ngram-mod"}, None)
+    assert args == ["--spec-type", "ngram-mod"]
+
+    assert inference_manager.speculative_args({"spec_type": "draft-simple"}, None) == []
+    assert inference_manager.speculative_args({"spec_type": "none"}, "/m/a_dflash.gguf") == []
+
+
+def test_speculative_args_falls_back_to_the_defaults():
+    """The test fixture and older callers pass limits without the spec keys."""
+    assert inference_manager.speculative_args({}, "/m/a_dflash.gguf") == []
+
+    args = inference_manager.speculative_args({"spec_type": "draft-simple"}, "/m/a_dflash.gguf")
+    assert args == [
+        "--model-draft", "/m/a_dflash.gguf", "-ngld", "99",
+        "--spec-draft-n-max", "16", "--spec-draft-n-min", "0", "--spec-draft-p-min", "0.75",
+        "--spec-type", "draft-simple",
+    ]
+
+
 def test_allocator_skips_ports_held_by_unrelated_processes(engine_env):
     """
     Our own bookkeeping is not enough. A previous DLNE run that was killed without cleanup,

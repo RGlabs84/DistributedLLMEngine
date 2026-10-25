@@ -24,7 +24,7 @@ type `@dlne` in the chat panel.
 | `engine/` | The coordinator and worker: model scheduling, worker registry, free-trial quota, admin API |
 | `dlne_server.py` | Command line: `start` (coordinator), `worker`, `apikey`, `adminkey`, `status` |
 | `tests/` | Python test suite (`pytest`) |
-| `scripts/` | Release tooling (`release.py`, `release_apply.py`, `package_llama.py`) and the Discord status tile |
+| `scripts/` | Release tooling (`release.py`, `release_apply.py`, `package_llama.py`), `publish_public.py` (the scanned snapshot that updates this public repository) and the Discord status tile |
 | `site/` | The public website |
 
 The coordinator's `/` is a small public page that points at the extension and shows live
@@ -54,6 +54,20 @@ Everything under `/v1/admin/*` needs that operator key as `Authorization: Bearer
 default only accepts it from the coordinator's own machine (`ADMIN_ALLOW_REMOTE=true` to change
 that). BarrkBOT's `/dlne` command uses it.
 
+Settings live in `config/config.txt` (`KEY=VALUE`). Two groups matter for most operators:
+
+- **Behind a reverse proxy** (Caddy, nginx) on the same machine or LAN: set
+  `TRUST_PROXY_HEADERS=true` so clients are told apart by `X-Forwarded-For` rather than all
+  looking like the proxy. The header is only believed from a loopback or private address, so
+  the coordinator's own port can stay open to the internet alongside the proxy. Keep
+  `/v1/admin/*` off the proxy.
+- **Speculative decoding**: off by default, because whether it pays depends on the GPUs. Give a
+  model a draft companion (`<model>_dflash.gguf` beside it) and set, for example,
+  `SPEC_TYPE=draft-simple` and `SPEC_DRAFT_N_MAX=4`. `SPEC_DRAFT_N_MIN` and `SPEC_DRAFT_P_MIN`
+  are also read, as are the ngram types (`SPEC_TYPE=ngram-mod`, no draft model needed).
+  Measure before and after: on the public swarm's two 8 GB cards, 4-token drafts gave 45 tok/s
+  against 39 without, while 8 and 16-token drafts were slower than none.
+
 ## Releases
 
 Workers run code and binaries they download from the coordinator, so every release is signed.
@@ -67,7 +81,8 @@ their llama.cpp RPC protocol, and the coordinator only routes to workers that sp
 
 - Prompts, and the code the agent reads, go to the coordinator you point the extension at. The
   public coordinator is run by the maintainer; treat it like any hosted AI service.
-- The public coordinator speaks plain HTTP. Run your own for anything sensitive.
+- The public coordinator is reached over HTTPS (`https://73-215-216-195.sslip.io`, Caddy in front
+  of the coordinator). Run your own for anything sensitive.
 - The agent asks before it edits files, runs a command, or reads outside your workspace.
 - Report security problems privately to the maintainer rather than in a public issue.
 

@@ -16,6 +16,7 @@ Treat all of them as frozen.
 
 import asyncio
 import concurrent.futures
+import contextlib
 import ipaddress
 import hmac
 import json
@@ -265,10 +266,17 @@ def get_client_ip(request: Request | WebSocket) -> str:
     Returns:
         The best available client address, or ``"unknown"`` when the transport does not
         expose one (which some ASGI test harnesses do not).
+
+    ONLY A PROXY'S OWN CONNECTION MAY FORWARD
+        The coordinator stays reachable directly on its port for clients that predate the
+        HTTPS proxy, so a caller from the internet can send its own one-entry header and be
+        believed - choosing which address its quota and its worker registration are
+        attributed to. Proxies sit on this host or the LAN, so the header is only read when
+        the socket peer is a loopback or private address; a public peer is the client.
     """
     peer = request.client.host if request.client else "unknown"
 
-    if get_worker_limits().get("trust_proxy_headers", False):
+    if get_worker_limits().get("trust_proxy_headers", False) and _peer_may_forward(peer):
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
             parts = [entry.strip() for entry in forwarded.split(",") if entry.strip()]
@@ -287,6 +295,15 @@ def get_client_ip(request: Request | WebSocket) -> str:
                     return peer
                 return claimed
     return peer
+
+
+def _peer_may_forward(peer: str) -> bool:
+    """True for a loopback or private socket peer: somewhere a reverse proxy could be."""
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_private
 
 
 def _as_number(value: Any, default: float = 0.0) -> float:
@@ -361,11 +378,15 @@ class StarterQuotaManager:
             self._usage = {}
 
     def _save_locked(self) -> None:
+        # Written aside and renamed into place: a crash halfway through an in-place write
+        # left a file _load could not parse, which reset every client's trial to zero.
         p = self._get_path()
+        tmp = f"{p}.tmp"
         try:
             os.makedirs(os.path.dirname(p), exist_ok=True)
-            with open(p, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._usage, f, indent=2)
+            os.replace(tmp, p)
         except Exception:
             pass
 
@@ -1644,6 +1665,25 @@ MODEL_LOADING_NUDGE = (
 ENGINE_CONNECT_TIMEOUT_SECONDS = 10.0
 ENGINE_READ_TIMEOUT_SECONDS = 900.0
 
+# The pooled client for the Coordinator's calls into its own llama-server engines.
+#
+# A new httpx.AsyncClient per request loads the CA bundle (about 3 ms, with spikes near
+# 30 ms, measured on TheWall) and opens a fresh connection, all for a loopback hop.
+# Idle connections are dropped after 2 s, inside llama-server's 5 s keep-alive, so a
+# request never lands on a socket the engine has already closed. Keyed by event loop
+# because pooled connections cannot cross loops (each TestClient runs its own).
+_engine_http: Optional[Tuple[Any, httpx.AsyncClient]] = None
+
+
+@contextlib.asynccontextmanager
+async def engine_client():
+    """Yields the shared engine client; leaving the block does not close it."""
+    global _engine_http
+    loop = asyncio.get_running_loop()
+    if _engine_http is None or _engine_http[0] is not loop or _engine_http[1].is_closed:
+        _engine_http = (loop, httpx.AsyncClient(limits=httpx.Limits(keepalive_expiry=2.0)))
+    yield _engine_http[1]
+
 # Request slots llama-server is started with for ordinary traffic (the queue_channels=2 every
 # chat and completion path passes to astart_model). Autocomplete only runs while one is free.
 FIM_ENGINE_SLOTS = 2
@@ -2172,7 +2212,7 @@ async def chat_completions(request: Request):
                     "stream": True
                 }
                 try:
-                    async with httpx.AsyncClient() as client:
+                    async with engine_client() as client:
                         async with client.stream("POST", llama_url, json=summary_payload, timeout=120.0) as resp:
                             if resp.status_code == 200:
                                 summary_text = ""
@@ -2247,7 +2287,7 @@ async def chat_completions(request: Request):
                 idempotent, so the two mechanisms cannot double-decrement.
             """
             try:
-                async with httpx.AsyncClient() as client:
+                async with engine_client() as client:
                     # Split, not a single scalar: connect is to a loopback port and should
                     # fail fast, while read has to survive an engine still pushing weights
                     # to remote RPC backends. See ENGINE_READ_TIMEOUT_SECONDS.
@@ -2431,7 +2471,7 @@ async def completions(request: Request):
         if is_stream:
             async def stream_generator():
                 try:
-                    async with httpx.AsyncClient() as client:
+                    async with engine_client() as client:
                         engine_timeout = httpx.Timeout(ENGINE_READ_TIMEOUT_SECONDS, connect=ENGINE_CONNECT_TIMEOUT_SECONDS)
                         async with client.stream("POST", llama_url, json=body, headers=forwarded_headers, timeout=engine_timeout) as response:
                             if response.status_code != 200:
@@ -2454,7 +2494,7 @@ async def completions(request: Request):
             )
         else:
             try:
-                async with httpx.AsyncClient() as client:
+                async with engine_client() as client:
                     engine_timeout = httpx.Timeout(ENGINE_READ_TIMEOUT_SECONDS, connect=ENGINE_CONNECT_TIMEOUT_SECONDS)
                     resp = await client.post(llama_url, json=body, headers=forwarded_headers, timeout=engine_timeout)
                     return Response(

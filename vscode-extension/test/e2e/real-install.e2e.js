@@ -20,7 +20,7 @@ const { createSandbox } = require('../helpers/sandbox');
 const { WorkerManager } = require('../../dist/worker/workerManager');
 
 const LIVE = process.env.DLNE_LIVE === '1';
-const LIVE_URL = 'http://73.215.216.195:11435';
+const LIVE_URL = require('../../dist/serverUrl').DEFAULT_SERVER_URL;
 
 test(`real install on a clean machine (${LIVE ? 'live coordinator source' : 'checkout source'})`, { timeout: 15 * 60 * 1000 }, async (t) => {
   stub.reset();

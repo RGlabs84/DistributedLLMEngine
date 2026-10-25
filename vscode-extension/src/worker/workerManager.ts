@@ -6,6 +6,7 @@ import * as net from 'net';
 import * as http from 'http';
 import * as https from 'https';
 import { EngineVerificationError, FetchResult, RELEASE_PUBKEY_HEX, fetchVerifiedEngine, fetchVerifiedRpcBin, hostRpcPlatform } from './engineRelease';
+import { resolveServerUrl } from '../serverUrl';
 
 function downloadFile(urlStr: string, destPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -450,7 +451,7 @@ export class WorkerManager {
     const scriptPath = this.findEngineScript();
 
     const config = vscode.workspace.getConfiguration('dlne');
-    const serverUrl = config.get<string>('serverUrl') || 'http://73.215.216.195:11435';
+    const serverUrl = resolveServerUrl(config);
     const rawPython = config.get<string>('worker.pythonPath') || '';
     let pythonPath = this.resolvePythonPath(rawPython, rootWorkspace);
 
@@ -945,7 +946,7 @@ export class WorkerManager {
 
     // 2. Fallback to spawning child process
     const config = vscode.workspace.getConfiguration('dlne');
-    const serverUrl: string = config.get<string>('serverUrl') || 'http://73.215.216.195:11435';
+    const serverUrl: string = resolveServerUrl(config);
     const rootWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
     const rawKey = config.get<string>('worker.networkKey') || '';
@@ -955,7 +956,9 @@ export class WorkerManager {
     const maxVram: number = config.get<number>('worker.maxVramGb') || -1;
     const maxRam: number = config.get<number>('worker.maxRamGb') || 4.0;
 
-    const coordHost = serverUrl.replace(/^https?:\/\//, '');
+    // The full URL, scheme included: dlne_server.py only adds http:// to a bare host, so
+    // stripping https:// here sent workers to port 80, where the proxy answers with a redirect.
+    const coordinatorArg = serverUrl;
 
     this.currentState = 'starting';
     this.statusMessage = 'Initializing local Vulkan compute worker...';
@@ -985,7 +988,7 @@ export class WorkerManager {
     }
 
     const spawnCmd = pythonPath;
-    const args = [scriptPath, 'worker', '--coordinator', coordHost];
+    const args = [scriptPath, 'worker', '--coordinator', coordinatorArg];
 
     if (networkKey) args.push('--network-key', networkKey);
     if (allowedGpus) args.push('--allowed-gpus', allowedGpus);

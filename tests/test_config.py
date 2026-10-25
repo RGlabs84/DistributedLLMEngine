@@ -711,6 +711,60 @@ def test_a_malformed_listen_port_keeps_the_default(isolated_config):
     assert engine_config.get_worker_limits()["wg_listen_port"] == 51820
 
 
+def test_speculation_is_off_until_the_operator_measures_it(monkeypatch):
+    """Drafting was measured slower on the production host; it is a per-host choice."""
+    monkeypatch.setattr(engine_config, "get_config", lambda force_reload=False: {})
+    limits = engine_config.get_worker_limits()
+
+    assert limits["spec_type"] == "none"
+    assert limits["spec_draft_n_max"] == 16
+    assert limits["spec_draft_n_min"] == 0
+    assert limits["spec_draft_p_min"] == 0.75
+
+
+def test_speculation_settings_are_read_from_config(monkeypatch):
+    monkeypatch.setattr(engine_config, "get_config", lambda force_reload=False: {
+        "SPEC_TYPE": " Draft-Simple, ngram-mod ",
+        "SPEC_DRAFT_N_MAX": "8",
+        "SPEC_DRAFT_N_MIN": "2",
+        "SPEC_DRAFT_P_MIN": "0.6",
+    })
+    limits = engine_config.get_worker_limits()
+
+    assert limits["spec_type"] == "draft-simple,ngram-mod"
+    assert limits["spec_draft_n_max"] == 8
+    assert limits["spec_draft_n_min"] == 2
+    assert limits["spec_draft_p_min"] == 0.6
+
+
+def test_spec_type_none_wins_over_anything_listed_with_it(monkeypatch):
+    monkeypatch.setattr(engine_config, "get_config",
+                        lambda force_reload=False: {"SPEC_TYPE": "ngram-mod,none"})
+    assert engine_config.get_worker_limits()["spec_type"] == "none"
+
+
+@pytest.mark.parametrize("settings", [
+    {"SPEC_TYPE": "draft-simpel"},          # llama-server would refuse to start
+    {"SPEC_TYPE": "draft-simple,bogus"},    # one bad entry spoils the list
+    {"SPEC_TYPE": " , "},
+    {"SPEC_DRAFT_N_MAX": "0"},
+    {"SPEC_DRAFT_N_MAX": "65"},
+    {"SPEC_DRAFT_N_MAX": "lots"},
+    {"SPEC_DRAFT_N_MIN": "-1"},
+    {"SPEC_DRAFT_N_MIN": "17"},             # above the (default) maximum
+    {"SPEC_DRAFT_P_MIN": "1.5"},
+    {"SPEC_DRAFT_P_MIN": "-0.1"},
+    {"SPEC_DRAFT_P_MIN": "high"},
+])
+def test_a_bad_spec_setting_keeps_the_default(monkeypatch, settings):
+    """A typo in config.txt must not stop the engine from starting."""
+    monkeypatch.setattr(engine_config, "get_config", lambda force_reload=False: settings)
+    limits = engine_config.get_worker_limits()
+
+    for key, value in engine_config.SPEC_DEFAULTS.items():
+        assert limits[key] == value
+
+
 def test_draft_device_defaults_to_auto_and_honours_an_override(monkeypatch):
     """Empty means 'pick per machine' at the point of use; DRAFT_DEVICE pins it explicitly."""
     monkeypatch.setattr(engine_config, "get_config", lambda force_reload=False: {})

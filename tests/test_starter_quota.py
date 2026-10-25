@@ -60,6 +60,28 @@ def test_autocomplete_is_refused_once_chat_trial_is_spent(tmp_path, monkeypatch)
     assert not allowed
 
 
+def test_a_failed_save_leaves_the_previous_file_intact(tmp_path, monkeypatch):
+    """
+    The save used to truncate the file in place; dying halfway left unparseable JSON, and
+    the next start loaded that as "nobody has used anything", resetting every trial.
+    """
+    mgr = _manager(tmp_path)
+    mgr.check_and_consume("ip", limit=3)
+    path = tmp_path / "starter_quota.json"
+    before = path.read_text()
+
+    def dump_then_die(obj, f, **kwargs):
+        f.write('{"ip": ')
+        raise OSError("disk full")
+
+    monkeypatch.setattr(coordinator.json, "dump", dump_then_die)
+    mgr.check_and_consume("ip", limit=3)
+    monkeypatch.undo()
+
+    assert path.read_text() == before
+    assert _manager(tmp_path).peek("ip", limit=3) == (True, 1, 2)
+
+
 def test_remaining_count_is_stashed_for_the_header(tmp_path, monkeypatch):
     monkeypatch.setattr(coordinator, "starter_quota_mgr", _manager(tmp_path))
     req = _request("/v1/chat/completions")
