@@ -106,6 +106,13 @@ FATAL_EXIT_CODE = 1
 # engine from the coordinator, then restarts the worker). 75 is EX_TEMPFAIL in sysexits.h.
 VERSION_MISMATCH_EXIT_CODE = 75
 
+# Exit code meaning "the coordinator will not admit this machine as a CPU-only node" (no
+# usable GPU, and below its CPU_MIN_* floors). Retrying cannot help: the hardware is what it
+# is. The worker prints the reason on a line starting REFUSAL_MARKER, which the VS Code
+# extension shows the user. 78 is EX_CONFIG in sysexits.h.
+CPU_BELOW_MINIMUM_EXIT_CODE = 78
+REFUSAL_MARKER = "DLNE_REFUSAL: "
+
 # How long a node that is AHEAD of its coordinator waits between heartbeats. The coordinator
 # is probably mid-restart onto the same version; hammering it helps nobody.
 AHEAD_OF_COORDINATOR_RETRY_SECONDS = 30.0
@@ -497,8 +504,11 @@ class WorkerNode:
             log_path = os.path.join(log_dir, "rpc_server.log")
             self.rpc_log_file = open(log_path, "a")
             banner_offset = self.rpc_log_file.tell()
+            # CPU only: name the device rather than only hiding GPUs from Vulkan, which would
+            # leave Metal (macOS) and any other backend in play.
+            device_args = ["--device", "CPU"] if allowed_gpu == "none" else []
             self.rpc_process = subprocess.Popen(
-                [binary_path, "--host", self.rpc_ip, "--port", str(self.rpc_port)] + cache_args,
+                [binary_path, "--host", self.rpc_ip, "--port", str(self.rpc_port)] + cache_args + device_args,
                 stdout=self.rpc_log_file,
                 stderr=subprocess.STDOUT,
                 env=env
@@ -616,6 +626,15 @@ class WorkerNode:
                             log_error(f"FATAL: The Coordinator rejected this node's credentials! {_response_detail(e.response)}")
                             log_system("Your NETWORK_KEY is missing or does not match the Coordinator - ask your admin for a fresh invite file.")
                             self.request_shutdown(FATAL_EXIT_CODE, "Coordinator rejected worker authentication (HTTP 401)")
+                            return
+                        elif (e.response.status_code == 403
+                              and e.response.headers.get("X-DLNE-Refusal", "") == "cpu-minimum"):
+                            # Below the swarm's floor for CPU-only nodes. The hardware will not
+                            # change between heartbeats, so stop and say exactly what is missing.
+                            reason = _response_detail(e.response) or "this machine is below the swarm's minimum for CPU-only nodes"
+                            log_error(f"The coordinator will not admit this machine: {reason}")
+                            print(f"{REFUSAL_MARKER}{reason}", flush=True)
+                            self.request_shutdown(CPU_BELOW_MINIMUM_EXIT_CODE, "below the minimum for CPU-only nodes")
                             return
                         else:
                             log_error(f"Coordinator responded with error: {e.response.status_code}")

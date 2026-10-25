@@ -343,6 +343,58 @@ def gpu_section(hardware: Any) -> Dict[str, Any]:
     return gpu if isinstance(gpu, dict) else {}
 
 
+def cpu_node_shortfalls(hw: Any, limits: Dict[str, Any]) -> List[str]:
+    """
+    What a node with no usable GPU lacks against the CPU_MIN_* floors, as plain phrases for
+    the person whose machine it is ("4 physical cores (this machine has 2)"). Empty when it
+    qualifies, or when it has a GPU, which these rules do not cover.
+
+    A missing measurement counts as a shortfall: a node that cannot show its memory
+    bandwidth or instruction sets is not admitted on trust, since one slow CPU node holds up
+    every token of the pipeline it is placed in.
+    """
+    hw = hw if isinstance(hw, dict) else {}
+    if _as_number(gpu_section(hw).get("vram_total_gb", 0)) > 0:
+        return []
+
+    missing: List[str] = []
+    min_ram = float(limits.get("cpu_min_ram_gb", 8.0))
+    min_cores = int(limits.get("cpu_min_cores", 4))
+    min_bandwidth = float(limits.get("cpu_min_bandwidth_gbs", 30.0))
+
+    ram = _as_number(hw.get("ram_gb", 0))
+    if ram < min_ram:
+        missing.append(f"at least {min_ram:g} GB of RAM lent to DLNE (this machine lends {ram:g} GB)")
+    cores = _as_number(hw.get("cpu_cores", 0))
+    if cores < min_cores:
+        missing.append(f"{min_cores} physical CPU cores (this machine has {cores:g})")
+
+    # AVX2 + FMA is llama.cpp's fast x86 path; ARM CPUs are judged on bandwidth alone.
+    if hw.get("cpu_arch", "x86_64") == "x86_64":
+        features = hw.get("cpu_features")
+        features = set(features) if isinstance(features, list) else set()
+        lacking = [f.upper() for f in ("avx2", "fma") if f not in features]
+        if lacking:
+            missing.append(f"a CPU with AVX2 and FMA (missing: {', '.join(lacking)}; Intel 2013+ or AMD Ryzen)")
+
+    bandwidth = hw.get("mem_bandwidth_gbs")
+    if not isinstance(bandwidth, (int, float)) or isinstance(bandwidth, bool):
+        missing.append(f"a memory bandwidth measurement of at least {min_bandwidth:g} GB/s (none was reported)")
+    elif bandwidth < min_bandwidth:
+        missing.append(f"memory bandwidth of at least {min_bandwidth:g} GB/s (measured {bandwidth:g} GB/s)")
+    return missing
+
+
+def cpu_refusal_text(missing: List[str]) -> str:
+    return "This machine has no usable GPU, and a CPU-only node needs " + "; ".join(missing) + "."
+
+
+# Set on a heartbeat refused for the CPU floors, so the worker can tell that apart from any
+# other 403 and stop with a reason instead of retrying forever.
+CPU_REFUSAL_HEADER = "X-DLNE-Refusal"
+CPU_REFUSAL_VALUE = "cpu-minimum"
+
+
 def get_request_token(request: Request | WebSocket) -> str:
     """Extracts the node token from an Authorization header or the ``token`` query param."""
     auth = request.headers.get("Authorization", "")
@@ -515,15 +567,11 @@ class NonContribBlockerMiddleware(BaseHTTPMiddleware):
                         )
                     return HTMLResponse("<h1>Access Denied</h1><p>You must be an active compute node or present a valid DLNE API key to access the network.</p>", status_code=403)
 
-                # Enforce Non-Contrib Clause
-                hw = worker.get("hardware", {})
-                vram = _as_number(gpu_section(hw).get("vram_total_gb", 0))
-                sysram = _as_number(hw.get("ram_gb", 0))
-                cpu = _as_number(hw.get("cpu_cores", 0))
-
-                if vram <= 0:
-                    if sysram < 8.0 or cpu < 2:
-                        return HTMLResponse("<h1>Access Denied</h1><p>Non-Contributing Policy: CPU-only nodes must contribute at least 2 Physical Cores and 8GB of RAM to access the network.</p>", status_code=403)
+                # Enforce Non-Contrib Clause: a CPU-only node earns access on the same floors
+                # it was admitted on (a node registered under older, laxer rules does not).
+                missing = cpu_node_shortfalls(worker.get("hardware", {}), get_worker_limits())
+                if missing:
+                    return JSONResponse({"detail": cpu_refusal_text(missing)}, status_code=403)
 
         return await call_next(request)
 
@@ -1066,15 +1114,11 @@ async def worker_heartbeat(request: Request, payload: HeartbeatPayload):
     # apply to a key that is present-but-null. Chaining .get onto that None raised
     # AttributeError — a remote, unauthenticated HTTP 500 whenever ALLOW_UNSIGNED_WORKERS
     # was on, and a log flood either way.
-    hw = payload.hardware
-    vram = _as_number(gpu_section(hw).get("vram_total_gb", 0))
-    sysram = _as_number(hw.get("ram_gb", 0))
-    cpu = _as_number(hw.get("cpu_cores", 0))
-
-    if vram <= 0:
-        if sysram < 8.0 or cpu < 2:
-            log_error(f"Rejected Worker Heartbeat from {safe_ip}: Insufficient CPU-only hardware (Requires 8GB RAM and 2 Cores).")
-            raise HTTPException(status_code=403, detail="CPU-only nodes require at least 8GB RAM and 2 Physical Cores.")
+    missing = cpu_node_shortfalls(payload.hardware, get_worker_limits())
+    if missing:
+        log_error(f"Rejected CPU-only worker {safe_id} from {safe_ip}: needs {'; '.join(missing)}.")
+        raise HTTPException(status_code=403, detail=cpu_refusal_text(missing),
+                            headers={CPU_REFUSAL_HEADER: CPU_REFUSAL_VALUE})
 
     # --- 5. Registration --------------------------------------------------------------
     registry.update_worker(

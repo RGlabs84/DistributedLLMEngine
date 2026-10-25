@@ -38,7 +38,7 @@ MANIFEST_NAME = "release.json"
 # written "_"), together with the upstream build they come from (llama_build) and its RPC
 # protocol (rpc_proto). The fields are optional so the manifest stays schema 1: an older
 # extension still verifies the signature over them and ignores them.
-RPC_PLATFORMS = ("win-x64", "linux-x64", "macos-arm64")
+RPC_PLATFORMS = ("win-x64", "linux-x64", "macos-arm64", "win-arm64", "linux-arm64", "macos-x64")
 RPC_EXECUTABLES = ("ggml-rpc-server", "ggml-rpc-server.exe")
 # What an RPC zip may hold: bin/<name>, flat, where name is the server or one of its libraries.
 _RPC_MEMBER_RE = re.compile(
@@ -423,13 +423,10 @@ def host_rpc_platform(system: Optional[str] = None, machine: Optional[str] = Non
 
     system = system if system is not None else _platform.system()
     machine = (machine if machine is not None else _platform.machine()).lower()
-    if system == "Windows" and machine in ("amd64", "x86_64"):
-        return "win-x64"
-    if system == "Linux" and machine in ("x86_64", "amd64"):
-        return "linux-x64"
-    if system == "Darwin" and machine in ("arm64", "aarch64"):
-        return "macos-arm64"
-    return None
+    arch = "x64" if machine in ("amd64", "x86_64") else "arm64" if machine in ("arm64", "aarch64") else None
+    os_key = {"Windows": "win", "Linux": "linux", "Darwin": "macos"}.get(system)
+    key = f"{os_key}-{arch}" if os_key and arch else None
+    return key if key in RPC_PLATFORMS else None
 
 
 def load_manifest(path: str) -> Optional[Dict[str, Any]]:

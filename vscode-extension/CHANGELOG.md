@@ -1,11 +1,26 @@
 # Change Log
 
-All notable changes to the **DLNE Frontier Coding Assistant** extension will be documented in this file.
+All notable changes to the **DLNE Coding Assistant** extension will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+
+## [1.2.1] - 2026-10-25
+
+Pairs with DLNE coordinator **2.1.3**.
+
+### Added
+- **Contribute your CPU.** New setting `dlne.worker.device`: `auto` (the GPU if there is one, otherwise the CPU), `gpu`, or `cpu` (lend only the CPU and keep the GPU for yourself). A CPU-only machine needs 8 GB of RAM lent, 4 physical cores, AVX2 and FMA on Intel/AMD, and 30 GB/s of memory bandwidth, which the engine measures in a second or two when you join.
+- **More machines can contribute:** Windows and Linux on ARM64 (GPU through Vulkan, or the CPU), and Intel Macs (CPU only: llama.cpp's Intel Mac build has no GPU support), alongside Windows/Linux x64 and Apple Silicon. These builds are new and the least tested.
+
+### Fixed (Intel Macs)
+- An Intel Mac with an AMD GPU could be reported as a Metal GPU node, which the engine cannot use. Only Apple Silicon is treated as Metal now.
+
+### Fixed
+- A machine without a GPU was refused by the swarm with nothing on screen: the extension lent 4 GB of RAM by default, and a CPU-only machine needs 8. Starting now offers to lend 12 GB first, and if the swarm still refuses the machine, you are told exactly what it lacks (for example "memory bandwidth of at least 30 GB/s (measured 21.5 GB/s)").
+- Choosing CPU-only (`allowedGpus: none`) made the engine look for a file no release ships, so it never started.
 
 ## [1.2.0] - 2026-10-25
 

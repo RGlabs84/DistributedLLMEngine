@@ -847,6 +847,7 @@ def test_heartbeat_accepts_a_null_gpu_section(monkeypatch):
         port=50052,
         token="tok",
         hardware={"gpu": None, "ram_gb": 32.0, "cpu_cores": 8, "cpu_threads": 16,
+                  "cpu_arch": "x86_64", "cpu_features": ["avx2", "fma"], "mem_bandwidth_gbs": 45.0,
                   "is_yielding": False},
     )
 

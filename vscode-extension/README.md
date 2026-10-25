@@ -22,7 +22,16 @@ DLNE runs on a **swarm**: a coordinator plus the GPUs of the people who use it.
 
 You choose how much to lend (`dlne.worker.maxVramGb`, `dlne.worker.maxRamGb`, `dlne.worker.allowedGpus`), and you can stop at any time.
 
-> **Contributing works on Windows (x64), Linux (x64) and macOS on Apple Silicon.** GPUs are used through Vulkan on Windows and Linux and Metal on macOS, with a CPU fallback. macOS support is the newest of the three. Intel Macs and ARM Linux/Windows can use the free trial and everything else, but cannot contribute yet.
+> **Contributing works on Windows and Linux (x64 and ARM64) and on macOS (Apple Silicon and Intel).** GPUs are used through Vulkan on Windows and Linux and Metal on Apple Silicon. Intel Macs contribute their CPU (llama.cpp has no GPU support for them). The ARM64 and Intel Mac builds are the newest and the least tested.
+
+**No GPU? You can contribute your CPU**, if it's fast enough not to slow everyone else down. A CPU-only machine needs:
+
+- at least **8 GB of RAM** lent to DLNE (`dlne.worker.maxRamGb`; you're offered 12 GB when you start),
+- **4 physical cores**,
+- on Intel/AMD, **AVX2 and FMA** (Intel from 2013, any AMD Ryzen),
+- **30 GB/s of memory bandwidth**, measured in a second or two when you join. Good dual-channel DDR4 just makes it; DDR5 and LPDDR5 pass easily.
+
+A CPU's speed here is set by how fast it can read memory, and one slow machine would hold up every answer it takes part in, so a machine below any of these is told exactly what it's missing instead of joining. To lend only your CPU even though you have a GPU, set `dlne.worker.device` to `cpu`.
 
 ---
 
@@ -89,9 +98,10 @@ Then in VS Code settings:
 | `dlne.serverUrl` | `https://73-215-216-195.sslip.io` | The coordinator: the public swarm (over HTTPS), or your own. |
 | `dlne.apiKey` | `""` | Optional API key. Leave blank to use the free trial or your contribution. |
 | `dlne.worker.networkKey` | public swarm key | The swarm's shared worker key. Change it only for a private coordinator. |
+| `dlne.worker.device` | `auto` | What to contribute: `auto` (GPU if there is one, else CPU), `gpu`, or `cpu`. |
 | `dlne.worker.allowedGpus` | `""` | GPU indices to lend (e.g. `0,1`). Blank lends all detected GPUs. |
 | `dlne.worker.maxVramGb` | `-1` | Most VRAM to lend, in GB (`-1`: detect). |
-| `dlne.worker.maxRamGb` | `4.0` | Most system RAM the worker may use, in GB. |
+| `dlne.worker.maxRamGb` | `4.0` | Most system RAM the worker may use, in GB. A CPU-only machine needs at least 8. |
 | `dlne.worker.autoStart` | `false` | Resume contributing when VS Code opens (set for you when you start contributing). |
 | `dlne.worker.pythonPath` | `python3` | Python used for the engine. |
 | `dlne.enableInlineCompletion` | `true` | Ghost-text autocomplete. |

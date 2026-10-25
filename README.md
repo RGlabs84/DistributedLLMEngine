@@ -54,7 +54,13 @@ Everything under `/v1/admin/*` needs that operator key as `Authorization: Bearer
 default only accepts it from the coordinator's own machine (`ADMIN_ALLOW_REMOTE=true` to change
 that). BarrkBOT's `/dlne` command uses it.
 
-Settings live in `config/config.txt` (`KEY=VALUE`). Two groups matter for most operators:
+Settings live in `config/config.txt` (`KEY=VALUE`). Three groups matter for most operators:
+
+- **What a CPU-only worker must bring**: `CPU_MIN_RAM_GB` (8), `CPU_MIN_CORES` (4 physical) and
+  `CPU_MIN_BANDWIDTH_GBS` (30, measured by the worker when it joins); x86 CPUs also need AVX2
+  and FMA. These can only be raised. A CPU's speed here is its memory bandwidth, and one slow
+  node holds up every token of the pipeline it is in, so a node below any floor is refused
+  with the exact reason, which the extension shows its owner.
 
 - **Behind a reverse proxy** (Caddy, nginx) on the same machine or LAN: set
   `TRUST_PROXY_HEADERS=true` so clients are told apart by `X-Forwarded-For` rather than all
@@ -72,8 +78,9 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Two groups matter for most o
 
 Workers run code and binaries they download from the coordinator, so every release is signed.
 `scripts/release.py` builds a reproducible engine archive and signs a manifest (Ed25519) naming
-it and the pinned llama.cpp build: one `ggml-rpc-server` zip per worker platform (Windows x64,
-Linux x64, macOS Apple Silicon) and the coordinator's own build. The extension and the worker
+it and the pinned llama.cpp build: one `ggml-rpc-server` zip per worker platform (Windows and
+Linux on x64 and ARM64, macOS on Apple Silicon and Intel, the last CPU-only) and the
+coordinator's own build. The extension and the worker
 refuse anything that does not match the maintainer's key, and never downgrade. Workers report
 their llama.cpp RPC protocol, and the coordinator only routes to workers that speak its own.
 

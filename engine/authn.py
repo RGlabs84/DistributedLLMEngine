@@ -715,7 +715,15 @@ HARDWARE_BOUNDS = {
     "ram_gb": (0.0, 2048.0),          # 2 TB, i.e. a well-specified server
     "cpu_cores": (0, 256),            # physical cores
     "cpu_threads": (0, 512),          # logical processors
+    # Measured by CPU-only nodes (engine/hardware.measure_memory_bandwidth_gbs). A 12-channel
+    # DDR5 server reaches ~460 GB/s; anything near the cap is a lie, not a machine.
+    "mem_bandwidth_gbs": (0.0, 2048.0),
 }
+
+# cpu_features is a list of instruction-set names (engine/hardware.CPU_FEATURE_NAMES); a
+# node gets to say which it has, not to send arbitrary data along with it.
+_MAX_CPU_FEATURES = 32
+_MAX_NAME_LENGTH = 32
 
 # Fields a worker reports that MUST be genuine JSON booleans, and where they may appear.
 # These are not numbers, so HARDWARE_BOUNDS cannot express them, but they are every bit as
@@ -857,5 +865,16 @@ def validate_hardware_profile(hw: dict) -> Tuple[bool, str]:
         if isinstance(container, dict) and field in container:
             if not isinstance(container[field], bool):
                 return (False, f"{label} must be true or false")
+
+    # Instruction sets and architecture decide whether a CPU-only node is admitted, so they
+    # must be what they claim to be: a short list of short names, and a short name.
+    features = hw.get("cpu_features")
+    if features is not None:
+        if (not isinstance(features, list) or len(features) > _MAX_CPU_FEATURES
+                or not all(isinstance(f, str) and 0 < len(f) <= _MAX_NAME_LENGTH for f in features)):
+            return (False, "cpu_features must be a list of instruction-set names")
+    arch = hw.get("cpu_arch")
+    if arch is not None and not (isinstance(arch, str) and len(arch) <= _MAX_NAME_LENGTH):
+        return (False, "cpu_arch must be a short name")
 
     return (True, "ok")

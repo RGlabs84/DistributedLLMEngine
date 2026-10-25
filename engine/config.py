@@ -218,6 +218,13 @@ SPEC_DEFAULTS = {
 }
 
 
+CPU_NODE_DEFAULTS = {
+    "cpu_min_ram_gb": 8.0,
+    "cpu_min_cores": 4,             # physical: hyperthreads add little to a bandwidth-bound job
+    "cpu_min_bandwidth_gbs": 30.0,  # good dual-channel DDR4 measures ~30-35, DDR5 ~45-70
+}
+
+
 def get_worker_limits() -> dict:
     """
     Returns the typed operational limits, with defaults for every key.
@@ -304,6 +311,12 @@ def get_worker_limits() -> dict:
         # types (draft-*) only apply when the model has a "_dflash" companion; the ngram
         # types need no second model. See SPEC_DEFAULTS for why it ships switched off.
         **SPEC_DEFAULTS,
+        # What a node with no usable GPU must bring to be admitted. Generating a token reads
+        # every weight a node holds, so a CPU node's speed is its memory bandwidth, and one
+        # slow node holds up every token of the pipeline it sits in. These are floors: an
+        # operator can raise them, and a node below any one of them is refused with the
+        # reason (see coordinator.cpu_node_shortfalls).
+        **CPU_NODE_DEFAULTS,
     }
 
     config = get_config()
@@ -407,6 +420,17 @@ def get_worker_limits() -> dict:
 
     if "DRAFT_DEVICE" in config:
         limits["draft_device"] = config["DRAFT_DEVICE"].strip()
+
+    # The CPU-node floors may only be raised: lowering them is how one slow machine drags
+    # the whole swarm down, so a value under the default (or a typo) keeps the default.
+    for key, cast in (("CPU_MIN_RAM_GB", float), ("CPU_MIN_CORES", int), ("CPU_MIN_BANDWIDTH_GBS", float)):
+        if key in config:
+            try:
+                value = cast(config[key])
+            except ValueError:
+                continue
+            if value >= CPU_NODE_DEFAULTS[key.lower()]:
+                limits[key.lower()] = value
 
     if "SPEC_TYPE" in config:
         types = [t.strip().lower() for t in config["SPEC_TYPE"].split(",") if t.strip()]

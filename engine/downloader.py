@@ -153,7 +153,11 @@ def download_and_extract_engine(role: str, coordinator_url: Optional[str] = None
         allowed_gpu = '-1'
 
     if allowed_gpu == 'none':
-        candidates = [target_bin_base + "-cpu" + ext]
+        # CPU only. The pinned llama.cpp build carries its CPU backends beside the GPU one
+        # and picks the best for this processor itself, so it is the same binary; the
+        # worker hides the GPUs from it (GGML_VK_VISIBLE_DEVICES=""). A separate "-cpu"
+        # build is only looked for after it, for installs that predate the pinned builds.
+        candidates = [target_bin_base + ext, target_bin_base + "-cpu" + ext]
     else:
         # We test in descending order of hardware requirements (AVX2 is minimum)
         candidates = [

@@ -7,7 +7,7 @@ Turn one pinned upstream llama.cpp build into the binaries a DLNE release ships.
 
 Output, in release_dist/assets/llama/ (what `scripts/release.py build|deploy` signs):
 
-    rpc-bin-win-x64.zip, rpc-bin-linux-x64.zip, rpc-bin-macos-arm64.zip
+    rpc-bin-<platform>.zip for win-x64, linux-x64, macos-arm64, win-arm64, linux-arm64, macos-x64
         ggml-rpc-server and the ggml libraries it loads, under bin/. Deterministic: the
         same upstream archives always give the same bytes.
     llama-<build>-bin-ubuntu-vulkan-x64.tar.gz
@@ -49,6 +49,12 @@ SOURCES = {
     "win-x64": "llama-{b}-bin-win-vulkan-x64.zip",
     "linux-x64": "llama-{b}-bin-ubuntu-vulkan-x64.tar.gz",
     "macos-arm64": "llama-{b}-bin-macos-arm64.tar.gz",
+    # Opened by CPU-only contribution (2.1.3). Each still carries its GPU path - Vulkan on
+    # ARM Windows (Snapdragon X's Adreno) and ARM Linux, Metal on Intel Macs with an AMD GPU -
+    # beside the CPU backends.
+    "win-arm64": "llama-{b}-bin-win-vulkan-arm64.zip",
+    "linux-arm64": "llama-{b}-bin-ubuntu-vulkan-arm64.tar.gz",
+    "macos-x64": "llama-{b}-bin-macos-x64.tar.gz",
 }
 SERVER_SOURCE = "llama-{b}-bin-ubuntu-vulkan-x64.tar.gz"
 

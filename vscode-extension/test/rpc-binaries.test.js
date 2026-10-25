@@ -88,12 +88,12 @@ test('another platform\'s signed build is never taken for this one', needsUnzip,
   }));
 
 test('a platform DLNE ships no build for gets a clear note and no download', () =>
-  on({ key: 'none', platform: 'darwin', arch: 'x64', exe: 'ggml-rpc-server' }, async ({ sb, wm, ensure }) => {
-    sb.publishRpcBin('v1', { platform: 'macos-arm64' });
+  on({ key: 'none', platform: 'linux', arch: 'ia32', exe: 'ggml-rpc-server' }, async ({ sb, wm, ensure }) => {
+    sb.publishRpcBin('v1', { platform: 'linux-x64' });
     await ensure();
     assert.deepEqual(sb.release.hits, []);
     const log = stub.state.channels.map((c) => c.text()).join('\n');
-    assert.match(log, /ships no GPU engine for darwin\/x64/);
+    assert.match(log, /ships no GPU engine for linux\/ia32/);
   }));
 
 test('installed binaries the release still names are not downloaded again', needsUnzip, () =>

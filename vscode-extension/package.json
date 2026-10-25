@@ -2,7 +2,7 @@
   "name": "dlne-code-assistant",
   "displayName": "DLNE Coding Assistant: Free AI Agent",
   "description": "A free AI coding agent and autocomplete, running on GPUs its users share. 200 free chats, no account or API key.",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "publisher": "dlne",
   "license": "MIT",
   "repository": {
@@ -146,6 +146,17 @@
           "default": false,
           "description": "Automatically resume compute worker contribution when VS Code is open (only when explicitly enabled via contribute/toggle)"
         },
+        "dlne.worker.device": {
+          "type": "string",
+          "enum": ["auto", "gpu", "cpu"],
+          "enumDescriptions": [
+            "Use the GPU when there is one, otherwise the CPU.",
+            "Only contribute a GPU; do not start without one.",
+            "Contribute the CPU and RAM only, even when there is a GPU (it stays free for you)."
+          ],
+          "default": "auto",
+          "description": "What to contribute. Without a GPU the swarm needs at least 8 GB of RAM (dlne.worker.maxRamGb), 4 CPU cores, AVX2 on Intel/AMD, and 30 GB/s of memory bandwidth."
+        },
         "dlne.worker.allowedGpus": {
           "type": "string",
           "default": "",
@@ -159,7 +170,7 @@
         "dlne.worker.maxRamGb": {
           "type": "number",
           "default": 4.0,
-          "description": "Maximum Host System RAM overhead in GB (default: 4.0GB)"
+          "description": "Most system RAM the worker may use, in GB. With a GPU it only needs a little; contributing a CPU needs at least 8 (you are offered 12 when you start)."
         },
         "dlne.chatModel": {
           "type": "string",

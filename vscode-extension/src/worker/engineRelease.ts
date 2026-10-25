@@ -48,7 +48,7 @@ export interface ReleaseManifest {
 }
 
 /** The platforms DLNE ships ggml-rpc-server for, as named in the release (engine/release.py). */
-export const RPC_PLATFORMS = ['win-x64', 'linux-x64', 'macos-arm64'] as const;
+export const RPC_PLATFORMS = ['win-x64', 'linux-x64', 'macos-arm64', 'win-arm64', 'linux-arm64', 'macos-x64'] as const;
 export type RpcPlatform = (typeof RPC_PLATFORMS)[number];
 
 export function rpcField(platform: string, what: 'sha256' | 'size'): string {
@@ -57,10 +57,10 @@ export function rpcField(platform: string, what: 'sha256' | 'size'): string {
 
 /** This machine's RPC platform, or null when DLNE ships no ggml-rpc-server for it. */
 export function hostRpcPlatform(platform: string = process.platform, arch: string = process.arch): RpcPlatform | null {
-  if (platform === 'win32' && arch === 'x64') return 'win-x64';
-  if (platform === 'linux' && arch === 'x64') return 'linux-x64';
-  if (platform === 'darwin' && arch === 'arm64') return 'macos-arm64';
-  return null;
+  const os = ({ win32: 'win', linux: 'linux', darwin: 'macos' } as Record<string, string>)[platform];
+  const cpu = ({ x64: 'x64', arm64: 'arm64' } as Record<string, string>)[arch];
+  const key = os && cpu ? `${os}-${cpu}` : '';
+  return (RPC_PLATFORMS as readonly string[]).includes(key) ? (key as RpcPlatform) : null;
 }
 
 /** The release could not be trusted. `userMessage` is written to be shown as-is. */

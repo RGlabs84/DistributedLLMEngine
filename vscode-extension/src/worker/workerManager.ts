@@ -7,6 +7,7 @@ import * as http from 'http';
 import * as https from 'https';
 import { EngineVerificationError, FetchResult, RELEASE_PUBKEY_HEX, fetchVerifiedEngine, fetchVerifiedRpcBin, hostRpcPlatform } from './engineRelease';
 import { resolveServerUrl } from '../serverUrl';
+import { CPU_BELOW_MINIMUM_EXIT_CODE, CPU_MIN_RAM_GB, CPU_OFFER_RAM_GB, ContributionPlan, parseRefusal, planContribution } from './contribution';
 
 function downloadFile(urlStr: string, destPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -341,8 +342,9 @@ export class WorkerManager {
       }
     } catch {}
 
-    // 3. Apple Metal check
-    if (isMac) {
+    // 3. Apple Metal check: Apple Silicon only. llama.cpp's Intel Mac build has no Metal
+    // backend, so an Intel Mac contributes its CPU whatever GPU it has.
+    if (isMac && process.arch === 'arm64') {
       try {
         const out = child_process.execSync('system_profiler SPDisplaysDataType', { encoding: 'utf-8', timeout: 3000 });
         if (out.includes('Apple') || out.includes('Metal')) {
@@ -918,6 +920,15 @@ export class WorkerManager {
       return true;
     }
 
+    // What this machine contributes. Without a GPU the coordinator only admits a CPU that
+    // meets its floors; the RAM one is the user's setting, so it is settled here, before a
+    // worker starts only to be refused.
+    const plan = await this.planThisMachine();
+    if (!plan) {
+      return false;
+    }
+    this.contributionPlan = plan;
+
     // 1. Check if systemd user service exists on Linux
     const homeDir = process.env.HOME || '';
     const systemdService = path.join(homeDir, '.config', 'systemd', 'user', 'dlne-worker.service');
@@ -952,7 +963,7 @@ export class WorkerManager {
     const rawKey = config.get<string>('worker.networkKey') || '';
     const networkKey = this.resolveNetworkKey(rawKey, rootWorkspace);
 
-    const allowedGpus: string = config.get<string>('worker.allowedGpus') || '';
+    const allowedGpus: string = plan.allowedGpus;
     const maxVram: number = config.get<number>('worker.maxVramGb') || -1;
     const maxRam: number = config.get<number>('worker.maxRamGb') || 4.0;
 
@@ -1021,25 +1032,22 @@ export class WorkerManager {
         env: spawnEnv
       });
 
+      this.lastRefusal = null;
       this.workerProcess.stdout?.on('data', (data) => {
         const text = data.toString();
         this.outputChannel.append(text);
+        this.lastRefusal = parseRefusal(text) ?? this.lastRefusal;
         if (text.includes('Heartbeat OK') || text.includes('Heartbeat ACK:') || text.includes('RPC Server started')) {
-          this.currentState = 'contributing';
-          this.vramContributed = this.localGpu.hasGpu ? this.localGpu.vramTotalGb : 4.0;
-          this.statusMessage = `Actively contributing ${this.vramContributed} GB via ${this.localGpu.api.toUpperCase()}!`;
-          this.emitChange();
+          this.markContributing();
         }
       });
 
       this.workerProcess.stderr?.on('data', (data) => {
         const text = data.toString();
         this.outputChannel.append(text);
+        this.lastRefusal = parseRefusal(text) ?? this.lastRefusal;
         if (text.includes('Heartbeat OK') || text.includes('Heartbeat ACK:')) {
-          this.currentState = 'contributing';
-          this.vramContributed = this.localGpu.hasGpu ? this.localGpu.vramTotalGb : 4.0;
-          this.statusMessage = `Actively contributing ${this.vramContributed} GB via ${this.localGpu.api.toUpperCase()}!`;
-          this.emitChange();
+          this.markContributing();
         }
       });
 
@@ -1078,7 +1086,74 @@ export class WorkerManager {
 
     if (code === VERSION_MISMATCH_EXIT_CODE) {
       void this.restartAfterVersionMismatch();
+    } else if (code === CPU_BELOW_MINIMUM_EXIT_CODE) {
+      // The coordinator will not admit this machine as a CPU-only node, and says why.
+      const reason = this.lastRefusal || 'this machine is below the swarm\'s minimum for contributing a CPU.';
+      this.currentState = 'error';
+      this.statusMessage = 'This machine is below the minimum for contributing a CPU';
+      this.emitChange();
+      void vscode.window.showErrorMessage(`DLNE can't use this machine yet: ${reason}`, 'Show Log').then((choice) => {
+        if (choice === 'Show Log') this.outputChannel.show(true);
+      });
     }
+  }
+
+  /** The coordinator's reason for its last refusal of this machine (from the worker's output). */
+  private lastRefusal: string | null = null;
+  /** What the running (or last started) worker contributes. */
+  private contributionPlan: ContributionPlan | null = null;
+
+  private markContributing(): void {
+    this.currentState = 'contributing';
+    if (this.contributionPlan?.cpuOnly) {
+      const ram = vscode.workspace.getConfiguration('dlne').get<number>('worker.maxRamGb') || CPU_MIN_RAM_GB;
+      this.vramContributed = ram;
+      this.statusMessage = `Actively contributing your CPU and ${ram} GB of RAM!`;
+    } else {
+      this.vramContributed = this.localGpu.hasGpu ? this.localGpu.vramTotalGb : 4.0;
+      this.statusMessage = `Actively contributing ${this.vramContributed} GB via ${this.localGpu.api.toUpperCase()}!`;
+    }
+    this.emitChange();
+  }
+
+  /**
+   * Decide what to contribute (dlne.worker.device and the detected GPU), and make sure a CPU-only
+   * node lends the RAM the coordinator requires. Null when the worker must not start.
+   */
+  private async planThisMachine(): Promise<ContributionPlan | null> {
+    const config = vscode.workspace.getConfiguration('dlne');
+    const gpu = this.localGpu.name === 'Probing GPU...' ? await this.detectLocalGpu() : this.localGpu;
+    const plan = planContribution(
+      config.get<string>('worker.device'),
+      gpu.hasGpu,
+      config.get<string>('worker.allowedGpus') || '',
+      config.get<number>('worker.maxRamGb') ?? 4.0
+    );
+    if (plan.error) {
+      this.currentState = 'idle';
+      this.statusMessage = 'No GPU to contribute';
+      this.emitChange();
+      void vscode.window.showErrorMessage(plan.error);
+      return null;
+    }
+    if (plan.needsMoreRam) {
+      const lend = `Lend ${CPU_OFFER_RAM_GB} GB`;
+      const choice = await vscode.window.showWarningMessage(
+        `DLNE: ${gpu.hasGpu ? 'You chose to contribute your CPU.' : 'This machine has no usable GPU, so DLNE would contribute your CPU.'} ` +
+          `The swarm needs at least ${CPU_MIN_RAM_GB} GB of RAM from a CPU-only machine (plus 4 cores and fast memory, ` +
+          `which it checks when you join), and you lend ${config.get<number>('worker.maxRamGb') ?? 4} GB. Lend ${CPU_OFFER_RAM_GB} GB?`,
+        { modal: true },
+        lend
+      );
+      if (choice !== lend) {
+        this.currentState = 'idle';
+        this.statusMessage = 'Not started: a CPU-only machine needs more RAM lent';
+        this.emitChange();
+        return null;
+      }
+      await config.update('worker.maxRamGb', CPU_OFFER_RAM_GB, vscode.ConfigurationTarget.Global);
+    }
+    return plan;
   }
 
   /** Recent automatic restarts for a version mismatch, so a mismatch that never resolves cannot loop forever. */

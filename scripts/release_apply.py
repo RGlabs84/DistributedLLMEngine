@@ -41,7 +41,7 @@ BACKUP_META = "backup.json"
 # The llama.cpp binaries a release signs (mirrors engine/release.py, which this stdlib-only
 # script cannot import): one ggml-rpc-server zip per worker platform, served for download,
 # and the upstream build the coordinator itself runs.
-RPC_PLATFORMS = ("win-x64", "linux-x64", "macos-arm64")
+RPC_PLATFORMS = ("win-x64", "linux-x64", "macos-arm64", "win-arm64", "linux-arm64", "macos-x64")
 SERVER_LLAMA_UPLOAD = "server-llama.tar.gz"
 LLAMA_DIR = "llama"      # root/llama/<build>/ holds each installed server build
 BIN_LINK = "bin"         # root/bin -> the server build in use (llama-server, ggml-rpc-server)

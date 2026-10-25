@@ -364,9 +364,21 @@ test('rpcField and hostRpcPlatform name platforms exactly as the Python side doe
   assert.equal(hostRpcPlatform('win32', 'x64'), 'win-x64');
   assert.equal(hostRpcPlatform('linux', 'x64'), 'linux-x64');
   assert.equal(hostRpcPlatform('darwin', 'arm64'), 'macos-arm64');
-  for (const [p, a] of [['darwin', 'x64'], ['linux', 'arm64'], ['win32', 'arm64'], ['freebsd', 'x64']]) {
+  // Added with CPU-only contribution (coordinator 2.1.3).
+  assert.equal(hostRpcPlatform('darwin', 'x64'), 'macos-x64');
+  assert.equal(hostRpcPlatform('linux', 'arm64'), 'linux-arm64');
+  assert.equal(hostRpcPlatform('win32', 'arm64'), 'win-arm64');
+  for (const [p, a] of [['freebsd', 'x64'], ['linux', 'ia32'], ['linux', 's390x'], ['android', 'arm64']]) {
     assert.equal(hostRpcPlatform(p, a), null, `${p}/${a}`);
   }
+});
+
+test('the extension ships for exactly the platforms the Python release signs', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const py = fs.readFileSync(path.join(__dirname, '..', '..', 'engine', 'release.py'), 'utf8');
+  const pyList = /^RPC_PLATFORMS = \(([^)]*)\)/m.exec(py)[1].match(/"([^"]+)"/g).map((s) => s.slice(1, -1));
+  assert.deepEqual([...RPC_PLATFORMS], pyList);
 });
 
 test('a manifest that signs RPC binaries verifies, and changing them breaks the signature', () => {

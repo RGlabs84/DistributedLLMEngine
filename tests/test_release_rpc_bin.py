@@ -199,7 +199,9 @@ def test_an_rpc_zip_needs_the_server(tmp_path):
 
 @pytest.mark.parametrize("system,machine,expected", [
     ("Windows", "AMD64", "win-x64"), ("Linux", "x86_64", "linux-x64"), ("Darwin", "arm64", "macos-arm64"),
-    ("Darwin", "x86_64", None), ("Linux", "aarch64", None), ("Windows", "ARM64", None), ("FreeBSD", "amd64", None),
+    # Added with CPU-only contribution in 2.1.3.
+    ("Darwin", "x86_64", "macos-x64"), ("Linux", "aarch64", "linux-arm64"), ("Windows", "ARM64", "win-arm64"),
+    ("FreeBSD", "amd64", None), ("Linux", "riscv64", None), ("Linux", "s390x", None),
 ])
 def test_host_platforms(system, machine, expected):
     assert release.host_rpc_platform(system, machine) == expected

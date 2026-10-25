@@ -33,6 +33,7 @@ keys are never renamed, removed or re-nested here.
 import psutil
 import platform
 import os
+import queue
 import re
 import subprocess
 import threading
@@ -390,7 +391,8 @@ def _detect_gpu_type() -> str:
             for line in lines:
                 if "amd" in line or "radeon" in line or "intel" in line:
                     return "vulkan"
-        elif os_name == "Darwin":
+        elif os_name == "Darwin" and get_cpu_arch() == "arm64":
+            # Only Apple Silicon: the Intel Mac build of llama.cpp has no Metal backend.
             result = subprocess.run(["system_profiler", "SPDisplaysDataType"], capture_output=True, text=True)
             if "Apple" in result.stdout and "Metal" in result.stdout:
                 return "metal"
@@ -574,7 +576,10 @@ def _probe_all_gpus() -> Tuple[List[Dict[str, Any]], bool]:
                      ("id", "name", "vram_total_gb", "vram_free_gb", "load_percent")}
                     for card in drm_cards]
 
-    if os_name == "Darwin":
+    # Apple Silicon only. llama.cpp's Intel Mac build has no Metal backend, so an Intel Mac's
+    # AMD GPU cannot be used and must not be reported: the Coordinator would plan around VRAM
+    # the engine never touches. Such a Mac contributes its CPU.
+    if os_name == "Darwin" and get_cpu_arch() == "arm64":
         try:
             # Apple Silicon (M1/M2/M3/M4) Unified Memory Architecture
             result = subprocess.run(["system_profiler", "SPDisplaysDataType"], capture_output=True, text=True)
@@ -749,6 +754,174 @@ def get_cpu_threads() -> int:
         return min(actual_threads, limit)
     return actual_threads
 
+# --------------------------------------------------------------------------------------
+# CPU instruction sets and memory bandwidth (what a CPU-only node is judged on)
+# --------------------------------------------------------------------------------------
+#
+# Generating a token reads every weight a node holds, so on a CPU the speed is set by
+# memory bandwidth far more than by core count, and a slow node holds up every token of the
+# pipeline it sits in. The Coordinator therefore admits a CPU-only node on a measured
+# bandwidth floor plus the instruction sets llama.cpp's fast CPU paths need (AVX2 + FMA).
+
+# Reported instruction sets, in the names llama.cpp's CPU variants are built around.
+CPU_FEATURE_NAMES = ("avx2", "fma", "f16c", "avx512f", "avx_vnni", "amx")
+
+# /proc/cpuinfo spells AMX per sub-feature; any of them means the tile unit is there.
+_LINUX_FLAG_ALIASES = {"amx_tile": "amx"}
+
+# Windows exposes no FMA or F16C query. Every x86 CPU with AVX2 has both (Intel Haswell and
+# AMD Excavator onward), so they are inferred from AVX2 there.
+_WIN_PF_AVX2 = 40
+_WIN_PF_AVX512F = 41
+
+_cached_cpu_features: Optional[List[str]] = None
+
+
+def get_cpu_arch() -> str:
+    """'x86_64', 'arm64', or the platform's own spelling of anything else."""
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64", "x64"):
+        return "x86_64"
+    if machine in ("arm64", "aarch64"):
+        return "arm64"
+    return machine
+
+
+def _linux_cpu_features(cpuinfo_text: str) -> List[str]:
+    for line in cpuinfo_text.splitlines():
+        if line.startswith("flags"):
+            flags = {_LINUX_FLAG_ALIASES.get(f, f) for f in line.split(":", 1)[-1].split()}
+            return [name for name in CPU_FEATURE_NAMES if name in flags]
+    return []
+
+
+def _windows_cpu_features(present=None) -> List[str]:
+    if present is None:
+        import ctypes
+        present = ctypes.windll.kernel32.IsProcessorFeaturePresent  # type: ignore[attr-defined]
+    found = []
+    if present(_WIN_PF_AVX2):
+        found += ["avx2", "fma", "f16c"]
+    if present(_WIN_PF_AVX512F):
+        found.append("avx512f")
+    return [name for name in CPU_FEATURE_NAMES if name in found]
+
+
+def _macos_cpu_features() -> List[str]:
+    flags = set()
+    for key in ("machdep.cpu.features", "machdep.cpu.leaf7_features"):
+        result = subprocess.run(["sysctl", "-n", key], capture_output=True, text=True, timeout=5)
+        flags.update(f.lower().replace(".", "_") for f in result.stdout.split())
+    return [name for name in CPU_FEATURE_NAMES if name in flags]
+
+
+def get_cpu_features() -> List[str]:
+    """
+    The subset of CPU_FEATURE_NAMES this CPU has. Empty on ARM (Apple Silicon contributes
+    through Metal) and when the probe fails, which the Coordinator treats as "missing".
+    Probed once: a CPU does not gain instructions while DLNE runs.
+    """
+    global _cached_cpu_features
+    if _cached_cpu_features is None:
+        features: List[str] = []
+        try:
+            if get_cpu_arch() == "x86_64":
+                system = platform.system()
+                if system == "Linux":
+                    with open("/proc/cpuinfo", "r", encoding="utf-8", errors="replace") as handle:
+                        features = _linux_cpu_features(handle.read())
+                elif system == "Windows":
+                    features = _windows_cpu_features()
+                elif system == "Darwin":
+                    features = _macos_cpu_features()
+        except Exception:  # noqa: BLE001 - an unknown CPU is reported as having nothing
+            features = []
+        _cached_cpu_features = features
+    return list(_cached_cpu_features)
+
+
+# Each measuring process copies a buffer this large back and forth. 128 MiB is past any
+# consumer L3 cache, the 96 MiB of a 3D V-Cache chiplet included, so the copy really goes
+# to RAM; two of them per process cap the probe at 2 GiB with eight processes.
+BANDWIDTH_CHUNK_BYTES = 128 * 1024 * 1024
+BANDWIDTH_PASSES = 4
+BANDWIDTH_MAX_PROCESSES = 8
+
+_cached_bandwidth: Optional[float] = None
+_bandwidth_measured = False
+
+
+def _bandwidth_worker(ready, start_event, results, chunk_bytes: int, passes: int) -> None:
+    src = bytearray(b"\xa5" * 4096) * (chunk_bytes // 4096)
+    dst = bytearray(chunk_bytes)
+    dst[:] = src  # touch every page before the clock starts
+    ready.put(True)
+    start_event.wait()
+    began = time.perf_counter()
+    for _ in range(passes):
+        dst[:] = src
+    results.put((time.perf_counter() - began, passes * chunk_bytes * 2))
+
+
+def measure_memory_bandwidth_gbs(processes: Optional[int] = None,
+                                 chunk_bytes: int = BANDWIDTH_CHUNK_BYTES,
+                                 passes: int = BANDWIDTH_PASSES) -> float:
+    """
+    Sustained memory bandwidth in GB/s, counted the way STREAM's copy test counts it (bytes
+    read plus bytes written).
+
+    A bytearray slice copy is a C memcpy, but it holds the GIL, so threads would take turns;
+    separate processes copy at the same time, the way llama.cpp's threads do. One process
+    per physical core up to BANDWIDTH_MAX_PROCESSES: memory saturates long before that.
+    """
+    import multiprocessing
+
+    if processes is None:
+        processes = max(1, min(_detect_physical_cores(), BANDWIDTH_MAX_PROCESSES))
+    ctx = multiprocessing.get_context("spawn")
+    ready, start_event, results = ctx.Queue(), ctx.Event(), ctx.Queue()
+    workers = [ctx.Process(target=_bandwidth_worker, args=(ready, start_event, results, chunk_bytes, passes), daemon=True)
+               for _ in range(processes)]
+    for worker in workers:
+        worker.start()
+    try:
+        # Every process has allocated and touched its buffers before the clock starts, so
+        # start-up cost (interpreter launch, page faults) never counts as slow memory.
+        waiting = len(workers)
+        deadline = time.monotonic() + 60
+        while waiting:
+            try:
+                ready.get(timeout=0.25)
+                waiting -= 1
+            except queue.Empty:
+                # A process that died (no memory for its buffers, a broken interpreter) will
+                # never report ready; fail now rather than at the deadline.
+                if any(w.exitcode not in (None, 0) for w in workers) or time.monotonic() > deadline:
+                    raise RuntimeError("a bandwidth probe process did not start")
+        began = time.perf_counter()
+        start_event.set()
+        moved = sum(results.get(timeout=120)[1] for _ in workers)
+        elapsed = time.perf_counter() - began
+    finally:
+        for worker in workers:
+            worker.join(timeout=5)
+            if worker.is_alive():
+                worker.terminate()
+    return round(moved / elapsed / 1e9, 1)
+
+
+def get_memory_bandwidth_gbs() -> Optional[float]:
+    """measure_memory_bandwidth_gbs(), once per process; None when the probe itself failed."""
+    global _cached_bandwidth, _bandwidth_measured
+    if not _bandwidth_measured:
+        _bandwidth_measured = True
+        try:
+            _cached_bandwidth = measure_memory_bandwidth_gbs()
+        except Exception:  # noqa: BLE001 - the Coordinator refuses an unmeasured CPU node
+            _cached_bandwidth = None
+    return _cached_bandwidth
+
+
 def get_hardware_profile() -> Dict[str, Any]:
     """
     Builds the profile a worker sends on every heartbeat.
@@ -762,12 +935,21 @@ def get_hardware_profile() -> Dict[str, Any]:
     # chain ran twice for every heartbeat (audit item 3.5).
     gpu_info = get_gpu_info()
 
-    return {
+    profile = {
         "os": platform.system(),
+        "cpu_arch": get_cpu_arch(),
         "cpu_cores": get_cpu_cores(),
         "cpu_threads": get_cpu_threads(),
+        "cpu_features": get_cpu_features(),
         "ram_gb": get_system_ram(),
         "gpu": gpu_info,
         "gpu_type": get_gpu_type(),
         "is_yielding": is_gaming_or_heavy_load(gpu_info)
     }
+    # Measured only where it decides admission: a node with no usable GPU. It costs a few
+    # seconds and up to 2 GiB once, so GPU nodes never pay it.
+    if not gpu_info.get("has_gpu"):
+        bandwidth = get_memory_bandwidth_gbs()
+        if bandwidth is not None:
+            profile["mem_bandwidth_gbs"] = bandwidth
+    return profile
