@@ -113,6 +113,15 @@ Then in VS Code settings:
 
 ---
 
+## Support DLNE
+
+Two ways to keep it free:
+
+- **Donate compute at home**: click **Start Contributing** in the DLNE sidebar (see [How it stays free](#how-it-stays-free)).
+- **Buy a coffee**: [buymeacoffee.com/wubarrk](https://buymeacoffee.com/wubarrk) helps pay for the coordinator's power and hardware.
+
+---
+
 ## Links
 
 - **Source**: [RGlabs84/DistributedLLMEngine](https://github.com/RGlabs84/DistributedLLMEngine)

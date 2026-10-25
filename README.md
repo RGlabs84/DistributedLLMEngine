@@ -92,6 +92,11 @@ their llama.cpp RPC protocol, and the coordinator only routes to workers that sp
 - The agent asks before it edits files, runs a command, or reads outside your workspace.
 - Report security problems privately to the maintainer rather than in a public issue.
 
+## Support
+
+Contribute a GPU (or a fast CPU) from the extension's sidebar, or
+[buy a coffee](https://buymeacoffee.com/wubarrk) toward the coordinator's power and hardware.
+
 ## License
 
 MIT, see [LICENSE.md](LICENSE.md).
