@@ -697,11 +697,31 @@ async def rpc_tunnel_endpoint(websocket: WebSocket, worker_id: str, port: int = 
     Persistent outbound reverse RPC WebSocket tunnel for NAT / firewall-isolated workers.
     Bridges `llama-server` on the Coordinator (`127.0.0.1:501xx`) directly to the worker's
     local `127.0.0.1:50052` (`ggml-rpc-server`) without requiring inbound ports on the worker.
+
+    ONLY A REGISTERED WORKER OPENS ITS OWN TUNNEL (2.1.4)
+        The caller presents its current heartbeat token (``Authorization: Bearer``), and the
+        registry must hold that token for the worker named in the path. The tunnel is then
+        keyed by the worker's REGISTERED address, never by what the caller claims. Before
+        this, anyone could connect under any worker id, which closed that worker's tunnel,
+        or open tunnels until the hundred relay ports ran out. ``port`` is still accepted
+        from older clients and ignored.
     """
     from engine.reverse_tunnel import reverse_bridge
 
     client_ip = get_client_ip(websocket)
-    await reverse_bridge.handle_websocket(websocket, worker_id, client_ip, int(port))
+    worker = registry.find_by_token(get_request_token(websocket))
+    if not worker or worker.get("worker_id") != worker_id:
+        log_warning(
+            f"Refused a reverse tunnel for {safe_log_text(worker_id, max_chars=64)} from "
+            f"{safe_log_text(client_ip, max_chars=45)}: no registered worker holds that token."
+        )
+        # Closing before accept answers the handshake with HTTP 403.
+        await websocket.close(code=1008)
+        return
+    await reverse_bridge.handle_websocket(
+        websocket, worker_id, str(worker.get("ip", client_ip)), int(worker.get("port", port)),
+        source_ip=client_ip,
+    )
 
 
 @app.websocket("/ws/events")

@@ -28,7 +28,7 @@ import socket
 import struct
 import threading
 import time
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Optional, Tuple
 
 from fastapi import WebSocket, WebSocketDisconnect
 from engine.logger import log_coordinator, log_warning, log_error
@@ -48,6 +48,11 @@ READ_CHUNK_SIZE = 1048576
 
 RELAY_PORT_MIN = 50100
 RELAY_PORT_MAX = 50199
+# One address may hold this many tunnels at once. Every tunnel belongs to an authenticated
+# worker, but the swarm's network key is public, so registering workers is cheap; without a
+# cap one address could still take every relay port. Eight leaves room for a household or
+# office of contributors behind one router.
+MAX_TUNNELS_PER_SOURCE = 8
 
 
 def _enable_socket_low_latency(target: Any) -> None:
@@ -86,6 +91,8 @@ class _WorkerTunnelSession:
         self.rpc_port = rpc_port
         self.relay_port = relay_port
         self.websocket = websocket
+        # Where the WebSocket came from (for the per-source cap); set by the manager.
+        self.source_ip = client_ip
         self.server: Optional[asyncio.AbstractServer] = None
         self._next_stream_id = 1
         self._streams: Dict[int, asyncio.StreamWriter] = {}
@@ -248,8 +255,26 @@ class ReverseRpcBridgeManager:
         return 0
 
     async def handle_websocket(
-        self, websocket: WebSocket, worker_id: str, client_ip: str, rpc_port: int = 50052
+        self, websocket: WebSocket, worker_id: str, client_ip: str, rpc_port: int = 50052,
+        source_ip: Optional[str] = None,
     ) -> None:
+        """
+        ``client_ip``/``rpc_port`` are the worker's registered endpoint (what the engine is
+        told to dial); ``source_ip`` is where the WebSocket actually came from, used for the
+        per-source cap. Callers authenticate the worker first (coordinator.rpc_tunnel_endpoint).
+        """
+        source = source_ip or client_ip
+        with self._lock:
+            from_source = sum(1 for wid, sess in self._by_worker_id.items()
+                              if sess.source_ip == source and wid != worker_id)
+        if from_source >= MAX_TUNNELS_PER_SOURCE:
+            log_coordinator(
+                f"Refused a reverse tunnel for {worker_id}: {source} already holds "
+                f"{from_source} (the most one address may hold)."
+            )
+            await websocket.close(code=1008)
+            return
+
         await websocket.accept()
 
         # Optimize underlying TCP socket for sub-millisecond RPC message delivery
@@ -275,6 +300,7 @@ class ReverseRpcBridgeManager:
                 await websocket.close()
                 return
             session = _WorkerTunnelSession(worker_id, client_ip, rpc_port, relay_port, websocket)
+            session.source_ip = source
             self._by_worker_id[worker_id] = session
             self._by_ip_port[(client_ip, rpc_port)] = relay_port
 
@@ -358,7 +384,21 @@ reverse_bridge = ReverseRpcBridgeManager()
 # Worker-side Outbound Reverse RPC Client
 # ======================================================================================
 
-async def _run_worker_tunnel_once(ws_url: str, local_rpc_port: int, stop_event: threading.Event) -> None:
+def _auth_header_kwargs(websockets_version: str, token: Optional[str]) -> Dict[str, Any]:
+    """The connect() keyword carrying ``Authorization`` for this websockets release: the
+    client rewritten in 14.0 takes ``additional_headers``, the legacy one ``extra_headers``."""
+    if not token:
+        return {}
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        major = int(str(websockets_version).split(".")[0])
+    except ValueError:
+        major = 14
+    return {"additional_headers": headers} if major >= 14 else {"extra_headers": headers}
+
+
+async def _run_worker_tunnel_once(ws_url: str, local_rpc_port: int, stop_event: threading.Event,
+                                  token: Optional[str] = None) -> None:
     try:
         import websockets
     except ImportError:
@@ -372,6 +412,7 @@ async def _run_worker_tunnel_once(ws_url: str, local_rpc_port: int, stop_event: 
         max_size=None,
         ping_interval=15,
         ping_timeout=15,
+        **_auth_header_kwargs(getattr(websockets, "__version__", "14"), token),
     ) as ws:
         try:
             transport = getattr(ws, "transport", None)
@@ -449,10 +490,16 @@ def start_worker_reverse_tunnel(
     worker_id: str,
     local_rpc_port: int,
     stop_event: threading.Event,
+    token_provider: Optional[Callable[[], Optional[str]]] = None,
 ) -> Optional[threading.Thread]:
     """
     Spawns a background daemon thread on a Worker node that maintains a persistent outbound
     reverse RPC WebSocket tunnel to the Coordinator (`/ws/rpc_tunnel/{worker_id}`).
+
+    ``token_provider`` returns the worker's CURRENT heartbeat token, read again on every
+    (re)connect because the token rotates every minute; the Coordinator admits a tunnel only
+    for the worker that token is registered to. Until the first heartbeat is accepted the
+    tunnel is refused, and the loop below simply tries again three seconds later.
     """
     base = coordinator_url.strip().rstrip("/")
     if base.startswith("https://"):
@@ -469,7 +516,8 @@ def start_worker_reverse_tunnel(
         asyncio.set_event_loop(loop)
         while not stop_event.is_set():
             try:
-                loop.run_until_complete(_run_worker_tunnel_once(ws_url, local_rpc_port, stop_event))
+                token = token_provider() if token_provider else None
+                loop.run_until_complete(_run_worker_tunnel_once(ws_url, local_rpc_port, stop_event, token))
             except Exception:
                 pass
             if stop_event.wait(3.0):

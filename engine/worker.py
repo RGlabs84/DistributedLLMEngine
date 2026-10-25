@@ -691,6 +691,8 @@ class WorkerNode:
                         self.worker_id,
                         self.rpc_port,
                         self._shutdown_event,
+                        # Read at each connect: the token rotates every minute.
+                        token_provider=lambda: self.access_token,
                     )
                 except Exception:
                     pass

@@ -25,7 +25,6 @@ type `@dlne` in the chat panel.
 | `dlne_server.py` | Command line: `start` (coordinator), `worker`, `apikey`, `adminkey`, `status` |
 | `tests/` | Python test suite (`pytest`) |
 | `scripts/` | Release tooling (`release.py`, `release_apply.py`, `package_llama.py`), `publish_public.py` (the scanned snapshot that updates this public repository) and the Discord status tile |
-| `site/` | The public website |
 
 The coordinator's `/` is a small public page that points at the extension and shows live
 swarm status. The OpenAI-compatible API lives under `/v1/*`.
