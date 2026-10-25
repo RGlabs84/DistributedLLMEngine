@@ -1,0 +1,17 @@
+# Core runtime — everything a DLNE node needs to join a network and do inference.
+#
+# Deliberately headless-clean: a worker on a server with no display must be able to
+# `pip install -r requirements.txt` and run. The VS Code extension installs exactly this.
+fastapi>=0.100.0
+uvicorn[standard]>=0.24.0
+httpx>=0.25.0
+psutil>=5.9.0
+GPUtil>=1.4.0
+rich>=13.0.0
+colorama>=0.4.6
+pydantic>=2.5.0
+websockets>=12.0
+bcrypt>=4.0.0
+cryptography>=41.0.0
+setuptools>=68.0.0
+pytest>=8.0.0

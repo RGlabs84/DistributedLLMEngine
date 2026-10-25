@@ -1,0 +1,43 @@
+🚀 **DLNE Architecture: How it tricks apps into using a Supercomputer!** 🚀
+
+Ever wonder how DLNE acts as a zero-config drop-in replacement for single-node systems like Ollama? Here is the secret sauce:
+
+### 🎭 The "Ollama Illusion"
+Third-party frontends (like AnythingLLM, SillyTavern, or OpenWebUI) are designed to talk to a local instance of Ollama. They do this by sending JSON requests to a specific, hardcoded port: `11434`.
+
+1. **The Hijack**: When the DLNE Coordinator launches, it intentionally binds to `0.0.0.0:11434`.
+2. **The Mirror**: DLNE completely mirrors the OpenAI/Ollama API structure.
+3. **The Intercept**: When you open AnythingLLM and tell it to use "Ollama", it assumes a local daemon will generate the response. Instead, the DLNE Coordinator intercepts the payload, pauses the request, and spins up the distributed swarm!
+4. **The Delivery**: DLNE streams the distributed response back out of port `11434`. 
+
+**The result?** AnythingLLM has absolutely no idea it is talking to a 50-node supercomputer of connected laptops. It thinks it's just a normal local program!
+
+---
+
+### 🕸️ The Network Sharding Pipeline
+When the Coordinator receives a request, it orchestrates a network of gRPC worker nodes.
+
+📱 **AnythingLLM (Prompt: "Hello")**
+   ⬇️ *intercepts on port 11434*
+🧠 **DLNE Coordinator** (Calculates total VRAM across all laptops)
+   ⬇️ *boots hidden llama-server and injects worker IPs*
+⚙️ **Inference Engine** (Shards the model layers)
+   ↙️             ↘️
+💻 **Worker 1**     💻 **Worker 2**
+*(Loads L0-15)*    *(Loads L16-32)*
+   ↘️             ↙️
+⚙️ **Inference Engine** (Token stream starts)
+   ⬇️ *proxies stream*
+📱 **AnythingLLM (Response)**
+
+*(If network VRAM is abundant, the Coordinator automatically scales up parallel slots, allowing multiple users to query the swarm simultaneously without queuing!)*
+
+---
+
+### 🌍 Deployment Topologies
+
+**Topology A: The Local LAN (Zero-Config)**
+Run the Coordinator on a central desktop. Run the Worker app on spare laptops in the background. The UDP Broadcaster automatically discovers the Coordinator over the local Wi-Fi. A single chatbot can utilize the combined idle VRAM of 50+ laptops to run massive 70B+ parameter models for free.
+
+**Topology B: Remote Workstations (VPNs)**
+DLNE natively integrates with VPN environments, whether you are using our built-in **WireGuard** auto-installer or commercial VPN solutions like **GlobalProtect**. Remote users working from coffee shops can securely tunnel into the Coordinator over the VPN, contributing idle GPU compute directly into the local hive-mind without exposing the swarm to the open internet!

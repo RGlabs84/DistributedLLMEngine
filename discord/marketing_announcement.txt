@@ -1,0 +1,21 @@
+🚀 **Introducing DLNE (Distributed LLM Network Engine)**
+Hey everyone! I've been quietly working on something massive in the background, and we are finally ready to open the doors. 
+
+DLNE is a zero-configuration, decentralized engine that democratizes AI compute. It allows anyone—whether you have an RTX 4090 rig or just an old potato laptop—to instantly pool hardware resources and run massive open-source AI models as a single, unified supercomputer!
+
+🌟 **What makes it special?**
+- **Zero-Configuration Setup**: No complex port forwarding or DNS configs. Double-click the app, and you are instantly part of the swarm!
+- **Cross-Platform & Hardware Agnostic**: We just finished building a deeply optimized compilation pipeline. DLNE natively supports **CUDA** (with split tiers for both Modern and Legacy NVIDIA cards), **Vulkan** (AMD/Intel), and **Pure CPU**. That old crypto mining rig collecting dust in your garage? It can become a huge asset here!
+- **The "Client Portal"**: You never have to memorize IPs. DLNE silently spins up a background proxy on localhost. If the network fails over to a new Coordinator, your browser seamlessly follows it. Your chat history is never lost!
+- **Democratized Model Voting**: Want to swap from a 7B model to a 70B model? The network dynamically calculates the total pooled VRAM across all active nodes and unlocks models that fit. When someone requests a swap, a frosted-glass modal pops up on everyone's screen to cast a vote!
+- **Ollama Drop-In Replacement**: Have existing frontends like AnythingLLM or SillyTavern? DLNE acts as a native drop-in replacement for Ollama! Just point your apps to `localhost:11434` and they will instantly connect to the entire distributed swarm.
+
+💻 **How it Works**
+DLNE sits on top of a custom backend and uses blazing-fast gRPC to shard the model layers across your physical devices. We are actively developing a sleek, one-shot Windows Installer to make joining the swarm completely frictionless—complete with sliders so you can visually configure exactly how many cores or how much VRAM you want to donate.
+
+🌍 **Join the Swarm!**
+Because the project has grown so massive, we’ve spun up a dedicated Discord Server to coordinate development, testing, and live network deployments! We have an automated bot that will assign you roles based on your hardware so you can plug right in.
+
+🔗 **Join the new DLNE Discord Server here:** [Insert your permanent `#getting-started` invite link here]
+
+Whether you want to help us write code, alpha test the engine, or just donate an old GPU to the hive-mind—we need you! Let's build a supercomputer. 🔥

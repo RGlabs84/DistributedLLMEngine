@@ -1,0 +1,594 @@
+"""
+DLNE configuration — the single source of truth for the flat ``KEY=VALUE`` config file.
+
+Every module that needs a setting reads it through this file so that there is exactly one
+parser, one cache and one writer in the process. The on-disk format is intentionally kept
+as flat ``KEY=VALUE`` lines (one per line, ``#`` for comments): invite files, the setup
+wizard and the release build scripts all generate and consume that shape, so INI sections
+or JSON must never be introduced here.
+
+Public surface (relied on by other modules — do not rename):
+    CONFIG_FILE        absolute path of ``config/config.txt``
+    get_base_dir()     absolute path of the installation root (writable state)
+    get_bundle_dir()   absolute path of the read-only assets shipped inside the build
+    get_config()       raw ``UPPERCASE_KEY -> str`` snapshot, cached on the file's stat
+    get_worker_limits()typed view of the subset the engine treats as operational limits
+    set_config_values()atomic read-modify-write that preserves comments and unknown keys
+"""
+
+import os
+import sys
+import tempfile
+import threading
+import time
+
+
+# --------------------------------------------------------------------------------------
+# Locations
+# --------------------------------------------------------------------------------------
+
+def get_base_dir() -> str:
+    """
+    Absolute path to the DLNE installation root.
+
+    When frozen by PyInstaller the payload is unpacked next to the executable, so the
+    executable's directory *is* the root. Running from source this file lives at
+    ``<root>/engine/config.py``, so the root is two directories up.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def get_bundle_dir() -> str:
+    """
+    Absolute path to the read-only assets shipped *inside* the build (``webui/`` and
+    anything else passed to PyInstaller's ``--add-data``).
+
+    This is deliberately not :func:`get_base_dir`. A onefile build unpacks its payload
+    into a temporary directory and records it in ``sys._MEIPASS``; the executable's own
+    directory holds only the installation's writable state — ``config/``, ``models/``,
+    ``logs/``. The two are the same directory when running from source and different in
+    every shipped build, so reading bundled assets from the installation root finds
+    nothing once frozen. That is exactly how the graphical setup wizard came to report
+    "the wizard's web assets are missing from this build" on every release.
+    """
+    bundled = getattr(sys, "_MEIPASS", None)
+    return bundled if bundled else get_base_dir()
+
+
+# Exported so nothing else has to rebuild these paths by hand (setup_cli.py imports
+# CONFIG_FILE directly). os.path.join keeps this correct on Windows, Linux and macOS.
+CONFIG_DIR: str = os.path.join(get_base_dir(), "config")
+CONFIG_FILE: str = os.path.join(CONFIG_DIR, "config.txt")
+
+# Naming base for the staging file that is written first and then os.replace()d onto
+# CONFIG_FILE, so a crash mid-write can never leave a truncated config behind. The real
+# staging path is a *unique* name derived from this one (see _make_staging_file): a fixed
+# name meant two concurrent set_config_values() calls wrote the same bytes-in-progress and
+# could os.replace() a half-merged file onto the live config.
+_CONFIG_TMP_FILE: str = CONFIG_FILE + ".tmp"
+
+# os.replace() fails with WinError 5 (access denied) on Windows while any other handle to
+# the destination is open — an antivirus scanner, a text editor, a backup agent, or simply
+# another thread of ours mid-read. Those handles are all short-lived, so a few short
+# retries turn a silent "config unchanged, returned False" into a successful write.
+_REPLACE_ATTEMPTS: int = 5
+_REPLACE_BACKOFF_SECONDS: float = 0.05
+
+
+# --------------------------------------------------------------------------------------
+# Raw config access (cached)
+# --------------------------------------------------------------------------------------
+
+# get_worker_limits() is called by the coordinator's per-request middleware, so an
+# uncached implementation means a file read on every single HTTP request. The cache is
+# keyed on the file's (mtime_ns, size) — cheap to check, and any external edit (the setup
+# wizard, an operator with a text editor) changes at least one of the two.
+_CACHE_LOCK = threading.RLock()
+_cached_config: dict[str, str] = {}
+_cached_stamp: tuple[int, int] | None = None
+
+# Serialises the whole read-modify-write in set_config_values. Two threads that both read
+# the file, each apply their own update to that snapshot and then both write would lose one
+# of the two updates entirely — the setup wizard, the WireGuard peer allocator and the
+# coordinator all write config concurrently, so this is a real interleaving, not a
+# theoretical one. Deliberately a separate lock from _CACHE_LOCK, and always taken *before*
+# it, so the ordering can never invert into a deadlock.
+_WRITE_LOCK = threading.Lock()
+
+# Sentinel stamp used when the config file does not exist yet. It must differ from any
+# real stat result so that creating the file later is detected as a change.
+_MISSING_STAMP: tuple[int, int] = (-1, -1)
+
+
+def _log_config_error(message: str) -> None:
+    """
+    Surface a configuration failure loudly.
+
+    engine.logger imports this module, so importing the logger at module scope would be a
+    circular import. The deferred import keeps config.py dependency-free at import time,
+    and the print fallback guarantees the operator still sees the failure if the logger
+    itself is unavailable (e.g. during very early startup).
+    """
+    try:
+        from engine.logger import log_error
+        log_error(message)
+    except Exception:
+        print(f"[CONFIG] {message}")
+
+
+def _stat_stamp() -> tuple[int, int]:
+    """Returns the cache key (mtime_ns, size) for the config file, or the missing sentinel."""
+    try:
+        stat_result = os.stat(CONFIG_FILE)
+        return (stat_result.st_mtime_ns, stat_result.st_size)
+    except OSError:
+        return _MISSING_STAMP
+
+
+def _parse_config_lines(lines) -> dict[str, str]:
+    """
+    Parses flat ``KEY=VALUE`` lines into a dict with UPPERCASE keys.
+
+    Blank lines, ``#`` comment lines and lines without a ``=`` are skipped. Keys and
+    values are stripped so that a hand-edited ``KEY = value`` still resolves — the old
+    parser only stripped the whole line and silently produced a key with a trailing space.
+    Later occurrences of a key win, which matches the previous last-write-wins behaviour.
+    """
+    parsed: dict[str, str] = {}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip().upper()
+        if not key:
+            continue
+        parsed[key] = value.strip()
+    return parsed
+
+
+def get_config(force_reload: bool = False) -> dict[str, str]:
+    """
+    Returns the raw configuration as ``UPPERCASE_KEY -> str``.
+
+    The result is a copy: callers routinely keep the dict around and a mutation must not
+    be able to poison the shared cache. Pass ``force_reload=True`` right after something
+    outside this process (the setup wizard) has rewritten the file.
+    """
+    global _cached_config, _cached_stamp
+
+    stamp = _stat_stamp()
+    with _CACHE_LOCK:
+        if force_reload or _cached_stamp is None or stamp != _cached_stamp:
+            if stamp == _MISSING_STAMP:
+                # No config yet (first run, or the file was deleted): everything falls
+                # back to defaults rather than raising at import/request time.
+                _cached_config = {}
+            else:
+                try:
+                    # Slurped and parsed *after* the handle closes rather than iterated
+                    # through the open file. The config is a few hundred bytes, and on
+                    # Windows an open read handle is exactly what makes a concurrent
+                    # os.replace() of this path fail with "access denied" — so the handle
+                    # is held for the shortest possible time.
+                    with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as handle:
+                        raw_text = handle.read()
+                    _cached_config = _parse_config_lines(raw_text.splitlines())
+                except OSError as exc:
+                    # A transient read failure (file briefly locked by another writer on
+                    # Windows) must not explode inside a request handler. Serve the last
+                    # good snapshot and leave the stamp untouched so the next call retries.
+                    _log_config_error(f"Could not read {CONFIG_FILE}: {exc}")
+                    return dict(_cached_config)
+            _cached_stamp = stamp
+        return dict(_cached_config)
+
+
+# --------------------------------------------------------------------------------------
+# Typed view used by the engine
+# --------------------------------------------------------------------------------------
+
+def _as_bool(raw: str) -> bool:
+    """
+    Parses a boolean exactly the way DLNE always has: only the literal string ``true``
+    (any casing) is true. Anything else — including typos — is false, so the security
+    flags that use this helper (ALLOW_UNSIGNED_WORKERS, TRUST_PROXY_HEADERS) fail closed.
+    """
+    return raw.strip().lower() == "true"
+
+
+def get_worker_limits() -> dict:
+    """
+    Returns the typed operational limits, with defaults for every key.
+
+    Key names and types are part of the internal API (hardware.py, coordinator.py,
+    worker.py, inference_manager.py and downloader.py all index this dict), so they are
+    never renamed. Keys that previously had no default — ``network_key``, ``admin_hash``,
+    ``dependency_mirror_url`` — now always exist, which removes the KeyError-shaped
+    landmines that callers were papering over with ``.get(..., "")``.
+    """
+    limits = {
+        # Comma-separated when splitting tensors across multiple GPUs, hence a string.
+        "max_vram_gb": "-1",
+        "max_ram_gb": -1.0,
+        "max_cpu_threads": -1,
+        "allowed_gpu_indices": "-1",
+        "enforce_model_whitelist": False,
+        "enforce_contrib_clause": True,
+        "starter_quota_inferences": 200,
+        "redundancy_priority_index": 1,
+        "custom_gguf_dir": os.path.join(get_base_dir(), "models"),
+        # Previously undefined unless present in the file.
+        "admin_hash": "",
+        # SHA-256 (hex) of the operator key BarrkBOT presents as `Authorization: Bearer <key>`
+        # on /v1/admin/*. Only the hash lives here; `dlne_server.py adminkey create` mints
+        # the key and prints it exactly once. Empty disables key-based admin access.
+        "admin_key_hash": "",
+        # Admin-key requests are accepted only from this machine unless this is on. BarrkBOT
+        # shares the coordinator's host, so the default needs no exposure to the network.
+        "admin_allow_remote": False,
+        "network_key": "",
+        "dependency_mirror_url": "",
+        # Cluster authentication (see the worker heartbeat signing path).
+        "allow_unsigned_workers": False,
+        "trust_proxy_headers": False,
+        # How many reverse proxies sit in front of the Coordinator. Only consulted when
+        # trust_proxy_headers is on, where it selects which X-Forwarded-For entry is the
+        # one our outermost trusted proxy wrote (see coordinator.get_client_ip). 1 is the
+        # overwhelmingly common deployment — a single nginx or Caddy — and it must have a
+        # default here rather than only in the reader, because a missing key sends that
+        # reader back to the raw config file on a path that is otherwise served entirely
+        # from this cached, typed view.
+        "trusted_proxy_hops": 1,
+        # WireGuard hub details, read by the tunnel enrollment endpoint when it tells a
+        # joining node where to dial. WG_WAN_IP is written by both setup wizards; empty
+        # means "answer with the address the request arrived from", which is right for a
+        # LAN cluster and wrong only for a hub behind NAT that never ran the WAN setup.
+        "wg_wan_ip": "",
+        "wg_listen_port": 51820,
+        # Tunnel MTU, written into every WireGuard [Interface] stanza DLNE generates.
+        #
+        # 1380 rather than WireGuard's usual 1420. 1420 assumes a 1500-byte path; PPPoE
+        # (1492) and any carrier-side encapsulation put the real ceiling below that, and
+        # when the oversized packet is dropped the ICMP "fragmentation needed" reply is
+        # routinely filtered on residential links. The tunnel then passes small packets
+        # and silently black-holes large ones — handshakes, heartbeats and /health work
+        # while inference returns a blank response. Costing a few extra packets is the
+        # cheap side of that trade.
+        "wg_mtu": 1380,
+        # How long the worker set must stop changing before the Coordinator rebuilds the
+        # engine around it. A rebuild re-uploads every remote shard's weights, so reacting
+        # instantly to a flapping node is expensive; see the monitor loop for why only
+        # growth is debounced and shrinkage is not.
+        "topology_settle_seconds": 30,
+        # Whether new worker connections trigger auto-rebalance/restart of running models.
+        # False by default (zero-rework policy): existing running inference continues undisturbed.
+        "rebalance_on_join": False,
+        # "auto"   - shard only when the model does not fit the cheapest devices alone.
+        # "always" - hand every registered endpoint to llama-server, the pre-1.1.0
+        #            behaviour, kept for demos and for exercising the sharding path.
+        "shard_policy": "auto",
+        # Whether a speculative-decoding draft model may be spread across RPC backends.
+        # llama.cpp distributes it by default, which is almost never what anyone wants:
+        # the draft exists to save round trips, so putting it on the far end of one
+        # cancels the whole benefit. Off means DLNE pins it with --spec-draft-device.
+        "draft_on_rpc": False,
+        # Which local device the pinned draft model runs on (a llama.cpp device name such as
+        # "Vulkan0" or "CUDA0"). Empty means "pick for this machine": CUDA0 on NVIDIA, else
+        # Vulkan0. Resolved at the point of use because it depends on the detected GPU.
+        "draft_device": "",
+    }
+
+    config = get_config()
+
+    # Each key is only overridden when actually present, so a missing entry keeps the
+    # default above and a malformed numeric entry keeps it too (unchanged behaviour).
+    if "MAX_VRAM_GB" in config:
+        limits["max_vram_gb"] = config["MAX_VRAM_GB"]
+
+    if "MAX_RAM_GB" in config:
+        try:
+            limits["max_ram_gb"] = float(config["MAX_RAM_GB"])
+        except ValueError:
+            pass
+
+    if "MAX_CPU_THREADS" in config:
+        try:
+            limits["max_cpu_threads"] = int(config["MAX_CPU_THREADS"])
+        except ValueError:
+            pass
+
+    if "ALLOWED_GPU_INDICES" in config:
+        limits["allowed_gpu_indices"] = config["ALLOWED_GPU_INDICES"]
+
+    if "ENFORCE_MODEL_WHITELIST" in config:
+        limits["enforce_model_whitelist"] = _as_bool(config["ENFORCE_MODEL_WHITELIST"])
+
+    if "ENFORCE_CONTRIB_CLAUSE" in config:
+        limits["enforce_contrib_clause"] = _as_bool(config["ENFORCE_CONTRIB_CLAUSE"])
+
+    if "STARTER_QUOTA_INFERENCES" in config:
+        try:
+            limits["starter_quota_inferences"] = int(config["STARTER_QUOTA_INFERENCES"])
+        except ValueError:
+            pass
+
+    if "REDUNDANCY_PRIORITY_INDEX" in config:
+        try:
+            limits["redundancy_priority_index"] = int(config["REDUNDANCY_PRIORITY_INDEX"])
+        except ValueError:
+            pass
+
+    if "CUSTOM_GGUF_DIR" in config:
+        limits["custom_gguf_dir"] = config["CUSTOM_GGUF_DIR"]
+
+    if "ADMIN_HASH" in config:
+        limits["admin_hash"] = config["ADMIN_HASH"]
+
+    if "ADMIN_KEY_HASH" in config:
+        limits["admin_key_hash"] = config["ADMIN_KEY_HASH"].strip().lower()
+
+    if "ADMIN_ALLOW_REMOTE" in config:
+        limits["admin_allow_remote"] = _as_bool(config["ADMIN_ALLOW_REMOTE"])
+
+    if "NETWORK_KEY" in config:
+        limits["network_key"] = config["NETWORK_KEY"]
+
+    if "DEPENDENCY_MIRROR_URL" in config:
+        limits["dependency_mirror_url"] = config["DEPENDENCY_MIRROR_URL"]
+
+    if "ALLOW_UNSIGNED_WORKERS" in config:
+        limits["allow_unsigned_workers"] = _as_bool(config["ALLOW_UNSIGNED_WORKERS"])
+
+    if "WG_WAN_IP" in config:
+        limits["wg_wan_ip"] = config["WG_WAN_IP"]
+
+    if "WG_LISTEN_PORT" in config:
+        try:
+            limits["wg_listen_port"] = int(config["WG_LISTEN_PORT"])
+        except ValueError:
+            pass
+
+    if "WG_MTU" in config:
+        try:
+            mtu = int(config["WG_MTU"])
+        except ValueError:
+            mtu = 0
+        # Below 1280 is not a legal IPv6 link MTU and is far below anything a real path
+        # imposes; above 1500 cannot survive an ordinary Ethernet hop. Either is a typo
+        # rather than a deployment, and honouring it would break the tunnel it is meant
+        # to fix, so the default stands.
+        if 1280 <= mtu <= 1500:
+            limits["wg_mtu"] = mtu
+
+    if "TOPOLOGY_SETTLE_SECONDS" in config:
+        try:
+            settle = int(config["TOPOLOGY_SETTLE_SECONDS"])
+        except ValueError:
+            settle = -1
+        # Zero is meaningful — it restores the pre-1.1.0 "rebuild immediately" behaviour.
+        if settle >= 0:
+            limits["topology_settle_seconds"] = settle
+
+    if "SHARD_POLICY" in config:
+        policy = config["SHARD_POLICY"].strip().lower()
+        if policy in ("auto", "always"):
+            limits["shard_policy"] = policy
+
+    if "DRAFT_ON_RPC" in config:
+        limits["draft_on_rpc"] = _as_bool(config["DRAFT_ON_RPC"])
+
+    if "DRAFT_DEVICE" in config:
+        limits["draft_device"] = config["DRAFT_DEVICE"].strip()
+
+    if "REBALANCE_ON_JOIN" in config:
+        limits["rebalance_on_join"] = _as_bool(config["REBALANCE_ON_JOIN"])
+
+    if "TRUST_PROXY_HEADERS" in config:
+        limits["trust_proxy_headers"] = _as_bool(config["TRUST_PROXY_HEADERS"])
+
+    if "TRUSTED_PROXY_HOPS" in config:
+        try:
+            hops = int(config["TRUSTED_PROXY_HOPS"])
+        except ValueError:
+            hops = 0
+        # A non-positive hop count would index from the wrong end of the forwarded chain
+        # entirely, which is the exact bug the right-most read exists to prevent, so a
+        # typo keeps the safe default instead of silently mis-identifying every client.
+        if hops >= 1:
+            limits["trusted_proxy_hops"] = hops
+
+    return limits
+
+
+# --------------------------------------------------------------------------------------
+# Writing
+# --------------------------------------------------------------------------------------
+
+def _make_staging_file() -> tuple[int, str]:
+    """
+    Creates a uniquely named, empty staging file next to ``CONFIG_FILE``.
+
+    Returns the open file descriptor and its path. Two properties matter here:
+
+    * **Unique name.** A fixed ``config.txt.tmp`` is shared state: two concurrent writers
+      interleave their bytes in it and whichever one renames second publishes a corrupted
+      merge of both. ``mkstemp`` hands each caller its own private path.
+    * **Same directory.** ``os.replace`` is only atomic within a single filesystem, so the
+      staging file must not live in ``%TEMP%``. The directory is derived from
+      ``_CONFIG_TMP_FILE`` so that a test (or an embedder) which re-points the config tree
+      moves the staging file with it.
+
+    Note that ``mkstemp`` creates the file 0600 on POSIX, and the rename carries that
+    through to ``config.txt``. That is a deliberate tightening rather than an accident:
+    the file holds NETWORK_KEY and ADMIN_HASH, which no other local account should be
+    able to read.
+    """
+    staging_dir = os.path.dirname(_CONFIG_TMP_FILE) or CONFIG_DIR
+    os.makedirs(staging_dir, exist_ok=True)
+    # Prefix/suffix are cosmetic but make an orphaned file (killed process mid-write)
+    # obviously identifiable as DLNE's rather than mysterious litter.
+    return tempfile.mkstemp(
+        prefix=os.path.basename(_CONFIG_TMP_FILE) + ".",
+        suffix=".partial",
+        dir=staging_dir,
+    )
+
+
+def _discard_staging_file(path: str) -> None:
+    """
+    Removes an abandoned staging file, ignoring the case where it never existed.
+
+    Leaving it behind would be harmless to correctness — the unique name means it can
+    never be mistaken for the live config — but it would accumulate one file per failed
+    write in the operator's ``config/`` directory.
+    """
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        # Already gone, or the same permission problem that made the write fail. Either
+        # way there is nothing useful left to do about it.
+        pass
+
+
+def _replace_with_retry(source_path: str, destination_path: str) -> bool:
+    """
+    ``os.replace(source, destination)`` with a short bounded retry, returning success.
+
+    On Windows the rename fails with ``PermissionError`` / WinError 5 while *any* other
+    handle to the destination is open — an on-access antivirus scan, an editor, a backup
+    agent, or one of our own reader threads between ``open()`` and ``close()``. Those
+    handles are held for milliseconds, so retrying briefly converts a silent "the config
+    did not change and nobody noticed" into a completed write. A genuinely permanent
+    failure (read-only volume, ACL) still returns False after the last attempt, and the
+    caller logs it.
+    """
+    last_error: OSError | None = None
+
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source_path, destination_path)
+            return True
+        except OSError as exc:
+            last_error = exc
+            # No point sleeping after the final attempt.
+            if attempt < _REPLACE_ATTEMPTS - 1:
+                time.sleep(_REPLACE_BACKOFF_SECONDS)
+
+    _log_config_error(
+        f"Could not replace {destination_path} after {_REPLACE_ATTEMPTS} attempts "
+        f"({_REPLACE_ATTEMPTS * _REPLACE_BACKOFF_SECONDS:.2f}s): {last_error}. "
+        "The configuration on disk is UNCHANGED — close any program holding that file "
+        "open (editor, antivirus scan, backup agent) and try again."
+    )
+    return False
+
+
+def set_config_values(updates: dict[str, str]) -> bool:
+    """
+    Applies ``{KEY: value}`` to ``config/config.txt`` atomically and returns success.
+
+    The file is rewritten line by line so comments, blank lines, key order and any key
+    this module has never heard of survive untouched. Keys already present are edited in
+    place (keeping their original spelling); new keys are appended UPPERCASE. The result
+    is written to a unique staging file in the same directory and then ``os.replace``d
+    onto the real path, which is atomic on every supported platform — a crash mid-write
+    can never truncate the config that the whole cluster's identity lives in.
+
+    The entire read-modify-write runs under ``_WRITE_LOCK``, so two threads updating
+    different keys at the same moment can no longer lose one of the two updates.
+    """
+    global _cached_stamp
+
+    if not updates:
+        return True
+
+    # Normalise once: keys are matched case-insensitively, values are always written as
+    # text (callers pass ints and bools freely).
+    normalised: dict[str, str] = {}
+    for key, value in updates.items():
+        clean_key = str(key).strip().upper()
+        if not clean_key:
+            continue
+        normalised[clean_key] = str(value)
+    if not normalised:
+        return True
+
+    # Everything from here on is one indivisible read-modify-write.
+    with _WRITE_LOCK:
+        existing_lines: list[str] = []
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as handle:
+                existing_lines = handle.read().splitlines()
+        except FileNotFoundError:
+            # First run: we are creating the config from scratch.
+            existing_lines = []
+        except OSError as exc:
+            _log_config_error(f"Could not read {CONFIG_FILE} before updating it: {exc}")
+            return False
+
+        written_keys: set[str] = set()
+        output_lines: list[str] = []
+
+        for raw_line in existing_lines:
+            stripped = raw_line.strip()
+
+            # Comments, blank lines and anything that is not a KEY=VALUE pair are copied
+            # through verbatim — operators annotate this file by hand.
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                output_lines.append(raw_line)
+                continue
+
+            key_text, _, _old_value = stripped.partition("=")
+            key = key_text.strip().upper()
+
+            if key not in normalised:
+                output_lines.append(raw_line)
+                continue
+
+            if key in written_keys:
+                # A duplicate of a key we just updated. Dropping it is required, not
+                # cosmetic: the parser is last-write-wins, so a stale duplicate further
+                # down the file would silently override the value we were asked to set.
+                continue
+
+            output_lines.append(f"{key_text.strip()}={normalised[key]}")
+            written_keys.add(key)
+
+        for key, value in normalised.items():
+            if key not in written_keys:
+                output_lines.append(f"{key}={value}")
+
+        staging_path = ""
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            descriptor, staging_path = _make_staging_file()
+            # os.fdopen takes ownership of the descriptor, so closing the file object is
+            # what closes it — mkstemp's descriptor is never leaked on any path below.
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("\n".join(output_lines) + "\n")
+                # Flush all the way to disk before the rename, otherwise a power loss can
+                # leave an atomically-renamed but empty file.
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            _log_config_error(f"Could not write {CONFIG_FILE}: {exc}")
+            _discard_staging_file(staging_path)
+            return False
+
+        if not _replace_with_retry(staging_path, CONFIG_FILE):
+            # _replace_with_retry has already logged the reason in operator-facing terms.
+            _discard_staging_file(staging_path)
+            return False
+
+        # Invalidate explicitly instead of trusting the stat comparison: a rewrite that
+        # happens inside the same filesystem timestamp tick and produces the same byte
+        # count would otherwise be served from the stale cache.
+        with _CACHE_LOCK:
+            _cached_stamp = None
+
+    return True

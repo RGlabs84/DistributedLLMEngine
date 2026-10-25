@@ -1,0 +1,17 @@
+# Example unit. `python dlne_server.py install-systemd` writes the real one for your machine
+# (your user, your install path and Python) to this same file.
+[Unit]
+Description=DLNE Distributed LLM Engine Server Unit
+After=network.target
+
+[Service]
+Type=simple
+User=dlne
+WorkingDirectory=/opt/dlne
+ExecStart=/opt/dlne/.venv/bin/python3 /opt/dlne/dlne_server.py start --host 0.0.0.0 --port 11435 --hybrid
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

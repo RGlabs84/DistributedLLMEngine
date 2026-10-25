@@ -1,0 +1,216 @@
+{
+  "name": "dlne-code-assistant",
+  "displayName": "DLNE Coding Assistant: Free AI Agent",
+  "description": "A free AI coding agent and autocomplete, running on GPUs its users share. 200 free chats, no account or API key.",
+  "version": "1.1.1",
+  "publisher": "dlne",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RGlabs84/DistributedLLMEngine"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Machine Learning",
+    "Chat"
+  ],
+  "keywords": [
+    "dlne",
+    "coding agent",
+    "deepseek",
+    "qwen",
+    "copilot",
+    "autocomplete",
+    "diff"
+  ],
+  "icon": "media/dlne_logo.png",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "dlne-sidebar",
+          "title": "DLNE Agent",
+          "icon": "media/dlne_icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "dlne-sidebar": [
+        {
+          "type": "webview",
+          "id": "dlne.chatView",
+          "name": "Frontier Coding Agent"
+        }
+      ]
+    },
+    "chatParticipants": [
+      {
+        "id": "dlne.agent",
+        "name": "dlne",
+        "fullName": "DLNE Frontier Agent",
+        "description": "Free coding agent running on the DLNE community GPU swarm",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "code",
+            "description": "Write, edit, or refactor files autonomously in workspace"
+          },
+          {
+            "name": "fix",
+            "description": "Analyze and fix active file diagnostics or bugs"
+          },
+          {
+            "name": "status",
+            "description": "Display live DLNE cluster VRAM pool, nodes, and active tier model"
+          },
+          {
+            "name": "clear",
+            "description": "Clear conversation history and reset context memory"
+          },
+          {
+            "name": "contribute",
+            "description": "Toggle local Vulkan GPU compute contribution"
+          },
+          {
+            "name": "model",
+            "description": "Switch active cluster model tier (14b / 32b / r1 / 70b / r1-70b / 72b)"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "dlne.openChat",
+        "title": "DLNE: Open Coding Agent Chat",
+        "category": "DLNE"
+      },
+      {
+        "command": "dlne.refreshStatus",
+        "title": "DLNE: Refresh Cluster Status",
+        "category": "DLNE"
+      },
+      {
+        "command": "dlne.fixDiagnostics",
+        "title": "DLNE: Fix Current File Problems",
+        "category": "DLNE"
+      },
+      {
+        "command": "dlne.toggleWorker",
+        "title": "DLNE: Toggle Compute Contribution (Give Compute to Receive Compute)",
+        "category": "DLNE"
+      },
+      {
+        "command": "dlne.installSuite",
+        "title": "DLNE: Set Up Compute Engine",
+        "category": "DLNE"
+      },
+      {
+        "command": "dlne.clusterMenu",
+        "title": "DLNE: Open Cluster & Worker Menu",
+        "category": "DLNE"
+      }
+    ],
+    "configuration": {
+      "title": "DLNE Assistant",
+      "properties": {
+        "dlne.serverUrl": {
+          "type": "string",
+          "default": "http://73.215.216.195:11435",
+          "description": "DLNE Coordinator URL. Pre-configured out of the box to the official Public Test Swarm (http://73.215.216.195:11435). Only modify this if connecting to your own private self-hosted cluster."
+        },
+        "dlne.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "DLNE Bearer API Key (leave empty to authenticate automatically via your local worker compute contribution)"
+        },
+        "dlne.worker.networkKey": {
+          "type": "string",
+          "default": "bd1d9bbf50b93e10a963fa2d0b6ee44e1138ca20f4036b765dbc51dd7bc7f083",
+          "description": "Cluster Network Key. Pre-configured out of the box for the official Public Swarm. Only modify this if connecting to a private custom cluster."
+        },
+        "dlne.worker.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python executable for running worker node ('python' on Windows, 'python3' on Linux)"
+        },
+        "dlne.worker.autoStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically resume compute worker contribution when VS Code is open (only when explicitly enabled via contribute/toggle)"
+        },
+        "dlne.worker.allowedGpus": {
+          "type": "string",
+          "default": "",
+          "description": "Comma-separated GPU indices to contribute (leave blank to contribute all detected Vulkan/CUDA GPUs)"
+        },
+        "dlne.worker.maxVramGb": {
+          "type": "number",
+          "default": -1,
+          "description": "Maximum VRAM in GB to contribute (-1 for auto-detect)"
+        },
+        "dlne.worker.maxRamGb": {
+          "type": "number",
+          "default": 4.0,
+          "description": "Maximum Host System RAM overhead in GB (default: 4.0GB)"
+        },
+        "dlne.chatModel": {
+          "type": "string",
+          "default": "",
+          "description": "Target model for Agent Chat (leave empty to use cluster active model)"
+        },
+        "dlne.fimModel": {
+          "type": "string",
+          "default": "",
+          "description": "Target model for Inline FIM Completion"
+        },
+        "dlne.enableInlineCompletion": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable real-time ghost text inline code completion"
+        },
+        "dlne.inlineCompletionDelay": {
+          "type": "integer",
+          "default": 150,
+          "description": "Debounce delay in milliseconds before requesting FIM completion"
+        },
+        "dlne.autoApproveReads": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically approve read-only tools (reading files, directory listing)"
+        },
+        "dlne.autoUpdate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically keep the DLNE extension and local compute engine runtime updated to the latest release"
+        },
+        "dlne.worker.allowUnsignedEngine": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Install the compute engine from a coordinator that does not publish a signed release. **Leave this off for the public swarm**: the engine runs on your machine, so DLNE only installs releases signed with the maintainer's key. Turn it on only for a private coordinator you run yourself. A signed release that fails verification is never installed, whatever this is set to."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "test": "tsc -p ./ && node --test --test-force-exit test/*.test.js",
+    "test:e2e": "tsc -p ./ && node --test --test-force-exit test/e2e/*.e2e.js",
+    "watch": "tsc -watch -p ./",
+    "publish:ovsx": "bash -c 'set -a && source .env && set +a && npx -y ovsx publish'",
+    "publish:vsce": "bash -c 'set -a && source .env && set +a && npx -y @vscode/vsce publish --allow-missing-repository'"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}

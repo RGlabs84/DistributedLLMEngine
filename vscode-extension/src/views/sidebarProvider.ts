@@ -1,0 +1,974 @@
+import * as vscode from 'vscode';
+import * as path from 'path';
+import { AgentLoop } from '../agent/agentLoop';
+import { DlneClient } from '../client/dlneClient';
+import { WorkerManager, WorkerStatus } from '../worker/workerManager';
+import { ToolCallResult } from '../agent/tools';
+
+export interface ChatMessageItem {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  thinking?: string;
+  toolCalls?: Array<{
+    name: string;
+    args: Record<string, any>;
+    result?: ToolCallResult;
+  }>;
+}
+
+export class SidebarProvider implements vscode.WebviewViewProvider {
+  private _view?: vscode.WebviewView;
+  private agentLoop: AgentLoop;
+  private conversationHistory: ChatMessageItem[] = [];
+
+  constructor(
+    private readonly _extensionUri: vscode.Uri,
+    private readonly client: DlneClient,
+    private readonly workerManager: WorkerManager,
+    private readonly context?: vscode.ExtensionContext
+  ) {
+    this.agentLoop = new AgentLoop(client);
+
+    // Load persisted history
+    if (this.context) {
+      const saved = this.context.workspaceState.get<ChatMessageItem[]>('dlne.chatHistory');
+      if (saved && Array.isArray(saved)) {
+        this.conversationHistory = saved;
+      }
+    }
+
+    this.workerManager.onStatusChange((status) => {
+      this._view?.webview.postMessage({ type: 'workerStatus', status });
+    });
+  }
+
+  private saveHistory() {
+    if (this.context) {
+      // Keep at most last 40 turns to avoid workspaceState bloat
+      const trimmed = this.conversationHistory.slice(-40);
+      this.context.workspaceState.update('dlne.chatHistory', trimmed);
+    }
+  }
+
+  resolveWebviewView(
+    webviewView: vscode.WebviewView,
+    context: vscode.WebviewViewResolveContext,
+    _token: vscode.CancellationToken
+  ) {
+    this._view = webviewView;
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [this._extensionUri]
+    };
+
+    // Pre-populate HTML with current worker status to eliminate visual flicker
+    webviewView.webview.html = this._getHtmlForWebview();
+
+    // Push state immediately on mount
+    webviewView.webview.postMessage({
+      type: 'restoreHistory',
+      history: this.conversationHistory,
+      workerStatus: this.workerManager.getStatus()
+    });
+
+    webviewView.webview.onDidReceiveMessage(async (data) => {
+      switch (data.type) {
+        case 'sendMessage': {
+          await this.handleUserMessage(data.text);
+          break;
+        }
+        case 'abortTask': {
+          this.agentLoop.abort();
+          this._view?.webview.postMessage({ type: 'taskAborted' });
+          break;
+        }
+        case 'clearChat': {
+          this.conversationHistory = [];
+          this.saveHistory();
+          this.agentLoop.clearHistory();
+          this._view?.webview.postMessage({ type: 'cleared' });
+          break;
+        }
+        case 'toggleWorker': {
+          await this.workerManager.toggle();
+          break;
+        }
+        case 'installSuite': {
+          await vscode.commands.executeCommand('dlne.installSuite');
+          break;
+        }
+        case 'selectModel': {
+          const selectedModel = data.model;
+          if (selectedModel) {
+            await vscode.workspace
+              .getConfiguration('dlne')
+              .update('chatModel', selectedModel, vscode.ConfigurationTarget.Global);
+            vscode.window.showInformationMessage(`🧠 Swapping DLNE Cluster Model to: ${selectedModel}...`);
+            const swapRes = await this.client.swapModel(selectedModel);
+            await vscode.commands.executeCommand('dlne.refreshStatus');
+            if (swapRes.status === 'error') {
+              vscode.window.showWarningMessage(`DLNE Model Swap Notice: ${swapRes.detail}`);
+            } else {
+              vscode.window.showInformationMessage(`✅ Active Cluster Model is now: ${selectedModel}`);
+            }
+          }
+          break;
+        }
+        case 'openFile': {
+          const relPath = data.path;
+          const folders = vscode.workspace.workspaceFolders;
+          if (folders && folders.length > 0) {
+            const fullPath = path.isAbsolute(relPath) ? relPath : path.join(folders[0].uri.fsPath, relPath);
+            try {
+              const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(fullPath));
+              await vscode.window.showTextDocument(doc, { preview: false });
+            } catch (err: any) {
+              vscode.window.showErrorMessage(`Could not open ${relPath}: ${err.message}`);
+            }
+          }
+          break;
+        }
+      }
+    });
+  }
+
+  private async handleUserMessage(text: string) {
+    if (!text.trim()) return;
+
+    const userMsg: ChatMessageItem = {
+      id: 'msg-' + Date.now() + '-u',
+      role: 'user',
+      text
+    };
+    this.conversationHistory.push(userMsg);
+    this.saveHistory();
+
+    this._view?.webview.postMessage({ type: 'appendUserMessage', text });
+
+    const assistantMsg: ChatMessageItem = {
+      id: 'msg-' + Date.now() + '-a',
+      role: 'assistant',
+      text: '',
+      thinking: '',
+      toolCalls: []
+    };
+    this.conversationHistory.push(assistantMsg);
+
+    await this.agentLoop.run(text, {
+      onLoadingProgress: (statusText) => {
+        this._view?.webview.postMessage({ type: 'loadingProgress', statusText });
+      },
+      onThinkingDelta: (delta) => {
+        assistantMsg.thinking = (assistantMsg.thinking || '') + delta;
+        this._view?.webview.postMessage({ type: 'thinkingDelta', delta });
+      },
+      onContentDelta: (delta) => {
+        assistantMsg.text += delta;
+        this._view?.webview.postMessage({ type: 'contentDelta', delta });
+      },
+      onToolStart: (toolName, args) => {
+        if (!assistantMsg.toolCalls) assistantMsg.toolCalls = [];
+        assistantMsg.toolCalls.push({ name: toolName, args });
+        this._view?.webview.postMessage({ type: 'toolStart', toolName, args });
+      },
+      onToolEnd: (result) => {
+        if (assistantMsg.toolCalls && assistantMsg.toolCalls.length > 0) {
+          assistantMsg.toolCalls[assistantMsg.toolCalls.length - 1].result = result;
+        }
+        this.saveHistory();
+        this._view?.webview.postMessage({ type: 'toolEnd', result });
+      },
+      onError: (error) => {
+        this._view?.webview.postMessage({ type: 'error', error });
+      }
+    });
+
+    this.saveHistory();
+    this._view?.webview.postMessage({ type: 'turnComplete' });
+  }
+
+  private _getHtmlForWebview(): string {
+    const st = this.workerManager.getStatus();
+    const isContrib = st.state === 'contributing';
+    const isStarting = st.state === 'starting';
+
+    const badgeClass = isContrib ? 'contributing' : isStarting ? 'starting' : 'idle';
+    const badgeText = st.state.toUpperCase();
+    const btnClass = isContrib ? 'contrib-btn stop-btn' : 'contrib-btn';
+    const btnText = isContrib ? '⏹ Stop Contributing' : isStarting ? '⏳ Initializing...' : '⚡ Contribute Local GPU';
+    const ruleText = isContrib
+      ? `✅ <strong>Active:</strong> Contributing ${st.vramContributedGb} GB to cluster. Inference unlocked!`
+      : `<strong>Core Rule:</strong> You must give compute to receive compute.`;
+    const apiTag = st.gpu.api ? st.gpu.api.toUpperCase() : 'VULKAN';
+    const gpuText = `<strong>${apiTag} GPU:</strong> ${st.gpu.name} (${st.gpu.vramTotalGb} GB)`;
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DLNE Frontier Agent</title>
+  <style>
+    :root {
+      --card-bg: var(--vscode-editor-background);
+      --card-border: var(--vscode-widget-border, #333);
+      --diff-add-bg: rgba(34, 197, 94, 0.16);
+      --diff-add-text: #4ade80;
+      --diff-del-bg: rgba(244, 63, 94, 0.16);
+      --diff-del-text: #f87171;
+    }
+
+    body {
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
+      color: var(--vscode-foreground);
+      background-color: var(--vscode-sideBar-background);
+      margin: 0;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      box-sizing: border-box;
+      gap: 10px;
+    }
+
+    /* Compute Contribution Card */
+    .contrib-card {
+      background-color: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .contrib-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 600;
+      font-size: 0.9em;
+    }
+    .badge {
+      font-size: 0.72em;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-weight: bold;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+    .badge.idle {
+      background-color: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+    }
+    .badge.starting {
+      background-color: #d7ba7d;
+      color: #1e1e1e;
+    }
+    .badge.contributing {
+      background-color: #10b981;
+      color: #0f172a;
+    }
+    .badge.error {
+      background-color: var(--vscode-errorForeground);
+      color: #fff;
+    }
+    .contrib-info {
+      font-size: 0.82em;
+      color: var(--vscode-descriptionForeground);
+      line-height: 1.35;
+    }
+    .contrib-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 4px;
+    }
+
+    /* Chat Container */
+    #chat-container {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding-bottom: 8px;
+    }
+    .message {
+      padding: 10px 12px;
+      border-radius: 6px;
+      line-height: 1.45;
+      word-wrap: break-word;
+    }
+    .user {
+      background-color: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      align-self: flex-end;
+      max-width: 88%;
+      white-space: pre-wrap;
+    }
+    .assistant {
+      background-color: var(--card-bg);
+      border: 1px solid var(--card-border);
+      align-self: flex-start;
+      width: 96%;
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .assistant-body {
+      white-space: pre-wrap;
+    }
+
+    /* Claude Code / Antigravity Style Thinking Drawer */
+    .thinking-drawer {
+      margin-bottom: 4px;
+      padding: 7px 10px;
+      background-color: rgba(255, 255, 255, 0.03);
+      border-left: 3px solid #8b5cf6;
+      border-radius: 4px;
+      font-size: 0.88em;
+      color: var(--vscode-descriptionForeground);
+    }
+    .thinking-drawer summary {
+      cursor: pointer;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      user-select: none;
+    }
+    .thinking-badge {
+      font-size: 0.78em;
+      color: #a78bfa;
+      font-weight: normal;
+    }
+    .thinking-content {
+      margin-top: 6px;
+      white-space: pre-wrap;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.9em;
+      line-height: 1.4;
+      color: var(--vscode-foreground);
+      opacity: 0.9;
+      max-height: 240px;
+      overflow-y: auto;
+    }
+
+    /* Claude Code / Antigravity Style File Modification Card */
+    .file-card {
+      background-color: var(--vscode-editor-background);
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      overflow: hidden;
+      margin: 4px 0;
+    }
+    .file-card-header {
+      background-color: rgba(255, 255, 255, 0.04);
+      padding: 6px 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.86em;
+      border-bottom: 1px solid var(--card-border);
+    }
+    .file-path {
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .diff-counts {
+      display: flex;
+      gap: 4px;
+      font-size: 0.8em;
+      font-family: monospace;
+      font-weight: bold;
+    }
+    .diff-badge-add {
+      color: #4ade80;
+      background-color: var(--diff-add-bg);
+      padding: 1px 5px;
+      border-radius: 3px;
+    }
+    .diff-badge-del {
+      color: #f87171;
+      background-color: var(--diff-del-bg);
+      padding: 1px 5px;
+      border-radius: 3px;
+    }
+    .file-card-actions {
+      display: flex;
+      gap: 6px;
+    }
+    .btn-file-open {
+      padding: 2px 8px;
+      font-size: 0.8em;
+      background-color: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border-radius: 3px;
+      border: none;
+      cursor: pointer;
+    }
+    .btn-file-open:hover {
+      background-color: var(--vscode-button-secondaryHoverBackground);
+    }
+
+    /* Unified Diff View */
+    .diff-box {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.82em;
+      line-height: 1.45;
+      overflow-x: auto;
+      max-height: 240px;
+      padding: 4px 0;
+      background-color: #121216;
+    }
+    .diff-line {
+      display: flex;
+      padding: 1px 8px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .diff-line.hdr {
+      color: #38bdf8;
+      background-color: rgba(56, 189, 248, 0.08);
+      font-style: italic;
+    }
+    .diff-line.add {
+      background-color: var(--diff-add-bg);
+      color: var(--diff-add-text);
+    }
+    .diff-line.del {
+      background-color: var(--diff-del-bg);
+      color: var(--diff-del-text);
+    }
+    .diff-line.ctx {
+      color: var(--vscode-foreground);
+      opacity: 0.75;
+    }
+
+    /* Terminal Execution Card */
+    .terminal-card {
+      background-color: #0e1117;
+      border: 1px solid var(--card-border);
+      border-radius: 5px;
+      padding: 6px 10px;
+      font-size: 0.84em;
+      font-family: var(--vscode-editor-font-family, monospace);
+      margin: 4px 0;
+    }
+    .terminal-cmd {
+      color: #38bdf8;
+      font-weight: bold;
+    }
+    .terminal-out {
+      margin-top: 4px;
+      color: #94a3b8;
+      white-space: pre-wrap;
+      max-height: 140px;
+      overflow-y: auto;
+    }
+
+    /* Tool Call Active Pill */
+    .tool-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin: 4px 0;
+      padding: 3px 8px;
+      font-size: 0.82em;
+      border-radius: 4px;
+      background-color: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+    }
+
+    #input-container {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    textarea {
+      width: 100%;
+      box-sizing: border-box;
+      resize: vertical;
+      background-color: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      border: 1px solid var(--vscode-input-border);
+      padding: 8px;
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: inherit;
+    }
+    .btn-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .btn-group-right {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    select.model-picker {
+      flex: 1;
+      max-width: 240px;
+      padding: 5px 8px;
+      background-color: var(--vscode-dropdown-background, var(--vscode-input-background));
+      color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
+      border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border));
+      border-radius: 4px;
+      font-size: 0.84em;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    button {
+      padding: 6px 12px;
+      background-color: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.88em;
+    }
+    button:hover {
+      background-color: var(--vscode-button-hoverBackground);
+    }
+    button.secondary {
+      background-color: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+    }
+    button.contrib-btn {
+      flex: 1;
+      font-weight: 600;
+    }
+    button.stop-btn {
+      background-color: #f43f5e;
+      color: #fff;
+    }
+  </style>
+</head>
+<body>
+  <!-- Compute Contribution Card -->
+  <div class="contrib-card" id="contrib-card">
+    <div class="contrib-header">
+      <span>🧠 Compute Contribution</span>
+      <span class="badge ${badgeClass}" id="worker-badge">${badgeText}</span>
+    </div>
+    <div class="contrib-info" id="gpu-display">${gpuText}</div>
+    <div class="contrib-info" id="contrib-rule">${ruleText}</div>
+    <div class="contrib-actions">
+      <button class="${btnClass}" id="toggle-worker-btn">${btnText}</button>
+      <button class="secondary" id="suite-btn" title="Install the signed DLNE compute engine">Set Up Engine</button>
+    </div>
+  </div>
+
+  <div id="chat-container">
+    <div class="message assistant" id="welcome-msg">
+      <strong>🧠 DLNE Frontier Reasoning Agent</strong>
+      <div class="assistant-body">Connected to cluster. Ready for autonomous coding, refactoring, and test verification.</div>
+    </div>
+  </div>
+
+  <div id="input-container">
+    <textarea id="prompt-input" rows="3" placeholder="Ask DLNE to write code, edit files, or fix bugs..."></textarea>
+    <div class="btn-row">
+      <select class="model-picker" id="model-select" title="Select Active DLNE Cluster Model Tier">
+        <option value="qwen3-coder-30b-instruct-q4_k_m.gguf">⚡ Qwen3 Coder 30B MoE (256K Context)</option>
+        <option value="qwen2.5-14b-1m.gguf">🌌 Qwen 2.5 14B (1 Million Context)</option>
+        <option value="qwen2.5-coder-32b-instruct-q4_k_m.gguf">🚀 Qwen 2.5 Coder 32B (24GB)</option>
+        <option value="qwen2.5-coder-14b-instruct-q4_k_m.gguf">🧠 Qwen 2.5 Coder 14B (16GB)</option>
+        <option value="DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf">⚡ DeepSeek-R1 32B (24GB)</option>
+        <option value="Llama-3.3-70B-Instruct-IQ3_M.gguf">🔥 Llama 3.3 70B (128K Big Guns)</option>
+        <option value="DeepSeek-R1-Distill-Llama-70B-Q4_K_M.gguf">💎 DeepSeek-R1 70B (42GB)</option>
+        <option value="Qwen2.5-72B-Instruct-Q4_K_M.gguf">👑 Qwen 2.5 72B (44GB Flagship)</option>
+      </select>
+      <div class="btn-group-right">
+        <button class="secondary" id="clear-btn">Clear</button>
+        <button class="secondary" id="stop-btn" style="display:none;">Stop</button>
+        <button id="send-btn">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const vscode = acquireVsCodeApi();
+    const chatContainer = document.getElementById('chat-container');
+    const promptInput = document.getElementById('prompt-input');
+    const sendBtn = document.getElementById('send-btn');
+    const stopBtn = document.getElementById('stop-btn');
+    const clearBtn = document.getElementById('clear-btn');
+    const modelSelect = document.getElementById('model-select');
+    const toggleWorkerBtn = document.getElementById('toggle-worker-btn');
+    const suiteBtn = document.getElementById('suite-btn');
+    const workerBadge = document.getElementById('worker-badge');
+    const gpuDisplay = document.getElementById('gpu-display');
+    const contribRule = document.getElementById('contrib-rule');
+
+    let currentAssistantMsg = null;
+    let currentThinkingElem = null;
+    let currentThinkingBadge = null;
+    let currentContentElem = null;
+    let activePillElem = null;
+
+    // Restore state from webview cache on instant reload
+    const previousState = vscode.getState();
+    if (previousState && previousState.chatHtml) {
+      chatContainer.innerHTML = previousState.chatHtml;
+    }
+
+    function saveWebviewState() {
+      vscode.setState({ chatHtml: chatContainer.innerHTML });
+    }
+
+    toggleWorkerBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'toggleWorker' });
+    });
+
+    suiteBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'installSuite' });
+    });
+
+    if (modelSelect) {
+      modelSelect.addEventListener('change', () => {
+        vscode.postMessage({ type: 'selectModel', model: modelSelect.value });
+      });
+    }
+
+    sendBtn.addEventListener('click', () => {
+      const text = promptInput.value.trim();
+      if (!text) return;
+      promptInput.value = '';
+      sendBtn.style.display = 'none';
+      stopBtn.style.display = 'inline-block';
+      vscode.postMessage({ type: 'sendMessage', text });
+    });
+
+    stopBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'abortTask' });
+    });
+
+    clearBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'clearChat' });
+      chatContainer.innerHTML = '';
+      saveWebviewState();
+    });
+
+    promptInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendBtn.click();
+      }
+    });
+
+    // Handle delegated click for Open File buttons in diff cards
+    chatContainer.addEventListener('click', (e) => {
+      const target = e.target;
+      if (target && target.classList.contains('btn-file-open')) {
+        const filePath = target.getAttribute('data-path');
+        if (filePath) {
+          vscode.postMessage({ type: 'openFile', path: filePath });
+        }
+      }
+    });
+
+    function renderDiffCard(parentElem, diff) {
+      const card = document.createElement('div');
+      card.className = 'file-card';
+
+      const header = document.createElement('div');
+      header.className = 'file-card-header';
+
+      const pathElem = document.createElement('div');
+      pathElem.className = 'file-path';
+      pathElem.innerHTML = '📄 ' + diff.path;
+
+      const counts = document.createElement('div');
+      counts.className = 'diff-counts';
+      if (diff.additions > 0) {
+        counts.innerHTML += '<span class="diff-badge-add">+' + diff.additions + '</span>';
+      }
+      if (diff.deletions > 0) {
+        counts.innerHTML += '<span class="diff-badge-del">-' + diff.deletions + '</span>';
+      }
+      pathElem.appendChild(counts);
+
+      const actions = document.createElement('div');
+      actions.className = 'file-card-actions';
+      const openBtn = document.createElement('button');
+      openBtn.className = 'btn-file-open';
+      openBtn.textContent = '📂 Open File';
+      openBtn.setAttribute('data-path', diff.path);
+      actions.appendChild(openBtn);
+
+      header.appendChild(pathElem);
+      header.appendChild(actions);
+      card.appendChild(header);
+
+      if (diff.lines && diff.lines.length > 0) {
+        const diffBox = document.createElement('div');
+        diffBox.className = 'diff-box';
+        diff.lines.forEach((l) => {
+          const row = document.createElement('div');
+          row.className = 'diff-line ' + l.type;
+          row.textContent = l.text;
+          diffBox.appendChild(row);
+        });
+        card.appendChild(diffBox);
+      }
+
+      parentElem.appendChild(card);
+    }
+
+    function renderTerminalCard(parentElem, cmd, output) {
+      const card = document.createElement('div');
+      card.className = 'terminal-card';
+      card.innerHTML = '<div class="terminal-cmd">⚡ Terminal: ' + cmd + '</div><div class="terminal-out">' + (output || '') + '</div>';
+      parentElem.appendChild(card);
+    }
+
+    function applyWorkerStatus(st) {
+      if (!st) return;
+      workerBadge.className = 'badge ' + st.state;
+      workerBadge.textContent = st.state.toUpperCase();
+
+      const apiTag = st.gpu && st.gpu.api ? st.gpu.api.toUpperCase() : 'VULKAN';
+      const gpuName = st.gpu && st.gpu.name ? st.gpu.name : 'Local GPU';
+      const vramGb = st.gpu && st.gpu.vramTotalGb ? st.gpu.vramTotalGb : 8;
+      gpuDisplay.innerHTML = '<strong>' + apiTag + ' GPU:</strong> ' + gpuName + ' (' + vramGb + ' GB)';
+
+      if (st.state === 'contributing') {
+        toggleWorkerBtn.textContent = '⏹ Stop Contributing';
+        toggleWorkerBtn.className = 'contrib-btn stop-btn';
+        contribRule.innerHTML = '✅ <strong>Active:</strong> Contributing ' + st.vramContributedGb + ' GB to cluster. Inference unlocked!';
+      } else if (st.state === 'starting') {
+        toggleWorkerBtn.textContent = '⏳ Initializing...';
+        toggleWorkerBtn.className = 'contrib-btn';
+        contribRule.innerHTML = '⏳ Connecting local worker to cluster coordinator...';
+      } else {
+        toggleWorkerBtn.textContent = '⚡ Contribute Local GPU';
+        toggleWorkerBtn.className = 'contrib-btn';
+        contribRule.innerHTML = '<strong>Core Rule:</strong> You must give compute to receive compute.';
+      }
+    }
+
+    window.addEventListener('message', (event) => {
+      const msg = event.data;
+      switch (msg.type) {
+        case 'workerStatus': {
+          applyWorkerStatus(msg.status);
+          break;
+        }
+
+        case 'restoreHistory': {
+          if (msg.workerStatus) {
+            applyWorkerStatus(msg.workerStatus);
+          }
+          if (msg.history && msg.history.length > 0) {
+            chatContainer.innerHTML = '';
+            msg.history.forEach((item) => {
+              if (item.role === 'user') {
+                const div = document.createElement('div');
+                div.className = 'message user';
+                div.textContent = item.text;
+                chatContainer.appendChild(div);
+              } else {
+                const asstDiv = document.createElement('div');
+                asstDiv.className = 'message assistant';
+
+                if (item.thinking) {
+                  const details = document.createElement('details');
+                  details.className = 'thinking-drawer';
+                  details.innerHTML = '<summary><span>🧠 Thought Process</span> <span class="thinking-badge">Complete</span></summary><div class="thinking-content">' + item.thinking + '</div>';
+                  asstDiv.appendChild(details);
+                }
+
+                if (item.toolCalls && item.toolCalls.length > 0) {
+                  item.toolCalls.forEach((tc) => {
+                    if (tc.result && tc.result.fileDiff) {
+                      renderDiffCard(asstDiv, tc.result.fileDiff);
+                    } else if (tc.result && tc.result.terminalCommand) {
+                      renderTerminalCard(asstDiv, tc.result.terminalCommand, tc.result.output);
+                    }
+                  });
+                }
+
+                if (item.text) {
+                  const body = document.createElement('div');
+                  body.className = 'assistant-body';
+                  body.textContent = item.text;
+                  asstDiv.appendChild(body);
+                }
+                chatContainer.appendChild(asstDiv);
+              }
+            });
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            saveWebviewState();
+          }
+          break;
+        }
+
+        case 'appendUserMessage': {
+          const div = document.createElement('div');
+          div.className = 'message user';
+          div.textContent = msg.text;
+          chatContainer.appendChild(div);
+          chatContainer.scrollTop = chatContainer.scrollHeight;
+
+          currentAssistantMsg = document.createElement('div');
+          currentAssistantMsg.className = 'message assistant';
+          chatContainer.appendChild(currentAssistantMsg);
+
+          currentThinkingElem = null;
+          currentThinkingBadge = null;
+          currentContentElem = null;
+          activePillElem = null;
+          saveWebviewState();
+          break;
+        }
+
+        case 'loadingProgress': {
+          if (currentAssistantMsg) {
+            if (!activePillElem) {
+              activePillElem = document.createElement('div');
+              activePillElem.className = 'tool-pill';
+              currentAssistantMsg.appendChild(activePillElem);
+            }
+            activePillElem.textContent = msg.statusText;
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+          }
+          break;
+        }
+
+        case 'thinkingDelta': {
+          if (activePillElem) {
+            activePillElem.remove();
+            activePillElem = null;
+          }
+          if (!currentThinkingElem && currentAssistantMsg) {
+            const details = document.createElement('details');
+            details.className = 'thinking-drawer';
+            details.open = true;
+
+            const summary = document.createElement('summary');
+            summary.innerHTML = '<span>🧠 Thought Process</span>';
+
+            currentThinkingBadge = document.createElement('span');
+            currentThinkingBadge.className = 'thinking-badge';
+            currentThinkingBadge.textContent = '⚡ Reasoning...';
+            summary.appendChild(currentThinkingBadge);
+
+            const content = document.createElement('div');
+            content.className = 'thinking-content';
+
+            details.appendChild(summary);
+            details.appendChild(content);
+            currentAssistantMsg.appendChild(details);
+            currentThinkingElem = content;
+          }
+          if (currentThinkingElem) {
+            currentThinkingElem.textContent += msg.delta;
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+          }
+          break;
+        }
+
+        case 'contentDelta': {
+          if (activePillElem) {
+            activePillElem.remove();
+            activePillElem = null;
+          }
+          if (!currentContentElem && currentAssistantMsg) {
+            currentContentElem = document.createElement('div');
+            currentContentElem.className = 'assistant-body';
+            currentAssistantMsg.appendChild(currentContentElem);
+          }
+          if (currentContentElem) {
+            currentContentElem.textContent += msg.delta;
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+          }
+          break;
+        }
+
+        case 'toolStart': {
+          if (currentContentElem) {
+            const fencedToolPattern = new RegExp('\\x60\\x60\\x60(?:json|tool_call)?\\\\s*\\\\{\\\\s*"name"\\\\s*:[\\\\s\\\\S]*?\\x60\\x60\\x60\\\\s*$', 'g');
+            const xmlToolPattern = new RegExp('<tool_call[\\\\s\\\\S]*?<\\\\/tool_call>\\\\s*$', 'g');
+            currentContentElem.textContent = (currentContentElem.textContent || '')
+              .replace(fencedToolPattern, '')
+              .replace(xmlToolPattern, '')
+              .trim();
+            if (!currentContentElem.textContent) {
+              currentContentElem.remove();
+              currentContentElem = null;
+            }
+          }
+          if (currentAssistantMsg) {
+            activePillElem = document.createElement('div');
+            activePillElem.className = 'tool-pill';
+            activePillElem.textContent = '🔧 Executing ' + msg.toolName + '...';
+            currentAssistantMsg.appendChild(activePillElem);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+          }
+          break;
+        }
+
+        case 'toolEnd': {
+          if (activePillElem) {
+            activePillElem.remove();
+            activePillElem = null;
+          }
+          currentContentElem = null;
+          const res = msg.result;
+          if (res && res.fileDiff && currentAssistantMsg) {
+            renderDiffCard(currentAssistantMsg, res.fileDiff);
+          } else if (res && res.terminalCommand && currentAssistantMsg) {
+            renderTerminalCard(currentAssistantMsg, res.terminalCommand, res.output);
+          } else if (res && currentAssistantMsg) {
+            const pill = document.createElement('div');
+            pill.className = 'tool-pill';
+            pill.textContent = '✅ ' + res.name + ': ' + (res.output.slice(0, 100));
+            currentAssistantMsg.appendChild(pill);
+          }
+          chatContainer.scrollTop = chatContainer.scrollHeight;
+          saveWebviewState();
+          break;
+        }
+
+        case 'turnComplete':
+        case 'taskAborted': {
+          if (currentThinkingBadge) {
+            currentThinkingBadge.textContent = 'Complete';
+          }
+          if (activePillElem) {
+            activePillElem.remove();
+            activePillElem = null;
+          }
+          sendBtn.style.display = 'inline-block';
+          stopBtn.style.display = 'none';
+          saveWebviewState();
+          break;
+        }
+
+        case 'error': {
+          const div = document.createElement('div');
+          div.className = 'message assistant';
+          div.style.color = 'var(--vscode-errorForeground)';
+          div.textContent = 'Error: ' + msg.error;
+          chatContainer.appendChild(div);
+          sendBtn.style.display = 'inline-block';
+          stopBtn.style.display = 'none';
+          saveWebviewState();
+          break;
+        }
+      }
+    });
+  </script>
+</body>
+</html>`;
+  }
+}
