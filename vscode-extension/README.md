@@ -17,8 +17,16 @@ No account, no API key, no subscription. Install it, open the DLNE sidebar, and 
 
 DLNE runs on a **swarm**: a coordinator plus the GPUs of the people who use it.
 
-1. **Try it**: your first **200 chats are free**, with nothing to set up. Autocomplete does not use them up. The status bar shows how many are left.
-2. **Keep using it**: lend some of your GPU (or CPU) to the swarm with one click (**Start Contributing** in the sidebar). While you contribute, chat and autocomplete are unlimited.
+1. **Try it**: **200 free chats**, with nothing to set up. Autocomplete does not use them up, and the status bar shows how many are left. They're counted once per internet connection on the server, so reinstalling or clearing settings doesn't reset them.
+2. **Keep using it**: lend some of your computer to the swarm with one click (**Start Contributing** in the sidebar).
+
+| You lend | Coding agent | When the swarm is busy |
+|---|---|---|
+| **A GPU** | Unlimited | First in line |
+| **A CPU** | 100 chats in any 5 hours (each frees up 5 hours after you used it) | Second in line |
+| Nothing | The 200 free chats | After contributors |
+
+A CPU contributor's chats show how many are left, and at the limit the agent says exactly when the next one frees up.
 
 You choose how much to lend (`dlne.worker.maxVramGb`, `dlne.worker.maxRamGb`, `dlne.worker.allowedGpus`), and you can stop at any time.
 

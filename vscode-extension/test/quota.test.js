@@ -103,14 +103,14 @@ test('streamed chat responses update the remaining count', async () => {
   });
 });
 
-test('a chat 403 records 0 and surfaces an error naming the status', async () => {
+test('a chat 403 records 0 and surfaces the status and the coordinator\'s reason', async () => {
   await withServer((req, res) => {
     res.writeHead(403, { 'Content-Type': 'application/json', 'X-DLNE-Quota-Remaining': '0' });
     res.end(JSON.stringify({ detail: 'trial used' }));
   }, async (client) => {
     await assert.rejects(
       client.executeSingleStreamAttempt(client.getServerUrl(), { model: 'm', messages: [] }, () => {}),
-      /403/
+      (err) => err.status === 403 && err.message === 'trial used'
     );
     assert.equal(client.getQuotaRemaining(), 0);
   });

@@ -53,7 +53,15 @@ Everything under `/v1/admin/*` needs that operator key as `Authorization: Bearer
 default only accepts it from the coordinator's own machine (`ADMIN_ALLOW_REMOTE=true` to change
 that). BarrkBOT's `/dlne` command uses it.
 
-Settings live in `config/config.txt` (`KEY=VALUE`). Three groups matter for most operators:
+Settings live in `config/config.txt` (`KEY=VALUE`). Four groups matter for most operators:
+
+- **Who goes first, and how much**: when the coding engine is busy, its slots go to GPU
+  contributors, API keys and the coordinator's own host first, CPU contributors second, and
+  free-trial users third (`engine/priority.py`); autocomplete only runs on a slot nobody is
+  waiting for. CPU contributors get `CPU_CODING_LIMIT` (100) coding chats in any
+  `CPU_CODING_WINDOW_HOURS` (5) hours. The free trial (`STARTER_QUOTA_INFERENCES`, 200) is
+  counted once per network address (IPv6 per /64) in `config/starter_quota.json`, never per
+  client-supplied token.
 
 - **What a CPU-only worker must bring**: `CPU_MIN_RAM_GB` (8), `CPU_MIN_CORES` (4 physical) and
   `CPU_MIN_BANDWIDTH_GBS` (30, measured by the worker when it joins); x86 CPUs also need AVX2

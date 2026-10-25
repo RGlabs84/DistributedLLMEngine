@@ -108,6 +108,30 @@ export interface ClusterStatusResult {
   message?: string;
 }
 
+/**
+ * What to tell the user when a chat request is refused: the coordinator's own sentence (its
+ * JSON `detail`, e.g. the CPU contributors' "You've used all 100 coding chats… frees up in
+ * 42 minutes"), never the raw response body.
+ */
+/** A chat request the coordinator refused, with its HTTP status kept for callers to branch on. */
+export class ServerRefusal extends Error {
+  constructor(public readonly status: number | undefined, message: string) {
+    super(message);
+    this.name = 'ServerRefusal';
+  }
+}
+
+export function serverErrorMessage(status: number | undefined, body: string): string {
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed && typeof parsed.detail === 'string' && parsed.detail.trim()) {
+      return parsed.detail.trim().slice(0, 600);
+    }
+  } catch {}
+  const text = (body || '').trim();
+  return text ? `Server returned ${status}: ${text.slice(0, 300)}` : `Server returned ${status}`;
+}
+
 export class DlneClient {
   private workerManager?: any;
   // Chat requests left in the free trial, as last reported by the coordinator; null until the
@@ -348,7 +372,7 @@ export class DlneClient {
         // a race, not a ban: the Coordinator registers the token on the next heartbeat
         // (every 5 s). Re-read the token and retry briefly before surfacing the error.
         const msg: string = err?.message || '';
-        if (msg.includes('403') && forbiddenRetries < 6) {
+        if ((err?.status === 403 || msg.includes('403')) && forbiddenRetries < 6) {
           forbiddenRetries++;
           // Only retry if the worker is already contributing (waiting for heartbeat token exchange).
           // NEVER auto-start the worker unless the user explicitly requested it in VS Code!
@@ -489,7 +513,7 @@ export class DlneClient {
           clearTimer();
           let errBody = '';
           res.on('data', (c) => errBody += c);
-          res.on('end', () => reject(new Error(`Server returned ${res.statusCode}: ${errBody}`)));
+          res.on('end', () => reject(new ServerRefusal(res.statusCode, serverErrorMessage(res.statusCode, errBody))));
           return;
         }
 

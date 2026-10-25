@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.2.2] - 2026-10-25
+
+Pairs with DLNE coordinator **2.2.0**.
+
+### Changed
+- **Contributors go first.** When the swarm is busy, GPU contributors' requests are served first, CPU contributors' second, and free-trial users' after them.
+- **CPU contributors get 100 coding chats in any 5 hours.** At the limit, the agent says exactly when the next one frees up. GPU contributors stay unlimited.
+- **The 200 free chats are counted once per internet connection**, on the server. Reinstalling, clearing settings or switching accounts no longer resets them.
+
+### Fixed
+- A refused chat showed the server's raw response. It now shows the server's own sentence (for example "The next one frees up in 42 minutes"), and only a spent free trial gets the "start contributing" guide.
+
 ## [1.2.1] - 2026-10-25
 
 Pairs with DLNE coordinator **2.1.3**.

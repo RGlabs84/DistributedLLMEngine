@@ -63,6 +63,7 @@ from engine.registry import WorkerRegistry, safe_log_text
 from engine.version import VERSION
 from engine import release as release_lib
 from engine.lease import lease_manager, InferenceLease
+from engine.priority import coding_gate, cpu_coding_window, tier_priority
 from engine.api_keys import api_key_manager, hash_admin_key
 
 # The rich-backed helpers in engine.logger deliberately expose no debug level, because
@@ -506,6 +507,47 @@ starter_quota_mgr = StarterQuotaManager()
 QUOTA_HEADER = "X-DLNE-Quota-Remaining"
 
 
+def trial_identity(client_ip: str) -> str:
+    """
+    Whose free trial a request spends: the network address it came from, never a value
+    the client chooses.
+
+    The trial used to be keyed by the bearer token when one was sent, and any token that
+    matched no worker or API key fell through to here - so sending a new made-up token with
+    every request gave a fresh 200 chats every time. The address is what the coordinator
+    actually sees (behind the proxy, the forwarded client address, trusted only from the
+    proxy itself). IPv6 is keyed by its /64, the block one home or phone is handed and can
+    rotate through freely. The count lives in config/starter_quota.json on the server,
+    written atomically and untouched by upgrades, so clearing anything on the user's side
+    changes nothing. Everyone behind one shared address shares its trial: the price of a
+    free tier that cannot be reset.
+    """
+    try:
+        address = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return client_ip
+    if address.version == 6:
+        if address.ipv4_mapped is not None:
+            return str(address.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return str(address)
+
+
+# Rolling-limit headers on a CPU contributor's coding chats: uses left, and the epoch second
+# the next one frees up.
+LIMIT_REMAINING_HEADER = "X-DLNE-Limit-Remaining"
+LIMIT_RESET_HEADER = "X-DLNE-Limit-Reset"
+
+
+def cpu_limit_text(limit: int, hours: float, reset_at: float) -> str:
+    minutes = max(1, int((reset_at - time.time()) // 60) + 1)
+    when = f"{minutes} minute{'s' if minutes != 1 else ''}" if minutes < 120 else f"{minutes // 60} hours {minutes % 60} minutes"
+    return (
+        f"You've used all {limit} coding chats for this {hours:g}-hour window (the allowance for CPU "
+        f"contributors). The next one frees up in {when}. Contributing a GPU removes the limit."
+    )
+
+
 def use_starter_quota(request: Request, client_id: str, limit: int) -> Tuple[bool, int]:
     """
     Applies the free starter trial to one request and returns (allowed, remaining).
@@ -532,23 +574,29 @@ class NonContribBlockerMiddleware(BaseHTTPMiddleware):
         if path.startswith("/v1/chat") or path.startswith("/v1/completions") or is_cluster_control:
             client_ip = get_client_ip(request)
             client_token = get_request_token(request)
+            # Every request that reaches the coding engine carries its tier, which decides
+            # its place in the engine's queue (engine/priority.py).
             if not get_worker_limits().get("enforce_contrib_clause", True):
+                request.state.dlne_tier = "open"
                 return await call_next(request)
 
             # Coordinator host is automatically granted access
-            if not is_local_ip(client_ip):
+            if is_local_ip(client_ip):
+                request.state.dlne_tier = "host"
+            else:
                 # Bearer API Key holders (VS Code extension / IDE clients) are authorized
                 if client_token and api_key_manager.verify_key(client_token):
+                    request.state.dlne_tier = "key"
                     return await call_next(request)
 
                 # Active contributing worker nodes are authorized
                 worker = registry.find_by_token(client_token) if client_token else None
                 if not worker:
                     # Check free starter quota for new users/evaluators
+                    request.state.dlne_tier = "trial"
                     quota_limit = int(get_worker_limits().get("starter_quota_inferences", 200))
                     if quota_limit > 0:
-                        client_id = client_token or client_ip
-                        allowed, remaining = use_starter_quota(request, client_id, quota_limit)
+                        allowed, remaining = use_starter_quota(request, trial_identity(client_ip), quota_limit)
                         if allowed:
                             response = await call_next(request)
                             response.headers[QUOTA_HEADER] = str(remaining)
@@ -569,11 +617,38 @@ class NonContribBlockerMiddleware(BaseHTTPMiddleware):
 
                 # Enforce Non-Contrib Clause: a CPU-only node earns access on the same floors
                 # it was admitted on (a node registered under older, laxer rules does not).
-                missing = cpu_node_shortfalls(worker.get("hardware", {}), get_worker_limits())
+                limits = get_worker_limits()
+                missing = cpu_node_shortfalls(worker.get("hardware", {}), limits)
                 if missing:
                     return JSONResponse({"detail": cpu_refusal_text(missing)}, status_code=403)
 
+                if _as_number(gpu_section(worker.get("hardware", {})).get("vram_total_gb", 0)) > 0:
+                    request.state.dlne_tier = "gpu"
+                else:
+                    # A CPU contributor: second in the queue, and its coding chats counted in a
+                    # rolling window. Autocomplete is never counted (it only runs on a free slot).
+                    request.state.dlne_tier = "cpu"
+                    if path.startswith("/v1/chat"):
+                        return await self._cpu_window(request, call_next, str(worker.get("worker_id")), limits)
+
         return await call_next(request)
+
+    @staticmethod
+    async def _cpu_window(request: Request, call_next, worker_id: str, limits: Dict[str, Any]):
+        limit = int(limits.get("cpu_coding_limit", 50))
+        hours = float(limits.get("cpu_coding_window_hours", 5.0))
+        allowed, remaining, reset_at = cpu_coding_window.check_and_record(worker_id, limit, hours * 3600)
+        headers = {LIMIT_REMAINING_HEADER: str(remaining), LIMIT_RESET_HEADER: str(int(reset_at))}
+        if not allowed:
+            wait = max(1, int(reset_at - time.time()))
+            return JSONResponse(
+                {"detail": cpu_limit_text(limit, hours, reset_at)},
+                status_code=429,
+                headers={**headers, "Retry-After": str(wait)},
+            )
+        response = await call_next(request)
+        response.headers.update(headers)
+        return response
 
 
 app.add_middleware(NonContribBlockerMiddleware)
@@ -1174,8 +1249,7 @@ def check_contrib_clause(request: Request):
     # Starter trial quota for new community users / evaluation
     quota_limit = int(get_worker_limits().get("starter_quota_inferences", 200))
     if quota_limit > 0:
-        client_id = token or ip
-        allowed, _remaining = use_starter_quota(request, client_id, quota_limit)
+        allowed, _remaining = use_starter_quota(request, trial_identity(ip), quota_limit)
         if allowed:
             return
 
@@ -1975,6 +2049,7 @@ async def chat_completions(request: Request):
 
     slot_released = False   # release_slot() is idempotent: at most one decrement per request
     slot_handed_off = False  # True once a StreamingResponse owns the release
+    gate_held = False        # True while this request holds an engine slot (coding_gate)
 
     async def release_slot() -> None:
         """
@@ -1990,7 +2065,10 @@ async def chat_completions(request: Request):
         into a permanent one: the slot would be marked returned while the counter still held
         it, and nothing would ever try again.
         """
-        nonlocal slot_released
+        nonlocal slot_released, gate_held
+        if gate_held:
+            gate_held = False
+            coding_gate.release()
         if slot_released:
             return
         slot_released = True
@@ -2206,6 +2284,13 @@ async def chat_completions(request: Request):
         safe_context = model_data.get("safe_context", 8192)
         dynamic_slots = model_data.get("dynamic_slots", 4)
         slot_context = safe_context // dynamic_slots
+
+        # Take one of the engine's request slots, by tier: GPU contributors (and API keys
+        # and this host) first, CPU contributors second, free-trial users third. Held until
+        # release_slot() gives it back with the rest of this request's resources.
+        tier = getattr(getattr(request, "state", None), "dlne_tier", None)
+        await coding_gate.acquire(tier_priority(tier), slots=dynamic_slots)
+        gate_held = True
 
         # Estimate tokens in the messages and truncate if they exceed (slot_context - 100)
         messages = body.get("messages", [])
@@ -2466,8 +2551,11 @@ async def completions(request: Request):
     # Never pile up keystroke completions: one at a time, and only while the engine has a
     # request slot free. This used to refuse whenever ANY lease was active, so one user's
     # chat turn switched ghost text off for everybody until it finished.
+    # Autocomplete never queues: it runs only on a slot nobody is waiting for, so it can
+    # never delay a chat at any tier (engine/priority.CodingGate).
     if (lease_manager.active_count(task_type="completion") > 0
-            or lease_manager.active_count() >= FIM_ENGINE_SLOTS):
+            or lease_manager.active_count() >= FIM_ENGINE_SLOTS
+            or coding_gate.stats()["waiting"] > 0):
         return {"choices": [{"text": "", "index": 0, "finish_reason": "busy"}]}
 
     client_ip = get_client_ip(request)
@@ -2628,6 +2716,9 @@ async def get_cluster_status(request: Request):
         "active_workers_count": len(active_endpoints),
         "active_endpoints": active_endpoints,
         "active_leases_count": lease_manager.active_count(),
+        # The coding engine's slots and who is waiting for them, by priority (0 = GPU
+        # contributors, 1 = CPU contributors, 2 = free trial). Counts only, no identities.
+        "coding_queue": coding_gate.stats(),
         "is_locked_for_edits": lease_manager.is_locked(),
         "in_flight_leases": lease_manager.active_leases_summary(),
         "is_swapping_models": is_swapping_models,

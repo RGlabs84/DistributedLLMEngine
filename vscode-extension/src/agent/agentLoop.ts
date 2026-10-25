@@ -20,6 +20,27 @@ const VALID_TOOLS = new Set([
   'get_workspace_diagnostics'
 ]);
 
+/**
+ * What the chat shows when a request fails. A refusal the coordinator explains (a CPU
+ * contributor's usage window, "frees up in 42 minutes", or what a machine lacks to contribute
+ * its CPU) is shown in its own words; only a spent free trial gets the "contribute" guide.
+ */
+export function refusalNotice(status: number | undefined, errMsg: string): string {
+  const trialUsedUp = /starter quota/i.test(errMsg) || errMsg.includes('NON-CONTRIB')
+    || (status === undefined && errMsg.includes('403'));
+  if (status === 429 || (status === 403 && !trialUsedUp)) {
+    return `\n\n${status === 429 ? '⏳' : '🔒'} ${errMsg}`;
+  }
+  if (trialUsedUp) {
+    return '\n\n🔒 **Your free trial is used up**\n\n' +
+      'DLNE is free forever, on one rule: *give compute to receive compute*. Share your idle GPU with the swarm to keep going.\n\n' +
+      '- Click the **DLNE status bar item** (or run **`@dlne /contribute`**) and choose **Start Contributing Local Compute**.\n' +
+      '- Or set an authorized API key in the `dlne.apiKey` setting.\n' +
+      '- Once your worker connects, resend your prompt to continue.';
+  }
+  return '\n\nError connecting to DLNE cluster: ' + errMsg;
+}
+
 export class AgentLoop {
   private messages: ChatMessage[] = [];
   private abortController: AbortController | null = null;
@@ -370,17 +391,7 @@ Begin with a short <think> plan.`
         if (callbacks.onError) {
           callbacks.onError(err);
         }
-        if (errMsg.includes('403') || errMsg.includes('NON-CONTRIB')) {
-          callbacks.onContentDelta(
-            '\n\n🔒 **Your free trial is used up**\n\n' +
-            'DLNE is free forever, on one rule: *give compute to receive compute*. Share your idle GPU with the swarm to keep going.\n\n' +
-            '- Click the **DLNE status bar item** (or run **`@dlne /contribute`**) and choose **Start Contributing Local Compute**.\n' +
-            '- Or set an authorized API key in the `dlne.apiKey` setting.\n' +
-            '- Once your worker connects, resend your prompt to continue.'
-          );
-        } else {
-          callbacks.onContentDelta('\n\nError connecting to DLNE cluster: ' + errMsg);
-        }
+        callbacks.onContentDelta(refusalNotice((err as { status?: number })?.status, errMsg));
         return;
       }
 

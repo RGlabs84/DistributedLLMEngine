@@ -59,3 +59,24 @@ test('no source file hardcodes the old address any more', () => {
   walk(path.join(__dirname, '..', 'src'));
   assert.deepEqual(offenders, []);
 });
+
+test('a refused chat shows the coordinator\'s sentence, not raw JSON', () => {
+  const { serverErrorMessage } = require('../dist/client/dlneClient');
+  const detail = "You've used all 100 coding chats for this 5-hour window (the allowance for CPU contributors). The next one frees up in 42 minutes. Contributing a GPU removes the limit.";
+  assert.equal(serverErrorMessage(429, JSON.stringify({ detail })), detail);
+  assert.equal(serverErrorMessage(502, '<html>Bad Gateway</html>'), 'Server returned 502: <html>Bad Gateway</html>');
+  assert.equal(serverErrorMessage(500, ''), 'Server returned 500');
+  assert.equal(serverErrorMessage(403, JSON.stringify({ detail: 'x'.repeat(2000) })).length, 600);
+});
+
+test('the chat explains each kind of refusal in its own words', () => {
+  const { refusalNotice } = require('../dist/agent/agentLoop');
+  const window = "You've used all 100 coding chats for this 5-hour window (the allowance for CPU contributors). The next one frees up in 42 minutes.";
+  assert.equal(refusalNotice(429, window), `\n\n⏳ ${window}`);
+  const floors = 'This machine has no usable GPU, and a CPU-only node needs 4 physical CPU cores (this machine has 2).';
+  assert.equal(refusalNotice(403, floors), `\n\n🔒 ${floors}`);
+  const trial = 'DLNE Compute Required: Free starter quota (200/200 inferences) used.';
+  assert.match(refusalNotice(403, trial), /Your free trial is used up/);
+  assert.match(refusalNotice(undefined, 'Server returned 403: old coordinator'), /Your free trial is used up/);
+  assert.match(refusalNotice(undefined, 'connect ECONNREFUSED'), /^\n\nError connecting to DLNE cluster: connect ECONNREFUSED$/);
+});

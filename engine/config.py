@@ -317,6 +317,10 @@ def get_worker_limits() -> dict:
         # operator can raise them, and a node below any one of them is refused with the
         # reason (see coordinator.cpu_node_shortfalls).
         **CPU_NODE_DEFAULTS,
+        # A CPU contributor's use of the GPU coding agent: this many chats in any window of
+        # this many hours (engine/priority.UsageWindow). GPU contributors are not limited.
+        "cpu_coding_limit": 100,
+        "cpu_coding_window_hours": 5.0,
     }
 
     config = get_config()
@@ -431,6 +435,22 @@ def get_worker_limits() -> dict:
                 continue
             if value >= CPU_NODE_DEFAULTS[key.lower()]:
                 limits[key.lower()] = value
+
+    if "CPU_CODING_LIMIT" in config:
+        try:
+            value = int(config["CPU_CODING_LIMIT"])
+        except ValueError:
+            value = 0
+        if value >= 1:
+            limits["cpu_coding_limit"] = value
+
+    if "CPU_CODING_WINDOW_HOURS" in config:
+        try:
+            hours = float(config["CPU_CODING_WINDOW_HOURS"])
+        except ValueError:
+            hours = 0.0
+        if 0.25 <= hours <= 168:
+            limits["cpu_coding_window_hours"] = hours
 
     if "SPEC_TYPE" in config:
         types = [t.strip().lower() for t in config["SPEC_TYPE"].split(",") if t.strip()]
