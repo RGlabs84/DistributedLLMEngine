@@ -203,8 +203,8 @@ def timing_fields(timings, usage=None):
 # ---------------------------------------------------------------------------------------------------------
 
 def extension_chat_body(messages, seed=None, pin_slot=None, template_kwargs=None):
-    """streamChat(): {messages, stream, temperature 0.2, max_tokens 4096, tools}."""
-    body = {"messages": messages, "stream": True, "temperature": 0.2, "max_tokens": 4096, "tools": TOOLS}
+    """streamChat(): {messages, stream, temperature 0.2, max_tokens AGENT_MAX_TOKENS (16384 since 1.3.5), tools}."""
+    body = {"messages": messages, "stream": True, "temperature": 0.2, "max_tokens": 16384, "tools": TOOLS}
     if seed is not None:
         body["seed"] = seed
     if pin_slot is not None:

@@ -240,7 +240,7 @@ def test_the_key_looks_like_a_real_one_apart_from_its_marker(tmp_path):
 def test_a_decoy_request_is_shaped_like_the_extensions_agent_request():
     body = build_decoy_request(make_decoy(), random.Random(3))
     assert body["stream"] is True
-    assert body["temperature"] == 0.2 and body["max_tokens"] == 4096
+    assert body["temperature"] == 0.2 and body["max_tokens"] == 16384   # the extension's AGENT_MAX_TOKENS (1.3.5+)
     assert body["messages"][0]["role"] == "system"
     assert body["messages"][0]["content"].startswith("You are the DLNE coding agent")
     assert body["messages"][-1]["role"] in ("user", "tool")
@@ -754,7 +754,7 @@ async def test_a_failure_to_seal_never_falls_back_to_plain_json(book, clock, mon
 async def test_the_member_opens_it_and_finds_an_ordinary_agent_request_with_its_own_decoy(book, clock):
     router, _, _ = await one_canary(book, clock)
     body = router.sent[0][1]
-    assert body["stream"] is True and body["max_tokens"] == 4096 and body["temperature"] == 0.2
+    assert body["stream"] is True and body["max_tokens"] == 16384 and body["temperature"] == 0.2
     assert book.fetched(body_token(body), "198.51.100.1") == tid("a")
 
 

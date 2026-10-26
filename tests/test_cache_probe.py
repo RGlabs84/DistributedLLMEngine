@@ -74,9 +74,10 @@ def test_fim_budget_and_stops_match_fim_provider():
 @needs_extension
 def test_request_options_match_stream_chat():
     src = read_ts("client", "dlneClient.ts")
-    assert "temperature: 0.2," in src and "max_tokens: 4096" in src
+    assert "temperature: 0.2," in src and "max_tokens: AGENT_MAX_TOKENS" in src
+    assert "export const AGENT_MAX_TOKENS = 16384;" in src
     body = cp.extension_chat_body([{"role": "user", "content": "x"}])
-    assert body["temperature"] == 0.2 and body["max_tokens"] == 4096 and body["stream"] is True and body["tools"] == cp.TOOLS
+    assert body["temperature"] == 0.2 and body["max_tokens"] == 16384 and body["stream"] is True and body["tools"] == cp.TOOLS
 
 
 @needs_extension

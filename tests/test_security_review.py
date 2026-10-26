@@ -82,7 +82,7 @@ def test_sr02_a_canary_has_no_field_the_extension_does_not_send():
     assert set(body) <= real, f"only a canary has: {sorted(set(body) - real)}"
     # the coordinator adds penalties to a PLAIN request; a sealed one reaches the member as the editor made it
     assert "frequency_penalty" not in body and "presence_penalty" not in body
-    assert body["temperature"] == 0.2 and body["max_tokens"] == 4096 and body["stream"] is True
+    assert body["temperature"] == 0.2 and body["max_tokens"] == 16384 and body["stream"] is True   # AGENT_MAX_TOKENS
 
 
 def test_sr03_a_canary_prompt_holds_the_decoy_link_and_no_decoy_key():

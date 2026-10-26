@@ -158,6 +158,15 @@ export class ServerBusy extends Error {
   }
 }
 
+/**
+ * The most an agent answer may be, in tokens. A file the agent writes arrives whole in one answer, so this is also
+ * the biggest file it can write at once: 4096 (to 1.3.4) stopped at about 350 lines, and a game of 380 lines came
+ * out cut off. Each coding slot holds 32K tokens of context, so 16K of answer still leaves room for the prompt.
+ * engine/canary.py writes its decoys with the same figure (a decoy must look exactly like this request), and
+ * test/security-review.test.js holds the two together.
+ */
+export const AGENT_MAX_TOKENS = 16384;
+
 /** What a streamChat caller can pass besides the messages. */
 export interface StreamChatOptions {
   /** `X-DLNE-Session` for this conversation (an AgentLoop makes one per conversation). */
@@ -451,7 +460,7 @@ export class DlneClient {
       messages,
       stream: true,
       temperature: 0.2,
-      max_tokens: 4096
+      max_tokens: AGENT_MAX_TOKENS
     };
     if (model) {
       payload.model = model;

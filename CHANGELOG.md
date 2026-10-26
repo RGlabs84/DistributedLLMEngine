@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.4.8] - 2026-10-26
+
+### Added
+- **The status states the rules the websites tell visitors.** `/v1/cluster/status` has a `policy` block, read from the limits the coordinator enforces: `trial_chats`, `cpu_chats` and `cpu_window_hours` (what a CPU contributor gets back), `cpu_min_ram_gb`, `cpu_min_cores`, `cpu_min_bandwidth_gbs`, and `coding_member_min_vram_gb`. The pages showed these figures typed in; now they can read them live.
+
+### Changed
+- **Privacy decoys ask for as many tokens as the agent does.** Extension 1.3.5 lets an agent answer run to 16,384 tokens (it was 4,096). Canary decoys must look exactly like a real agent request, so they ask for 16,384 too, and a test in the extension holds the two figures together.
+
+---
+
 ## [2.4.7] - 2026-10-26
 
 ### Changed

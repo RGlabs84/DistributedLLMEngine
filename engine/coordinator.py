@@ -3096,6 +3096,28 @@ async def get_cluster_status(request: Request):
         # state one of off|steady|waiting|downloading|swapping|cooldown, detail a sentence
         # such as "Switching to X in 6 min if the pool keeps 24 GB."
         "auto_swap": auto_swapper.status(),
+        "policy": _public_policy(),
+    }
+
+
+def _public_policy() -> Dict[str, Any]:
+    """
+    The rules the websites tell visitors (the free trial, what a CPU contributor gets back, what a machine needs to
+    join), read from the very limits the coordinator enforces, so a page can show them live instead of typing them
+    (2.4.8). Nothing here is private: every figure was already written on the pages and in the README.
+    """
+    from engine.coding_member_select import MIN_VRAM_GB
+
+    limits = get_worker_limits()
+    return {
+        "trial_chats": int(limits.get("starter_quota_inferences", 100)),
+        # The same reads, with the same fallbacks, as the CPU pool's chat limit and the CPU admission check above.
+        "cpu_chats": int(limits.get("cpu_coding_limit", 50)),
+        "cpu_window_hours": float(limits.get("cpu_coding_window_hours", 5.0)),
+        "cpu_min_ram_gb": float(limits.get("cpu_min_ram_gb", 8.0)),
+        "cpu_min_cores": int(limits.get("cpu_min_cores", 4)),
+        "cpu_min_bandwidth_gbs": float(limits.get("cpu_min_bandwidth_gbs", 30.0)),
+        "coding_member_min_vram_gb": float(MIN_VRAM_GB),
     }
 
 

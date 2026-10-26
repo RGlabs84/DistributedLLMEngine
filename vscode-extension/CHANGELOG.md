@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.5] - 2026-10-26
+
+Pairs with DLNE coordinator **2.4.0** or later (2.4.8 or later keeps its privacy decoys identical to these requests).
+
+### Changed
+- **The agent can write much bigger files.** An answer could be at most 4,096 tokens, and a file the agent writes arrives whole in one answer, so anything past about 350 lines came out cut off (a 380-line game said so and shrank itself). The limit is now 16,384 tokens, which still leaves room for the prompt in a coding slot's 32K context.
+
+---
+
 ## [1.3.4] - 2026-10-26
 
 Pairs with DLNE coordinator **2.4.0** or later.

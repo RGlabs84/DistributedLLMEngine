@@ -97,7 +97,7 @@ MISS_LOG_INTERVAL = 3600.0          # one log line per address per hour for unkn
 
 TICK_SECONDS = 60.0                 # the scheduler's coin-flip interval
 MIN_GAP_SECONDS = 900.0             # two canaries to one member are at least this far apart
-SEND_TIMEOUT_SECONDS = 600.0        # one canary's whole exchange, answer included (4096 tokens is minutes)
+SEND_TIMEOUT_SECONDS = 600.0        # one canary's whole exchange, answer included (16384 tokens at ~38 tok/s is ~7 min)
 
 
 # ============================================================================================
@@ -473,7 +473,9 @@ def build_decoy_request(decoy: Decoy, rng: Optional[random.Random] = None) -> di
         "messages": messages,
         "stream": True,
         "temperature": 0.2,
-        "max_tokens": 4096,
+        # The extension's AGENT_MAX_TOKENS (16384 since 1.3.5; 4096 before). It must match: a decoy asking for
+        # less than real requests do would be told apart by it.
+        "max_tokens": 16384,
         "tools": _AGENT_TOOLS,
         # Nothing else: the extension sends exactly these fields (vscode-extension/src/client/dlneClient.ts,
         # streamChat) and the coordinator cannot add any to a sealed body. A canary that carried
