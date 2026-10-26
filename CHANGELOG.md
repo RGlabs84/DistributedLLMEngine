@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.4.6] - 2026-10-26
+
+### Fixed
+- **A volunteer whose computer clock is wrong can join.** Signed messages carry Unix epoch seconds, which are the same in every time zone, and the coordinator refuses anything more than 30 s from its own clock. A computer whose clock was off was refused at its first heartbeat and stopped, and was told its network key was wrong. That happens with no automatic time sync, on a dual-boot PC whose hardware clock Windows keeps in local time while Linux reads it as UTC (off by the UTC offset, several whole hours), and with a wrong time zone. Now:
+  - The worker keeps the coordinator's time (`engine/swarm_clock.py`) and signs its heartbeats, its tunnel enrollment and a coding member's identity block with it.
+  - The coordinator puts its time on every answer to a worker (`X-DLNE-Time`, Unix seconds). The worker learns it from every answer, and from the standard `Date` header, read as GMT, as a fallback.
+  - A refusal for a "stale timestamp" is corrected and sent again at once. Only a clock that keeps jumping ends the worker, and then with a message about the clock.
+- **The owner is told, once, how far off the clock is.** For example "5 h behind the swarm's", and when it is a whole number of hours, that a time zone or a dual-boot hardware clock is the likely cause and how to fix it. The worker also prints `DLNE_CLOCK: {"offset_seconds": N}` for the editor.
+- The coordinator's 30 s window is unchanged. Its log now says how far a refused worker's clock was from its own.
+
+---
+
 ## [2.4.5] - 2026-10-26
 
 ### Changed

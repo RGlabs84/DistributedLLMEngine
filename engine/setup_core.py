@@ -599,11 +599,11 @@ def enroll_with_coordinator(join: Dict[str, Any], worker_id: str,
         telling the operator to go away and run setup again.
     """
     import secrets
-    import time
 
     import httpx
 
     from engine.authn import sign_enrollment
+    from engine.swarm_clock import swarm_clock
     from engine.wireguard import WireGuardOrchestrator, WireGuardUnavailableError
 
     result: Dict[str, Any] = {"ok": False, "conf_path": "", "tunnel_address": "",
@@ -626,24 +626,32 @@ def enroll_with_coordinator(join: Dict[str, Any], worker_id: str,
         result["error"] = str(exc)
         return result
 
-    timestamp = time.time()
-    nonce = secrets.token_hex(16)
-    payload = {
-        "worker_id": worker_id,
-        "public_key": public_key,
-        "timestamp": timestamp,
-        "nonce": nonce,
-        "signature": sign_enrollment(join["network_key"], worker_id, public_key,
-                                     timestamp, nonce),
-    }
-
     host = join["coordinator_host"]
     url = host if host.startswith("http") else f"http://{host}:{join['coordinator_port']}"
-    try:
-        response = httpx.post(f"{url.rstrip('/')}/worker/enroll", json=payload, timeout=timeout)
-    except httpx.HTTPError as exc:
-        result["error"] = f"Could not reach the Coordinator at {url}: {exc}"
-        return result
+    # Signed with the coordinator's time as this machine knows it (engine/swarm_clock.py). A refusal for a stale
+    # timestamp carries the coordinator's time, so the enrollment is signed and sent once more with it: a computer
+    # whose clock is wrong, by minutes or by a time zone's hours, still enrolls.
+    for attempt in range(2):
+        timestamp = swarm_clock.now()
+        nonce = secrets.token_hex(16)
+        payload = {
+            "worker_id": worker_id,
+            "public_key": public_key,
+            "timestamp": timestamp,
+            "nonce": nonce,
+            "signature": sign_enrollment(join["network_key"], worker_id, public_key,
+                                         timestamp, nonce),
+        }
+        try:
+            sent_at = swarm_clock.local()
+            response = httpx.post(f"{url.rstrip('/')}/worker/enroll", json=payload, timeout=timeout)
+            swarm_clock.learn_from(response, sent_at, swarm_clock.local())
+        except httpx.HTTPError as exc:
+            result["error"] = f"Could not reach the Coordinator at {url}: {exc}"
+            return result
+        if attempt == 0 and response.status_code == 401 and "stale timestamp" in response.text:
+            continue
+        break
 
     if response.status_code != 200:
         # The Coordinator's rejection reasons are written to be shown to an operator, so

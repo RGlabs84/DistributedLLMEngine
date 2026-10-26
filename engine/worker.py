@@ -44,6 +44,7 @@ from engine.version import VERSION
 from engine.config import get_base_dir, get_worker_limits
 from engine.authn import sign_heartbeat
 from engine.release import is_older
+from engine.swarm_clock import swarm_clock
 from engine.companion import (
     ALSO_MARKER, COMPANION_SUFFIX, GATE_TIMEOUT_SECONDS, also_cpu_ram_gib, split_cpu_threads,
 )
@@ -126,6 +127,15 @@ ROLE_MARKER = "DLNE_ROLE: "
 # How long a node that is AHEAD of its coordinator waits between heartbeats. The coordinator
 # is probably mid-restart onto the same version; hammering it helps nobody.
 AHEAD_OF_COORDINATOR_RETRY_SECONDS = 30.0
+
+# A heartbeat refused for a "stale timestamp" means this computer's clock and the coordinator's disagree by more
+# than its 30 s window (engine/swarm_clock.py). The refusal itself carries the coordinator's time, so the beat is
+# sent again at once with the corrected time; only a clock that keeps jumping gets this many refusals in a row.
+MAX_STALE_RETRIES = 3
+
+# How far off this computer's clock is, for the VS Code extension, when it is outside the coordinator's window:
+# 'DLNE_CLOCK: {"offset_seconds": -18000}' (positive: this clock is behind). The worker corrects for it either way.
+CLOCK_MARKER = "DLNE_CLOCK: "
 
 # The roles the coordinator can give a node in a heartbeat answer ("role"): an RPC node (a share
 # of the big pipeline), a CPU pool member (phone app) or a coding member (a whole coding model).
@@ -455,9 +465,11 @@ class WorkerNode:
         never transmitted - a 401 that no log line would explain.
 
         The timestamp is generated here, immediately before the POST, to spend as little of
-        the skew window as possible on our own processing.
+        the skew window as possible on our own processing. It is the coordinator's time as this
+        node knows it (engine/swarm_clock.py), so a computer whose own clock is wrong, by seconds
+        or by a time zone's hours, is still inside the coordinator's window.
         """
-        timestamp = time.time()
+        timestamp = swarm_clock.now()
         nonce = secrets.token_hex(16)
         hardware = self.hardware_profile
         if isinstance(hardware, dict) and self.rpc_proto:
@@ -830,6 +842,20 @@ class WorkerNode:
             self._announced = line
         print(line, flush=True)
 
+    def _report_clock(self) -> None:
+        """
+        Tell the owner, once per change, when this computer's clock is outside the coordinator's window (the swarm
+        clock corrects for it either way), and print CLOCK_MARKER for the editor. A companion stays quiet: the GPU
+        half of its machine says it (and must not use up the one report).
+        """
+        if self.companion_of:
+            return
+        message = swarm_clock.report()
+        if not message:
+            return
+        log_warning(message)
+        print(CLOCK_MARKER + json.dumps({"offset_seconds": int(round(swarm_clock.offset))}), flush=True)
+
     def _follow_assignment(self, answer: Any) -> None:
         """
         What a heartbeat answer asks of this node. ``role`` ("rpc", "coding", "app" or null for
@@ -1134,6 +1160,7 @@ class WorkerNode:
         :meth:`request_shutdown` - never through ``sys.exit()``, which from here would
         unwind this thread only and leave the process running without heartbeats.
         """
+        stale_refusals = 0     # "stale timestamp" refusals in a row (MAX_STALE_RETRIES)
         try:
             while self.is_running and not self._shutdown_event.is_set():
                 try:
@@ -1177,8 +1204,14 @@ class WorkerNode:
                         # Announce to coordinator
                         safe_url = self.coordinator_url.rstrip('/')
                         # 5-second socket connection timeout and 10-second read timeout to handle network drops
+                        sent_at = swarm_clock.local()
                         response = httpx.post(f"{safe_url}/worker/heartbeat", json=payload, timeout=httpx.Timeout(10.0, connect=5.0))
+                        # Every answer, a refusal included, carries the coordinator's time: the next signed
+                        # timestamp follows it (engine/swarm_clock.py).
+                        swarm_clock.learn_from(response, sent_at, swarm_clock.local())
+                        self._report_clock()
                         response.raise_for_status()
+                        stale_refusals = 0
                         if token_rotated and not self.companion_of:
                             # (A companion has tokens of its own for its own tunnel; the file the editor reads to
                             # prove "I contribute" is the GPU node's.)
@@ -1225,6 +1258,21 @@ class WorkerNode:
                                 VERSION_MISMATCH_EXIT_CODE,
                                 "engine version does not match the coordinator",
                             )
+                            return
+                        elif e.response.status_code == 401 and "stale timestamp" in _response_detail(e.response):
+                            # Not the credentials: this computer's clock and the coordinator's disagree. The refusal
+                            # carried the coordinator's time and the clock has learned it, so the beat goes again
+                            # at once, correctly timed. A clock that keeps jumping ends here after a few tries.
+                            stale_refusals += 1
+                            if stale_refusals <= MAX_STALE_RETRIES:
+                                log_warning("The coordinator's clock and this computer's disagree; "
+                                            "corrected for it, sending the heartbeat again.")
+                                continue
+                            log_error("FATAL: The coordinator keeps refusing this computer's timestamps, even after "
+                                      "correcting for its clock.")
+                            log_system("This computer's clock seems to keep jumping. Turn on automatic time sync in "
+                                       "the system settings (and make sure only one tool sets the time), then restart.")
+                            self.request_shutdown(FATAL_EXIT_CODE, "clock keeps disagreeing with the coordinator")
                             return
                         elif e.response.status_code == 401:
                             # Retrying cannot fix a credential mismatch - it only spams the

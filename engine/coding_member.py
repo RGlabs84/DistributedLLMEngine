@@ -59,6 +59,7 @@ from engine import coding_member_select as select
 from engine import member_identity, no_trace
 from engine.app_pool import sha256_ok
 from engine.model_alias import alias_args
+from engine.swarm_clock import swarm_clock
 from engine.e2e import KeyRing, ResponseSealer
 from engine.fim_warm import fim_warm_body
 from engine.logger import log_error, log_success, log_system, log_warning
@@ -592,9 +593,10 @@ class CodingMember:
         }
 
     def status(self) -> Dict[str, Any]:
-        """The ``coding`` block of the heartbeat (section 2), signed with the identity key as of now.
+        """The ``coding`` block of the heartbeat (section 2), signed with the identity key as of now: the
+        coordinator's now (engine/swarm_clock.py), so a member whose own clock is wrong is still believed.
         Called for every heartbeat, which is also what rotates the end-to-end key when it is due."""
-        return member_identity.sign_block(self._block(), self._identity_priv)
+        return member_identity.sign_block(self._block(), self._identity_priv, now=swarm_clock.now())
 
     def role_detail(self) -> Dict[str, Any]:
         """What the worker prints for the extension on its DLNE_ROLE line (contract section 10): the model

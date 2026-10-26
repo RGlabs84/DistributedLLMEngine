@@ -66,6 +66,7 @@ from engine.logger import log_coordinator, log_error, log_warning
 from engine.registry import WorkerRegistry, is_app_member, is_coding_member, safe_log_text
 from engine.app_pool import LocalAppServer, app_pool
 from engine.standby import StandbyBook
+from engine.swarm_clock import CLOCK_HEADER
 from engine.throughput import POOL_CODING, POOL_PHONE, StreamTokenCounter, completion_tokens, throughput
 from engine import coding_router as coding_members_lib
 from engine.coding_router import coding_router
@@ -747,6 +748,49 @@ class NonContribBlockerMiddleware(BaseHTTPMiddleware):
 app.add_middleware(NonContribBlockerMiddleware)
 
 
+class WorkerClockMiddleware:
+    """
+    Puts this coordinator's clock on every answer to a worker (``X-DLNE-Time``, Unix seconds): a worker signs its
+    timestamps with it (engine/swarm_clock.py), so a volunteer whose own clock is wrong, by minutes or by a time
+    zone's hours, is not refused for a "stale timestamp". A refusal carries it too, so the worker can correct and
+    send again at once. Plain ASGI rather than a BaseHTTPMiddleware: it only adds a header to the response start.
+    """
+
+    def __init__(self, app_: Any) -> None:
+        self.app = app_
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or not str(scope.get("path", "")).startswith("/worker/"):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_clock(message: Dict[str, Any]) -> None:
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers") or [])
+                headers.append((CLOCK_HEADER.lower().encode(), f"{time.time():.3f}".encode()))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_clock)
+
+
+app.add_middleware(WorkerClockMiddleware)
+
+
+def _log_refusal(what: str, safe_ip: str, safe_id: str, reason: str, claimed: Any) -> None:
+    """
+    One refused signed message, in the log. A stale timestamp says how far the worker's clock is from this one
+    and is a warning, not an error: since 2.4.6 the worker learns this coordinator's time from the refusal and
+    sends again at once (a whole number of hours is a time zone or a dual-boot hardware clock).
+    """
+    if reason == "stale timestamp" and isinstance(claimed, (int, float)) and math.isfinite(claimed):
+        skew = float(claimed) - time.time()
+        log_warning(f"Rejected {what} from {safe_ip} ({safe_id}): stale timestamp, its clock is {skew:+.0f} s "
+                    "from ours; it corrects itself and sends again.")
+        return
+    log_error(f"Rejected {what} from {safe_ip} ({safe_id}): {safe_log_text(reason)}")
+
+
 # ======================================================================================
 # Landing page
 # ======================================================================================
@@ -1145,7 +1189,7 @@ async def worker_enroll(request: Request, payload: EnrollmentPayload):
         payload.timestamp, payload.nonce, payload.signature,
     )
     if not ok:
-        log_error(f"Rejected tunnel enrollment from {safe_ip} ({safe_id}): {safe_log_text(reason)}")
+        _log_refusal("tunnel enrollment", safe_ip, safe_id, reason, payload.timestamp)
         raise HTTPException(status_code=401, detail=f"Enrollment rejected: {reason}")
 
     if _nonce_cache.seen(payload.nonce):
@@ -1271,7 +1315,7 @@ async def worker_heartbeat(request: Request, payload: HeartbeatPayload):
             payload.staged_version,
         )
         if not ok:
-            log_error(f"Rejected Worker Heartbeat from {safe_ip} ({safe_id}): {safe_log_text(reason)}")
+            _log_refusal("Worker Heartbeat", safe_ip, safe_id, reason, payload.timestamp)
             raise HTTPException(status_code=401, detail=f"Heartbeat rejected: {reason}")
 
         # Freshness alone does not stop replay — a captured heartbeat is a valid bearer
