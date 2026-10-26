@@ -38,6 +38,11 @@ logs/
 # generated into the repo by accident cannot be committed.
 *.pem
 *.key
+# Android release signing: the keystore and its passwords live in
+# ~/WubarrkCODING/DLNE_RELEASE_KEYS/android/ (see android/README.md), never in the repo.
+*.jks
+*.keystore
+keystore.properties
 # The Discord bot token, when supplied by file rather than by environment variable
 # (see discord/scripts/bot_token.py). A bearer credential must never be tracked.
 discord/scripts/.bot_token

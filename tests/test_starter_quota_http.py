@@ -154,13 +154,13 @@ async def test_disabling_the_clause_removes_the_wall(trial, monkeypatch):
             assert (await _chat(c)).status_code != 403
 
 
-def test_every_default_says_200(monkeypatch):
-    """The config default (no override present) and the manager default must agree on 200."""
+def test_every_default_says_100(monkeypatch):
+    """The config default (no override present) and the manager default must agree on 100."""
     from engine import config
 
     monkeypatch.setattr(config, "get_config", lambda force_reload=False: {})
-    assert config.get_worker_limits()["starter_quota_inferences"] == 200
-    assert coordinator.StarterQuotaManager.__init__.__defaults__[-1] == 200
+    assert config.get_worker_limits()["starter_quota_inferences"] == 100
+    assert coordinator.StarterQuotaManager.__init__.__defaults__[-1] == 100
 
 
 def test_config_override_is_honoured(monkeypatch):

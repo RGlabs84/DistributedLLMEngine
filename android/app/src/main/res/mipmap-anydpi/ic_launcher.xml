@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The launcher icon is the one official DLNE logo (vscode-extension/media/dlne_logo.png,
+    copied unchanged to drawable-nodpi/dlne_logo.png). Do not draw another one: regenerate
+    everything with android/tools/generate_dlne_icons.py; OfficialIconPolicyTest guards it.
+
+    Foreground: the logo inset 17% on every side, i.e. it fills the central 66% of the
+    108 dp layer, inside the safe zone no launcher mask crops. Background: the logo's own
+    near-black backdrop colour, so the square merges into the layer.
+    minSdk is 26, so every supported Android version uses this adaptive icon and no legacy
+    mipmap-*dpi PNGs are needed.
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground>
+        <inset
+            android:drawable="@drawable/dlne_logo"
+            android:inset="17%" />
+    </foreground>
+    <!-- Themed icons (Android 13+): the brain alone, cut out of the logo; only alpha is used. -->
+    <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
+</adaptive-icon>

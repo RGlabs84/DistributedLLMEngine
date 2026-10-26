@@ -110,7 +110,7 @@ export interface ClusterStatusResult {
 
 /**
  * What to tell the user when a chat request is refused: the coordinator's own sentence (its
- * JSON `detail`, e.g. the CPU contributors' "You've used all 100 coding chats… frees up in
+ * JSON `detail`, e.g. the CPU contributors' "You've used all 300 coding chats… frees up in
  * 42 minutes"), never the raw response body.
  */
 /** A chat request the coordinator refused, with its HTTP status kept for callers to branch on. */
@@ -484,7 +484,7 @@ export class DlneClient {
             return;
           }
           if (elapsed === 2) {
-            onLoadingProgress('🧠 Evaluating prompt across distributed Vulkan GPU cluster...');
+            onLoadingProgress('Evaluating prompt across distributed Vulkan GPU cluster...');
           } else if (elapsed === 6) {
             onLoadingProgress('⚡ Distributing activation tensors across 3 GPUs (24 GB VRAM pool)...');
           } else if (elapsed >= 10 && elapsed % 4 === 0) {

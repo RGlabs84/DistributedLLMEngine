@@ -1,0 +1,32 @@
+{
+  "_comment": "The CPU pool's model tiers, smallest first, signed into every release (engine/release.py app_tiers). Each file is downloaded from its pinned Hugging Face revision and run only if its size and SHA-256 match. min_ram_gb is what a member must lend to host the tier.",
+  "tiers": [
+    {
+      "id": "qwen3-4b",
+      "name": "Qwen3 4B Instruct 2507",
+      "file": "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+      "url": "https://huggingface.co/bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/resolve/ae44f08e1392f39c0e474af10c3ff8355c8b6688/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+      "sha256": "2fde00ce69dd4899c70d020845e2638353015bba0fdf161b3eb965f2bca4464e",
+      "size": 2497280736,
+      "min_ram_gb": 8
+    },
+    {
+      "id": "qwen36-a3b",
+      "name": "Qwen3.6 35B-A3B",
+      "file": "Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+      "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+      "sha256": "66a3ca888ce13482b40c333db2432c0ebde3a7b13754fc29f0c6f5e89703ec66",
+      "size": 13676723168,
+      "min_ram_gb": 16
+    },
+    {
+      "id": "qwen36-a3b-q4",
+      "name": "Qwen3.6 35B-A3B (full quality)",
+      "file": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+      "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+      "sha256": "ac0e2c1189e055faa36eff361580e79c5bd6f8e76bffb4ce547f167d53e31a61",
+      "size": 22134528992,
+      "min_ram_gb": 24
+    }
+  ]
+}

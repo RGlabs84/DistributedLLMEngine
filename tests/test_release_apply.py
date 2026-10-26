@@ -29,13 +29,20 @@ BUILT_AT = "2026-10-25T12:00:00Z"
 
 # --- fixtures -----------------------------------------------------------------------------
 
-def make_repo(base, name, version, extra_engine=None):
+PNG = b"\x89PNG\r\n\x1a\n"
+
+
+def make_repo(base, name, version, extra_engine=None, static=None):
     root = base / name
     (root / "engine").mkdir(parents=True)
     (root / "engine" / "version.py").write_text(f'VERSION = "{version}"\n')
     (root / "engine" / "alpha.py").write_text(f"ALPHA = '{version}'\n")
     for fname, body in (extra_engine or {}).items():
         (root / "engine" / fname).write_text(body)
+    if static:
+        (root / "engine" / "static").mkdir()
+        for fname, body in static.items():
+            (root / "engine" / "static" / fname).write_bytes(body)
     (root / "dlne_server.py").write_text(f"print('server {version}')\n")
     (root / "requirements.txt").write_text("fastapi\n")
     return str(root)
@@ -219,6 +226,9 @@ def _hand_archive(tmp_path, entries):
 @pytest.mark.parametrize("evil", ["../evil.py", "engine/../../evil.py", "/etc/evil.py", "engine\\evil.py",
                                   "C:/evil.py", "config/config.txt", "engine/sub/x.py", "models/m.gguf",
                                   "engine/data.txt", ".env",
+                                  # Only engine/static/<name>.png ships there, nothing else and nothing deeper:
+                                  "engine/static/notes.txt", "engine/static/icon.svg", "engine/static/sub/icon.png",
+                                  "engine/static/../evil.png", "engine/static.png", "static/icon.png",
                                   # These pass the "engine/<name>.py" shape, so only the path guard stops them:
                                   "engine/..\\evil.py", "engine/c:evil.py", "engine/..\\..\\evil.py"])
 def test_an_archive_cannot_write_outside_what_a_release_ships(tmp_path, host, evil):
@@ -238,6 +248,73 @@ def test_a_corrupt_zip_is_refused(tmp_path, host):
     with pytest.raises(apply_mod.ApplyError, match="valid zip"):
         run_apply(host, str(bad), manifest, rec)
     _assert_untouched(host, before, rec)
+
+
+def test_a_png_that_is_not_a_png_is_refused(tmp_path, host):
+    path, manifest = _hand_archive(tmp_path, {"engine/version.py": 'VERSION = "2.0.0"\n',
+                                              "engine/static/icon-192.png": b"<svg>not an image</svg>"})
+    before, rec = tree_state(host), Recorder()
+    with pytest.raises(apply_mod.ApplyError, match=r"engine/static/icon-192\.png is not a PNG image"):
+        run_apply(host, path, manifest, rec)
+    _assert_untouched(host, before, rec)
+
+
+# --- the icons ship beside the code -------------------------------------------------------
+
+def test_the_icons_install_into_engine_static_and_are_owned_by_the_release(tmp_path, host):
+    icons = {"icon-192.png": PNG + b"192", "favicon-32.png": PNG + b"32"}
+    archive, manifest = build(tmp_path, make_repo(tmp_path, "n", "2.0.0", static=icons), "2.0.0")
+    run_apply(host, archive, manifest, Recorder())
+    for name, data in icons.items():
+        assert open(os.path.join(host, "engine", "static", name), "rb").read() == data
+    assert [f for f in apply_mod.managed_files(host) if f.startswith("engine/static/")] == [
+        "engine/static/favicon-32.png", "engine/static/icon-192.png"]
+
+
+def test_a_stray_file_in_engine_static_is_not_a_release_file(tmp_path, host):
+    os.makedirs(os.path.join(host, "engine", "static"))
+    open(os.path.join(host, "engine", "static", "notes.txt"), "w").write("mine")
+    archive, manifest = build(tmp_path, make_repo(tmp_path, "n", "2.0.0", static={"icon-192.png": PNG}), "2.0.0")
+    run_apply(host, archive, manifest, Recorder())
+    assert open(os.path.join(host, "engine", "static", "notes.txt")).read() == "mine"
+    assert "engine/static/notes.txt" not in apply_mod.managed_files(host)
+
+
+def test_icons_the_release_dropped_are_pruned_and_a_rollback_brings_them_back(tmp_path, host):
+    first = make_repo(tmp_path, "first", "2.0.0", static={"icon-192.png": PNG + b"old", "favicon-32.png": PNG + b"f"})
+    run_apply(host, *build(tmp_path, first, "2.0.0", "first.zip"), Recorder())
+    second = make_repo(tmp_path, "second", "3.0.0", static={"icon-192.png": PNG + b"new"})
+    result = run_apply(host, *build(tmp_path, second, "3.0.0", "second.zip"), Recorder())
+
+    assert result["pruned"] == ["engine/static/favicon-32.png"]
+    assert open(os.path.join(host, "engine", "static", "icon-192.png"), "rb").read() == PNG + b"new"
+    assert not os.path.exists(os.path.join(host, "engine", "static", "favicon-32.png"))
+
+    rec = Recorder()
+    apply_mod.rollback_release(host, result["backup"], rec.restart, rec.health, log=lambda _m: None)
+    assert open(os.path.join(host, "engine", "static", "icon-192.png"), "rb").read() == PNG + b"old"
+    assert open(os.path.join(host, "engine", "static", "favicon-32.png"), "rb").read() == PNG + b"f"
+
+
+def test_rolling_back_to_a_release_without_icons_removes_them(tmp_path, host):
+    """The host starts at 1.0.0, which had no engine/static: going back to it must not keep the new icons."""
+    archive, manifest = build(tmp_path, make_repo(tmp_path, "n", "2.0.0", static={"icon-192.png": PNG}), "2.0.0")
+    run_apply(host, archive, manifest, Recorder())
+    rec = Recorder()
+    apply_mod.rollback_release(host, None, rec.restart, rec.health, log=lambda _m: None)
+    assert not os.path.exists(os.path.join(host, "engine", "static", "icon-192.png"))
+    assert apply_mod.installed_version(host) == "1.0.0"
+
+
+def test_an_unhealthy_release_with_new_icons_is_rolled_back_byte_for_byte(tmp_path, host):
+    os.makedirs(os.path.join(host, "engine", "static"))
+    open(os.path.join(host, "engine", "static", "icon-192.png"), "wb").write(PNG + b"old")
+    before = tree_state(host)
+    new = make_repo(tmp_path, "n", "2.0.0", static={"icon-192.png": PNG + b"new", "icon-512.png": PNG + b"big"})
+    archive, manifest = build(tmp_path, new, "2.0.0")
+    with pytest.raises(apply_mod.ApplyError, match="Rolled back"):
+        run_apply(host, archive, manifest, Recorder(healthy_for="1.0.0"))
+    assert tree_state(host) == before
 
 
 # --- a release that does not come up is undone --------------------------------------------

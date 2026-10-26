@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.2.4] - 2026-10-25
+
+Pairs with DLNE coordinator **2.3.0** or later.
+
+### Changed
+- **One DLNE icon everywhere.** The only DLNE mark is now the cyan-and-pink brain with "DLNE" under it (`media/dlne_logo.png`), which the Marketplace listing and the chat participant already used. The line-art "swarm" icons are gone (`dlne_icon.svg`, `brain.svg`, `brain_logo.svg`, and the duplicate `brain.png` and `dlne_sidebar.png`), and so is the brain emoji, which had stood in for the logo in the sidebar, the status bar, the chat participant and notifications.
+- **The Activity Bar icon is that same brain**, traced from the logo as a single-colour silhouette (`media/dlne_activitybar.svg`), because VS Code draws Activity Bar icons in one colour taken from your theme.
+- The sidebar shows the logo image beside "Compute Contribution" and the agent's welcome line. The status bar says "DLNE" in plain text, with a glyph only for contributing or locked.
+- **The public swarm's address is `https://dlne.duckdns.org`.** A name that follows the server's changing home connection, in place of an address with the IP in it. Settings that still hold either earlier public address (`http://73.215.216.195:11435` or `https://73-215-216-195.sslip.io`) are read as the new one; both keep working.
+
+---
+
+## [1.2.3] - 2026-10-25
+
+Pairs with DLNE coordinator **2.3.0**.
+
+### Changed
+- **A computer without a GPU now powers the DLNE phone app.** Since coordinator 2.3.0 a CPU contributor no longer joins the coding pipeline: its worker joins the CPU pool, which answers the phone app (the chat page at `/chat`, and the Android app). Each member runs a whole model on its CPU, and the server picks it from the RAM you lend: 8 GB runs Qwen3 4B (the fast overflow model), 16 GB runs Qwen3.6 35B-A3B (the main phone model), 24 GB runs it at full quality once 2 volunteers can host it. The modal, notifications, status bar, sidebar and chat commands all say so, instead of describing a GPU.
+- **You are offered the RAM that suits your machine**, not a flat 12 GB: 24 GB from 48 GB of RAM, 16 GB from 32 GB, 12 GB from 16 GB, otherwise the 8 GB minimum, never more than half your RAM. The modal explains what each amount runs, and offers the other ladder steps your machine can afford. A machine under 16 GB (half its RAM is under the 8 GB minimum) is told so, instead of being asked to lend more than it can spare. `dlne.worker.maxRamGb` still sets any amount by hand. The RAM figure allows for the OS reporting a little under what the machine was sold with (a 16 GB laptop reads about 15.5), so common machines land on the right step.
+- **What a CPU contributor gets:** the coding agent 2nd in line (GPU contributors are 1st and unlimited), with **300 chats in any 5 hours** (was 100). The free trial is **100 chats** (was 200), still counted once per internet connection. Both limits are enforced by the server.
+- **The model server runs at low priority on half your cores** (2 to 8 threads), so your computer stays usable. The modal and README say so.
+- **An integrated GPU does not count as a GPU contributor**, except Intel Arc 140V / 140T (Lunar Lake, Arrow Lake) and AMD Strix Halo (Radeon 8060S / 8050S / 8040S, i.e. Ryzen AI Max). A machine whose only GPU is any other integrated GPU (Intel UHD or Iris, Arc Graphics on Meteor Lake, Radeon 780M, Vega) contributes its CPU, is told why, and its worker is told to leave the integrated GPU alone. The same rule is enforced by the worker and the server.
+
+### Added
+- **Use DLNE on your phone.** A link at the bottom of the sidebar, an item in the cluster menu, and the command `DLNE: Use DLNE on Your Phone` open the phone chat page on your coordinator.
+
+### Fixed
+- A machine without a GPU was shown as a GPU contributor in the sidebar ("CPU GPU: CPU Compute Node", "Inference unlocked!"), and the engine installer said contributing would "unlock unlimited frontier coding models". Neither is true of a CPU contributor.
+- The RAM offer could be more than the machine has: a flat 12 GB was offered to an 8 GB laptop.
+
+---
+
 ## [1.2.2] - 2026-10-25
 
 Pairs with DLNE coordinator **2.2.0**.

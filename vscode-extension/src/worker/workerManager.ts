@@ -3,11 +3,15 @@ import * as child_process from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as net from 'net';
+import * as os from 'os';
 import * as http from 'http';
 import * as https from 'https';
 import { EngineVerificationError, FetchResult, RELEASE_PUBKEY_HEX, fetchVerifiedEngine, fetchVerifiedRpcBin, hostRpcPlatform } from './engineRelease';
 import { resolveServerUrl } from '../serverUrl';
-import { CPU_BELOW_MINIMUM_EXIT_CODE, CPU_MIN_RAM_GB, CPU_OFFER_RAM_GB, ContributionPlan, parseRefusal, planContribution } from './contribution';
+import {
+  CPU_BELOW_MINIMUM_EXIT_CODE, CPU_MIN_RAM_GB, CPU_POOL_HEADLINE, ContributionPlan, cpuReason, installedRamGb, lendLabel,
+  parseRefusal, parseVulkanSummary, pickVulkanGpu, planContribution, ramChoices, ramOfferText, ramTooSmallText, workerStartedNotice,
+} from './contribution';
 
 function downloadFile(urlStr: string, destPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -83,6 +87,8 @@ export interface LocalGpuInfo {
   name: string;
   vramTotalGb: number;
   api: 'vulkan' | 'cuda' | 'metal' | 'cpu';
+  /** The integrated GPU left out because it does not count as a GPU contributor (hasGpu is false). */
+  integratedGpu?: string;
 }
 
 export type WorkerState = 'idle' | 'starting' | 'contributing' | 'error';
@@ -90,7 +96,10 @@ export type WorkerState = 'idle' | 'starting' | 'contributing' | 'error';
 export interface WorkerStatus {
   state: WorkerState;
   gpu: LocalGpuInfo;
+  /** GB lent: VRAM for a GPU, RAM when cpuPool. */
   vramContributedGb: number;
+  /** This machine contributes (or would) its CPU, which powers the DLNE phone app, not a GPU. */
+  cpuPool: boolean;
   message?: string;
 }
 
@@ -144,8 +153,25 @@ export class WorkerManager {
       state: this.currentState,
       gpu: this.localGpu,
       vramContributedGb: this.vramContributed,
+      cpuPool: this.contributesCpu(),
       message: this.statusMessage
     };
+  }
+
+  /**
+   * Whether this machine's contribution is its CPU. A running worker answers for itself; before
+   * one starts (or after a window reload, with no plan to hand), it follows dlne.worker.device
+   * and the GPU found, once the probe has finished.
+   */
+  private contributesCpu(): boolean {
+    if (this.contributionPlan && (this.currentState === 'contributing' || this.currentState === 'starting')) {
+      return this.contributionPlan.cpuOnly;
+    }
+    if (this.localGpu.name === 'Probing GPU...') {
+      return false;
+    }
+    const device = vscode.workspace.getConfiguration('dlne').get<string>('worker.device');
+    return planContribution(device, this.localGpu.hasGpu, '', CPU_MIN_RAM_GB, this.localGpu.integratedGpu).cpuOnly;
   }
 
   public isContributing(): boolean {
@@ -228,10 +254,7 @@ export class WorkerManager {
     if (isRunning) {
       this.failedChecksCount = 0;
       if (this.currentState !== 'contributing') {
-        this.currentState = 'contributing';
-        this.vramContributed = this.localGpu.hasGpu ? this.localGpu.vramTotalGb : 8.0;
-        this.statusMessage = `Actively contributing ${this.vramContributed} GB via ${this.localGpu.api.toUpperCase()}!`;
-        this.emitChange();
+        this.markContributing();
       }
     } else {
       this.failedChecksCount++;
@@ -269,30 +292,17 @@ export class WorkerManager {
       }
     } catch {}
 
-    // 2. Check Vulkan API (Universal - prefers DISCRETE_GPU over INTEGRATED_GPU)
+    // 2. Check Vulkan API (Universal - prefers DISCRETE_GPU; an integrated GPU counts only if
+    // contribution.ts lists it, otherwise the machine contributes its CPU and says why)
+    let integratedGpu: string | undefined;
     try {
       const vkCmd = isWin ? 'vulkaninfo.exe --summary' : 'vulkaninfo --summary';
       const out = child_process.execSync(vkCmd, { encoding: 'utf-8', timeout: 3000 });
-      const devices: { name: string; isDiscrete: boolean }[] = [];
-      let pendingType = '';
-      for (const rawLine of out.split('\n')) {
-        const line = rawLine.trim();
-        if (line.startsWith('deviceType') && line.includes('=')) {
-          pendingType = line.split('=')[1]?.trim() || '';
-        } else if (line.startsWith('deviceName') && line.includes('=')) {
-          const dName = line.split('=')[1]?.trim() || '';
-          if (dName && !dName.toLowerCase().includes('llvmpipe') && !dName.toLowerCase().includes('software')) {
-            devices.push({
-              name: dName,
-              isDiscrete: pendingType.includes('DISCRETE_GPU')
-            });
-          }
-          pendingType = '';
-        }
-      }
+      const picked = pickVulkanGpu(parseVulkanSummary(out));
+      integratedGpu = picked.integratedGpu;
 
-      if (devices.length > 0) {
-        const preferred = devices.find((d) => d.isDiscrete) || devices[0];
+      if (picked.gpu) {
+        const preferred = picked.gpu;
         let vramGb = 8.0;
         if (isWin) {
           try {
@@ -356,7 +366,7 @@ export class WorkerManager {
     }
 
     // 4. Host CPU RAM fallback
-    this.localGpu = { hasGpu: false, name: 'CPU Compute Node', vramTotalGb: 4.0, api: 'cpu' };
+    this.localGpu = { hasGpu: false, name: 'CPU Compute Node', vramTotalGb: 4.0, api: 'cpu', integratedGpu };
     this.emitChange();
     return this.localGpu;
   }
@@ -464,7 +474,7 @@ export class WorkerManager {
 
     if (interactive) {
       const choice = await vscode.window.showInformationMessage(
-        '⚡ DLNE Compute Engine is required to contribute GPU/CPU compute to the cluster and unlock unlimited frontier coding models. Would you like to install it automatically now?',
+        '⚡ DLNE Compute Engine is required to share your computer. A GPU powers the coding agent; a computer without one powers the DLNE phone app. Would you like to install it automatically now?',
         'Install Automatically',
         'Not Now'
       );
@@ -913,10 +923,7 @@ export class WorkerManager {
     const processActive = this.isProcessActive();
 
     if (portOpen || sysdActive || processActive || (this.workerProcess && !this.workerProcess.killed)) {
-      this.currentState = 'contributing';
-      this.vramContributed = this.localGpu.hasGpu ? this.localGpu.vramTotalGb : 8.0;
-      this.statusMessage = `Actively contributing ${this.vramContributed} GB via ${this.localGpu.api.toUpperCase()}!`;
-      this.emitChange();
+      this.markContributing();
       return true;
     }
 
@@ -942,11 +949,10 @@ export class WorkerManager {
         for (let i = 0; i < 10; i++) {
           await new Promise((r) => setTimeout(r, 400));
           if (await this.isPortListening(50052)) {
-            this.currentState = 'contributing';
-            this.vramContributed = this.localGpu.hasGpu ? this.localGpu.vramTotalGb : 4.0;
-            this.statusMessage = `Actively contributing ${this.vramContributed} GB via ${this.localGpu.api.toUpperCase()}!`;
-            this.emitChange();
-            vscode.window.showInformationMessage(`⚡🧠 DLNE Worker Started: Contributing ${this.vramContributed} GB via Vulkan!`);
+            this.markContributing();
+            vscode.window.showInformationMessage(
+              plan.cpuOnly ? workerStartedNotice(true) : `⚡ DLNE Worker Started: Contributing ${this.vramContributed} GB via Vulkan!`
+            );
             return true;
           }
         }
@@ -972,7 +978,7 @@ export class WorkerManager {
     const coordinatorArg = serverUrl;
 
     this.currentState = 'starting';
-    this.statusMessage = 'Initializing local Vulkan compute worker...';
+    this.statusMessage = plan.cpuOnly ? 'Joining the CPU pool that powers the DLNE phone app...' : 'Initializing local Vulkan compute worker...';
     this.emitChange();
 
     let scriptPath = this.findEngineScript();
@@ -1088,9 +1094,9 @@ export class WorkerManager {
       void this.restartAfterVersionMismatch();
     } else if (code === CPU_BELOW_MINIMUM_EXIT_CODE) {
       // The coordinator will not admit this machine as a CPU-only node, and says why.
-      const reason = this.lastRefusal || 'this machine is below the swarm\'s minimum for contributing a CPU.';
+      const reason = this.lastRefusal || 'this machine is below the swarm\'s minimum for powering the DLNE phone app.';
       this.currentState = 'error';
-      this.statusMessage = 'This machine is below the minimum for contributing a CPU';
+      this.statusMessage = 'This machine is below the minimum for powering the DLNE phone app';
       this.emitChange();
       void vscode.window.showErrorMessage(`DLNE can't use this machine yet: ${reason}`, 'Show Log').then((choice) => {
         if (choice === 'Show Log') this.outputChannel.show(true);
@@ -1105,10 +1111,10 @@ export class WorkerManager {
 
   private markContributing(): void {
     this.currentState = 'contributing';
-    if (this.contributionPlan?.cpuOnly) {
+    if (this.contributesCpu()) {
       const ram = vscode.workspace.getConfiguration('dlne').get<number>('worker.maxRamGb') || CPU_MIN_RAM_GB;
       this.vramContributed = ram;
-      this.statusMessage = `Actively contributing your CPU and ${ram} GB of RAM!`;
+      this.statusMessage = `${CPU_POOL_HEADLINE}, with ${ram} GB of RAM!`;
     } else {
       this.vramContributed = this.localGpu.hasGpu ? this.localGpu.vramTotalGb : 4.0;
       this.statusMessage = `Actively contributing ${this.vramContributed} GB via ${this.localGpu.api.toUpperCase()}!`;
@@ -1127,7 +1133,8 @@ export class WorkerManager {
       config.get<string>('worker.device'),
       gpu.hasGpu,
       config.get<string>('worker.allowedGpus') || '',
-      config.get<number>('worker.maxRamGb') ?? 4.0
+      config.get<number>('worker.maxRamGb') ?? 4.0,
+      gpu.integratedGpu
     );
     if (plan.error) {
       this.currentState = 'idle';
@@ -1137,21 +1144,27 @@ export class WorkerManager {
       return null;
     }
     if (plan.needsMoreRam) {
-      const lend = `Lend ${CPU_OFFER_RAM_GB} GB`;
-      const choice = await vscode.window.showWarningMessage(
-        `DLNE: ${gpu.hasGpu ? 'You chose to contribute your CPU.' : 'This machine has no usable GPU, so DLNE would contribute your CPU.'} ` +
-          `The swarm needs at least ${CPU_MIN_RAM_GB} GB of RAM from a CPU-only machine (plus 4 cores and fast memory, ` +
-          `which it checks when you join), and you lend ${config.get<number>('worker.maxRamGb') ?? 4} GB. Lend ${CPU_OFFER_RAM_GB} GB?`,
-        { modal: true },
-        lend
-      );
-      if (choice !== lend) {
+      // The amounts follow the pool's model ladder and what this machine can spare (contribution.ts).
+      const totalGb = installedRamGb(os.totalmem());
+      const choices = ramChoices(totalGb);
+      if (choices.length === 0) {
+        this.currentState = 'idle';
+        this.statusMessage = 'Not started: not enough RAM to power the DLNE phone app';
+        this.emitChange();
+        void vscode.window.showWarningMessage(ramTooSmallText(totalGb));
+        return null;
+      }
+      const labels = choices.map((c, i) => lendLabel(c, i === 0 && choices.length > 1));
+      const { message, detail } = ramOfferText(cpuReason(gpu.hasGpu, gpu.integratedGpu), choices);
+      const picked = await vscode.window.showWarningMessage(message, { modal: true, detail }, ...labels);
+      const chosen = picked === undefined ? -1 : labels.indexOf(picked);
+      if (chosen < 0) {
         this.currentState = 'idle';
         this.statusMessage = 'Not started: a CPU-only machine needs more RAM lent';
         this.emitChange();
         return null;
       }
-      await config.update('worker.maxRamGb', CPU_OFFER_RAM_GB, vscode.ConfigurationTarget.Global);
+      await config.update('worker.maxRamGb', choices[chosen].gb, vscode.ConfigurationTarget.Global);
     }
     return plan;
   }

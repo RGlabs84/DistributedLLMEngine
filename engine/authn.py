@@ -877,4 +877,21 @@ def validate_hardware_profile(hw: dict) -> Tuple[bool, str]:
     if arch is not None and not (isinstance(arch, str) and len(arch) <= _MAX_NAME_LENGTH):
         return (False, "cpu_arch must be a short name")
 
+    # A CPU pool member (2.3.0) says so, and reports what it serves.
+    pool = hw.get("pool")
+    if pool is not None and pool != "app":
+        return (False, "pool must be \"app\" when present")
+    app = hw.get("app")
+    if app is not None:
+        if not isinstance(app, dict) or set(app) - {"model", "ready", "slots"}:
+            return (False, "app must be an object with model, ready and slots")
+        model = app.get("model")
+        if model is not None and not (isinstance(model, str) and 0 < len(model) <= _MAX_NAME_LENGTH * 2):
+            return (False, "app.model must be a short name")
+        if "ready" in app and not isinstance(app["ready"], bool):
+            return (False, "app.ready must be true or false")
+        slots = app.get("slots")
+        if slots is not None and (isinstance(slots, bool) or not isinstance(slots, int) or not 1 <= slots <= 64):
+            return (False, "app.slots must be a whole number from 1 to 64")
+
     return (True, "ok")

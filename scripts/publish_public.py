@@ -47,11 +47,12 @@ FORBIDDEN_PATTERNS = (
     ".agent_rules.md", "*_backup*", "DLNE Backup*",
 )
 
-# gitleaks findings that are public by design: the swarm's published network key and a
-# fake key in the test suite.
+# gitleaks findings that are public by design: the swarm's published network key and fake
+# keys in the test suite (tests/test_search.py proves a Brave key never reaches a log).
 KNOWN_PUBLIC = frozenset({
     "b8e1f0c9a7d24e3f8a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f",
     "bd1d9bbf50b93e10a963fa2d0b6ee44e1138ca20f4036b765dbc51dd7bc7f083",
+    "BSA-test-key-must-never-leak-7c1f",
 })
 
 

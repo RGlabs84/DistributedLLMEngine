@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- The only permission the app needs: talking to the DLNE service over HTTPS. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+        allowBackup / dataExtractionRules: conversations stay on this phone. They are kept
+        out of cloud backup and device-to-device transfer so nothing typed into the app is
+        copied to another service.
+        usesCleartextTraffic=false: only HTTPS servers are accepted (the settings screen
+        enforces the same rule for self-hosted URLs).
+    -->
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.DLNE"
+        android:usesCleartextTraffic="false"
+        android:enableOnBackInvokedCallback="true"
+        tools:targetApi="36">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Share target: text shared from another app opens a new chat with it typed in. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

@@ -16,6 +16,7 @@ const state = {
   infoChoice: undefined,
   channels: [],          // every output channel created, with its recorded lines
   statusBarItems: [],
+  commands: [],          // [id, ...args] for every vscode.commands.executeCommand()
 };
 
 function reset() {
@@ -29,6 +30,7 @@ function reset() {
   state.infoChoice = undefined;
   state.channels = [];
   state.statusBarItems = [];
+  state.commands = [];
 }
 
 class EventEmitter {
@@ -76,7 +78,19 @@ const vscode = {
   ProgressLocation: { Notification: 15, Window: 10, SourceControl: 1 },
   StatusBarAlignment: { Left: 1, Right: 2 },
   ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+  // Just enough of Uri for media files: a base ({ fsPath }) plus path segments, as a string.
+  Uri: {
+    joinPath(base, ...parts) {
+      const text = [base.fsPath, ...parts].join('/');
+      return { fsPath: text, toString: () => text };
+    },
+  },
   extensions: { getExtension: () => undefined },
+  commands: {
+    async executeCommand(id, ...args) {
+      state.commands.push([id, ...args]);
+    },
+  },
   workspace: {
     workspaceFolders: undefined,
     getConfiguration(section) {

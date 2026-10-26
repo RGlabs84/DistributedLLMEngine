@@ -1447,6 +1447,12 @@ class InferenceManager:
         target_slots = max(1, queue_channels)
         desired_total_context = json_max_context * target_slots
         safe_context = max(MIN_CONTEXT_TOKENS, min(desired_total_context, hardware_max_context))
+        # The operator's fixed size wins (ENGINE_CONTEXT): the estimate above counts a KV cache
+        # in every layer, four times too much for hybrid models like Qwen3.6, and cannot see
+        # experts kept in RAM.
+        fixed_context = int(get_worker_limits().get("engine_context") or 0)
+        if fixed_context:
+            safe_context = max(MIN_CONTEXT_TOKENS, fixed_context)
 
         # Recompute from the context we actually settled on
         reserved_gb = weights + (safe_context * kv_gb_per_token)
@@ -1738,9 +1744,19 @@ class InferenceManager:
                     f"(bypassing loopback TCP RPC for {requested_endpoints})."
                 )
 
+            limits = get_worker_limits()
+            # The operator's extra flags (ENGINE_EXTRA_ARGS, allow-listed in config.py), placed
+            # after the defaults so they win. Only on this host's own GPUs: a card split or an
+            # expert placement written for them is wrong once volunteers' GPUs join over RPC.
+            extra = list(limits.get("engine_extra_args") or ())
+            if extra and not remote_rpc_endpoints:
+                cmd.extend(extra)
+                log_coordinator(f"Engine extra arguments: {' '.join(extra)}")
+            elif extra:
+                log_warning("ENGINE_EXTRA_ARGS left out: the engine is running across volunteers' GPUs.")
+
             # Speculative decoding, with the model's draft companion when it has one.
             dflash_path = resolved_path.replace(".gguf", "_dflash.gguf")
-            limits = get_worker_limits()
             spec = speculative_args(limits, dflash_path if os.path.exists(dflash_path) else None)
             if spec:
                 cmd.extend(spec)

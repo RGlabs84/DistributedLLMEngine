@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { DlneClient, formatLoadingTelemetry } from '../client/dlneClient';
 import { WorkerManager } from '../worker/workerManager';
+import { CPU_POOL_HEADLINE, CPU_POOL_PERK } from '../worker/contribution';
 import { AgentLoop } from '../agent/agentLoop';
 import { ToolCallResult } from '../agent/tools';
 
@@ -87,7 +88,7 @@ export function registerNativeChatParticipant(
             `- **Local Compute Worker**: \`${worker.state === 'contributing' ? 'Running' : 'Idle (Not Contributing)'}\` (${worker.gpu.name})`,
             `- **Policy Rule**: *You must give compute to receive compute.*`,
             ``,
-            `👉 Use \`@dlne /contribute\` or click the status bar item to start contributing compute and unlock distributed models.`
+            `👉 Use \`@dlne /contribute\` or click the status bar item to start contributing: a GPU powers the coding agent (first in line), and a computer without one powers the DLNE phone app (coding agent second in line).`
           ].join('\n')
         );
         return { metadata: { command: 'status' } };
@@ -102,10 +103,13 @@ export function registerNativeChatParticipant(
 
       const status = detailed.data;
 
-      const contribBadge =
-        worker.state === 'contributing'
-          ? `✅ **CONTRIBUTING** (${worker.vramContributedGb} GB via ${worker.gpu.api.toUpperCase()} — ${worker.gpu.name})`
-          : `⏸️ **IDLE** (${worker.gpu.name})`;
+      const contribBadge = worker.cpuPool
+        ? worker.state === 'contributing'
+          ? `✅ **CONTRIBUTING** (CPU pool, ${worker.vramContributedGb} GB of RAM: ${CPU_POOL_HEADLINE})`
+          : `⏸️ **IDLE** (your CPU can power the DLNE phone app)`
+        : worker.state === 'contributing'
+        ? `✅ **CONTRIBUTING** (${worker.vramContributedGb} GB via ${worker.gpu.api.toUpperCase()} — ${worker.gpu.name})`
+        : `⏸️ **IDLE** (${worker.gpu.name})`;
 
       const loadingRow = status.model_loading?.is_loading
         ? `| **Model Sync Status** | **${formatLoadingTelemetry(status.model_loading)}** |\n`
@@ -113,7 +117,7 @@ export function registerNativeChatParticipant(
 
       stream.markdown(
         [
-          `### 🧠 DLNE Distributed Cluster Status`,
+          `### DLNE Distributed Cluster Status`,
           `| Metric | Value |`,
           `| :--- | :--- |`,
           `| **Cluster State** | \`${status.status}\` |`,
@@ -121,7 +125,7 @@ export function registerNativeChatParticipant(
           loadingRow.trimEnd(),
           `| **Total Compute Pool** | **${status.total_memory_gb} GB** (${status.total_vram_gb} GB VRAM + ${status.total_sysram_gb} GB SysRAM) |`,
           `| **Active RPC Nodes** | ${status.active_workers_count} node(s) |`,
-          `| **Local GPU Contribution** | ${contribBadge} |`,
+          `| **Local Contribution** | ${contribBadge} |`,
           `| **Active Leases** | ${status.active_leases_count} |`,
           `| **Extension Version** | \`v${extVersion}\` |`,
           `| **Server Version** | \`v${status.server_version}\` |`,
@@ -134,15 +138,19 @@ export function registerNativeChatParticipant(
 
     // 2. /contribute command
     if (cmd === 'contribute') {
-      stream.progress('Toggling local Vulkan GPU compute contribution...');
+      stream.progress('Toggling local compute contribution...');
       await workerManager.toggle();
       const updated = workerManager.getStatus();
-      if (updated.state === 'contributing') {
+      if (updated.state === 'contributing' && updated.cpuPool) {
         stream.markdown(
-          `### ⚡🧠 Compute Contribution Active!\nContributing **${updated.vramContributedGb} GB VRAM** (${updated.gpu.name}) via **${updated.gpu.api.toUpperCase()}** to the DLNE cluster. Frontier inference unlocked!`
+          `### 📱 Compute Contribution Active!\n${CPU_POOL_HEADLINE}: **${updated.vramContributedGb} GB** of RAM lent, at low priority on half your cores. You get ${CPU_POOL_PERK}.`
+        );
+      } else if (updated.state === 'contributing') {
+        stream.markdown(
+          `### ⚡ Compute Contribution Active!\nContributing **${updated.vramContributedGb} GB VRAM** (${updated.gpu.name}) via **${updated.gpu.api.toUpperCase()}** to the DLNE cluster. Frontier inference unlocked!`
         );
       } else {
-        stream.markdown(`### ⏹️ Compute Contribution Stopped\nYour local GPU worker is now idle.`);
+        stream.markdown(`### ⏹️ Compute Contribution Stopped\nYour local worker is now idle.`);
       }
       return { metadata: { command: 'contribute' } };
     }
@@ -215,7 +223,7 @@ export function registerNativeChatParticipant(
     });
 
     let isStreamingThought = false;
-    stream.progress('🧠 Connecting to DLNE Distributed Vulkan Cluster...');
+    stream.progress('Connecting to DLNE Distributed Vulkan Cluster...');
 
     await agentLoop.run(fullPrompt, {
       onLoadingProgress: (statusText: string) => {
@@ -224,7 +232,7 @@ export function registerNativeChatParticipant(
       onThinkingDelta: (delta: string) => {
         if (!isStreamingThought) {
           isStreamingThought = true;
-          stream.markdown(`\n> 🧠 **Thought Process:**\n> `);
+          stream.markdown(`\n> **Thought Process:**\n> `);
         }
         stream.markdown(delta.replace(/\n/g, '\n> '));
       },
@@ -308,7 +316,7 @@ export function registerNativeChatParticipant(
         {
           prompt: '',
           command: 'contribute',
-          label: '⚡ Toggle GPU Contribution'
+          label: '⚡ Toggle Contribution'
         }
       ];
     }

@@ -10,6 +10,7 @@ No account, no API key, no subscription. Install it, open the DLNE sidebar, and 
 - **Agent chat**: in the DLNE sidebar, or as `@dlne` in VS Code's Chat view.
 - **Ghost-text autocomplete**: suggestions inline as you type.
 - **Fix problems**: `DLNE: Fix Current File Problems` sends the file's errors and warnings to the agent.
+- **On your phone**: [DLNE Chat](https://dlne.duckdns.org/chat) is the same swarm in a phone browser (add it to your home screen), and there is an Android app. In VS Code, use the **Use DLNE on your phone** link in the sidebar, or the command `DLNE: Use DLNE on Your Phone`.
 
 ---
 
@@ -17,14 +18,14 @@ No account, no API key, no subscription. Install it, open the DLNE sidebar, and 
 
 DLNE runs on a **swarm**: a coordinator plus the GPUs of the people who use it.
 
-1. **Try it**: **200 free chats**, with nothing to set up. Autocomplete does not use them up, and the status bar shows how many are left. They're counted once per internet connection on the server, so reinstalling or clearing settings doesn't reset them.
+1. **Try it**: **100 free chats**, with nothing to set up. Autocomplete does not use them up, and the status bar shows how many are left. They're counted once per internet connection on the server, so reinstalling or clearing settings doesn't reset them.
 2. **Keep using it**: lend some of your computer to the swarm with one click (**Start Contributing** in the sidebar).
 
 | You lend | Coding agent | When the swarm is busy |
 |---|---|---|
 | **A GPU** | Unlimited | First in line |
-| **A CPU** | 100 chats in any 5 hours (each frees up 5 hours after you used it) | Second in line |
-| Nothing | The 200 free chats | After contributors |
+| **A CPU** | 300 chats in any 5 hours (each frees up 5 hours after you used it) | Second in line |
+| Nothing | The 100 free chats | After contributors |
 
 A CPU contributor's chats show how many are left, and at the limit the agent says exactly when the next one frees up.
 
@@ -32,9 +33,35 @@ You choose how much to lend (`dlne.worker.maxVramGb`, `dlne.worker.maxRamGb`, `d
 
 > **Contributing works on Windows and Linux (x64 and ARM64) and on macOS (Apple Silicon and Intel).** GPUs are used through Vulkan on Windows and Linux and Metal on Apple Silicon. Intel Macs contribute their CPU (llama.cpp has no GPU support for them). The ARM64 and Intel Mac builds are the newest and the least tested.
 
-**No GPU? You can contribute your CPU**, if it's fast enough not to slow everyone else down. A CPU-only machine needs:
+### No GPU? Your computer powers the DLNE phone app
 
-- at least **8 GB of RAM** lent to DLNE (`dlne.worker.maxRamGb`; you're offered 12 GB when you start),
+A contributor without a usable GPU does not join the coding pipeline. Its worker joins the **CPU pool**, which answers the DLNE phone app (the [chat page](https://dlne.duckdns.org/chat) and the Android app). Each member runs a whole model on its CPU, and the server picks the model from how much RAM you lend:
+
+| RAM you lend | Model your computer runs |
+|---|---|
+| 8 GB | Qwen3 4B, the fast overflow model |
+| 16 GB | Qwen3.6 35B-A3B, the main phone model |
+| 24 GB | Qwen3.6 35B-A3B at full quality, once 2 volunteers can host it |
+
+In return you get the coding agent **2nd in line** (GPU contributors are 1st), with **300 chats in any 5 hours**. The model server runs at low priority on half your cores (2 to 8 threads), so your computer stays usable.
+
+When you start, DLNE offers an amount to suit your machine, and never more than half your RAM:
+
+| Your RAM | Offered by default | Also offered |
+|---|---|---|
+| 48 GB or more | 24 GB | 16 GB, 8 GB |
+| 32 to 47 GB | 16 GB | 8 GB |
+| 24 to 31 GB | 12 GB (runs the 8 GB model, with room to spare) | 8 GB |
+| 16 to 23 GB | Half your RAM, 8 to 11 GB | 8 GB (when the default is higher) |
+| Under 16 GB | Nothing: half your RAM is under the 8 GB minimum | |
+
+To lend a different amount, set `dlne.worker.maxRamGb` yourself.
+
+**An integrated GPU does not count as a GPU contributor**, except Intel Arc 140V / 140T (Lunar Lake, Arrow Lake) and AMD Strix Halo (Radeon 8060S / 8050S / 8040S, i.e. Ryzen AI Max). A machine whose only GPU is any other integrated GPU contributes its CPU instead, and DLNE tells you so.
+
+A CPU-only machine needs, if it's fast enough not to slow everyone else down:
+
+- at least **8 GB of RAM** lent to DLNE (`dlne.worker.maxRamGb`; you're asked how much when you start),
 - **4 physical cores**,
 - on Intel/AMD, **AVX2 and FMA** (Intel from 2013, any AMD Ryzen),
 - **30 GB/s of memory bandwidth**, measured in a second or two when you join. Good dual-channel DDR4 just makes it; DDR5 and LPDDR5 pass easily.
@@ -61,13 +88,14 @@ The agent's slash commands: `/code`, `/fix`, `/status`, `/model`, `/contribute`,
 - **Your prompts, and the code the agent reads, go to the coordinator.** The public coordinator is run by the DLNE maintainer, so treat it like any hosted AI service. Do not send secrets.
 - **The connection to the public swarm is encrypted (HTTPS)**, so nobody between you and the coordinator can read it. For anything sensitive, run your own coordinator (below).
 - When the model is split across several contributors' GPUs, those machines process the model's intermediate numbers for your request, not your text.
-- As a contributor, your machine runs DLNE's worker and `ggml-rpc-server`, and accepts connections from the coordinator on port 50052.
+- As a GPU contributor, your machine runs DLNE's worker and `ggml-rpc-server`, and accepts connections from the coordinator on port 50052.
+- As a CPU contributor, your machine answers phone-app requests, so it sees the text of those questions and answers (the phone app tells its users this) and any search results for them. Its model server listens on your machine only, and the coordinator reaches it through a tunnel your worker opens.
 
 ---
 
 ## Which model?
 
-The swarm serves one model at a time, chosen by the coordinator from the GPU memory available. Today that is usually **Qwen 2.5 Coder 14B**. Larger models (32B and up) become possible as more GPUs join. `/status` shows what is running now.
+The coding agent runs on GPU contributors' machines: one model at a time, chosen by the coordinator from the GPU memory available. Today that is usually **Qwen 2.5 Coder 14B**. Larger models (32B and up) become possible as more GPUs join. `/status` shows what is running now. The phone app runs a different, smaller model on CPU contributors' machines (see above).
 
 ---
 
@@ -103,13 +131,13 @@ Then in VS Code settings:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `dlne.serverUrl` | `https://73-215-216-195.sslip.io` | The coordinator: the public swarm (over HTTPS), or your own. |
+| `dlne.serverUrl` | `https://dlne.duckdns.org` | The coordinator: the public swarm (over HTTPS), or your own. |
 | `dlne.apiKey` | `""` | Optional API key. Leave blank to use the free trial or your contribution. |
 | `dlne.worker.networkKey` | public swarm key | The swarm's shared worker key. Change it only for a private coordinator. |
-| `dlne.worker.device` | `auto` | What to contribute: `auto` (GPU if there is one, else CPU), `gpu`, or `cpu`. |
+| `dlne.worker.device` | `auto` | What to contribute: `auto` (a GPU if there is one that counts, else the CPU), `gpu`, or `cpu` (power the phone app and keep the GPU for yourself). |
 | `dlne.worker.allowedGpus` | `""` | GPU indices to lend (e.g. `0,1`). Blank lends all detected GPUs. |
 | `dlne.worker.maxVramGb` | `-1` | Most VRAM to lend, in GB (`-1`: detect). |
-| `dlne.worker.maxRamGb` | `4.0` | Most system RAM the worker may use, in GB. A CPU-only machine needs at least 8. |
+| `dlne.worker.maxRamGb` | `4.0` | Most system RAM the worker may use, in GB. A CPU-only machine needs at least 8; the more it lends, the bigger the phone-app model it runs (16 GB: Qwen3.6). You're offered an amount when you start. |
 | `dlne.worker.autoStart` | `false` | Resume contributing when VS Code opens (set for you when you start contributing). |
 | `dlne.worker.pythonPath` | `python3` | Python used for the engine. |
 | `dlne.enableInlineCompletion` | `true` | Ghost-text autocomplete. |

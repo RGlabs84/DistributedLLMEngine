@@ -209,6 +209,60 @@ _PCI_VENDOR_NVIDIA = "0x10de"
 # coordinator and then run inference on the CPU at a fraction of the promised speed.
 _SOFTWARE_VULKAN_DEVICES = ("llvmpipe", "swiftshader", "lavapipe", "software rasterizer")
 
+# Integrated GPUs share the CPU's memory bus and are slower than the cards in the GPU pool,
+# so they do not make a GPU contributor (the owner's rule, 2.3.0): such a machine contributes
+# its CPU to the phone pool instead. The exceptions are the integrated GPUs fast enough to
+# hold their own: Intel Arc 140V/140T, AMD Strix Halo (Radeon 8060S/8050S/8040S, Mesa's
+# GFX1151) and Apple Silicon (Metal, unified memory).
+_ALLOWED_INTEGRATED = re.compile(r"arc\W*(?:\(tm\)\W*)?140[vt]\b|radeon\W*80[456]0s\b|gfx1151|strix[ _]halo|"
+                                 r"ryzen\W*ai\W*max|\bapple\b")
+# Mesa's code names in "(RADV ...)": the ones that name an APU's integrated GPU.
+_INTEGRATED_CODENAMES = re.compile(r"\((?:radv|anv)?\s*(?:raven2?|picasso|renoir|lucienne|cezanne|barcelo|rembrandt|"
+                                   r"mendocino|raphael\w*|phoenix\w*|hawk\w*|strix\w*|krackan\w*|vangogh|"
+                                   r"gfx90c|gfx1035|gfx1036|gfx1037|gfx1103|gfx1150|gfx1152|"
+                                   r"adl|rpl|mtl|lnl|arl|tgl|icl|cml|kbl|skl|ehl|jsl)\b")
+# Names that only integrated GPUs carry (Windows and lspci spell them without a code name).
+_INTEGRATED_NAMES = re.compile(r"uhd graphics|iris|intel\(r\) hd graphics|intel.* graphics$|\bvega \d+\b|"
+                               r"radeon\(tm\) graphics$|radeon graphics$|radeon \d{3}m\b|adreno|"
+                               r"arc\W*(?:\(tm\)\W*)?(?:130v|graphics)\b")
+# Discrete parts whose names could otherwise look integrated ("AMD Radeon Graphics (RADV NAVI12)").
+_DISCRETE_NAMES = re.compile(r"\bnavi\s?\d|polaris|vega1[02]|gfx1[12]0\d|gfx9[04]\d|radeon\W+(?:rx|pro|vii)|"
+                             r"instinct|arc\W*(?:\(tm\)\W*)?(?:a|b)\d{3}|arc\W*(?:\(tm\)\W*)?pro\b|geforce|quadro|rtx|tesla")
+
+
+def counts_as_gpu(name: str, integrated: Optional[bool] = None) -> bool:
+    """
+    Whether a GPU makes its machine a GPU contributor. ``integrated`` is Vulkan's own answer
+    when known (vulkaninfo's deviceType), which beats any name: TheWall's discrete Navi12
+    cards are called "AMD Radeon Graphics (RADV NAVI12)". Without it the name decides, and an
+    unknown name counts, so no real graphics card is ever turned away by a guess.
+    """
+    lowered = (name or "").lower()
+    if _ALLOWED_INTEGRATED.search(lowered):
+        return True
+    if integrated is not None:
+        return not integrated
+    if _DISCRETE_NAMES.search(lowered):
+        return True
+    return not (_INTEGRATED_CODENAMES.search(lowered) or _INTEGRATED_NAMES.search(lowered))
+
+
+def _vulkan_device_types(summary: str) -> List[bool]:
+    """``integrated`` for each hardware device in ``vulkaninfo --summary`` output, in order
+    (software rasterisers skipped, matching the device list the probes build)."""
+    types: List[bool] = []
+    pending: Optional[bool] = None
+    for line in summary.splitlines():
+        line = line.strip()
+        if line.startswith("deviceType") and "=" in line:
+            pending = "INTEGRATED" in line.split("=", 1)[1]
+        elif line.startswith("deviceName") and "=" in line:
+            name = line.split("=", 1)[1].strip().lower()
+            if not any(token in name for token in _SOFTWARE_VULKAN_DEVICES):
+                types.append(bool(pending))
+            pending = None
+    return types
+
 
 def _read_sysfs(path: str) -> str:
     """Contents of a sysfs attribute, or "" when it is absent or unreadable."""
@@ -471,6 +525,10 @@ def _probe_all_gpus() -> Tuple[List[Dict[str, Any]], bool]:
             gpu_names = [name for name in gpu_names
                          if not any(token in name.lower() for token in _SOFTWARE_VULKAN_DEVICES)]
             if not gpu_names: raise ValueError()
+            # Vulkan's own integrated/discrete verdict per device, in the same order.
+            integrated = _vulkan_device_types(result.stdout)
+            if len(integrated) != len(gpu_names):
+                integrated = []
 
             gb = 0.0
             if os_name == "Windows":
@@ -518,6 +576,8 @@ def _probe_all_gpus() -> Tuple[List[Dict[str, Any]], bool]:
                         c["vk_index"] = bus_to_vk[pci_b]
                     else:
                         c["vk_index"] = card["id"]
+                    if 0 <= c["vk_index"] < len(integrated):
+                        c["integrated"] = integrated[c["vk_index"]]
                     result.append(c)
                 return result, False
             else:
@@ -531,7 +591,10 @@ def _probe_all_gpus() -> Tuple[List[Dict[str, Any]], bool]:
                 gb = min(usable) if usable else 0.0
 
             for idx, name in enumerate(gpu_names):
-                gpus.append({"id": idx, "name": name, "vram_total_gb": gb, "vram_free_gb": gb, "load_percent": 0.0})
+                gpu = {"id": idx, "name": name, "vram_total_gb": gb, "vram_free_gb": gb, "load_percent": 0.0}
+                if idx < len(integrated):
+                    gpu["integrated"] = integrated[idx]
+                gpus.append(gpu)
             # A fixed identity with a constant 0.0 load: nothing here can change.
             return gpus, False
     except Exception: pass
@@ -621,6 +684,10 @@ def get_gpu_info() -> Dict[str, Any]:
     elif allowed != "-1":
         allowed_ids = [int(x.strip()) for x in allowed.split(",") if x.strip().isdigit()]
         gpus = [g for g in gpus if g["id"] in allowed_ids]
+
+    # Integrated GPUs (other than the allowed few) are not GPU contributions: a machine with
+    # only those contributes its CPU (counts_as_gpu).
+    gpus = [g for g in gpus if counts_as_gpu(g.get("name") or "", g.get("integrated"))]
 
     if not gpus:
         return {"has_gpu": False, "vram_total_gb": 0, "vram_free_gb": 0, "name": None, "load_percent": 0.0}

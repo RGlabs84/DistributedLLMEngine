@@ -1,0 +1,84 @@
+<!doctype html>
+<!--
+  DRAFT privacy policy for the DLNE Android app. Publish it at a stable public URL (for
+  example GitHub Pages or the DLNE site) and give that URL to Play Console.
+  Before publishing, fill in every [BRACKETED] item and confirm the two statements marked
+  "OWNER: CONFIRM" against how the server is actually run.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DLNE app privacy policy</title>
+<style>
+  :root { --fg: #161d1e; --muted: #3f4949; --bg: #f6fafa; --accent: #00676e; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #dce5e6; --muted: #a9b9bb; --bg: #0a1214; --accent: #00f0ff; } }
+  body { margin: 0 auto; max-width: 44rem; padding: 2rem 1rem 4rem; background: var(--bg); color: var(--fg);
+         font: 1rem/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  h1, h2 { line-height: 1.25; } h2 { margin-top: 2rem; font-size: 1.2rem; }
+  a { color: var(--accent); } .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>DLNE app privacy policy</h1>
+<p class="muted">Effective [DATE OF PUBLICATION]. Applies to the DLNE app for Android (package <code>io.dlne.chat</code>), published by [DEVELOPER NAME AS SHOWN ON GOOGLE PLAY].</p>
+
+<h2>In short</h2>
+<ul>
+  <li>No accounts. The app never asks for your name, email address or phone number.</li>
+  <li>No ads, no analytics, no crash-reporting services, no advertising identifiers and no tracking of any kind. The app does not use Google Play Services.</li>
+  <li>Your chats are stored only on your phone.</li>
+  <li>When you send a message, the conversation is sent over an encrypted connection to the DLNE service, and an answer is written by one of the computers that volunteers lend to DLNE.</li>
+  <li>Those computers belong to other people. Don't send passwords, private details or anything secret.</li>
+  <li>Lookups (weather, Wikipedia, news, web search) are made by the DLNE server, not your phone; reported answers are kept on the server for review.</li>
+</ul>
+
+<h2>What stays on your phone</h2>
+<p>Your conversations (the messages you write and the answers you receive) and two settings: the server address and whether you have read the first-run notice. They are kept in the app's private storage, are excluded from Android cloud backup and device-to-device transfer, and are deleted when you delete a chat, use <em>Settings &gt; Delete all chats</em>, or uninstall the app.</p>
+
+<h2>What leaves your phone, and why</h2>
+<p><strong>Your conversation, when you press Send.</strong> The app sends the recent part of the open conversation (up to about 12,000 characters: your messages and the previous answers) to the DLNE service over HTTPS, so that an answer can be written. Nothing is sent until you press Send.</p>
+<p><strong>A status check.</strong> While the app is open it asks the service, about once a minute, which model is in use and how many machines are serving. This request contains no personal information.</p>
+<p><strong>A report, only if you send one.</strong> See <a href="#reports">Reporting an answer</a> below.</p>
+<p><strong>Your network address.</strong> Like any internet service, the DLNE service sees the IP address your request comes from. It uses it only to share the service fairly: one answer at a time and a few requests per minute for each network. [OWNER: CONFIRM that the address is kept only in memory for this purpose and is not logged or stored.]</p>
+
+<h2>Who processes your messages</h2>
+<p>The DLNE service passes each conversation to one computer in its pool of volunteer machines. That computer runs an open-source language model, writes the answer and streams it back to you through the service. Volunteer computers are owned and run by members of the public, not by DLNE. The DLNE software does not save the text of your messages, but a volunteer controls their own computer, so treat anything you send as something the owner of that computer could see.</p>
+<p>[OWNER: CONFIRM that neither the coordinator server nor the volunteer software writes message text to logs or disk, and how long any request logs (time, size, errors) are kept: [RETENTION PERIOD].]</p>
+<p>No conversation is sold, rented, shared for advertising, or used to build a profile of you. [OWNER: CONFIRM before keeping this sentence:] Messages are not used to train models.</p>
+
+<h2>Lookups: weather, Wikipedia, news and web search</h2>
+<p>To answer questions about current things, the model can ask the DLNE server to look something up: the weather (Open-Meteo), an article on Wikipedia, the news (GDELT) or a web search (through a SearXNG search service). <strong>These lookups are made by the DLNE server, not your phone.</strong> Your phone never contacts these services, and no third-party search or lookup provider receives anything from your phone: not your network address, not your conversation, not any identifier. The server sends them only the short lookup text the model writes, such as a city name or a topic.</p>
+<p>[OWNER: CONFIRM that the server does not store lookup texts or results, and name the search engines the SearXNG service forwards web searches to.]</p>
+<p>The pages found are listed under the answer as sources. Tapping a source opens it in your web browser, and that website then sees your visit like any other.</p>
+
+<h2 id="reports">Reporting an answer</h2>
+<p>You can report any answer that is harmful, wrong or offensive from inside the app. A report contains that answer, the question it answered, the reason you choose and the note you may add (up to 500 characters). Nothing else from your chats, and no account or device identifier, is sent. <strong>Reported answers are kept on the DLNE server</strong> so the DLNE team can review them and improve the service.</p>
+<p>[OWNER: CONFIRM how long reports are kept ([RETENTION PERIOD]), who can read them, and whether the network address a report came from is stored with it.] To have a report removed, contact us and quote it.</p>
+
+<h2>If you change the server</h2>
+<p>Unless you change it, the app connects to the public DLNE service at <code>https://dlne.duckdns.org</code>. Settings lets you point the app at a different DLNE server, for example one you run yourself. Your messages then go to that server instead, and its operator's practices apply. The app only connects to servers over HTTPS.</p>
+
+<h2>Links</h2>
+<p>Links and sources in answers, and the links in Settings (source code, Buy Me a Coffee, the DLNE extension on Open VSX), open in your web browser only when you tap them. Those websites have their own privacy policies.</p>
+
+<h2>Children</h2>
+<p>The app is not directed at children. Answers are generated by AI and are not filtered for young audiences.</p>
+
+<h2>Security</h2>
+<p>All traffic between the app and the service is encrypted with HTTPS; the app refuses unencrypted connections. The app asks for one Android permission: internet access.</p>
+
+<h2>Your choices</h2>
+<ul>
+  <li>Delete any chat from the chat list, or every chat from Settings.</li>
+  <li>Don't include personal or confidential information in your messages.</li>
+  <li>Because there are no accounts, the service holds no profile of you to delete. For any question about this policy, contact us below.</li>
+</ul>
+
+<h2>Changes</h2>
+<p>If this policy changes, the new version will be published at this address with a new effective date.</p>
+
+<h2>Contact</h2>
+<p>[CONTACT EMAIL]<br>Source code: <a href="https://github.com/RGlabs84/DistributedLLMEngine">github.com/RGlabs84/DistributedLLMEngine</a></p>
+</body>
+</html>

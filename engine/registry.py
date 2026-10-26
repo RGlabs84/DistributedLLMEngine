@@ -137,6 +137,11 @@ def _as_profile(hardware: Any) -> Dict[str, Any]:
     return hardware if isinstance(hardware, dict) else {}
 
 
+def is_app_member(hardware: Any) -> bool:
+    """A CPU pool member (it reports ``"pool": "app"`` in its signed hardware profile)."""
+    return _as_profile(hardware).get("pool") == "app"
+
+
 def _gpu_section(hardware: Any) -> Dict[str, Any]:
     """
     Return a worker's ``gpu`` sub-dictionary, or an empty dict.
@@ -188,7 +193,15 @@ class WorkerRegistry:
         self.required_rpc_major: Optional[int] = None
 
     def rpc_compatible(self, hardware: Any) -> bool:
-        """Whether a worker's reported rpc-server protocol can serve this Coordinator's engine."""
+        """
+        Whether a worker can serve this Coordinator's 14B engine over RPC: its rpc-server
+        protocol matches, and it is not a CPU pool member. A CPU pool member (2.3.0) runs a
+        whole small model for phone requests and has no rpc-server at all; counting it here
+        would put its RAM in the 14B memory budget and its address in --rpc. Every endpoint
+        list and memory total below goes through this one check.
+        """
+        if is_app_member(hardware):
+            return False
         if self.required_rpc_major is None:
             return True
         proto = _as_profile(hardware).get("rpc_proto")
@@ -602,7 +615,7 @@ class WorkerRegistry:
             total = 0
             for w_id, data in self.workers.items():
                 hardware = data.get("hardware", {})
-                if hardware.get("is_yielding", False):
+                if hardware.get("is_yielding", False) or is_app_member(hardware):
                     continue
                 total += _as_int(hardware.get("cpu_cores", 0))
             return total
@@ -614,7 +627,15 @@ class WorkerRegistry:
             total = 0
             for w_id, data in self.workers.items():
                 hardware = data.get("hardware", {})
-                if hardware.get("is_yielding", False):
+                if hardware.get("is_yielding", False) or is_app_member(hardware):
                     continue
                 total += _as_int(hardware.get("cpu_threads", 0))
             return total
+
+    def app_members(self) -> List[Dict[str, Any]]:
+        """Live CPU pool members (worker records), for engine/app_pool.py."""
+        with self._lock:
+            self.prune_dead_workers()
+            return [dict(data) for data in self.workers.values()
+                    if is_app_member(data.get("hardware", {}))
+                    and not _as_profile(data.get("hardware", {})).get("is_yielding", False)]

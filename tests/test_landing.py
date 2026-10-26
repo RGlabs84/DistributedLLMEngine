@@ -11,7 +11,7 @@ from html.parser import HTMLParser
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from engine import coordinator, landing
+from engine import coordinator, icons, landing
 
 REMOTE = ("203.0.113.77", 40000)   # TEST-NET-3: a stranger, not the coordinator host
 
@@ -23,13 +23,15 @@ def _client(ip=REMOTE):
 class _Collector(HTMLParser):
     def __init__(self):
         super().__init__()
-        self.links, self.scripts, self.styles, self.tags = [], [], [], []
+        self.links, self.scripts, self.styles, self.images, self.tags = [], [], [], [], []
 
     def handle_starttag(self, tag, attrs):
         self.tags.append(tag)
         attrs = dict(attrs)
         if tag == "a":
             self.links.append(attrs)
+        if tag == "img":
+            self.images.append(attrs)
         if tag == "script":
             self.scripts.append(attrs)
         if tag == "link":
@@ -78,18 +80,46 @@ def test_the_page_points_at_the_extension_and_the_discord():
 
 
 def test_every_link_is_https_and_opens_safely():
+    """Off-site links are https and open safely; the one on-site link is the phone chat."""
     for a in _parsed().links:
+        if a["href"] == "/chat":
+            continue
         assert a["href"].startswith("https://"), a
         assert "noopener" in a.get("rel", ""), a
+
+
+def test_the_page_points_phones_at_the_chat():
+    assert "/chat" in [a.get("href") for a in _parsed().links]
 
 
 def test_the_page_is_self_contained():
     """No CDN, no external font, no tracker: it must load behind any firewall."""
     page = _parsed()
     assert all("src" not in s for s in page.scripts), "an external script is referenced"
-    assert page.styles == [], "an external stylesheet is referenced"
-    assert "<img" not in landing.LANDING_HTML
+    assert [s for s in page.styles if "stylesheet" in (s.get("rel") or "")] == [], "an external stylesheet is referenced"
+    assert all(s["href"].startswith("/chat/") for s in page.styles), "a link points off this server"
     assert "@import" not in landing.LANDING_HTML
+
+
+def test_the_page_shows_the_dlne_logo_and_its_favicon_from_the_chat_routes():
+    """The one DLNE icon: the logo PNGs the chat router serves, linked with their cache-busting version."""
+    page = _parsed()
+    assert [img["src"] for img in page.images] == [icons.icon_url("icon-192.png")]
+    assert page.images[0]["alt"] == "DLNE"
+    favicons = {s["sizes"]: s["href"] for s in page.styles if s.get("rel") == "icon"}
+    assert favicons == {"32x32": icons.icon_url("favicon-32.png"), "48x48": icons.icon_url("favicon-48.png")}
+    assert "<svg" not in landing.LANDING_HTML and "data:" not in landing.LANDING_HTML
+
+
+@pytest.mark.anyio
+async def test_the_landing_logo_and_favicons_are_served():
+    page = _parsed()
+    async with _client() as c:
+        for url in [img["src"] for img in page.images] + [link["href"] for link in page.styles]:
+            resp = await c.get(url)
+            assert resp.status_code == 200, url
+            assert resp.headers["content-type"] == "image/png", url
+            assert resp.content == icons.icon_png(url.split("?")[0].rsplit("/", 1)[1]), url
 
 
 def test_the_page_works_on_a_phone_and_in_the_dark():
@@ -105,8 +135,8 @@ def test_the_live_status_uses_the_public_endpoint_and_degrades_gracefully():
 
 
 def test_the_page_states_the_free_trial_the_coordinator_actually_gives():
-    assert "200" in landing.LANDING_HTML
-    assert coordinator.StarterQuotaManager.__init__.__defaults__[-1] == 200
+    assert "100" in landing.LANDING_HTML
+    assert coordinator.StarterQuotaManager.__init__.__defaults__[-1] == 100
 
 
 def test_the_page_is_small():

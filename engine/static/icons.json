@@ -1,0 +1,37 @@
+{
+  "generated_by": "scripts/make_dlne_icons.py",
+  "icons": {
+    "apple-touch-icon.png": {
+      "purpose": "apple",
+      "sha256": "d8c314e143f15fda230cd8d0e3d76718e0bd3d2e5588ad8587ada4060bd1c81c",
+      "size": 180
+    },
+    "favicon-32.png": {
+      "purpose": "favicon",
+      "sha256": "823fc70aba792714e17fd4aa024d7c81154d5c8cb4f312992ce6450f632d4ce8",
+      "size": 32
+    },
+    "favicon-48.png": {
+      "purpose": "favicon",
+      "sha256": "1b689881b0e28792d084ea1a64cfcef65eedaf1e7824c3c554b42b3bd76f1cc0",
+      "size": 48
+    },
+    "icon-192.png": {
+      "purpose": "any",
+      "sha256": "89696b4545f7de2e84fe5b552cf659b1a02c875d7bab997cf85eebd66bb8b5f6",
+      "size": 192
+    },
+    "icon-512.png": {
+      "purpose": "any",
+      "sha256": "b7bc18fac878ac2d91e2d01f63fcd1d6e9e4a044b0a5ae95b35861f616956d59",
+      "size": 512
+    },
+    "icon-maskable-512.png": {
+      "purpose": "maskable",
+      "sha256": "8c0d78741253888bbb3192eba710baa179cc530caad1decc73de86c21d35c453",
+      "size": 512
+    }
+  },
+  "source": "vscode-extension/media/dlne_logo.png",
+  "source_sha256": "f679dda7a0c4930d61607145e2a3d917edfa12780be3e1a1fc56aaadaf8a2d76"
+}

@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+from typing import List
 
 
 # --------------------------------------------------------------------------------------
@@ -217,6 +218,46 @@ SPEC_DEFAULTS = {
     "spec_draft_p_min": 0.75,
 }
 
+# The coding engine's per-host tuning for models the automatic sizing cannot place (a
+# mixture-of-experts model whose experts partly live in RAM, 2.3.3). ENGINE_CONTEXT fixes the
+# total -c (0 = automatic). ENGINE_EXTRA_ARGS adds llama-server flags, only from this list and
+# only while the engine runs on this host's own GPUs: a split like -ts names local cards.
+ENGINE_DEFAULTS = {
+    "engine_context": 0,
+    "engine_extra_args": (),
+}
+ENGINE_ARG_FLAGS_WITH_VALUE = frozenset({
+    "--n-cpu-moe", "-ncmoe", "-ts", "--tensor-split", "-ot", "--override-tensor", "-sm", "--split-mode",
+    "-mg", "--main-gpu", "-t", "--threads", "-tb", "--threads-batch", "-C", "--cpu-mask", "--cpu-strict",
+    "-Cb", "--cpu-mask-batch", "--cpu-strict-batch", "--chat-template-kwargs", "--reasoning-budget",
+    "--reasoning-format", "--ctx-checkpoints", "--checkpoint-min-step",
+})
+ENGINE_ARG_FLAGS = frozenset({"--swa-full", "--no-mmap"})
+
+
+def parse_engine_args(raw: str) -> List[str]:
+    """ENGINE_EXTRA_ARGS as llama-server arguments, or [] if any token is not allowed (a typo
+    keeps the engine on its defaults rather than failing to start)."""
+    import shlex
+
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return []
+    out: List[str] = []
+    i = 0
+    while i < len(tokens):
+        flag = tokens[i]
+        if flag in ENGINE_ARG_FLAGS:
+            out.append(flag)
+            i += 1
+        elif flag in ENGINE_ARG_FLAGS_WITH_VALUE and i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+            out += [flag, tokens[i + 1]]
+            i += 2
+        else:
+            return []
+    return out
+
 
 CPU_NODE_DEFAULTS = {
     "cpu_min_ram_gb": 8.0,
@@ -243,7 +284,7 @@ def get_worker_limits() -> dict:
         "allowed_gpu_indices": "-1",
         "enforce_model_whitelist": False,
         "enforce_contrib_clause": True,
-        "starter_quota_inferences": 200,
+        "starter_quota_inferences": 100,
         "redundancy_priority_index": 1,
         "custom_gguf_dir": os.path.join(get_base_dir(), "models"),
         # Previously undefined unless present in the file.
@@ -311,6 +352,7 @@ def get_worker_limits() -> dict:
         # types (draft-*) only apply when the model has a "_dflash" companion; the ngram
         # types need no second model. See SPEC_DEFAULTS for why it ships switched off.
         **SPEC_DEFAULTS,
+        **ENGINE_DEFAULTS,
         # What a node with no usable GPU must bring to be admitted. Generating a token reads
         # every weight a node holds, so a CPU node's speed is its memory bandwidth, and one
         # slow node holds up every token of the pipeline it sits in. These are floors: an
@@ -319,8 +361,39 @@ def get_worker_limits() -> dict:
         **CPU_NODE_DEFAULTS,
         # A CPU contributor's use of the GPU coding agent: this many chats in any window of
         # this many hours (engine/priority.UsageWindow). GPU contributors are not limited.
-        "cpu_coding_limit": 100,
+        "cpu_coding_limit": 300,
         "cpu_coding_window_hours": 5.0,
+        # The CPU pool (engine/app_pool.py). A bigger model tier unlocks once this many members
+        # can host it; phone users get one answer at a time and this many requests a minute.
+        "app_tier_min_members": 2,
+        "app_rate_per_minute": 6,
+        # The coordinator host's own pool member: off unless the operator gives it cores. The
+        # mask is llama.cpp's --cpu-mask (hex, one thread pinned per logical CPU).
+        "app_local_enabled": False,
+        "app_local_cpu_mask": "",
+        "app_local_threads": 4,
+        "app_local_ram_gb": 8.0,
+        "app_local_port": 8099,
+        # A volunteer's pool member: llama-server threads, 0 = half the physical cores, 2 to 8
+        # (engine/app_member.default_threads), so the owner keeps the rest of their machine.
+        "app_member_threads": 0,
+        # The phone chat's lookup tools (engine/search.py: weather, wikipedia, news, web_search),
+        # always run by the coordinator, never by a pool member. Every tool works with no key:
+        # web_search asks the local SearXNG first, then Brave (only with a key, and only
+        # search_daily_limit times a day, which keeps it inside Brave's free monthly credit),
+        # then Wikipedia. The Brave key is a secret: it goes to Brave and nowhere else.
+        "search_enabled": True,
+        "searxng_url": "http://127.0.0.1:8888",
+        "brave_search_api_key": "",
+        "search_daily_limit": 33,
+        # How long a lookup's answer is reused for the same question (weather and news keep
+        # theirs shorter); 0 turns caching off.
+        "search_cache_minutes": 30,
+        # How much evidence one lookup hands the model: a CPU model reads every token before
+        # its first word, so this is deliberately tight.
+        "search_context_tokens": 1000,
+        # Lookups per network address in any hour, across all four tools (cache hits are free).
+        "search_per_network_per_hour": 30,
     }
 
     config = get_config()
@@ -436,6 +509,49 @@ def get_worker_limits() -> dict:
             if value >= CPU_NODE_DEFAULTS[key.lower()]:
                 limits[key.lower()] = value
 
+    for key, cast, low, high in (("APP_TIER_MIN_MEMBERS", int, 1, 1000), ("APP_RATE_PER_MINUTE", int, 1, 600),
+                                 ("APP_LOCAL_THREADS", int, 1, 256), ("APP_LOCAL_RAM_GB", float, 1, 4096),
+                                 ("APP_LOCAL_PORT", int, 1024, 65535), ("APP_MEMBER_THREADS", int, 0, 256)):
+        if key in config:
+            try:
+                value = cast(config[key])
+            except ValueError:
+                continue
+            if low <= value <= high:
+                limits[key.lower()] = value
+
+    if "APP_LOCAL_ENABLED" in config:
+        limits["app_local_enabled"] = _as_bool(config["APP_LOCAL_ENABLED"])
+
+    if "APP_LOCAL_CPU_MASK" in config:
+        mask = config["APP_LOCAL_CPU_MASK"].strip().lower()
+        # llama.cpp takes the mask as hex; anything else would fail its argument parsing.
+        if mask == "" or (mask.startswith("0x") and len(mask) > 2 and all(c in "0123456789abcdef" for c in mask[2:])):
+            limits["app_local_cpu_mask"] = mask
+
+    if "SEARCH_ENABLED" in config:
+        limits["search_enabled"] = _as_bool(config["SEARCH_ENABLED"])
+
+    if "SEARXNG_URL" in config:
+        url = config["SEARXNG_URL"].strip()
+        # The coordinator fetches this address itself, so only an http(s) base is accepted;
+        # empty skips SearXNG and web_search starts at Brave (or Wikipedia).
+        if url == "" or url.lower().startswith(("http://", "https://")):
+            limits["searxng_url"] = url.rstrip("/")
+
+    if "BRAVE_SEARCH_API_KEY" in config:
+        limits["brave_search_api_key"] = config["BRAVE_SEARCH_API_KEY"].strip()
+
+    for key, low, high in (("SEARCH_DAILY_LIMIT", 0, 100000), ("SEARCH_CACHE_MINUTES", 0, 1440),
+                           ("SEARCH_CONTEXT_TOKENS", 300, 8000), ("SEARCH_PER_NETWORK_PER_HOUR", 1, 1000)):
+        if key in config:
+            try:
+                value = int(config[key])
+            except ValueError:
+                continue
+            if low <= value <= high:
+                limits[key.lower()] = value
+
     if "CPU_CODING_LIMIT" in config:
         try:
             value = int(config["CPU_CODING_LIMIT"])
@@ -482,6 +598,17 @@ def get_worker_limits() -> dict:
             p_min = -1.0
         if 0.0 <= p_min <= 1.0:
             limits["spec_draft_p_min"] = p_min
+
+    if "ENGINE_CONTEXT" in config:
+        try:
+            context = int(config["ENGINE_CONTEXT"])
+        except ValueError:
+            context = -1
+        if context == 0 or 2048 <= context <= 1048576:
+            limits["engine_context"] = context
+
+    if "ENGINE_EXTRA_ARGS" in config:
+        limits["engine_extra_args"] = parse_engine_args(config["ENGINE_EXTRA_ARGS"])
 
     if "REBALANCE_ON_JOIN" in config:
         limits["rebalance_on_join"] = _as_bool(config["REBALANCE_ON_JOIN"])

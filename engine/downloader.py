@@ -74,6 +74,19 @@ def test_binary_compatibility(binary_path: str, _allow_dependency_install: bool 
 RPC_RECORD = ".dlne_rpc_bin.json"   # shared with the VS Code extension, which writes the same record
 
 
+def fetch_verified_manifest(coord_url: str, urlopen=urllib.request.urlopen) -> dict:
+    """The coordinator's release manifest, verified against the baked-in release key."""
+    import json
+    from engine import release
+
+    with urlopen(f"{coord_url}/v1/release", timeout=15) as response:
+        manifest = json.loads(response.read(1_000_000))
+    ok, reason = release.verify_manifest(manifest)
+    if not ok:
+        raise release.ReleaseError(f"the coordinator's release failed verification ({reason})")
+    return manifest
+
+
 def sync_rpc_bin(coord_url: str, base_dir: str, platform_key: str, urlopen=urllib.request.urlopen) -> bool:
     """
     Make ``base_dir``/bin hold the ggml-rpc-server build the coordinator's signed release names
@@ -90,11 +103,7 @@ def sync_rpc_bin(coord_url: str, base_dir: str, platform_key: str, urlopen=urlli
     import json
     from engine import release
 
-    with urlopen(f"{coord_url}/v1/release", timeout=15) as response:
-        manifest = json.loads(response.read(1_000_000))
-    ok, reason = release.verify_manifest(manifest)
-    if not ok:
-        raise release.ReleaseError(f"the coordinator's release failed verification ({reason})")
+    manifest = fetch_verified_manifest(coord_url, urlopen)
     sha = manifest.get(release.rpc_field(platform_key, "sha256"))
     if sha is None:
         raise release.ReleaseError(f"the coordinator's signed release has no RPC build for {platform_key}")
@@ -123,6 +132,10 @@ def sync_rpc_bin(coord_url: str, base_dir: str, platform_key: str, urlopen=urlli
             zf.extractall(base_dir)   # every entry is bin/<flat name>, checked just above
         if not platform_key.startswith("win"):
             os.chmod(os.path.join(base_dir, "bin", exe), 0o755)
+            # The CPU pool's server ships in the same zip (2.3.0).
+            app_server = os.path.join(base_dir, "bin", "llama-server")
+            if os.path.exists(app_server):
+                os.chmod(app_server, 0o755)
         with open(record_path, "w", encoding="utf-8") as handle:
             json.dump({"sha256": sha, "llama_build": manifest.get("llama_build"), "rpc_proto": manifest.get("rpc_proto")}, handle)
         log_success(f"Installed llama.cpp {manifest.get('llama_build')} ggml-rpc-server (RPC {manifest.get('rpc_proto')}).")

@@ -63,6 +63,11 @@ TOP_LEVEL_FILES = ("dlne_server.py", "requirements.txt", ARCHIVE_NAME, MANIFEST_
 # RPC zips, so rolling back to it must not delete the ones on disk.
 _LEGACY_TOP_LEVEL_FILES = ("dlne_server.py", "requirements.txt", ARCHIVE_NAME, MANIFEST_NAME)
 PACKAGE_DIR = "engine"
+# The DLNE icons the coordinator serves ship beside the code (mirrors SHIPPED_ASSET_DIRS in
+# engine/release.py): engine/static/<name>.png, nothing else, nothing deeper.
+STATIC_DIR = "engine/static"
+STATIC_EXT = ".png"
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 _VERSION_RE = re.compile(r'^VERSION[ \t]*=[ \t]*"([^"]+)"[ \t]*$', re.MULTILINE)
 
@@ -119,6 +124,11 @@ def managed_files(root: str) -> List[str]:
         for entry in sorted(os.listdir(package)):
             if entry.endswith(".py") and os.path.isfile(os.path.join(package, entry)):
                 found.append(f"{PACKAGE_DIR}/{entry}")
+    static = os.path.join(root, *STATIC_DIR.split("/"))
+    if os.path.isdir(static):
+        for entry in sorted(os.listdir(static)):
+            if entry.endswith(STATIC_EXT) and os.path.isfile(os.path.join(static, entry)):
+                found.append(f"{STATIC_DIR}/{entry}")
     return sorted(found)
 
 
@@ -133,7 +143,8 @@ def _archive_members(archive: zipfile.ZipFile) -> Dict[str, bytes]:
         if name.startswith("/") or ".." in parts or "\\" in name or ":" in name:
             raise ApplyError(f"The archive contains an unsafe path: {name!r}")
         if not (name in ("dlne_server.py", "requirements.txt")
-                or (len(parts) == 2 and parts[0] == PACKAGE_DIR and parts[1].endswith(".py"))):
+                or (len(parts) == 2 and parts[0] == PACKAGE_DIR and parts[1].endswith(".py"))
+                or (len(parts) == 3 and "/".join(parts[:2]) == STATIC_DIR and parts[2].endswith(STATIC_EXT))):
             raise ApplyError(f"The archive contains a file a release never ships: {name!r}")
         members[name] = archive.read(info)
     return members
@@ -170,6 +181,8 @@ def check_archive(archive_path: str, manifest: Dict, pubkey_hex: Optional[str] =
                 compile(data, name, "exec")
             except SyntaxError as exc:
                 raise ApplyError(f"{name} does not compile: {exc.msg} (line {exc.lineno}).") from exc
+        elif name.endswith(STATIC_EXT) and not data.startswith(PNG_SIGNATURE):
+            raise ApplyError(f"{name} is not a PNG image.")
 
     if pubkey_hex:
         try:

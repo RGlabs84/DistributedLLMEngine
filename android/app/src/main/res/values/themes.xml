@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        The platform theme only matters for the instant before Compose draws (and for the
+        splash screen on Android 12+). It follows the system light/dark setting through
+        values-night/colors.xml; everything visible afterwards is styled in Compose.
+    -->
+    <style name="Theme.DLNE" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+    </style>
+</resources>

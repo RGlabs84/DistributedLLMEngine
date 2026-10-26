@@ -9,7 +9,7 @@ DLNE's rule is "give compute to receive compute", graded by what is given:
     gpu      a contributor lending a GPU                   1st        unlimited
     open     anyone, when the contribution rule is off     2nd        unlimited
     cpu      a contributor lending a CPU (the phone pool)  2nd        a rolling window
-    trial    everyone else, on the 200 free chats          3rd        the free trial
+    trial    everyone else, on the 100 free chats          3rd        the free trial
 
 PRIORITY. llama-server runs a fixed number of request slots and serves whatever arrives in
 arrival order, so priority has to be decided before a request reaches it. ``CodingGate``
@@ -30,7 +30,7 @@ import heapq
 import itertools
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Deque, Dict, List, Optional, Tuple
 
 TIER_PRIORITY = {"host": 0, "key": 0, "gpu": 0, "open": 1, "cpu": 1, "trial": 2}
@@ -119,11 +119,17 @@ class CodingGate:
 
 
 class UsageWindow:
-    """At most ``limit`` uses per key in any ``window_seconds`` (a sliding window)."""
+    """
+    At most ``limit`` uses per key in any ``window_seconds`` (a sliding window).
+
+    Keys are kept least recently used first, so each check also drops the keys that went
+    quiet for a whole window from the front: amortised O(1), and the table only ever holds
+    the keys active in the last window (the phone throttle sees every network that asks).
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._uses: Dict[str, Deque[float]] = {}
+        self._uses: "OrderedDict[str, Deque[float]]" = OrderedDict()
 
     def check_and_record(self, key: str, limit: int, window_seconds: float,
                          now: Optional[float] = None) -> Tuple[bool, int, float]:
@@ -134,12 +140,18 @@ class UsageWindow:
         """
         now = time.time() if now is None else now
         with self._lock:
+            while self._uses:
+                oldest_key, oldest = next(iter(self._uses.items()))
+                if oldest and oldest[-1] > now - window_seconds:
+                    break
+                del self._uses[oldest_key]
             uses = self._uses.setdefault(key, deque())
             while uses and uses[0] <= now - window_seconds:
                 uses.popleft()
             if len(uses) >= limit:
                 return False, 0, uses[0] + window_seconds
             uses.append(now)
+            self._uses.move_to_end(key)
             return True, limit - len(uses), uses[0] + window_seconds
 
     def peek(self, key: str, limit: int, window_seconds: float,

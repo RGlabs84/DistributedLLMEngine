@@ -17,10 +17,12 @@ Treat all of them as frozen.
 import asyncio
 import concurrent.futures
 import contextlib
+import functools
 import ipaddress
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -47,6 +49,7 @@ from engine import benchmark
 from engine import gguf
 from engine.config import get_base_dir, get_config, get_worker_limits
 from engine.landing import LANDING_HTML
+from engine.chat_page import chat_router
 # Imported as symbols, not copied as string literals. start_model's message is a control
 # signal — see the sentinel block at the top of engine/inference_manager.py — and the two
 # modules must never grow independent copies of the same set of magic strings.
@@ -59,11 +62,13 @@ from engine.inference_manager import (
     is_retryable_start_failure,
 )
 from engine.logger import log_coordinator, log_error, log_warning
-from engine.registry import WorkerRegistry, safe_log_text
+from engine.registry import WorkerRegistry, is_app_member, safe_log_text
+from engine.app_pool import LocalAppServer, app_pool
+from engine.downloader import download_and_extract_engine
 from engine.version import VERSION
 from engine import release as release_lib
 from engine.lease import lease_manager, InferenceLease
-from engine.priority import coding_gate, cpu_coding_window, tier_priority
+from engine.priority import UsageWindow, coding_gate, cpu_coding_window, tier_priority
 from engine.api_keys import api_key_manager, hash_admin_key
 
 # The rich-backed helpers in engine.logger deliberately expose no debug level, because
@@ -407,11 +412,11 @@ def get_request_token(request: Request | WebSocket) -> str:
 class StarterQuotaManager:
     """
     Manages free starter quota for new users/evaluators of the DLNE network.
-    Grants a starter allocation (default: 200 chat requests) per client before
+    Grants a starter allocation (default: 100 chat requests) per client before
     enforcing local GPU worker contribution or an authorized API key.
     """
 
-    def __init__(self, relative_path: str = "config/starter_quota.json", default_quota: int = 200):
+    def __init__(self, relative_path: str = "config/starter_quota.json", default_quota: int = 100):
         self.filename = relative_path
         self.default_quota = default_quota
         self._lock = threading.Lock()
@@ -594,7 +599,7 @@ class NonContribBlockerMiddleware(BaseHTTPMiddleware):
                 if not worker:
                     # Check free starter quota for new users/evaluators
                     request.state.dlne_tier = "trial"
-                    quota_limit = int(get_worker_limits().get("starter_quota_inferences", 200))
+                    quota_limit = int(get_worker_limits().get("starter_quota_inferences", 100))
                     if quota_limit > 0:
                         allowed, remaining = use_starter_quota(request, trial_identity(client_ip), quota_limit)
                         if allowed:
@@ -661,11 +666,15 @@ app.add_middleware(NonContribBlockerMiddleware)
 @app.get("/", include_in_schema=False)
 async def root():
     """
-    The only page this server serves. DLNE is a VS Code extension; the browser chat room that
-    used to live here is gone, so anyone who finds the address gets pointed at the extension
-    and a live view of the swarm. Public by design: it is a signpost, not a service.
+    The landing page. DLNE is a VS Code extension; the browser chat room that used to live
+    here is gone, so anyone who finds the address gets pointed at the extension (and the phone
+    chat at /chat) and a live view of the swarm. Public by design: it is a signpost, not a service.
     """
     return HTMLResponse(LANDING_HTML)
+
+
+# The phone chat at /chat (engine/chat_page.py): an installable page over the CPU pool.
+app.include_router(chat_router)
 
 
 # ======================================================================================
@@ -1221,12 +1230,17 @@ async def worker_heartbeat(request: Request, payload: HeartbeatPayload):
         role=payload.role, staged_version=payload.staged_version,
     )
 
+    # A CPU pool member is told which model tier to serve (engine/app_pool.py).
+    if is_app_member(payload.hardware):
+        tier = app_pool.assignment(_as_number(payload.hardware.get("ram_gb", 0)), _app_members(),
+                                   int(get_worker_limits().get("app_tier_min_members", 2)))
+        return {"status": "ok", "app_model": tier}
     return {"status": "ok"}
 
 
 def check_contrib_clause(request: Request):
     """Enforces the Non-Contrib Clause: blocks any IP not actively running a Worker or presenting a valid API key,
-    while permitting new community users a free starter quota (default: 200 chat requests) for evaluation."""
+    while permitting new community users a free starter quota (default: 100 chat requests) for evaluation."""
     if not get_worker_limits().get("enforce_contrib_clause", True):
         return
 
@@ -1247,7 +1261,7 @@ def check_contrib_clause(request: Request):
         return  # Active contributing worker node
 
     # Starter trial quota for new community users / evaluation
-    quota_limit = int(get_worker_limits().get("starter_quota_inferences", 200))
+    quota_limit = int(get_worker_limits().get("starter_quota_inferences", 100))
     if quota_limit > 0:
         allowed, _remaining = use_starter_quota(request, trial_identity(ip), quota_limit)
         if allowed:
@@ -1583,7 +1597,7 @@ async def admin_stats(request: Request):
     """
     _require_admin(request)
 
-    chat_limit = int(get_worker_limits().get("starter_quota_inferences", 200))
+    chat_limit = int(get_worker_limits().get("starter_quota_inferences", 100))
     keys = api_key_manager.list_keys()
     return {
         "server_version": VERSION,
@@ -1611,7 +1625,7 @@ async def admin_stats(request: Request):
 async def admin_quota(request: Request):
     """Free-trial usage: totals plus the heaviest users, with identifiers masked."""
     _require_admin(request)
-    chat_limit = int(get_worker_limits().get("starter_quota_inferences", 200))
+    chat_limit = int(get_worker_limits().get("starter_quota_inferences", 100))
     return {"chat_limit": chat_limit, **starter_quota_mgr.summary(chat_limit, top=10)}
 
 
@@ -2719,6 +2733,12 @@ async def get_cluster_status(request: Request):
         # The coding engine's slots and who is waiting for them, by priority (0 = GPU
         # contributors, 1 = CPU contributors, 2 = free trial). Counts only, no identities.
         "coding_queue": coding_gate.stats(),
+        # The phone app's CPU pool: members, the unlocked model tier and the ladder. Counts
+        # and model names only.
+        "app_pool": app_pool.status(_app_members(), int(get_worker_limits().get("app_tier_min_members", 2))),
+        # The phone model's lookups: which tools are on and today's counts. No key, no URL,
+        # nothing about any network (engine/search.search_status).
+        "app_search": _app_search_status(),
         "is_locked_for_edits": lease_manager.is_locked(),
         "in_flight_leases": lease_manager.active_leases_summary(),
         "is_swapping_models": is_swapping_models,
@@ -3816,6 +3836,179 @@ async def monitor_workers_async():
             await asyncio.sleep(MONITOR_TICK_SECONDS)
 
 
+# ======================================================================================
+# The CPU pool (phone app)
+# ======================================================================================
+
+def _app_members():
+    from engine.reverse_tunnel import reverse_bridge
+    return app_pool.members(registry, reverse_bridge.get_relay_port)
+
+
+def _load_app_tiers() -> None:
+    manifest = release_lib.load_manifest(os.path.join(get_base_dir(), release_lib.MANIFEST_NAME))
+    app_pool.load_tiers(release_lib.app_tiers(manifest) if manifest else [])
+    if app_pool.tiers:
+        log_coordinator("CPU pool tiers: " + ", ".join(t.get("name") or t["id"] for t in app_pool.tiers) + ".")
+
+
+async def monitor_app_pool_async() -> None:
+    """
+    Keeps the coordinator host's own CPU pool member serving the tier it should (the owner's
+    APP_LOCAL_* allocation), restarting it if it dies or when a bigger tier unlocks.
+    """
+    limits = get_worker_limits()
+    models_dir = limits.get("custom_gguf_dir") or os.path.join(get_base_dir(), "models")
+    app_pool.local = LocalAppServer(
+        models_dir=models_dir,
+        binary_resolver=lambda: download_and_extract_engine("coordinator"),
+        log_dir=os.path.join(get_base_dir(), "logs"),
+        port=int(limits.get("app_local_port", 8099)),
+        threads=int(limits.get("app_local_threads", 4)),
+        ram_gb=float(limits.get("app_local_ram_gb", 8.0)),
+        cpu_mask=limits.get("app_local_cpu_mask") or None,
+    )
+    while True:
+        try:
+            local = app_pool.local
+            min_members = int(get_worker_limits().get("app_tier_min_members", 2))
+            tier_id = app_pool.assignment(local.ram_gb, _app_members(), min_members)
+            tier = next((t for t in app_pool.tiers if t["id"] == tier_id), None)
+            before = (local.serving, local.process)
+            await asyncio.to_thread(local.ensure, tier)
+            if (local.serving, local.process) != before and local.process is not None:
+                async with engine_client() as client:
+                    if await local.wait_ready(client):
+                        log_coordinator(f"CPU pool (local): ready, serving {tier.get('name')}.")
+                    else:
+                        log_error("CPU pool (local): the model server did not become ready; see logs/app_server.log.")
+        except Exception as exc:  # noqa: BLE001 - the monitor must outlive any one failure
+            log_error(f"CPU pool monitor: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(20)
+
+
+@app.post("/v1/app/chat/completions")
+async def app_chat_completions(request: Request):
+    """
+    The phone app's chat: answered by the CPU pool (engine/app_pool.py). Free for anyone,
+    throttled per network address; never touches the GPU coding engine.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="The request body must be JSON.")
+    if not isinstance(body, dict) or not isinstance(body.get("messages"), list) or not body["messages"]:
+        raise HTTPException(status_code=400, detail="Send a non-empty 'messages' list.")
+
+    network = trial_identity(get_client_ip(request))
+    limits = get_worker_limits()
+    per_minute = int(limits.get("app_rate_per_minute", 6))
+    allowed, why = app_pool.admit(network, per_minute)
+    if not allowed:
+        return JSONResponse({"detail": why}, status_code=429,
+                            headers={"Retry-After": str(app_pool.retry_after(network, per_minute))})
+
+    members = _app_members()
+    active = app_pool.status(members, int(limits.get("app_tier_min_members", 2)))["active_tier"]
+    tools, run_tool = _app_lookup_tools(network)
+
+    async def generate():
+        try:
+            async with engine_client() as client:
+                async for chunk in app_pool.stream(body, members, active, client, tools=tools,
+                                                   run_tool=run_tool and functools.partial(run_tool, client=client)):
+                    yield chunk
+        finally:
+            app_pool.finished(network)
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+def _app_search_status() -> Optional[Dict[str, Any]]:
+    try:
+        from engine import search
+    except ImportError:
+        return None
+    return search.search_status()
+
+
+def _app_lookup_tools(network: str):
+    """The phone model's lookup tools and their runner (engine/search.py), or (None, None)
+    when search is off or not installed."""
+    try:
+        from engine import search
+    except ImportError:
+        return None, None
+    if not search.search_status().get("enabled"):
+        return None, None
+    return search.TOOLS, functools.partial(search.run_tool, network_id=network)
+
+
+# Reports of phone answers (Play's policy for AI apps): kept on this machine for the operator.
+APP_REPORTS_FILE = "app_reports.jsonl"
+APP_REPORTS_MAX_BYTES = 50 * 1024 * 1024
+APP_REPORT_REASONS = ("harmful", "wrong", "offensive", "other")
+app_report_window = UsageWindow()
+
+
+@app.post("/v1/app/report")
+async def app_report(request: Request):
+    """A phone user reports an answer. Appended to config/app_reports.jsonl; read with
+    GET /v1/admin/app_reports. Throttled per network; the file is capped in size."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="The request body must be JSON.")
+    if not isinstance(body, dict) or body.get("reason") not in APP_REPORT_REASONS:
+        raise HTTPException(status_code=400, detail=f"reason must be one of: {', '.join(APP_REPORT_REASONS)}.")
+    fields = {"question": 4000, "answer": 8000, "note": 500}
+    report = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "reason": body["reason"]}
+    for key, cap in fields.items():
+        value = body.get(key, "")
+        if not isinstance(value, str):
+            raise HTTPException(status_code=400, detail=f"{key} must be text.")
+        report[key] = value[:cap]
+    if not report["answer"].strip():
+        raise HTTPException(status_code=400, detail="Say which answer you are reporting.")
+
+    network = trial_identity(get_client_ip(request))
+    allowed, _remaining, reset_at = app_report_window.check_and_record(network, 10, 3600.0)
+    if not allowed:
+        wait = max(1, math.ceil(reset_at - time.time()))
+        return JSONResponse({"detail": "Thanks; that's a lot of reports from here. Please try again later."},
+                            status_code=429, headers={"Retry-After": str(wait)})
+    path = os.path.join(get_base_dir(), "config", APP_REPORTS_FILE)
+
+    def append() -> bool:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > APP_REPORTS_MAX_BYTES:
+            return False
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(report, ensure_ascii=False) + "\n")
+        return True
+
+    if not await asyncio.to_thread(append):
+        log_warning("Phone answer reports: the file is full; read and clear config/app_reports.jsonl.")
+    return {"ok": True}
+
+
+@app.get("/v1/admin/app_reports")
+async def admin_app_reports(request: Request, limit: int = 100):
+    """The newest phone answer reports, for the operator."""
+    _require_admin(request)
+    path = os.path.join(get_base_dir(), "config", APP_REPORTS_FILE)
+
+    def read() -> List[Dict[str, Any]]:
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()[-max(1, min(int(limit), 1000)):]
+        return [json.loads(line) for line in lines if line.strip()]
+
+    return {"reports": await asyncio.to_thread(read)}
+
+
 @app.on_event("startup")
 async def startup_event():
     """Starts the long-lived monitors once uvicorn's event loop is running."""
@@ -3823,6 +4016,9 @@ async def startup_event():
     _apply_rpc_requirement()
     spawn_background_task(monitor_workers_async(), "monitor-workers")
     spawn_background_task(monitor_models_json_async(), "monitor-models-json")
+    _load_app_tiers()
+    if get_worker_limits().get("app_local_enabled", False) and app_pool.tiers:
+        spawn_background_task(monitor_app_pool_async(), "app-pool")
 
 
 # ======================================================================================

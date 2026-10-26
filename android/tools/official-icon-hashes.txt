@@ -1,0 +1,7 @@
+# SHA-256 of the official logo and of every file generated from it.
+# Written by android/tools/generate_dlne_icons.py; checked by OfficialIconPolicyTest.
+f679dda7a0c4930d61607145e2a3d917edfa12780be3e1a1fc56aaadaf8a2d76  vscode-extension/media/dlne_logo.png
+f679dda7a0c4930d61607145e2a3d917edfa12780be3e1a1fc56aaadaf8a2d76  android/app/src/main/res/drawable-nodpi/dlne_logo.png
+3e160bfa762d48f08df18861242dfd6d4a34bb8af3a2fa224eb717e786354930  android/app/src/main/res/drawable-nodpi/ic_launcher_monochrome.png
+9b874b8daf5fbf107b20559a564fa8779d24091c2f680edbd52ace03bbed2319  android/play/icon-512.png
+ca16fc7d09c05e0ddaef60e405652206d9de94f4fe824e15befb60866cb763bc  android/play/feature-graphic.png

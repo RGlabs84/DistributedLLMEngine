@@ -20,8 +20,8 @@ def _manager(tmp_path):
     return coordinator.StarterQuotaManager(str(tmp_path / "starter_quota.json"), default_quota=3)
 
 
-def test_default_trial_is_200_chat_requests(tmp_path):
-    assert coordinator.StarterQuotaManager(str(tmp_path / "q.json")).default_quota == 200
+def test_default_trial_is_100_chat_requests(tmp_path):
+    assert coordinator.StarterQuotaManager(str(tmp_path / "q.json")).default_quota == 100
 
 
 def test_peek_never_spends_quota(tmp_path):

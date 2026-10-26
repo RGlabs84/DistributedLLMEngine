@@ -1,5 +1,6 @@
 import { DlneClient, ChatMessage } from '../client/dlneClient';
 import { ToolRegistry } from './tools';
+import { CPU_POOL_PERK } from '../worker/contribution';
 
 export interface AgentCallbacks {
   onThinkingDelta: (delta: string) => void;
@@ -34,6 +35,7 @@ export function refusalNotice(status: number | undefined, errMsg: string): strin
   if (trialUsedUp) {
     return '\n\n🔒 **Your free trial is used up**\n\n' +
       'DLNE is free forever, on one rule: *give compute to receive compute*. Share your idle GPU with the swarm to keep going.\n\n' +
+      `- No GPU? Lend your CPU: it powers the DLNE phone app, and you get ${CPU_POOL_PERK}.\n` +
       '- Click the **DLNE status bar item** (or run **`@dlne /contribute`**) and choose **Start Contributing Local Compute**.\n' +
       '- Or set an authorized API key in the `dlne.apiKey` setting.\n' +
       '- Once your worker connects, resend your prompt to continue.';

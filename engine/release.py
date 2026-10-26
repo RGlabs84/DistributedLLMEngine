@@ -40,9 +40,15 @@ MANIFEST_NAME = "release.json"
 # extension still verifies the signature over them and ignores them.
 RPC_PLATFORMS = ("win-x64", "linux-x64", "macos-arm64", "win-arm64", "linux-arm64", "macos-x64")
 RPC_EXECUTABLES = ("ggml-rpc-server", "ggml-rpc-server.exe")
-# What an RPC zip may hold: bin/<name>, flat, where name is the server or one of its libraries.
+# llama-server, which a CPU pool member runs with its whole model (2.3.0), ships in the same zip.
+APP_SERVER_EXECUTABLES = ("llama-server", "llama-server.exe")
+# What an RPC zip may hold: bin/<name>, flat, where name is one of the two servers or one of
+# their libraries (ggml's; llama-server's own: llama, llama-common, llama-server-impl, mtmd).
 _RPC_MEMBER_RE = re.compile(
-    r"^bin/(ggml-rpc-server(\.exe)?|(lib)?ggml[A-Za-z0-9_.-]*\.(dll|so(\.[0-9.]+)?|dylib)|libomp\.dll|LICENSE)$"
+    r"^bin/(ggml-rpc-server(\.exe)?|llama-server(\.exe)?"
+    r"|(lib)?ggml[A-Za-z0-9_.-]*\.(dll|so(\.[0-9.]+)?|dylib)"
+    r"|(lib)?(llama|llama-common|llama-server-impl|mtmd)(\.[0-9]+)*\.(dll|dylib|so(\.[0-9]+)*)"
+    r"|libomp\.dll|LICENSE)$"
 )
 _PROTO_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _BUILD_RE = re.compile(r"^b\d+$")
@@ -59,7 +65,7 @@ def rpc_field(platform: str, what: str) -> str:
 
 def proto_major(proto: Any) -> Optional[int]:
     """The major of an RPC protocol version like "8.0.1"; None when it is not one."""
-    if isinstance(proto, str) and _PROTO_RE.match(proto):
+    if isinstance(proto, str) and _PROTO_RE.fullmatch(proto):
         return int(proto.split(".")[0])
     return None
 
@@ -67,6 +73,11 @@ def proto_major(proto: Any) -> Optional[int]:
 # directory. A stray secrets file, a scratch script or a test fixture cannot leak into a release.
 SHIPPED_FILES = ("dlne_server.py", "requirements.txt")
 SHIPPED_PACKAGES = ("engine",)
+# Binary files a release carries beside the code: directory -> the one extension allowed in it,
+# directly inside (no subfolders). engine/static holds the DLNE icons the coordinator serves
+# (engine/icons.py); without them it refuses to start, so a release that dropped them would be
+# rolled back at deploy. Never extend this to a directory that can hold secrets or scratch files.
+SHIPPED_ASSET_DIRS = {"engine/static": ".png"}
 
 # Every archive entry gets the same timestamp and permissions, so the output depends only on
 # names and contents.
@@ -98,7 +109,7 @@ def read_version(repo_root: str) -> str:
 
 def write_version(repo_root: str, version: str) -> None:
     """Set the version in engine/version.py, leaving the rest of the file untouched."""
-    if not _SEMVER_RE.match(version):
+    if not _SEMVER_RE.fullmatch(version):
         raise ReleaseError(f"'{version}' is not a version like 2.0.0.")
     path = os.path.join(repo_root, "engine", "version.py")
     with open(path, "r", encoding="utf-8") as handle:
@@ -111,7 +122,7 @@ def write_version(repo_root: str, version: str) -> None:
 
 
 def parse_version(version: str) -> Tuple[int, int, int]:
-    if not _SEMVER_RE.match(str(version)):
+    if not _SEMVER_RE.fullmatch(str(version)):
         raise ReleaseError(f"'{version}' is not a version like 2.0.0.")
     major, minor, patch = (int(part) for part in version.split("."))
     return (major, minor, patch)
@@ -119,7 +130,7 @@ def parse_version(version: str) -> Tuple[int, int, int]:
 
 def bump_version(current: str, part: str) -> str:
     """``bump_version("1.1.12", "minor") == "1.2.0"``; ``part`` may also be an explicit version."""
-    if _SEMVER_RE.match(part):
+    if _SEMVER_RE.fullmatch(part):
         return part
     major, minor, patch = parse_version(current)
     if part == "major":
@@ -157,6 +168,13 @@ def shipped_files(repo_root: str) -> List[str]:
         for entry in sorted(os.listdir(base)):
             if entry.endswith(".py") and os.path.isfile(os.path.join(base, entry)):
                 found.append(f"{package}/{entry}")
+    for directory, extension in SHIPPED_ASSET_DIRS.items():
+        base = os.path.join(repo_root, *directory.split("/"))
+        if not os.path.isdir(base):
+            continue   # a tree without the assets still builds; the real repository's test pins that it has them
+        for entry in sorted(os.listdir(base)):
+            if entry.endswith(extension) and os.path.isfile(os.path.join(base, entry)):
+                found.append(f"{directory}/{entry}")
     return sorted(found)
 
 
@@ -241,9 +259,74 @@ def check_rpc_bin(path: str) -> None:
         raise ReleaseError(f"{label} has no bin/ggml-rpc-server.")
 
 
+# ---------------------------------------------------------------------------------------
+# The CPU pool's model tiers (what phone requests are answered with)
+# ---------------------------------------------------------------------------------------
+#
+# Signed as flat text and integer fields (never nested objects or floats), the shape every
+# verifier in the field already canonicalises identically: "app_tiers" lists the tier ids
+# smallest first, and each id has app_<id>_{name,file,url,sha256,size,min_ram_gb}. Members
+# download the file from ``url`` (a Hugging Face URL pinned to one revision) and run it only
+# if it has exactly ``size`` bytes and ``sha256``.
+
+_APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+_APP_FILE_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}\.gguf$")
+_APP_URL_RE = re.compile(r"^https://huggingface\.co/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/resolve/[0-9a-f]{40}/[A-Za-z0-9._-]+\.gguf$")
+
+
+def app_field(tier_id: str, what: str) -> str:
+    """``app_field("qwen3-4b", "sha256") == "app_qwen3_4b_sha256"``."""
+    return f"app_{tier_id.replace('-', '_')}_{what}"
+
+
+def _check_app_model(model: Dict[str, Any]) -> Optional[str]:
+    tier_id = model.get("id")
+    # fullmatch, never match: "$" also matches before a trailing newline, which the extension's
+    # verifier (JavaScript) rejects, so Python would sign what the field refuses.
+    if not isinstance(tier_id, str) or not _APP_ID_RE.fullmatch(tier_id):
+        return f"bad tier id {tier_id!r}"
+    if not isinstance(model.get("name"), str) or not model["name"] or not all(" " <= c <= "~" for c in model["name"]):
+        return f"tier {tier_id}: name must be printable ASCII"
+    if not isinstance(model.get("file"), str) or not _APP_FILE_RE.fullmatch(model["file"]):
+        return f"tier {tier_id}: bad file name"
+    if not isinstance(model.get("url"), str) or not _APP_URL_RE.fullmatch(model["url"]) or not model["url"].endswith("/" + model["file"]):
+        return f"tier {tier_id}: the url must be a Hugging Face file pinned to a revision, ending in the file name"
+    if not isinstance(model.get("sha256"), str) or not _SHA256_RE.fullmatch(model["sha256"]):
+        return f"tier {tier_id}: bad sha256"
+    for key, top in (("size", 1 << 40), ("min_ram_gb", 512)):
+        value = model.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= top:
+            return f"tier {tier_id}: bad {key}"
+    return None
+
+
+def _check_tier_list(tiers: List[Dict[str, Any]]) -> Optional[str]:
+    """Tier ids unique, and the list smallest first (the pool's unlock ladder depends on it)."""
+    ids = [tier.get("id") for tier in tiers]
+    if len(set(ids)) != len(ids):
+        return "tier ids must be unique"
+    rams = [tier.get("min_ram_gb") for tier in tiers]
+    if any(later < earlier for earlier, later in zip(rams, rams[1:])):
+        return "tiers must be listed smallest first (min_ram_gb never decreasing)"
+    return None
+
+
+def app_tiers(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The CPU pool's tiers named by ``manifest``, smallest first; [] when it names none."""
+    ids = manifest.get("app_tiers")
+    if not isinstance(ids, str) or not ids:
+        return []
+    tiers = []
+    for tier_id in ids.split(","):
+        tiers.append({"id": tier_id, **{what: manifest.get(app_field(tier_id, what))
+                                         for what in ("name", "file", "url", "sha256", "size", "min_ram_gb")}})
+    return tiers
+
+
 def make_manifest(version: str, archive_path: str, git_commit: str, built_at: str, notes: str = "",
                   rpc_zips: Optional[Dict[str, str]] = None, llama_build: Optional[str] = None,
-                  rpc_proto: Optional[str] = None, server_llama: Optional[str] = None) -> Dict[str, Any]:
+                  rpc_proto: Optional[str] = None, server_llama: Optional[str] = None,
+                  app_models: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """
     The unsigned manifest for ``archive_path``. Every string is validated as printable ASCII.
 
@@ -263,7 +346,7 @@ def make_manifest(version: str, archive_path: str, git_commit: str, built_at: st
         "notes": notes,
     }
     if rpc_zips or server_llama:
-        if not (isinstance(llama_build, str) and _BUILD_RE.match(llama_build)):
+        if not (isinstance(llama_build, str) and _BUILD_RE.fullmatch(llama_build)):
             raise ReleaseError("Binaries need the llama.cpp build they come from, like b11838.")
         if proto_major(rpc_proto) is None:
             raise ReleaseError("Binaries need their RPC protocol version, like 8.0.1.")
@@ -278,6 +361,19 @@ def make_manifest(version: str, archive_path: str, git_commit: str, built_at: st
     if server_llama is not None:
         manifest["server_llama_sha256"] = sha256_file(server_llama)
         manifest["server_llama_size"] = os.path.getsize(server_llama)
+    if app_models:
+        ids = []
+        for model in app_models:
+            problem = _check_app_model(model)
+            if problem:
+                raise ReleaseError(f"CPU pool model list: {problem}.")
+            ids.append(model["id"])
+            for what in ("name", "file", "url", "sha256", "size", "min_ram_gb"):
+                manifest[app_field(model["id"], what)] = model[what]
+        problem = _check_tier_list(app_models)
+        if problem:
+            raise ReleaseError(f"CPU pool model list: {problem}.")
+        manifest["app_tiers"] = ",".join(ids)
     for field in ("version", "file", "sha256", "git_commit", "built_at", "notes"):
         _require_printable_ascii(field, str(manifest[field]))
     return manifest
@@ -324,12 +420,12 @@ def verify_manifest(manifest: Any, pubkey_hex: Optional[str] = None) -> Tuple[bo
     if manifest.get("schema") != MANIFEST_SCHEMA:
         return (False, f"unsupported manifest schema {manifest.get('schema')!r}")
     version = manifest.get("version")
-    if not isinstance(version, str) or not _SEMVER_RE.match(version):
+    if not isinstance(version, str) or not _SEMVER_RE.fullmatch(version):
         return (False, "the manifest has no valid version")
     if manifest.get("file") != ARCHIVE_NAME:
         return (False, "the manifest names an unexpected file")
     sha = manifest.get("sha256")
-    if not isinstance(sha, str) or not _SHA256_RE.match(sha):
+    if not isinstance(sha, str) or not _SHA256_RE.fullmatch(sha):
         return (False, "the manifest has no valid sha256")
     size = manifest.get("size")
     if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
@@ -345,16 +441,27 @@ def verify_manifest(manifest: Any, pubkey_hex: Optional[str] = None) -> Tuple[bo
         if sha_key in manifest or size_key in manifest:
             has_binaries = True
             sha, size = manifest.get(sha_key), manifest.get(size_key)
-            if not isinstance(sha, str) or not _SHA256_RE.match(sha):
+            if not isinstance(sha, str) or not _SHA256_RE.fullmatch(sha):
                 return (False, f"the manifest has no valid {sha_key}")
             if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
                 return (False, f"the manifest has no valid {size_key}")
     if has_binaries or "llama_build" in manifest or "rpc_proto" in manifest:
         build = manifest.get("llama_build")
-        if not isinstance(build, str) or not _BUILD_RE.match(build):
+        if not isinstance(build, str) or not _BUILD_RE.fullmatch(build):
             return (False, "the manifest has no valid llama_build")
         if proto_major(manifest.get("rpc_proto")) is None:
             return (False, "the manifest has no valid rpc_proto")
+    if "app_tiers" in manifest:
+        tiers = app_tiers(manifest)
+        if not tiers:
+            return (False, "the manifest's app_tiers is empty")
+        for tier in tiers:
+            problem = _check_app_model(tier)
+            if problem:
+                return (False, f"the manifest's CPU pool tiers are invalid: {problem}")
+        problem = _check_tier_list(tiers)
+        if problem:
+            return (False, f"the manifest's CPU pool tiers are invalid: {problem}")
     signature = manifest.get("signature")
     if not isinstance(signature, str) or not signature:
         return (False, "the release manifest is not signed")

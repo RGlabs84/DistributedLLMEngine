@@ -134,7 +134,8 @@ def write_rpc_zip(members: List[Tuple[str, bytes]], out_path: str) -> None:
             info = zipfile.ZipInfo(f"bin/{name}", date_time=_FIXED_DATE_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.create_system = 3
-            info.external_attr = (0o100755 if name in release.RPC_EXECUTABLES else 0o100644) << 16
+            executable = name in release.RPC_EXECUTABLES or name in release.APP_SERVER_EXECUTABLES
+            info.external_attr = (0o100755 if executable else 0o100644) << 16
             z.writestr(info, data, compresslevel=9)
     with open(out_path, "wb") as handle:
         handle.write(buffer.getvalue())

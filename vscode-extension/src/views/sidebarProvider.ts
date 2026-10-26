@@ -3,6 +3,8 @@ import * as path from 'path';
 import { AgentLoop } from '../agent/agentLoop';
 import { DlneClient } from '../client/dlneClient';
 import { WorkerManager, WorkerStatus } from '../worker/workerManager';
+import { contributionCopy } from '../worker/contribution';
+import { phoneChatUrl } from '../serverUrl';
 import { ToolCallResult } from '../agent/tools';
 
 export interface ChatMessageItem {
@@ -39,7 +41,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
 
     this.workerManager.onStatusChange((status) => {
-      this._view?.webview.postMessage({ type: 'workerStatus', status });
+      this._view?.webview.postMessage({ type: 'workerStatus', status, copy: contributionCopy(status) });
     });
   }
 
@@ -66,10 +68,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     webviewView.webview.html = this._getHtmlForWebview();
 
     // Push state immediately on mount
+    const workerStatus = this.workerManager.getStatus();
     webviewView.webview.postMessage({
       type: 'restoreHistory',
       history: this.conversationHistory,
-      workerStatus: this.workerManager.getStatus()
+      workerStatus,
+      workerCopy: contributionCopy(workerStatus)
     });
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
@@ -98,13 +102,17 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           await vscode.commands.executeCommand('dlne.installSuite');
           break;
         }
+        case 'openPhoneApp': {
+          await vscode.commands.executeCommand('dlne.openPhoneApp');
+          break;
+        }
         case 'selectModel': {
           const selectedModel = data.model;
           if (selectedModel) {
             await vscode.workspace
               .getConfiguration('dlne')
               .update('chatModel', selectedModel, vscode.ConfigurationTarget.Global);
-            vscode.window.showInformationMessage(`🧠 Swapping DLNE Cluster Model to: ${selectedModel}...`);
+            vscode.window.showInformationMessage(`Swapping DLNE Cluster Model to: ${selectedModel}...`);
             const swapRes = await this.client.swapModel(selectedModel);
             await vscode.commands.executeCommand('dlne.refreshStatus');
             if (swapRes.status === 'error') {
@@ -188,7 +196,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage({ type: 'turnComplete' });
   }
 
+  /**
+   * The official DLNE logo (media/dlne_logo.png) as this webview can load it. It is the only DLNE
+   * mark in the sidebar: no emoji stands in for it, and resolveWebviewView sets `_view` before
+   * the page is built (the plain URI is only for building the page without a view, as tests do).
+   */
+  private _logoSrc(): string {
+    const logo = vscode.Uri.joinPath(this._extensionUri, 'media', 'dlne_logo.png');
+    return (this._view ? this._view.webview.asWebviewUri(logo) : logo).toString();
+  }
+
   private _getHtmlForWebview(): string {
+    const logoSrc = this._logoSrc();
     const st = this.workerManager.getStatus();
     const isContrib = st.state === 'contributing';
     const isStarting = st.state === 'starting';
@@ -196,12 +215,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const badgeClass = isContrib ? 'contributing' : isStarting ? 'starting' : 'idle';
     const badgeText = st.state.toUpperCase();
     const btnClass = isContrib ? 'contrib-btn stop-btn' : 'contrib-btn';
-    const btnText = isContrib ? '⏹ Stop Contributing' : isStarting ? '⏳ Initializing...' : '⚡ Contribute Local GPU';
-    const ruleText = isContrib
-      ? `✅ <strong>Active:</strong> Contributing ${st.vramContributedGb} GB to cluster. Inference unlocked!`
-      : `<strong>Core Rule:</strong> You must give compute to receive compute.`;
-    const apiTag = st.gpu.api ? st.gpu.api.toUpperCase() : 'VULKAN';
-    const gpuText = `<strong>${apiTag} GPU:</strong> ${st.gpu.name} (${st.gpu.vramTotalGb} GB)`;
+    const { deviceHtml: gpuText, ruleHtml: ruleText, buttonText: btnText } = contributionCopy(st);
+    // Shown as the link's tooltip; it comes from a setting, so it is escaped for the attribute.
+    const phoneUrl = phoneChatUrl(vscode.workspace.getConfiguration('dlne'))
+      .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -250,6 +267,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       align-items: center;
       font-weight: 600;
       font-size: 0.9em;
+    }
+    /* The DLNE logo image (the cyan-and-pink brain with DLNE under it). */
+    .logo {
+      width: 24px;
+      height: 24px;
+      border-radius: 22%;
+      vertical-align: middle;
+      margin-right: 6px;
     }
     .badge {
       font-size: 0.72em;
@@ -550,13 +575,24 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       background-color: #f43f5e;
       color: #fff;
     }
+
+    /* About */
+    .about {
+      flex-shrink: 0;
+      font-size: 0.82em;
+      color: var(--vscode-descriptionForeground);
+    }
+    .about a {
+      color: var(--vscode-textLink-foreground);
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
   <!-- Compute Contribution Card -->
   <div class="contrib-card" id="contrib-card">
     <div class="contrib-header">
-      <span>🧠 Compute Contribution</span>
+      <span><img class="logo" src="${logoSrc}" alt="" width="24" height="24">Compute Contribution</span>
       <span class="badge ${badgeClass}" id="worker-badge">${badgeText}</span>
     </div>
     <div class="contrib-info" id="gpu-display">${gpuText}</div>
@@ -569,7 +605,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   <div id="chat-container">
     <div class="message assistant" id="welcome-msg">
-      <strong>🧠 DLNE Frontier Reasoning Agent</strong>
+      <strong><img class="logo" src="${logoSrc}" alt="" width="24" height="24">DLNE Frontier Reasoning Agent</strong>
       <div class="assistant-body">Connected to cluster. Ready for autonomous coding, refactoring, and test verification.</div>
     </div>
   </div>
@@ -581,7 +617,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         <option value="qwen3-coder-30b-instruct-q4_k_m.gguf">⚡ Qwen3 Coder 30B MoE (256K Context)</option>
         <option value="qwen2.5-14b-1m.gguf">🌌 Qwen 2.5 14B (1 Million Context)</option>
         <option value="qwen2.5-coder-32b-instruct-q4_k_m.gguf">🚀 Qwen 2.5 Coder 32B (24GB)</option>
-        <option value="qwen2.5-coder-14b-instruct-q4_k_m.gguf">🧠 Qwen 2.5 Coder 14B (16GB)</option>
+        <option value="qwen2.5-coder-14b-instruct-q4_k_m.gguf">Qwen 2.5 Coder 14B (16GB)</option>
         <option value="DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf">⚡ DeepSeek-R1 32B (24GB)</option>
         <option value="Llama-3.3-70B-Instruct-IQ3_M.gguf">🔥 Llama 3.3 70B (128K Big Guns)</option>
         <option value="DeepSeek-R1-Distill-Llama-70B-Q4_K_M.gguf">💎 DeepSeek-R1 70B (42GB)</option>
@@ -593,6 +629,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         <button id="send-btn">Send</button>
       </div>
     </div>
+  </div>
+
+  <div class="about">
+    <a href="#" id="phone-link" title="${phoneUrl}">📱 Use DLNE on your phone</a>
   </div>
 
   <script>
@@ -631,6 +671,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     suiteBtn.addEventListener('click', () => {
       vscode.postMessage({ type: 'installSuite' });
+    });
+
+    document.getElementById('phone-link').addEventListener('click', (e) => {
+      e.preventDefault();
+      vscode.postMessage({ type: 'openPhoneApp' });
     });
 
     if (modelSelect) {
@@ -731,42 +776,29 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       parentElem.appendChild(card);
     }
 
-    function applyWorkerStatus(st) {
-      if (!st) return;
+    // The wording comes from the extension (contributionCopy), so the first render and these
+    // updates say the same thing, for a GPU contributor and for the CPU pool alike.
+    function applyWorkerStatus(st, copy) {
+      if (!st || !copy) return;
       workerBadge.className = 'badge ' + st.state;
       workerBadge.textContent = st.state.toUpperCase();
-
-      const apiTag = st.gpu && st.gpu.api ? st.gpu.api.toUpperCase() : 'VULKAN';
-      const gpuName = st.gpu && st.gpu.name ? st.gpu.name : 'Local GPU';
-      const vramGb = st.gpu && st.gpu.vramTotalGb ? st.gpu.vramTotalGb : 8;
-      gpuDisplay.innerHTML = '<strong>' + apiTag + ' GPU:</strong> ' + gpuName + ' (' + vramGb + ' GB)';
-
-      if (st.state === 'contributing') {
-        toggleWorkerBtn.textContent = '⏹ Stop Contributing';
-        toggleWorkerBtn.className = 'contrib-btn stop-btn';
-        contribRule.innerHTML = '✅ <strong>Active:</strong> Contributing ' + st.vramContributedGb + ' GB to cluster. Inference unlocked!';
-      } else if (st.state === 'starting') {
-        toggleWorkerBtn.textContent = '⏳ Initializing...';
-        toggleWorkerBtn.className = 'contrib-btn';
-        contribRule.innerHTML = '⏳ Connecting local worker to cluster coordinator...';
-      } else {
-        toggleWorkerBtn.textContent = '⚡ Contribute Local GPU';
-        toggleWorkerBtn.className = 'contrib-btn';
-        contribRule.innerHTML = '<strong>Core Rule:</strong> You must give compute to receive compute.';
-      }
+      gpuDisplay.innerHTML = copy.deviceHtml;
+      contribRule.innerHTML = copy.ruleHtml;
+      toggleWorkerBtn.textContent = copy.buttonText;
+      toggleWorkerBtn.className = st.state === 'contributing' ? 'contrib-btn stop-btn' : 'contrib-btn';
     }
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
       switch (msg.type) {
         case 'workerStatus': {
-          applyWorkerStatus(msg.status);
+          applyWorkerStatus(msg.status, msg.copy);
           break;
         }
 
         case 'restoreHistory': {
           if (msg.workerStatus) {
-            applyWorkerStatus(msg.workerStatus);
+            applyWorkerStatus(msg.workerStatus, msg.workerCopy);
           }
           if (msg.history && msg.history.length > 0) {
             chatContainer.innerHTML = '';
@@ -783,7 +815,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 if (item.thinking) {
                   const details = document.createElement('details');
                   details.className = 'thinking-drawer';
-                  details.innerHTML = '<summary><span>🧠 Thought Process</span> <span class="thinking-badge">Complete</span></summary><div class="thinking-content">' + item.thinking + '</div>';
+                  details.innerHTML = '<summary><span>Thought Process</span> <span class="thinking-badge">Complete</span></summary><div class="thinking-content">' + item.thinking + '</div>';
                   asstDiv.appendChild(details);
                 }
 
@@ -855,7 +887,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             details.open = true;
 
             const summary = document.createElement('summary');
-            summary.innerHTML = '<span>🧠 Thought Process</span>';
+            summary.innerHTML = '<span>Thought Process</span>';
 
             currentThinkingBadge = document.createElement('span');
             currentThinkingBadge.className = 'thinking-badge';

@@ -181,7 +181,14 @@ def test_a_substituted_zip_is_caught(tmp_path, pem):
     ("bin/ggml-rpc-server", True), ("bin/ggml-rpc-server.exe", True), ("bin/libggml-base.so.0.27.0", True),
     ("bin/ggml-vulkan.dll", True), ("bin/libggml-metal.0.dylib", True), ("bin/libomp.dll", True), ("bin/LICENSE", True),
     ("bin/evil.exe", False), ("ggml-rpc-server", False), ("bin/sub/ggml.dll", False), ("../bin/ggml.dll", False),
-    ("bin/llama-server", False), ("bin/libllama.so", False), ("bin/ggml.dll.lnk", False),
+    ("bin/ggml.dll.lnk", False),
+    # llama-server and exactly its own libraries ship too (the CPU pool, 2.3.0) ...
+    ("bin/llama-server", True), ("bin/llama-server.exe", True), ("bin/libllama.so.0.7.0", True),
+    ("bin/libllama-common.so.0", True), ("bin/libllama-server-impl.so", True), ("bin/mtmd.dll", True),
+    ("bin/libmtmd.0.dylib", True), ("bin/llama-common.dll", True),
+    # ... but no other llama.cpp tool.
+    ("bin/llama-cli", False), ("bin/libllama-cli-impl.so", False), ("bin/libllama-bench-impl.so", False),
+    ("bin/llama.exe", False), ("bin/llama-server.sh", False),
 ])
 def test_what_an_rpc_zip_may_contain(name, ok):
     assert (release.rpc_members([name]) == []) is ok
@@ -216,23 +223,24 @@ def test_protocol_majors():
 
 # --- the packager -------------------------------------------------------------------------
 
-def test_packaging_resolves_symlinks_and_keeps_only_the_rpc_server_and_its_libraries(tmp_path):
+def test_packaging_resolves_symlinks_and_keeps_only_the_two_servers_and_their_libraries(tmp_path):
     tarball = make_server_tarball(tmp_path / "u.tar.gz")
     members = dict(packager._read_members(tarball))
     assert members["libggml.so.0"] == b"real lib"          # the symlink, as a copy of its target
-    assert "llama-server" not in members                    # the RPC zip carries the server only
+    assert "llama-server" in members                        # the CPU pool's server (2.3.0)
     assert members["ggml-rpc-server"] == b"rpc new"
+    assert not any(name.startswith(("llama-cli", "libllama-cli")) for name in members)
 
 
 def test_packaged_zips_are_deterministic_and_executable(tmp_path):
-    members = [("ggml-rpc-server", b"exe"), ("libggml.so", b"lib")]
+    members = [("ggml-rpc-server", b"exe"), ("libggml.so", b"lib"), ("llama-server", b"exe2")]
     a, b = str(tmp_path / "a.zip"), str(tmp_path / "b.zip")
     packager.write_rpc_zip(members, a)
     packager.write_rpc_zip(members, b)
     assert open(a, "rb").read() == open(b, "rb").read()
     with zipfile.ZipFile(a) as z:
         modes = {i.filename: (i.external_attr >> 16) & 0o777 for i in z.infolist()}
-    assert modes == {"bin/ggml-rpc-server": 0o755, "bin/libggml.so": 0o644}
+    assert modes == {"bin/ggml-rpc-server": 0o755, "bin/libggml.so": 0o644, "bin/llama-server": 0o755}
 
 
 def test_an_upstream_archive_without_the_rpc_server_is_refused(tmp_path):

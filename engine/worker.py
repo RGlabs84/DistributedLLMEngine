@@ -35,7 +35,7 @@ import subprocess
 import threading
 import sys
 import os
-from typing import Dict
+from typing import Any, Dict
 from engine.logger import log_worker, log_error, log_system, log_warning
 from engine.hardware import get_hardware_profile
 from engine.downloader import download_and_extract_engine
@@ -213,6 +213,9 @@ class WorkerNode:
         self.rpc_process = None
         # The RPC protocol the running ggml-rpc-server announced, e.g. "8.0.1" ("" = unknown).
         self.rpc_proto = ""
+        # Set when this node serves the CPU pool (no usable GPU) instead of running an RPC
+        # engine: engine/app_member.py.
+        self.app_member = None
         self.is_running = False
         self.rpc_ip = rpc_ip
         self.rpc_port = rpc_port
@@ -366,6 +369,10 @@ class WorkerNode:
             # Inside the signed profile, so the protocol a node claims cannot be rewritten in
             # flight; the Coordinator routes only to nodes that speak its own major.
             hardware = {**hardware, "rpc_proto": self.rpc_proto}
+        app_member = getattr(self, "app_member", None)
+        if isinstance(hardware, dict) and app_member is not None:
+            # A CPU pool member says so, and what it serves, inside the signed profile.
+            hardware = {**hardware, "pool": "app", "app": app_member.status()}
         # Captured once for the same both-signed-and-sent reason as the profile: the
         # staging thread updates this the moment an update finishes verifying.
         staged_version = self._staged_version
@@ -399,6 +406,49 @@ class WorkerNode:
     # ----------------------------------------------------------------------------------
     # RPC engine subprocess
     # ----------------------------------------------------------------------------------
+
+    # ----------------------------------------------------------------------------------
+    # CPU pool member (no usable GPU)
+    # ----------------------------------------------------------------------------------
+
+    def _serves_cpu_pool(self) -> bool:
+        """
+        A node with no usable GPU serves the phone app's CPU pool instead of joining the 14B
+        pipeline (the owner's tiers: GPU = coding, CPU = phone app). Never the coordinator
+        host's own hybrid worker: its pool member is run by the coordinator itself.
+        """
+        if self.role == "hybrid":
+            return False
+        gpu = self.hardware_profile.get("gpu") if isinstance(self.hardware_profile, dict) else None
+        return not (isinstance(gpu, dict) and gpu.get("has_gpu"))
+
+    def start_app_member(self) -> bool:
+        from engine import release
+        from engine.app_member import APP_PORT, AppMember, default_threads
+        from engine.downloader import fetch_verified_manifest
+        from engine.hardware import get_cpu_cores
+
+        # Same signed engine zip as an RPC node; llama-server ships in it beside ggml-rpc-server.
+        download_and_extract_engine(
+            "worker", coordinator_url=None if self.role == "hybrid" else self.coordinator_url)
+
+        cache: Dict[str, Any] = {"at": 0.0, "tiers": []}
+
+        def tiers() -> list:
+            # The tier list comes from the coordinator's signed release, re-read at most
+            # every ten minutes.
+            if time.time() - cache["at"] > 600:
+                cache["tiers"] = release.app_tiers(fetch_verified_manifest(self.coordinator_url.rstrip("/")))
+                cache["at"] = time.time()
+            return cache["tiers"]
+
+        threads = int(get_worker_limits().get("app_member_threads", 0)) or default_threads(get_cpu_cores())
+        self.app_member = AppMember(get_base_dir(), tiers, threads=threads)
+        # The heartbeat names this port, and the tunnel carries the coordinator to it.
+        self.rpc_port = APP_PORT
+        log_worker("No usable GPU: this node serves the phone app's CPU pool. "
+                   "The coordinator assigns its model with the first heartbeat.")
+        return True
 
     def start_rpc_server(self) -> bool:
         """
@@ -584,6 +634,14 @@ class WorkerNode:
                         response.raise_for_status()
                         if token_rotated:
                             _write_token_to_disk(self.access_token)
+                        if self.app_member is not None:
+                            # The coordinator says which model tier this member serves.
+                            try:
+                                answer = response.json()
+                            except ValueError:
+                                answer = {}
+                            if isinstance(answer, dict):
+                                self.app_member.assign(answer.get("app_model"))
                         if self.verbose_heartbeats:
                             log_worker(f"Heartbeat OK | Status: {status_msg}")
 
@@ -669,7 +727,8 @@ class WorkerNode:
         """
         self.is_running = True
 
-        if not self.start_rpc_server():
+        started = self.start_app_member() if self._serves_cpu_pool() else self.start_rpc_server()
+        if not started:
             # No engine means no contribution. Fall through to the same clean teardown as
             # any other fatal condition instead of heartbeating a phantom endpoint.
             self.request_shutdown(FATAL_EXIT_CODE, "RPC engine could not be started")
@@ -734,6 +793,11 @@ class WorkerNode:
             self._stopped = True
 
         log_worker("Shutting down Worker Node...")
+        if self.app_member is not None:
+            try:
+                self.app_member.stop()
+            except Exception as e:
+                log_error(f"Error stopping the CPU pool model server: {e}")
         if self.rpc_process:
             try:
                 self.rpc_process.terminate()

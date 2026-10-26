@@ -9,6 +9,8 @@ import { SidebarProvider } from './views/sidebarProvider';
 import { registerNativeChatParticipant } from './views/nativeChatParticipant';
 import { ClusterStatusBar } from './statusbar/clusterStatusBar';
 import { WorkerManager } from './worker/workerManager';
+import { CPU_POOL_HEADLINE, CPU_POOL_PERK, workerStartedNotice } from './worker/contribution';
+import { phoneChatUrl } from './serverUrl';
 
 function isNewerVersion(current: string, remote: string): boolean {
   const cParts = current.split('.').map((n) => parseInt(n, 10) || 0);
@@ -171,7 +173,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('dlne.toggleWorker', async () => {
       const active = await workerManager.toggle();
       if (active) {
-        vscode.window.showInformationMessage('⚡ DLNE Worker Started! Actively contributing compute to the cluster.');
+        vscode.window.showInformationMessage(workerStartedNotice(workerManager.getStatus().cpuPool));
       } else {
         vscode.window.showInformationMessage('DLNE Worker Stopped.');
       }
@@ -184,7 +186,7 @@ export function activate(context: vscode.ExtensionContext) {
       if (runtime) {
         vscode.window.showInformationMessage('✅ DLNE Compute Engine is ready!');
         const startNow = await vscode.window.showInformationMessage(
-          'Would you like to start contributing compute to the DLNE swarm now?',
+          'Would you like to start contributing now? A GPU powers the coding agent; a computer without one powers the DLNE phone app.',
           'Start Contributing (Recommended)',
           'Later'
         );
@@ -192,6 +194,12 @@ export function activate(context: vscode.ExtensionContext) {
           await workerManager.startWorker();
         }
       }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('dlne.openPhoneApp', async () => {
+      await vscode.env.openExternal(vscode.Uri.parse(phoneChatUrl(vscode.workspace.getConfiguration('dlne'))));
     })
   );
 
@@ -210,8 +218,12 @@ export function activate(context: vscode.ExtensionContext) {
       const items: vscode.QuickPickItem[] = [
         {
           label: isContrib ? '$(debug-stop) Stop Contributing Compute' : '$(zap) Start Contributing Local Compute',
-          description: isContrib ? `Actively contributing ${workerStatus.vramContributedGb}GB` : `Join ${workerStatus.gpu.name} to pool`,
-          detail: 'Core Rule: You must give compute to receive compute.'
+          description: workerStatus.cpuPool
+            ? isContrib ? `Powering the DLNE phone app with ${workerStatus.vramContributedGb}GB of RAM` : CPU_POOL_HEADLINE
+            : isContrib ? `Actively contributing ${workerStatus.vramContributedGb}GB` : `Join ${workerStatus.gpu.name} to pool`,
+          detail: workerStatus.cpuPool
+            ? `You get ${CPU_POOL_PERK}.`
+            : 'Core Rule: You must give compute to receive compute.'
         },
         {
           label: `$(server) Swarm Auto-Tiering: ${tier}`,
@@ -221,6 +233,10 @@ export function activate(context: vscode.ExtensionContext) {
         {
           label: '$(comment-discussion) Open DLNE Agent Chat',
           description: 'Launch autonomous distributed coding chat'
+        },
+        {
+          label: '$(device-mobile) Use DLNE on your phone',
+          description: phoneChatUrl(vscode.workspace.getConfiguration('dlne'))
         },
         {
           label: '$(gear) Set Up Compute Engine',
@@ -248,6 +264,8 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.executeCommand('dlne.installSuite');
       } else if (chosen.label.includes('Open DLNE Agent')) {
         vscode.commands.executeCommand('dlne.openChat');
+      } else if (chosen.label.includes('on your phone')) {
+        vscode.commands.executeCommand('dlne.openPhoneApp');
       } else if (chosen.label.includes('Refresh')) {
         await statusBar.updateStatus();
       }

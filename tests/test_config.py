@@ -278,7 +278,8 @@ def test_worker_limits_covers_every_key_read_by_the_engine():
     undefaulted = {}
 
     for dirpath, dirnames, filenames in os.walk(repo_root):
-        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        # Hidden folders too: .venv, .git, and .claude/worktrees (other checkouts of the repo).
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
         for filename in filenames:
             if not filename.endswith(".py"):
                 continue

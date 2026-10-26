@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name" translatable="false">DLNE</string>
+
+    <!-- First-run privacy notice (must be acknowledged before the first message) -->
+    <string name="privacy_title">Before you start</string>
+    <string name="privacy_body">Answers are written by computers people lend to DLNE. Don\'t send passwords, private details or anything secret.</string>
+    <string name="privacy_ack">I understand</string>
+
+    <!-- Chat screen -->
+    <string name="open_chats">Open chats</string>
+    <string name="new_chat">New chat</string>
+    <string name="input_placeholder">Message DLNE</string>
+    <string name="input_hint">Volunteer computers write the answers. Don\'t share anything secret.</string>
+    <string name="send">Send</string>
+    <string name="stop">Stop</string>
+    <string name="wait_seconds">%1$ds</string>
+    <string name="send_available_in">You can send again in %1$d seconds</string>
+    <string name="empty_title">Ask DLNE anything</string>
+    <string name="empty_body">Your chats stay on this phone. Answers come from computers that volunteers lend to the DLNE network.</string>
+    <string name="waiting_for_machine">Waiting for a volunteer machine…</string>
+    <string name="not_answered">Not answered yet</string>
+    <string name="retry">Retry</string>
+    <string name="dismiss">Dismiss</string>
+    <string name="copy_message">Copy message</string>
+    <string name="copied">Copied</string>
+    <string name="copy_code">Copy code</string>
+    <string name="code">code</string>
+    <string name="notice_stopped">Stopped.</string>
+    <string name="no_browser">No app on this phone can open that link.</string>
+
+    <!-- Lookups the DLNE server makes for the model, by tool (weather, wikipedia, news, web_search) -->
+    <string name="lookup_weather">Checking the weather for “%1$s”</string>
+    <string name="lookup_wikipedia">Looking up “%1$s” on Wikipedia</string>
+    <string name="lookup_news">Checking the news for “%1$s”</string>
+    <string name="lookup_web">Searching the web for “%1$s”</string>
+    <string name="lookup_other">Looking up “%1$s”</string>
+    <string name="lookup_weather_no_query">Checking the weather…</string>
+    <string name="lookup_wikipedia_no_query">Looking it up on Wikipedia…</string>
+    <string name="lookup_news_no_query">Checking the news…</string>
+    <string name="lookup_web_no_query">Searching the web…</string>
+    <string name="lookup_other_no_query">Looking it up…</string>
+    <string name="sources">Sources</string>
+    <string name="open_source_page">Open source</string>
+    <string name="search_unavailable_default">A lookup wasn\'t possible this time; this answer comes from the model\'s memory and may be dated.</string>
+
+    <!-- Report answer (Google Play AI-generated content policy) -->
+    <string name="report_answer">Report answer</string>
+    <string name="report_body">Your question and this answer will be sent to the DLNE server and kept there for review. Nothing else from the chat is sent.</string>
+    <string name="report_reason_harmful">Harmful or dangerous</string>
+    <string name="report_reason_wrong">Wrong</string>
+    <string name="report_reason_offensive">Offensive</string>
+    <string name="report_reason_other">Something else</string>
+    <string name="report_note_label">Add a note (optional)</string>
+    <string name="report_note_count">%1$d/%2$d</string>
+    <string name="report_send">Send report</string>
+    <string name="report_thanks">Thanks, we\'ll review it</string>
+    <string name="report_unavailable">Reporting isn\'t available on this server</string>
+    <plurals name="report_too_many">
+        <item quantity="one">Too many reports from your network right now. Try again in %1$d second.</item>
+        <item quantity="other">Too many reports from your network right now. Try again in %1$d seconds.</item>
+    </plurals>
+    <string name="report_network">Couldn\'t send the report. Check your connection and try again.</string>
+    <string name="report_failed">Couldn\'t send the report (error %1$d). Please try again later.</string>
+
+    <!-- Status line under the title -->
+    <plurals name="status_machines">
+        <item quantity="one">%1$d machine serving</item>
+        <item quantity="other">%1$d machines serving</item>
+    </plurals>
+    <string name="status_no_machines">No machines online right now</string>
+
+    <!-- Errors -->
+    <string name="error_network">Can\'t reach DLNE. Check your connection and try again.</string>
+    <string name="error_server">DLNE is having trouble right now (error %1$d). Try again in a moment.</string>
+    <string name="error_not_found">This server doesn\'t offer DLNE chat yet. If you changed the server address, check it in Settings.</string>
+    <string name="error_unexpected">Something went wrong. Please try again.</string>
+
+    <!-- Conversation drawer -->
+    <string name="chats">Chats</string>
+    <string name="no_chats">No chats yet.</string>
+    <string name="delete_chat">Delete chat</string>
+    <string name="delete_chat_title">Delete this chat?</string>
+    <string name="delete_chat_body">It will be removed from this phone. This can\'t be undone.</string>
+    <string name="delete">Delete</string>
+    <string name="cancel">Cancel</string>
+    <string name="settings">Settings</string>
+
+    <!-- Settings -->
+    <string name="back">Back</string>
+    <string name="settings_server_title">Server</string>
+    <string name="settings_server_label">Server address</string>
+    <string name="settings_server_help">Run your own DLNE server? Enter its address here. It must use https.</string>
+    <string name="settings_server_invalid">Enter an https address, for example https://dlne.example.org</string>
+    <string name="settings_server_saved">Server address saved</string>
+    <string name="settings_save">Save</string>
+    <string name="settings_use_default">Use default</string>
+    <string name="settings_privacy_title">Privacy</string>
+    <string name="settings_privacy_body_1">DLNE has no accounts, and this app collects nothing about you: no analytics, no ads, no tracking.</string>
+    <string name="settings_privacy_body_2">Your chats are stored only on this phone. When you send a message, the conversation so far travels over an encrypted connection to the DLNE service, which passes it to one of the computers people lend to DLNE to write the answer.</string>
+    <string name="settings_privacy_body_3">Those computers belong to other people, so don\'t send passwords, private details or anything secret. The service sees your network (IP) address, which it uses to limit how often each network can ask.</string>
+    <string name="settings_privacy_body_4">Lookups (weather, Wikipedia, news, web search) are made by the DLNE server, not your phone; reported answers are kept on the server for review.</string>
+    <string name="settings_delete_all">Delete all chats</string>
+    <string name="settings_delete_all_title">Delete all chats?</string>
+    <string name="settings_delete_all_body">Every chat stored on this phone will be removed. This can\'t be undone.</string>
+    <string name="settings_support_title">Support DLNE</string>
+    <string name="settings_coffee">Support DLNE: buy a coffee</string>
+    <string name="settings_coffee_sub">buymeacoffee.com/wubarrk</string>
+    <string name="settings_donate_compute">Donate compute at home</string>
+    <string name="settings_donate_compute_sub">Lend a computer to the network with the DLNE extension for VS Code and VSCodium.</string>
+    <string name="settings_about_title">About</string>
+    <string name="settings_source">Open source</string>
+    <string name="settings_source_sub">github.com/RGlabs84/DistributedLLMEngine</string>
+    <string name="settings_version">App version %1$s</string>
+    <string name="settings_server_version">Server version %1$s</string>
+</resources>

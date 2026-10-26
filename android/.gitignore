@@ -1,0 +1,20 @@
+# Gradle and Android Studio output
+.gradle/
+.kotlin/
+build/
+app/build/
+captures/
+.idea/
+*.iml
+.externalNativeBuild/
+.cxx/
+
+# Machine-specific SDK path (sdk.dir); every developer writes their own
+local.properties
+
+# Signing material never belongs in the repo. The release keystore and its passwords
+# live in ~/WubarrkCODING/DLNE_RELEASE_KEYS/android/ (see android/README.md).
+*.jks
+*.keystore
+keystore.properties
+signing.properties

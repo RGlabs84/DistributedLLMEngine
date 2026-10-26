@@ -2,7 +2,7 @@
 
 DLNE is a coding assistant for VS Code (and VSCodium, Cursor, Theia) powered by a swarm of
 shared GPUs. There is no subscription and no token fee. The rule is simple: give a little
-compute, get a lot of AI. New users get 200 free chats to try it; after that, sharing an
+compute, get a lot of AI. New users get 100 free chats to try it; after that, sharing an
 idle GPU with the swarm keeps it free.
 
 **Use it:** install **DLNE Code Assistant** from the Extensions view
@@ -53,13 +53,38 @@ Everything under `/v1/admin/*` needs that operator key as `Authorization: Bearer
 default only accepts it from the coordinator's own machine (`ADMIN_ALLOW_REMOTE=true` to change
 that). BarrkBOT's `/dlne` command uses it.
 
-Settings live in `config/config.txt` (`KEY=VALUE`). Four groups matter for most operators:
+Settings live in `config/config.txt` (`KEY=VALUE`). Six groups matter for most operators:
+
+- **The CPU pool (the phone app)**: workers with no usable GPU serve the phone app instead of
+  the coding pipeline, each running a whole model on its CPU (`engine/app_pool.py`,
+  `engine/app_member.py`). The tiers are signed into each release from
+  `scripts/app_models.json`: Qwen3 4B (members lending 8 GB), Qwen3.6 35B-A3B (16 GB) and
+  Qwen3.6 at full quality (24 GB). The coordinator's own machine serves the biggest tier its
+  allocation holds; a bigger tier unlocks when `APP_TIER_MIN_MEMBERS` (2) volunteers can host
+  it. A volunteer's member runs at low priority on half its cores, 2 to 8 threads
+  (`APP_MEMBER_THREADS` to override). Phone users are throttled per network: one answer at a
+  time and `APP_RATE_PER_MINUTE` (6) requests a minute. The coordinator's own machine joins
+  with `APP_LOCAL_ENABLED=true`, `APP_LOCAL_THREADS`, `APP_LOCAL_RAM_GB` and
+  `APP_LOCAL_CPU_MASK` (hex, one thread pinned per logical CPU; the public swarm uses cores
+  2-5 of a Ryzen 5 7600X: `0xf3c` with 8 threads and 16 GB). The model files go in the models
+  folder. The phone page is `/chat` (installable from Safari or Chrome); the Android app is in
+  `android/`. Reported answers (`POST /v1/app/report`) are kept in
+  `config/app_reports.jsonl` and read with `GET /v1/admin/app_reports`.
+
+- **Lookups (the phone model's search)**: the model is told today's date and may look things
+  up when it is unsure (`engine/search.py`): weather (Open-Meteo), Wikipedia (with Wikidata),
+  news (GDELT) and web search. All are free and run by the coordinator, never by pool
+  members. Web search asks a local SearXNG first (`SEARXNG_URL`; see `deploy/searxng/`), then
+  Brave Search only if `BRAVE_SEARCH_API_KEY` is set and within `SEARCH_DAILY_LIMIT` (33 a
+  day fits Brave's free monthly credit), then Wikipedia. Answers are cached
+  (`SEARCH_CACHE_MINUTES`, 30), each network gets `SEARCH_PER_NETWORK_PER_HOUR` (30) lookups,
+  and `SEARCH_ENABLED=false` turns lookups off.
 
 - **Who goes first, and how much**: when the coding engine is busy, its slots go to GPU
   contributors, API keys and the coordinator's own host first, CPU contributors second, and
   free-trial users third (`engine/priority.py`); autocomplete only runs on a slot nobody is
-  waiting for. CPU contributors get `CPU_CODING_LIMIT` (100) coding chats in any
-  `CPU_CODING_WINDOW_HOURS` (5) hours. The free trial (`STARTER_QUOTA_INFERENCES`, 200) is
+  waiting for. CPU contributors get `CPU_CODING_LIMIT` (300) coding chats in any
+  `CPU_CODING_WINDOW_HOURS` (5) hours. The free trial (`STARTER_QUOTA_INFERENCES`, 100) is
   counted once per network address (IPv6 per /64) in `config/starter_quota.json`, never per
   client-supplied token.
 
@@ -95,7 +120,7 @@ their llama.cpp RPC protocol, and the coordinator only routes to workers that sp
 
 - Prompts, and the code the agent reads, go to the coordinator you point the extension at. The
   public coordinator is run by the maintainer; treat it like any hosted AI service.
-- The public coordinator is reached over HTTPS (`https://73-215-216-195.sslip.io`, Caddy in front
+- The public coordinator is reached over HTTPS (`https://dlne.duckdns.org`, Caddy in front
   of the coordinator). Run your own for anything sensitive.
 - The agent asks before it edits files, runs a command, or reads outside your workspace.
 - Report security problems privately to the maintainer rather than in a public issue.

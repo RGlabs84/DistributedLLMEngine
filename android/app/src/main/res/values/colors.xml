@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Launcher icon background: the near-black navy backdrop of the official logo
+         (mean of the outer ring of vscode-extension/media/dlne_logo.png). -->
+    <color name="ic_launcher_background">#060B14</color>
+    <!-- Window background shown before Compose draws its first frame. -->
+    <color name="window_background">#F6FAFA</color>
+</resources>

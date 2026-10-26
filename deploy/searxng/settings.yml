@@ -1,0 +1,96 @@
+# SearXNG for DLNE on TheWall: the first stop of the phone chat's web_search tool
+# (engine/search.py). Only the coordinator on this machine calls it, so it listens on
+# loopback only, the limiter is off, and JSON is enabled for the coordinator to read.
+#
+# Loaded on top of SearXNG's own defaults (use_default_settings), so only what differs is
+# here. See README.md beside this file for the install.
+
+use_default_settings:
+  engines:
+    # Everything else in the default list is dropped. The engines that answered TheWall's
+    # household address when tested (2026-10-25); see the engines section for the ones that
+    # refused.
+    keep_only:
+      - brave
+      - brave.news
+      - bing
+      - bing news
+      - yahoo
+      - yahoo news
+      - mwmbl
+      - yep
+      - wikipedia
+
+general:
+  debug: false
+  instance_name: "DLNE search (TheWall)"
+
+server:
+  bind_address: "127.0.0.1"
+  port: 8888
+  # SearXNG refuses to start while this is still "ultrasecretkey", which is the point: the
+  # install step in README.md replaces it with a random value. (SEARXNG_SECRET also works.)
+  secret_key: "ultrasecretkey"
+  # The limiter exists to fend off bots on a public instance and needs a Valkey database.
+  # Nobody but the coordinator can reach this one; DLNE does its own rate limiting.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+  method: "GET"
+
+search:
+  # Moderate: the phone chat is public.
+  safe_search: 1
+  autocomplete: ""
+  # json for the coordinator; html so the owner can try a query in a browser over SSH.
+  formats:
+    - html
+    - json
+
+outgoing:
+  # The coordinator gives SearXNG 3 seconds in all, then moves on to the next service, so the
+  # engines must answer well inside that.
+  request_timeout: 2.0
+  max_request_timeout: 2.5
+  # A way for an engine's operator to reach whoever is sending these requests.
+  useragent_suffix: "DLNE (https://github.com/RGlabs84/DistributedLLMEngine)"
+  # If the household address starts getting CAPTCHAs, send the engines' traffic through Tor
+  # (README.md, "If the engines start refusing"). socks5h, so names are resolved by Tor too.
+  # Tor adds a second or two to every request: raise the timeouts above to match, and expect
+  # more lookups to fall through to Brave or Wikipedia.
+  #
+  # proxies:
+  #   all://:
+  #     - socks5h://127.0.0.1:9050
+  # using_tor_proxy: true
+  # extra_proxy_timeout: 10.0
+
+engines:
+  # Tested from TheWall on 2026-10-25: DuckDuckGo (CAPTCHA), Qwant (access denied), Google
+  # (access denied), Seznam (timeouts), Mojeek and Startpage (proof-of-work CAPTCHA) refuse
+  # this address, so they are not loaded. These answered (5 engines, 55-61 results a query);
+  # the ones SearXNG ships switched off are switched on. Retest before adding one back.
+  - name: brave
+    timeout: 2.0
+  - name: brave.news
+    timeout: 2.0
+  - name: bing
+    disabled: false
+    timeout: 2.0
+  - name: bing news
+    disabled: false
+    timeout: 2.0
+  - name: yahoo
+    disabled: false
+    timeout: 2.0
+  - name: yahoo news
+    disabled: false
+    timeout: 2.0
+  - name: mwmbl
+    disabled: false
+    timeout: 2.0
+  - name: yep
+    disabled: false
+    timeout: 2.0
+  - name: wikipedia
+    timeout: 1.5

@@ -188,15 +188,15 @@ def test_the_trial_belongs_to_the_network_address(ip, identity):
 
 def test_the_limits_are_the_owners():
     limits = engine_config.get_worker_limits()
-    assert limits["cpu_coding_limit"] == 100
+    assert limits["cpu_coding_limit"] == 300
     assert limits["cpu_coding_window_hours"] == 5.0
-    assert limits["starter_quota_inferences"] == 200
+    assert limits["starter_quota_inferences"] == 100
 
 
 @pytest.mark.parametrize("raw, limit, hours", [
     ({"CPU_CODING_LIMIT": "40", "CPU_CODING_WINDOW_HOURS": "3"}, 40, 3.0),
-    ({"CPU_CODING_LIMIT": "0", "CPU_CODING_WINDOW_HOURS": "0"}, 100, 5.0),
-    ({"CPU_CODING_LIMIT": "lots", "CPU_CODING_WINDOW_HOURS": "999"}, 100, 5.0),
+    ({"CPU_CODING_LIMIT": "0", "CPU_CODING_WINDOW_HOURS": "0"}, 300, 5.0),
+    ({"CPU_CODING_LIMIT": "lots", "CPU_CODING_WINDOW_HOURS": "999"}, 300, 5.0),
 ])
 def test_the_cpu_limit_is_configurable(monkeypatch, raw, limit, hours):
     monkeypatch.setattr(engine_config, "get_config", lambda force_reload=False: raw)

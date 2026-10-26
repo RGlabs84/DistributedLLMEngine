@@ -37,7 +37,7 @@ from engine import release  # noqa: E402
 DEFAULT_KEY = os.path.expanduser("~/WubarrkCODING/DLNE_RELEASE_KEYS/dlne_release_key.pem")
 DEFAULT_HOST = "archserver-wg"
 DEFAULT_ROOT = "~/DLNEv2"
-DEFAULT_URL = "http://73.215.216.195:11435"
+DEFAULT_URL = "https://dlne.duckdns.org"
 OUT_DIR = "release_dist"
 DEFAULT_BINARIES = os.path.join(REPO_ROOT, OUT_DIR, "assets", "llama")
 # The name the server's llama.cpp build is uploaded under (release_apply.py expects it).
@@ -65,6 +65,21 @@ def load_binaries(directory: str) -> Dict:
     return {"llama_build": info.get("llama_build"), "rpc_proto": info.get("rpc_proto"),
             "rpc_zips": zips, "server_llama": server}
 APPLY_SCRIPT = os.path.join(REPO_ROOT, "scripts", "release_apply.py")
+
+
+def load_app_models(repo: str) -> Optional[List[Dict]]:
+    """The CPU pool's model tiers from scripts/app_models.json at ``repo``, or None without one."""
+    path = os.path.join(repo, "scripts", "app_models.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            tiers = json.load(handle).get("tiers")
+    except (OSError, ValueError, AttributeError) as exc:
+        raise CliError(f"{path} is not a readable model list ({type(exc).__name__}).") from exc
+    if not isinstance(tiers, list) or not tiers:
+        raise CliError(f"{path} lists no tiers.")
+    return tiers
 
 
 class CliError(Exception):
@@ -144,7 +159,8 @@ def build_release(repo: str, out_dir: str, key_pem: bytes, notes: str, allow_dir
         b = binaries or {}
         manifest = release.make_manifest(version, archive_path, commit, built_at, notes,
                                          rpc_zips=b.get("rpc_zips"), llama_build=b.get("llama_build"),
-                                         rpc_proto=b.get("rpc_proto"), server_llama=b.get("server_llama"))
+                                         rpc_proto=b.get("rpc_proto"), server_llama=b.get("server_llama"),
+                                         app_models=load_app_models(repo))
     except release.ReleaseError as exc:
         raise CliError(str(exc)) from exc
     signed = release.sign_manifest(manifest, key_pem)
