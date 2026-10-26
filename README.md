@@ -5,9 +5,18 @@ shared GPUs. There is no subscription and no token fee. The rule is simple: give
 compute, get a lot of AI. New users get 100 free chats to try it; after that, sharing an
 idle GPU with the swarm keeps it free.
 
-**Use it:** install **DLNE Code Assistant** from the Extensions view
-([Open VSX](https://open-vsx.org/extension/dlne/dlne-code-assistant)), open the DLNE sidebar or
-type `@dlne` in the chat panel.
+**New in 2.4:** a GPU lent from home (8 GB or more) can run a whole coding model by itself and serve
+two agents for other people, with requests encrypted end-to-end from the editor. Secrets are redacted
+before anything leaves VS Code, and private repositories stay on machines the operator trusts.
+[What that does and doesn't protect](docs/privacy.md).
+
+**Use it:**
+- **VSCodium, Cursor, Theia** and other Open VSX editors: search the Extensions view for
+  **DLNE Code Assistant** ([Open VSX](https://open-vsx.org/extension/dlne/dlne-code-assistant)).
+- **VS Code:** download the `.vsix` from the [latest release](https://github.com/RGlabs84/DistributedLLMEngine/releases/latest),
+  then Extensions view, the `...` menu, **Install from VSIX...**. (It is not on the VS Code Marketplace yet.)
+- Then open the DLNE sidebar, or type `@dlne` in the chat panel. No account needed.
+- **No editor?** [DLNE Chat](https://dlne.duckdns.org/chat) runs in a phone browser.
 
 ## How it fits together
 
