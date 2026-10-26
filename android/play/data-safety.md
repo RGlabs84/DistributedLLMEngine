@@ -2,7 +2,7 @@
 
 Play Console > Policy and programs > App content > Data safety. These answers follow
 Google's definitions: "collected" means sent off the device by the app (including to your
-own server); "shared" means transferred to a third party. They describe app version 1.0.1
+own server); "shared" means transferred to a third party. They describe app version 1.0.2
 (`io.dlne.chat`) and the server's app endpoints (`/v1/app/chat/completions`,
 `/v1/app/report`). Re-check them whenever the app or server changes.
 

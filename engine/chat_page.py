@@ -18,6 +18,10 @@ object instead of ``choices``: ``searching`` (a tool and a query, up to four per
 shows the latest, worded by tool), ``sources`` (the whole list so far, so it replaces the last
 one), ``search_note`` (a muted line under the sources) and ``search_unavailable``. In-range
 ``[n]`` markers in the answer become links to source n. Sources are saved with the chat.
+``retract`` (sent by server 2.3.5) means the model began answering from memory while unsure and the
+server takes that text back to look the question up instead: the page empties the answer and drops
+its sources and notes, then the usual ``searching`` and ``sources`` events and a fresh answer follow.
+An older page ignores the event and shows both texts.
 
 REPORTS. Each answer has a "Report" action that posts the question, the answer, a reason and an
 optional note to ``POST /v1/app/report``.
@@ -28,6 +32,11 @@ and links (in answers, citations and source lists) are made only for http(s) URL
 live in a separate ``<script id="dlne-core">`` so tests can run them under node. The page is
 served with a strict Content-Security-Policy (``connect-src 'self'`` keeps it talking to this
 coordinator only).
+
+LINKS. The page links out to the DLNE website, the Discord, the coffee page and the extension (the
+constants below and in engine/landing.py), in the welcome screen's support line and in the menu. They
+are plain ``<a href>`` links that open in a new tab with ``rel="noopener noreferrer"``: navigation
+needs nothing from the CSP, which stays as strict as it was.
 
 PRIVACY. A volunteer's machine sees the text of the requests it answers, so the page says so on
 first run and, in fewer words, under the input; the menu adds that lookups are made by the
@@ -45,7 +54,7 @@ from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, Response
 
 from engine.icons import ICON_VERSION, ICONS, icon_png, icon_url
-from engine.landing import EXTENSION_URL
+from engine.landing import DISCORD_INVITE_URL, EXTENSION_URL, OG_IMAGE_URL, PUBLIC_URL, WEBSITE_URL
 
 COFFEE_URL = "https://buymeacoffee.com/wubarrk"
 
@@ -83,6 +92,13 @@ _HTML_TEMPLATE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>DLNE Chat</title>
 <meta name="description" content="Free AI chat, answered by computers people lend to DLNE.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="DLNE">
+<meta property="og:title" content="DLNE Chat - free AI chat on your phone">
+<meta property="og:description" content="Ask anything, free and without signing up. It looks things up when it isn't sure and shows its sources.">
+<meta property="og:url" content="{{PUBLIC_URL}}/chat">
+<meta property="og:image" content="{{OG_IMAGE_URL}}">
+<meta name="twitter:card" content="summary">
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="{{THEME_DARK}}" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="{{THEME_LIGHT}}" media="(prefers-color-scheme: light)">
@@ -255,8 +271,9 @@ a.source:hover { border-color: var(--user-border); }
   background: var(--surface); color: var(--text); font-size: .95rem; cursor: pointer;
 }
 .chip:hover { border-color: var(--user-border); }
-.support { margin: 0; font-size: .85rem; color: var(--faint); }
-.support a { color: var(--muted); text-underline-offset: 2px; }
+.support { margin: 0; font-size: .85rem; color: var(--faint); text-wrap: balance; }
+/* A link never breaks in two, and the padding makes a 13 px link an easier tap without changing the line. */
+.support a { color: var(--muted); text-underline-offset: 2px; white-space: nowrap; padding: 8px 0; }
 
 /* Composer */
 .composer {
@@ -374,7 +391,7 @@ dialog::backdrop { background: rgba(2, 8, 10, .62); }
         <button type="button" class="chip" data-prompt="Help me write a short, polite email asking my landlord to fix the heating.">Help me write an email</button>
         <button type="button" class="chip" data-prompt="Give me a quick vegetarian dinner idea with a shopping list.">Plan a quick dinner</button>
       </div>
-      <p class="support"><a href="{{COFFEE_URL}}" target="_blank" rel="noopener noreferrer">Support DLNE: buy a coffee</a> &middot; <a href="{{EXTENSION_URL}}" target="_blank" rel="noopener noreferrer">Donate compute at home</a></p>
+      <p class="support"><a href="{{WEBSITE_URL}}" target="_blank" rel="noopener noreferrer">Website</a> &middot; <a href="{{DISCORD_INVITE_URL}}" target="_blank" rel="noopener noreferrer">Discord</a> &middot; <a href="{{COFFEE_URL}}" target="_blank" rel="noopener noreferrer">Buy a coffee</a> &middot; <a href="{{EXTENSION_URL}}" target="_blank" rel="noopener noreferrer">Donate compute</a></p>
     </section>
     <div class="thread" id="thread" role="log"></div>
   </main>
@@ -415,6 +432,9 @@ dialog::backdrop { background: rgba(2, 8, 10, .62); }
     <h3>Your chats</h3>
     <div class="recent" id="recent"></div>
     <button type="button" class="smallbtn" id="clear-all">Delete all chats</button>
+    <h3>More from DLNE</h3>
+    <a class="linkrow" href="{{WEBSITE_URL}}" target="_blank" rel="noopener noreferrer">DLNE website</a>
+    <a class="linkrow" href="{{DISCORD_INVITE_URL}}" target="_blank" rel="noopener noreferrer">Discord</a>
     <h3>Support DLNE</h3>
     <a class="linkrow" href="{{COFFEE_URL}}" target="_blank" rel="noopener noreferrer">Support DLNE: buy a coffee</a>
     <a class="linkrow" href="{{EXTENSION_URL}}" target="_blank" rel="noopener noreferrer">Donate compute at home</a>
@@ -743,6 +763,16 @@ const DLNEChat = (() => {
     if (event.event === 'search_unavailable') {
       reply.searchNote = str(event.reason, 500) || NO_SEARCH;
       delete reply.searching;
+      return true;
+    }
+    if (event.event === 'retract') {
+      // Server 2.3.5: the model began answering from memory while unsure, so the server takes that
+      // text back and looks the question up instead. Forget everything shown so far; the usual
+      // "searching", "sources" and a fresh answer follow, and paint() redraws the whole answer.
+      reply.content = '';
+      delete reply.sources;
+      delete reply.lookupNotes;
+      delete reply.searchNote;
       return true;
     }
     return false;
@@ -1508,6 +1538,8 @@ const DLNEChat = (() => {
 """
 
 CHAT_HTML = (_HTML_TEMPLATE
+             .replace("{{PUBLIC_URL}}", PUBLIC_URL)
+             .replace("{{OG_IMAGE_URL}}", OG_IMAGE_URL)
              .replace("{{ICON_192}}", icon_url("icon-192.png"))
              .replace("{{ICON_FAVICON_32}}", icon_url("favicon-32.png"))
              .replace("{{ICON_FAVICON_48}}", icon_url("favicon-48.png"))
@@ -1517,6 +1549,8 @@ CHAT_HTML = (_HTML_TEMPLATE
              .replace("{{REPORT_PRIVACY}}", REPORT_PRIVACY)
              .replace("{{COFFEE_URL}}", COFFEE_URL)
              .replace("{{EXTENSION_URL}}", EXTENSION_URL)
+             .replace("{{WEBSITE_URL}}", WEBSITE_URL)
+             .replace("{{DISCORD_INVITE_URL}}", DISCORD_INVITE_URL)
              .replace("{{THEME_DARK}}", THEME_DARK)
              .replace("{{THEME_LIGHT}}", THEME_LIGHT))
 
@@ -1621,7 +1655,7 @@ SERVICE_WORKER_JS = (_SW_TEMPLATE.replace("{{VERSION}}", SHELL_VERSION)
 chat_router = APIRouter()
 
 
-@chat_router.get("/chat", include_in_schema=False)
+@chat_router.api_route("/chat", methods=["GET", "HEAD"], include_in_schema=False)
 async def chat_page() -> HTMLResponse:
     """The phone chat. Public, like the landing page: the endpoint it talks to is the throttle."""
     return HTMLResponse(CHAT_HTML, headers=_HTML_HEADERS)

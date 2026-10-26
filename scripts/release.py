@@ -82,6 +82,21 @@ def load_app_models(repo: str) -> Optional[List[Dict]]:
     return tiers
 
 
+def load_coding_models(repo: str) -> Optional[List[Dict]]:
+    """The GPU coding pool's ladder from scripts/coding_models.json at ``repo``, or None without one."""
+    path = os.path.join(repo, "scripts", "coding_models.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            tiers = json.load(handle).get("tiers")
+    except (OSError, ValueError, AttributeError) as exc:
+        raise CliError(f"{path} is not a readable model list ({type(exc).__name__}).") from exc
+    if not isinstance(tiers, list) or not tiers:
+        raise CliError(f"{path} lists no tiers.")
+    return tiers
+
+
 class CliError(Exception):
     """Something the operator needs to fix. The message is the whole story."""
 
@@ -160,7 +175,8 @@ def build_release(repo: str, out_dir: str, key_pem: bytes, notes: str, allow_dir
         manifest = release.make_manifest(version, archive_path, commit, built_at, notes,
                                          rpc_zips=b.get("rpc_zips"), llama_build=b.get("llama_build"),
                                          rpc_proto=b.get("rpc_proto"), server_llama=b.get("server_llama"),
-                                         app_models=load_app_models(repo))
+                                         app_models=load_app_models(repo),
+                                         coding_models=load_coding_models(repo))
     except release.ReleaseError as exc:
         raise CliError(str(exc)) from exc
     signed = release.sign_manifest(manifest, key_pem)

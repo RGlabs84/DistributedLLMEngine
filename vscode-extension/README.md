@@ -10,7 +10,7 @@ No account, no API key, no subscription. Install it, open the DLNE sidebar, and 
 - **Agent chat**: in the DLNE sidebar, or as `@dlne` in VS Code's Chat view.
 - **Ghost-text autocomplete**: suggestions inline as you type.
 - **Fix problems**: `DLNE: Fix Current File Problems` sends the file's errors and warnings to the agent.
-- **On your phone**: [DLNE Chat](https://dlne.duckdns.org/chat) is the same swarm in a phone browser (add it to your home screen), and there is an Android app. In VS Code, use the **Use DLNE on your phone** link in the sidebar, or the command `DLNE: Use DLNE on Your Phone`.
+- **On your phone**: [DLNE Chat](https://dlne.duckdns.org/chat) is the same swarm in a phone browser (on an iPhone: Safari, Share, Add to Home Screen), and there is an Android app (the APK is on the [DLNE website](https://live.ravenirongames.com/#dlne); it is not on Google Play yet). In VS Code, use the **Use DLNE on your phone** link in the sidebar, or the command `DLNE: Use DLNE on Your Phone`.
 
 ---
 
@@ -95,7 +95,7 @@ The agent's slash commands: `/code`, `/fix`, `/status`, `/model`, `/contribute`,
 
 ## Which model?
 
-The coding agent runs on GPU contributors' machines: one model at a time, chosen by the coordinator from the GPU memory available. Today that is usually **Qwen 2.5 Coder 14B**. Larger models (32B and up) become possible as more GPUs join. `/status` shows what is running now. The phone app runs a different, smaller model on CPU contributors' machines (see above).
+The coding agent runs on GPU contributors' machines: one model at a time, chosen by the coordinator from the GPU memory available. Today that is **Qwen3.6-35B-A3B** (a UD-IQ3_S quant) on two 8 GB AMD GPUs, with a 65,536-token context: 38.5 tokens/s for one user and about 27 each for two, measured on the public swarm. Bigger models unlock automatically as more GPUs join. `/status` shows what is running now, and the sidebar shows it under the chat box. There is nothing to pick: VS Code's Chat model picker lists a single entry, **DLNE Swarm (auto)**. The phone app runs a different, smaller model on CPU contributors' machines (see above).
 
 ---
 
@@ -142,7 +142,7 @@ Then in VS Code settings:
 | `dlne.worker.pythonPath` | `python3` | Python used for the engine. |
 | `dlne.enableInlineCompletion` | `true` | Ghost-text autocomplete. |
 | `dlne.inlineCompletionDelay` | `150` | Delay after typing before asking for a completion, in ms. |
-| `dlne.chatModel` / `dlne.fimModel` | `""` | Ask for a specific model (blank: whatever the swarm runs). |
+| `dlne.chatModel` / `dlne.fimModel` | `""` | Leave blank: the swarm serves the model it has active. Name a model file only for a private coordinator you run. |
 | `dlne.autoApproveReads` | `true` | Let the agent read, list and search inside your workspace without asking. Edits (which you can allow for a whole session), shell commands (always one at a time), and anything outside the workspace always ask. |
 | `dlne.autoUpdate` | `true` | Keep this extension and the engine on the latest signed release, and restart the worker when the coordinator upgrades. |
 | `dlne.worker.allowUnsignedEngine` | `false` | Install the engine from a coordinator that publishes no signed release. Only for a private coordinator you run. A signed release that fails verification is never installed, whatever this says. |
@@ -160,6 +160,8 @@ Two ways to keep it free:
 
 ## Links
 
+- **Website**: [live.ravenirongames.com/#dlne](https://live.ravenirongames.com/#dlne)
+- **Discord**: [discord.gg/RNxvxWn8cw](https://discord.gg/RNxvxWn8cw)
 - **Source**: [RGlabs84/DistributedLLMEngine](https://github.com/RGlabs84/DistributedLLMEngine)
 - **Issues**: [GitHub Issues](https://github.com/RGlabs84/DistributedLLMEngine/issues)
 - **License**: MIT

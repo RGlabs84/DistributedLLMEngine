@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { AgentLoop } from '../agent/agentLoop';
 import { DlneClient } from '../client/dlneClient';
+import { swarmModelLine } from '../client/modelChoice';
 import { WorkerManager, WorkerStatus } from '../worker/workerManager';
 import { contributionCopy } from '../worker/contribution';
 import { phoneChatUrl } from '../serverUrl';
@@ -73,8 +74,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       type: 'restoreHistory',
       history: this.conversationHistory,
       workerStatus,
-      workerCopy: contributionCopy(workerStatus)
+      workerCopy: contributionCopy(workerStatus),
+      modelLine: this._modelLine()
     });
+
+    // The model line follows the status the status bar already polls; nothing here asks for it.
+    const stopFollowing = this.client.onClusterStatus?.((status) => {
+      this._view?.webview.postMessage({ type: 'modelLine', text: swarmModelLine(status) });
+    });
+    webviewView.onDidDispose?.(() => stopFollowing?.());
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
       switch (data.type) {
@@ -104,23 +112,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         }
         case 'openPhoneApp': {
           await vscode.commands.executeCommand('dlne.openPhoneApp');
-          break;
-        }
-        case 'selectModel': {
-          const selectedModel = data.model;
-          if (selectedModel) {
-            await vscode.workspace
-              .getConfiguration('dlne')
-              .update('chatModel', selectedModel, vscode.ConfigurationTarget.Global);
-            vscode.window.showInformationMessage(`Swapping DLNE Cluster Model to: ${selectedModel}...`);
-            const swapRes = await this.client.swapModel(selectedModel);
-            await vscode.commands.executeCommand('dlne.refreshStatus');
-            if (swapRes.status === 'error') {
-              vscode.window.showWarningMessage(`DLNE Model Swap Notice: ${swapRes.detail}`);
-            } else {
-              vscode.window.showInformationMessage(`✅ Active Cluster Model is now: ${selectedModel}`);
-            }
-          }
           break;
         }
         case 'openFile': {
@@ -206,8 +197,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     return (this._view ? this._view.webview.asWebviewUri(logo) : logo).toString();
   }
 
+  /** "DLNE Swarm (auto)", followed by the live model's name once a status answer has said it. */
+  private _modelLine(): string {
+    return swarmModelLine(this.client.lastKnownClusterStatus?.());
+  }
+
   private _getHtmlForWebview(): string {
     const logoSrc = this._logoSrc();
+    const modelLine = this._modelLine()
+      .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
     const st = this.workerManager.getStatus();
     const isContrib = st.state === 'contributing';
     const isStarting = st.state === 'starting';
@@ -225,7 +223,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DLNE Frontier Agent</title>
+  <title>DLNE Code Assistant</title>
   <style>
     :root {
       --card-bg: var(--vscode-editor-background);
@@ -539,17 +537,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       gap: 6px;
       align-items: center;
     }
-    select.model-picker {
+    .model-line {
       flex: 1;
+      min-width: 0;
       max-width: 240px;
-      padding: 5px 8px;
-      background-color: var(--vscode-dropdown-background, var(--vscode-input-background));
-      color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
-      border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border));
-      border-radius: 4px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--vscode-descriptionForeground);
       font-size: 0.84em;
-      font-family: inherit;
-      cursor: pointer;
     }
     button {
       padding: 6px 12px;
@@ -605,7 +601,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   <div id="chat-container">
     <div class="message assistant" id="welcome-msg">
-      <strong><img class="logo" src="${logoSrc}" alt="" width="24" height="24">DLNE Frontier Reasoning Agent</strong>
+      <strong><img class="logo" src="${logoSrc}" alt="" width="24" height="24">DLNE Code Assistant</strong>
       <div class="assistant-body">Connected to cluster. Ready for autonomous coding, refactoring, and test verification.</div>
     </div>
   </div>
@@ -613,16 +609,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   <div id="input-container">
     <textarea id="prompt-input" rows="3" placeholder="Ask DLNE to write code, edit files, or fix bugs..."></textarea>
     <div class="btn-row">
-      <select class="model-picker" id="model-select" title="Select Active DLNE Cluster Model Tier">
-        <option value="qwen3-coder-30b-instruct-q4_k_m.gguf">⚡ Qwen3 Coder 30B MoE (256K Context)</option>
-        <option value="qwen2.5-14b-1m.gguf">🌌 Qwen 2.5 14B (1 Million Context)</option>
-        <option value="qwen2.5-coder-32b-instruct-q4_k_m.gguf">🚀 Qwen 2.5 Coder 32B (24GB)</option>
-        <option value="qwen2.5-coder-14b-instruct-q4_k_m.gguf">Qwen 2.5 Coder 14B (16GB)</option>
-        <option value="DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf">⚡ DeepSeek-R1 32B (24GB)</option>
-        <option value="Llama-3.3-70B-Instruct-IQ3_M.gguf">🔥 Llama 3.3 70B (128K Big Guns)</option>
-        <option value="DeepSeek-R1-Distill-Llama-70B-Q4_K_M.gguf">💎 DeepSeek-R1 70B (42GB)</option>
-        <option value="Qwen2.5-72B-Instruct-Q4_K_M.gguf">👑 Qwen 2.5 72B (44GB Flagship)</option>
-      </select>
+      <span class="model-line" id="model-line" title="The swarm picks the model from the GPUs available; there is nothing to choose.">${modelLine}</span>
       <div class="btn-group-right">
         <button class="secondary" id="clear-btn">Clear</button>
         <button class="secondary" id="stop-btn" style="display:none;">Stop</button>
@@ -642,7 +629,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const sendBtn = document.getElementById('send-btn');
     const stopBtn = document.getElementById('stop-btn');
     const clearBtn = document.getElementById('clear-btn');
-    const modelSelect = document.getElementById('model-select');
+    const modelLine = document.getElementById('model-line');
     const toggleWorkerBtn = document.getElementById('toggle-worker-btn');
     const suiteBtn = document.getElementById('suite-btn');
     const workerBadge = document.getElementById('worker-badge');
@@ -677,12 +664,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       e.preventDefault();
       vscode.postMessage({ type: 'openPhoneApp' });
     });
-
-    if (modelSelect) {
-      modelSelect.addEventListener('change', () => {
-        vscode.postMessage({ type: 'selectModel', model: modelSelect.value });
-      });
-    }
 
     sendBtn.addEventListener('click', () => {
       const text = promptInput.value.trim();
@@ -796,7 +777,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           break;
         }
 
+        case 'modelLine': {
+          modelLine.textContent = msg.text;
+          break;
+        }
+
         case 'restoreHistory': {
+          if (msg.modelLine) {
+            modelLine.textContent = msg.modelLine;
+          }
           if (msg.workerStatus) {
             applyWorkerStatus(msg.workerStatus, msg.workerCopy);
           }

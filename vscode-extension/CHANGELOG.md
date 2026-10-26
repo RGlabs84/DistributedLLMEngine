@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.2.5] - 2026-10-26
+
+Pairs with DLNE coordinator **2.3.0** or later. Server 2.3.5 adds the model's name to the status, which the sidebar shows; earlier servers show the model's file name.
+
+### Changed
+- **One model entry, "DLNE Swarm (auto)".** VS Code's Chat model picker listed eight models (Qwen 2.5 Coder 14B and 32B, Qwen3 Coder 30B, DeepSeek-R1 32B and 70B, Llama 3.3 70B, Qwen 2.5 72B) that the swarm does not run, with the 14B as the default, and choosing one wrote it into `dlne.chatModel`. There is now a single entry, and picking it changes nothing: the coordinator serves whichever model its ladder has active (today Qwen3.6-35B-A3B on the GPU pool).
+- **The sidebar's model dropdown is a read-only line** showing "DLNE Swarm (auto)" and the live model's name, taken from the status the status bar already polls. The dropdown offered the same eight models and asked the coordinator to swap its model to the one you picked.
+- **Requests no longer name a model**, unless you set `dlne.chatModel` or `dlne.fimModel` yourself (for a private coordinator). A request without a model is served by the coordinator's active model; naming one, even the active one from a status answer a few seconds old, can make the coordinator swap models. The Qwen2.5-Coder 14B file name that was the fallback when the status could not be read is gone.
+- A `dlne.chatModel` or `dlne.fimModel` still holding one of those eight names, saved by the old picker, is read as empty.
+- **"Frontier Coding Agent / Assistant" is now "DLNE Code Assistant"** in the sidebar title and welcome line, the chat participant's name, the update notice and the Loading message.
+- `/model` says what is running now instead of listing tiers (it said the 14B was active, "with speculative decoding"), and shows "not reported" or "?" rather than made-up figures when the server cannot be reached.
+
+### Removed
+- The `selectModel` sidebar action and the client's `swapModel` call to `/v1/cluster/swap`.
+
+---
+
 ## [1.2.4] - 2026-10-25
 
 Pairs with DLNE coordinator **2.3.0** or later.

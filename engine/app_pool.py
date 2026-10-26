@@ -80,7 +80,39 @@ FRESH_FACTS = re.compile(
     r"\b(?:latest|newest|most recent|recent(?:ly)?|current(?:ly)?|right now|nowadays|today|tonight|"
     r"tomorrow|yesterday|this (?:week|weekend|month|year|season)|last (?:night|week|weekend|month|year|season)|"
     r"who (?:won|is winning|leads)|winners?|scores?|standings|prices?|how much (?:is|are|does|do)|"
-    r"weather|forecast|news|headlines?|elections?|stocks?|20[2-9]\d)\b", re.IGNORECASE)
+    r"weather|forecast|news|headlines?|elections?|stocks?|20[2-9]\d|upcoming|release date|"
+    r"com(?:e|es|ing) out|how old is|net worth|still alive|"
+    r"next (?:game|match|race|fight|episode|season|election|launch|update|release|event)|"
+    r"who(?:'s| is| are) (?:the |our )?(?:president|prime minister|premier|ceo|chancellor|governor|mayor|"
+    r"king|queen|pope|leader|coach|head coach|owner|champions?|chair(?:man)?|secretary))\b", re.IGNORECASE)
+# "Who is <Name>?" is looked up too: from memory the model made people up ("Who is Wubarrk?" got
+# a place in Australia, launch night). Case-sensitive on the name, so "who is he" is left alone.
+NAMED_PERSON = re.compile(r"\b(?i:who)(?:'s|\s+(?i:is|was|are|were))\s+(?!(?i:the|a|an|this|that|it|he|she|"
+                          r"they|you|i|we|my|your|our|their|his|her)\b)[A-Z]")
+# A required lookup's first pass is held back and, when the model talks instead of calling a
+# tool, thrown away: capped so that costs a moment, not the 28 s of a whole answer (ops watch).
+HELD_PASS_TOKENS = 128
+# An answer from memory that says it can't know is a lookup the model should have made: on the
+# owner's phone it took "search the web", typed after three such answers, to get one. When a
+# first answer hedges like this the phone is told to take it back (a "retract" event) and the
+# question is searched. Only ever asked of an answer no lookup went into.
+# "I'm not sure" / "I don't know" count only once the next word has arrived and isn't one that
+# makes it a question back ("I'm not sure what you mean"): text is judged as it streams in.
+_UNSURE_OF = r"(?= (?!(?:what|which|whether|if|how|who|why|where|I)\b)\w+\W|[.,;:!?])"
+HEDGES = re.compile(
+    r"\bmy (?:last |latest )?(?:knowledge|training)|as of my (?:last |latest |most recent )?update|"
+    r"\bmy (?:information|data) (?:may|might|could|only)|"
+    r"\bI (?:don't|do not|can't|cannot) (?:have )?(?:access to )?(?:real-?time|live|current|up[- ]to[- ]date|"
+    r"the latest|recent)\b|"
+    r"\bI(?:'m| am)? (?:can't|cannot|unable to|not able to) (?:browse|search|look (?:it|that|this) up|access|"
+    r"check|verify|confirm)\b|"
+    r"\bI (?:don't|do not) have (?:any |specific |enough |reliable )?(?:information|info|details|data)\b|"
+    r"\bI(?:'m| am) not (?:sure|certain|aware|familiar)" + _UNSURE_OF + "|"
+    r"\bI (?:don't|do not) know" + _UNSURE_OF + "|"
+    r"\b(?:may|might|could) (?:be|have) (?:out of date|outdated|changed since)|"
+    r"\bno (?:widely |well[- ])?(?:known|recogni[sz]ed|notable) |\bnot (?:widely|well) known\b|"
+    r"\b(?:appears|seems) to be (?:a |an )?(?:fictional|obscure|misspell|typo)|\bcould(?:n't| not) find\b|"
+    r"\b(?:did you mean|perhaps you mean|may be a misspelling)\b", re.IGNORECASE)
 # Recommended for Qwen3.6 without thinking, and fine for the smaller tiers; clients cannot change them.
 SAMPLING = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5,
             "chat_template_kwargs": {"enable_thinking": False}}
@@ -244,7 +276,8 @@ class AppPool:
         request = {**SAMPLING, "stream": True, "max_tokens": _output_cap(body.get("max_tokens"))}
         sources: List[Dict[str, Any]] = []
         rounds = 0
-        fresh = lookups and bool(FRESH_FACTS.search(_last_user_text(convo)))
+        question = _last_user_text(convo)
+        fresh = lookups and bool(FRESH_FACTS.search(question) or NAMED_PERSON.search(question))
         while True:
             payload = {**request, "messages": convo}
             required = lookups and rounds == 0 and fresh
@@ -252,36 +285,49 @@ class AppPool:
                 payload["tools"] = tools
                 if required:
                     payload["tool_choice"] = "required"
+                    if _has_tool(tools, "web_search"):
+                        payload["max_tokens"] = min(payload["max_tokens"], HELD_PASS_TOKENS)
             calls: List[Dict[str, Any]] = []
             # A required lookup can come after the model has talked to itself (and made up an
             # answer, in the 2.3.2 smoke test): that text is held back and dropped if the pass
             # ends in a lookup, so the phone only ever sees the answer that follows it.
-            one_pass = self._one_pass(payload, members, active_id, client, citations=len(sources), hold=required)
+            watch = lookups and rounds == 0 and not required and _has_tool(tools, "web_search")
+            one_pass = self._one_pass(payload, members, active_id, client, citations=len(sources), hold=required,
+                                      stop_if=_hedges if watch else None)
             held_answer: Optional[List[bytes]] = None
+            hedged = False
             try:
                 async for kind, value in one_pass:
                     if kind == "bytes":
                         yield value
                     elif kind == "tool_calls":
                         calls = value[:MAX_CALLS_PER_ROUND]
+                        if required:   # a call the held pass's cap cut off has no arguments
+                            calls = [call for call in calls if call["arguments"]]
                     elif kind == "held":
                         held_answer = value
+                    elif kind == "hedged":
+                        hedged = True
                     else:  # "failed": the notice says why
                         yield _sse_notice(value)
                         return
             finally:
                 await one_pass.aclose()
-            if held_answer is not None and not calls:
+            if required and not calls:
                 if _has_tool(tools, "web_search"):
                     # Told a lookup was required, the model answered from memory anyway (2.3.3:
                     # a made-up Super Bowl winner and a fake ESPN link; llama-server does not
                     # enforce tool_choice for every chat format). Its text is dropped and the
                     # question itself is searched; the model then answers from the results.
-                    calls = [{"id": "call_required", "name": "web_search",
-                              "arguments": {"query": _last_user_text(convo)[:200]}}]
-                else:
+                    calls = [_question_search(convo, "call_required")]
+                elif held_answer is not None:
                     for chunk_bytes in held_answer:
                         yield chunk_bytes
+            if hedged:
+                # The model said it can't know (HEDGES): the phone drops what it was shown so far
+                # and the question is searched, as if the user had asked for that.
+                yield _sse_event({"event": "retract"})
+                calls = [_question_search(convo, "call_unsure")]
             if not calls:
                 self._note_speed(began)
                 yield b"data: [DONE]\n\n"
@@ -308,7 +354,8 @@ class AppPool:
             convo += [{"role": "tool", "tool_call_id": call["id"], "content": reply} for call, reply in zip(calls, replies)]
 
     async def _one_pass(self, payload: Dict[str, Any], members: List[Member], active_id: Optional[str],
-                        client, citations: int = 0, hold: bool = False) -> AsyncIterator[Tuple[str, Any]]:
+                        client, citations: int = 0, hold: bool = False,
+                        stop_if: Optional[Callable[[str], bool]] = None) -> AsyncIterator[Tuple[str, Any]]:
         """
         One request to a member, moving to another if it fails before the phone has been sent
         any text (up to MAX_ATTEMPTS). Yields ("bytes", sse) to pass on as they arrive, then
@@ -319,6 +366,9 @@ class AppPool:
         markers the model writes out of habit are taken out of the text (_PhantomCitations).
         With ``hold`` nothing is passed on: text before a lookup is dropped, and an answer
         that ends without one comes back as ("held", [sse...]) for the caller to judge.
+        With ``stop_if``, the text passed on so far is shown to it after each piece; once it
+        says yes the member is let go mid-answer (closing the request stops the model) and the
+        pass ends with ("hedged", text).
         """
         tried: List[str] = []
         for _attempt in range(MAX_ATTEMPTS):
@@ -332,6 +382,7 @@ class AppPool:
             calls: Dict[int, Dict[str, str]] = {}
             phantom = _PhantomCitations() if citations == 0 else None
             held: List[bytes] = []
+            shown = ""
             try:
                 async with client.stream("POST", f"{member.base_url}/v1/chat/completions", json=payload,
                                          timeout=_timeout(client)) as resp:
@@ -354,6 +405,12 @@ class AppPool:
                             choice = chunk["choices"][0]
                         except (ValueError, KeyError, IndexError, TypeError):
                             continue
+                        if "model" in chunk or "timings" in chunk:
+                            # The member's model file path (its home directory) and its timings
+                            # are not the phone's business.
+                            chunk.pop("model", None)
+                            chunk.pop("timings", None)
+                            data = json.dumps(chunk)
                         delta = choice.get("delta") or {}
                         if delta.get("tool_calls"):
                             for part in delta["tool_calls"]:
@@ -381,6 +438,11 @@ class AppPool:
                             continue
                         started = started or bool(delta.get("content"))
                         yield "bytes", f"data: {data}\n\n".encode()
+                        if stop_if is not None and isinstance(delta.get("content"), str):
+                            shown += delta["content"]
+                            if stop_if(shown):
+                                yield "hedged", shown
+                                return
                 if phantom is not None and phantom.held:
                     if hold:
                         held.append(_content_chunk(phantom.flush()))
@@ -534,6 +596,17 @@ def _last_user_text(convo: List[Dict[str, Any]]) -> str:
         if message.get("role") == "user" and isinstance(message.get("content"), str):
             return message["content"]
     return ""
+
+
+def _question_search(convo: List[Dict[str, Any]], call_id: str) -> Dict[str, Any]:
+    """A web search for the user's own words, made when the model should have made one."""
+    return {"id": call_id, "name": "web_search", "arguments": {"query": _last_user_text(convo)[:200]}}
+
+
+def _hedges(text: str) -> bool:
+    """True when answer text says it can't know (HEDGES), outside code blocks."""
+    prose = "".join(part for i, part in enumerate(text.split("```")) if i % 2 == 0)
+    return bool(HEDGES.search(prose.replace("’", "'")))
 
 
 def _output_cap(asked: Any) -> int:

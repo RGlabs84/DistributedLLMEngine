@@ -6,6 +6,7 @@ gone, the replacement is public, self-contained and well-formed, and nothing in 
 mistaken for (or reached as) the old WebUI.
 """
 
+import re
 from html.parser import HTMLParser
 
 import pytest
@@ -77,6 +78,37 @@ def test_the_page_points_at_the_extension_and_the_discord():
     assert landing.EXTENSION_URL in links
     assert landing.DISCORD_INVITE_URL in links
     assert landing.EXTENSION_URL.startswith("https://open-vsx.org/extension/")
+
+
+def test_the_footer_links_the_website_next_to_the_discord():
+    assert landing.WEBSITE_URL == "https://live.ravenirongames.com/#dlne"
+    assert landing.DISCORD_INVITE_URL == "https://discord.gg/RNxvxWn8cw"
+    footer = re.search(r"<footer.*?</footer>", landing.LANDING_HTML, re.S).group(0)
+    anchors = re.findall(r'<a href="([^"]+)" rel="([^"]+)">([^<]+)</a>', footer)
+    assert anchors == [(landing.WEBSITE_URL, "noopener", "DLNE website"),
+                       (landing.DISCORD_INVITE_URL, "noopener", "Join the Discord")]
+
+
+def test_on_a_phone_the_chat_is_the_big_primary_button_and_the_extension_the_secondary():
+    """Chosen by the screen's width alone (no user-agent sniffing); wide screens keep the extension first."""
+    page = landing.LANDING_HTML
+    ext = re.search(r'<a class="button ext" href="([^"]+)"', page)
+    chat = re.search(r'<a class="button chat" href="([^"]+)"', page)
+    assert ext.group(1) == landing.EXTENSION_URL and chat.group(1) == "/chat"
+    # Wide: the extension is the filled button, the chat the outlined one.
+    wide = page.split("@media (max-width: 600px)", 1)[0]
+    assert re.search(r"\.button \{[^}]*background: var\(--accent\)", wide)
+    assert re.search(r"\.button\.chat \{[^}]*background: transparent", wide)
+    # Narrow: the chat comes first, filled and bigger; the extension is outlined.
+    narrow = re.search(r"@media \(max-width: 600px\) \{(.*?)\n\}\n", page, re.S).group(1)
+    chat_rule = re.search(r"\.button\.chat \{([^}]*)\}", narrow).group(1)
+    assert "order: -1" in chat_rule and "background: var(--accent)" in chat_rule
+    assert float(re.search(r"font-size: ([\d.]+)rem", chat_rule).group(1)) > 1.05   # bigger than the other button
+    assert "background: transparent" in re.search(r"\.button\.ext \{([^}]*)\}", narrow).group(1)
+    assert "flex-direction: column" in narrow
+    script = re.search(r"<script>(.*?)</script>", page, re.S).group(1)
+    for sniffing in ("navigator", "userAgent", "matchMedia"):
+        assert sniffing not in script
 
 
 def test_every_link_is_https_and_opens_safely():

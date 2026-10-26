@@ -189,7 +189,6 @@ def build_tile_fields(status: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     fields = [
         ("🟢 Swarm Health", state_str, True),
         ("Active Frontier Model",f"`{model}`", True),
-        ("⚡ Speculative Draft Engine", "0.5B Q8_0 on Vulkan0 (Drafts 5 tok/step)", True),
         ("📊 Total Compute Pool", f"**{vram:.1f} GB VRAM** ({mem_total:.1f} GB Total)", True),
         ("🖥️ Compute Workers in Pool", f"**{workers_cnt} Node(s)** Active", True),
         ("🔒 Active Inference Leases", f"{leases} In-Flight ({'Locked' if leases > 0 else 'Idle / Unlocked'})", True),

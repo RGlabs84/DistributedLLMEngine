@@ -18,6 +18,13 @@ import kotlinx.serialization.json.contentOrNull
  *     {"dlne":{"event":"sources","sources":[{"n":1,"title":"...","url":"https://...","host":"example.com","age":"2 days ago"}]}}
  *     {"dlne":{"event":"search_note","note":"..."}}
  *     {"dlne":{"event":"search_unavailable","reason":"The search budget for today is used up; ..."}}
+ *     {"dlne":{"event":"retract"}}
+ *
+ * `retract` (server 2.3.5 and later) means the model began answering from memory while
+ * unsure, and the server takes that text back to look the question up instead. The usual
+ * `searching` and `sources` events follow, then a fresh answer. The app empties the reply
+ * being shown, keeps its bubble, and drops any sources it already holds for it (normally
+ * none); see [io.dlne.chat.ui.PendingReply.retracted].
  *
  * Titles, hosts and URLs come from arbitrary web pages, so everything is treated as
  * hostile: text is flattened to one plain line without control or bidi-override
@@ -45,6 +52,7 @@ internal object SearchEvents {
         "search_note" -> cleanText(string(event["note"]).orEmpty(), MAX_NOTE).takeIf { it.isNotEmpty() }
             ?.let { StreamEvent.SearchNote(it) }
         "search_unavailable" -> StreamEvent.SearchUnavailable(cleanText(string(event["reason"]).orEmpty(), MAX_NOTE))
+        "retract" -> StreamEvent.Retract
         else -> null
     }
 

@@ -50,6 +50,12 @@ private const val COFFEE_URL = "https://buymeacoffee.com/wubarrk"
 private const val DONATE_COMPUTE_URL = "https://open-vsx.org/extension/dlne/dlne-code-assistant"
 private const val SOURCE_URL = "https://github.com/RGlabs84/DistributedLLMEngine"
 
+/** The DLNE page on the project's website. Linked from Settings and from the chat drawer. */
+internal const val WEBSITE_URL = "https://live.ravenirongames.com/#dlne"
+
+/** The DLNE Discord server (news and help). Linked from Settings and from the chat drawer. */
+internal const val DISCORD_URL = "https://discord.gg/RNxvxWn8cw"
+
 class SettingsActions(
     val onBack: () -> Unit,
     /** Returns false if the address was not accepted. */
@@ -95,6 +101,15 @@ fun SettingsScreen(state: ChatUiState, actions: SettingsActions) {
                 BodyText(stringResource(R.string.settings_privacy_body_4))
             }
             DeleteAllChats(actions.onDeleteAllChats)
+
+            SectionDivider()
+            SectionTitle(stringResource(R.string.settings_community_title))
+            LinkRow(stringResource(R.string.settings_website), stringResource(R.string.settings_website_sub)) {
+                openInBrowser(context, WEBSITE_URL)
+            }
+            LinkRow(stringResource(R.string.settings_discord), stringResource(R.string.settings_discord_sub)) {
+                openInBrowser(context, DISCORD_URL)
+            }
 
             SectionDivider()
             SectionTitle(stringResource(R.string.settings_support_title))

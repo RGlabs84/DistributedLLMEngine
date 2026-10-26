@@ -47,6 +47,49 @@ class SearchEventsTest {
     }
 
     @Test
+    fun `retract is recognised, whatever else the line carries`() {
+        assertEquals(StreamEvent.Retract, parse("""{"dlne":{"event":"retract"}}"""))
+        // Extra fields from a newer server are ignored.
+        assertEquals(StreamEvent.Retract, parse("""{"dlne":{"event":"retract","reason":"unsure"}}"""))
+        // Like every dlne line it is never answer text: nothing from "choices" leaks out.
+        assertEquals(
+            StreamEvent.Retract,
+            parse("""{"dlne":{"event":"retract"},"choices":[{"delta":{"content":"leaked"}}]}"""),
+        )
+        // Surrounding whitespace and a split data field are handled like any other dlne line.
+        assertEquals(StreamEvent.Retract, SseEventParser.parse("""data:   {"dlne":{"event":"retract"}}  """))
+    }
+
+    @Test
+    fun `a retract in the middle of a stream arrives in order and survives split reads`() {
+        // The model starts from memory, the server takes it back and looks the question up.
+        val stream = """data: {"choices":[{"delta":{"content":"The mayor is "}}]}""" + "\n\n" +
+            """data: {"choices":[{"delta":{"content":"probably Smith."}}]}""" + "\n\n" +
+            """data: {"dlne":{"event":"retract"}}""" + "\n\n" +
+            """data: {"dlne":{"event":"searching","tool":"web_search","query":"mayor of Springfield"}}""" + "\n\n" +
+            """data: {"dlne":{"event":"sources","sources":[{"n":1,"title":"City hall","url":"https://springfield.example/mayor"}]}}""" + "\n\n" +
+            """data: {"choices":[{"delta":{"content":"The mayor is Jones [1]."}}]}""" + "\n\n" +
+            "data: [DONE]\n\n"
+        val whole = events(stream)
+        assertEquals(
+            listOf(
+                StreamEvent.Content("The mayor is "),
+                StreamEvent.Content("probably Smith."),
+                StreamEvent.Retract,
+                StreamEvent.Searching("web_search", "mayor of Springfield"),
+                StreamEvent.Sources(listOf(Source(1, "City hall", "https://springfield.example/mayor", "springfield.example", null))),
+                StreamEvent.Content("The mayor is Jones [1]."),
+                StreamEvent.Done,
+            ),
+            whole,
+        )
+        assertEquals(whole, events(*stream.map { it.toString() }.toTypedArray()))
+        for (split in 1 until stream.length step 5) {
+            assertEquals("split at $split", whole, events(stream.substring(0, split), stream.substring(split)))
+        }
+    }
+
+    @Test
     fun `unknown or malformed dlne events are dropped and never become text`() {
         val dropped = listOf(
             """{"dlne":{"event":"thinking","text":"secret plan"}}""",

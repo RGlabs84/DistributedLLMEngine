@@ -43,6 +43,10 @@ class LiveSmokeTest {
                         is StreamEvent.Sources -> println("SMOKE sources: " + event.sources.joinToString { "[${it.n}] ${it.title} (${it.host})" })
                         is StreamEvent.SearchNote -> println("SMOKE search note: ${event.note}")
                         is StreamEvent.SearchUnavailable -> println("SMOKE search unavailable: ${event.reason}")
+                        StreamEvent.Retract -> {
+                            answer.clear()
+                            println("\nSMOKE retract: the server took the answer back to look it up")
+                        }
                         StreamEvent.Done -> println("\nSMOKE [DONE]")
                     }
                 }

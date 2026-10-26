@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import * as https from 'https';
 import { resolveServerUrl } from '../serverUrl';
+import { requestedModel } from './modelChoice';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -23,6 +24,8 @@ export interface ModelLoadingTelemetry {
 export interface ClusterStatus {
   status: string;
   global_active_model: string | null;
+  /** The coding model by name, from server 2.3.5; older servers do not send it. */
+  coding_model?: { name?: string | null } | null;
   running_models: string[];
   recommended_tier?: string;
   recommended_model?: string;
@@ -41,7 +44,7 @@ export function formatLoadingTelemetry(ml?: ModelLoadingTelemetry): string {
   if (!ml || !ml.is_loading) {
     return 'Model ready';
   }
-  const modelName = ml.model || 'Frontier Model';
+  const modelName = ml.model || 'the model';
   const pct = typeof ml.progress_pct === 'number' ? `${ml.progress_pct.toFixed(1)}%` : '0.0%';
   const gbPart =
     typeof ml.loaded_gb === 'number' && typeof ml.total_gb === 'number' && ml.total_gb > 0
@@ -211,6 +214,9 @@ export class DlneClient {
             try {
               const parsed = JSON.parse(data);
               this.lastStatus = { data: parsed, at: Date.now(), server: base };
+              this.statusListeners.forEach((listener) => {
+                try { listener(parsed); } catch {}
+              });
               resolve({ status: 'ok', data: parsed, httpStatus: 200 });
             } catch (err: any) {
               resolve({ status: 'error', httpStatus: 200, message: err?.message || 'Invalid JSON' });
@@ -254,43 +260,23 @@ export class DlneClient {
     return this.getClusterStatus();
   }
 
-  async swapModel(modelName: string): Promise<{ status: string; active_model?: string; detail?: string }> {
-    const base = this.getServerUrl();
-    const url = new URL(`${base}/v1/cluster/swap`);
-    const postData = JSON.stringify({ model: modelName });
-    const headers = this.getHeaders();
-    headers['Content-Length'] = Buffer.byteLength(postData).toString();
+  private statusListeners: Array<(status: ClusterStatus) => void> = [];
 
-    return new Promise((resolve) => {
-      const client = url.protocol === 'https:' ? https : http;
-      const req = client.request(
-        url,
-        { method: 'POST', headers, timeout: 45000 },
-        (res) => {
-          let data = '';
-          res.on('data', (chunk) => (data += chunk));
-          res.on('end', () => {
-            try {
-              const parsed = JSON.parse(data);
-              if (res.statusCode === 200) {
-                resolve(parsed);
-              } else {
-                resolve({ status: 'error', detail: parsed.detail || `HTTP ${res.statusCode}` });
-              }
-            } catch {
-              resolve({ status: 'error', detail: data || `HTTP ${res.statusCode}` });
-            }
-          });
-        }
-      );
-      req.on('error', (err) => resolve({ status: 'error', detail: err.message }));
-      req.on('timeout', () => {
-        req.destroy();
-        resolve({ status: 'error', detail: 'Model swap timed out' });
-      });
-      req.write(postData);
-      req.end();
-    });
+  /**
+   * Called with every successful /v1/cluster/status answer (the status bar polls it every 10 s),
+   * so the sidebar can show the live model without polling on its own. Returns the unsubscribe.
+   */
+  onClusterStatus(listener: (status: ClusterStatus) => void): () => void {
+    this.statusListeners.push(listener);
+    return () => {
+      this.statusListeners = this.statusListeners.filter((l) => l !== listener);
+    };
+  }
+
+  /** The most recent status answer from the current coordinator, if there has been one. */
+  lastKnownClusterStatus(): ClusterStatus | null {
+    const s = this.lastStatus;
+    return s && s.server === this.getServerUrl() ? s.data : null;
   }
 
   private async waitUntilModelReady(
@@ -328,12 +314,11 @@ export class DlneClient {
   ): Promise<StreamChatResult> {
     const base = this.getServerUrl();
     const config = vscode.workspace.getConfiguration('dlne');
-    let model = config.get<string>('chatModel', '').trim() || undefined;
+    // No `model` unless the user set one: the coordinator then serves the model it has active. Naming
+    // one (even the active one, from a status answer a few seconds old) can make it swap models.
+    const model = requestedModel(config.get<string>('chatModel', ''));
     try {
       const cluster = await this.recentClusterStatus();
-      if (!model || model === 'undefined') {
-        model = cluster?.global_active_model || 'qwen2.5-coder-14b-instruct-q4_k_m.gguf';
-      }
       if (cluster?.model_loading?.is_loading || cluster?.is_swapping_models) {
         await this.waitUntilModelReady(onLoadingProgress, signal);
       }
@@ -343,9 +328,11 @@ export class DlneClient {
       messages,
       stream: true,
       temperature: 0.2,
-      max_tokens: 4096,
-      model: model || 'qwen2.5-coder-14b-instruct-q4_k_m.gguf'
+      max_tokens: 4096
     };
+    if (model) {
+      payload.model = model;
+    }
     if (tools && tools.length > 0) {
       payload.tools = tools;
     }
@@ -407,12 +394,8 @@ export class DlneClient {
             onLoadingProgress('🔄 Model adapting to active VRAM pool, synchronizing with cluster...');
           }
           await new Promise((r) => setTimeout(r, 2000));
-          const cluster = await this.getClusterStatus();
-          if (cluster?.global_active_model) {
-            payload.model = cluster.global_active_model;
-          } else {
-            delete payload.model;
-          }
+          // Whatever the swarm has active now: ask for it by leaving the model out.
+          delete payload.model;
           continue;
         }
         throw err;
@@ -425,7 +408,7 @@ export class DlneClient {
             onLoadingProgress(formatLoadingTelemetry(status.model_loading));
           } else {
             onLoadingProgress(
-              `⏳ Loading ${model || 'Frontier Model'} into distributed GPU pool...`
+              `⏳ Loading ${model || 'the model'} into distributed GPU pool...`
             );
           }
         }
@@ -626,7 +609,7 @@ export class DlneClient {
   async getCompletion(prompt: string, maxTokens: number = 64, stop: string[] = [], signal?: AbortSignal): Promise<string> {
     const base = this.getServerUrl();
     const config = vscode.workspace.getConfiguration('dlne');
-    const model = config.get<string>('fimModel', '').trim() || undefined;
+    const model = requestedModel(config.get<string>('fimModel', ''));
 
     const payload: Record<string, any> = {
       prompt,

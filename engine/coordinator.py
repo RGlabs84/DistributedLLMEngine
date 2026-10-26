@@ -67,6 +67,7 @@ from engine.app_pool import LocalAppServer, app_pool
 from engine.downloader import download_and_extract_engine
 from engine.version import VERSION
 from engine import release as release_lib
+from engine import coding_ladder, coding_speed
 from engine.lease import lease_manager, InferenceLease
 from engine.priority import UsageWindow, coding_gate, cpu_coding_window, tier_priority
 from engine.api_keys import api_key_manager, hash_admin_key
@@ -77,7 +78,8 @@ from engine.api_keys import api_key_manager, hash_admin_key
 # problem), so it talks to the underlying stdlib logger directly.
 _debug_logger = logging.getLogger("system")
 
-app = FastAPI(title="DLNE Coordinator")
+# No /docs, /redoc or /openapi.json: on the public swarm they listed every route, admin ones too.
+app = FastAPI(title="DLNE Coordinator", docs_url=None, redoc_url=None, openapi_url=None)
 registry = WorkerRegistry()
 manager = InferenceManager()
 
@@ -663,7 +665,7 @@ app.add_middleware(NonContribBlockerMiddleware)
 # Landing page
 # ======================================================================================
 
-@app.get("/", include_in_schema=False)
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 async def root():
     """
     The landing page. DLNE is a VS Code extension; the browser chat room that used to live
@@ -682,7 +684,27 @@ app.include_router(chat_router)
 # ======================================================================================
 
 active_websockets: List[WebSocket] = []
-global_active_model: str = canonical_model_tag(get_config().get("DEFAULT_MODEL", "qwen2.5-coder-14b-instruct-q4_k_m.gguf"))
+
+# The GPU coding pool's model ladder (engine/coding_ladder.py). Read once: it comes from the
+# signed release this process runs, which only changes with a restart. Tests replace it.
+_coding_tiers: Optional[List[Dict[str, Any]]] = None
+
+
+def _coding_ladder() -> List[Dict[str, Any]]:
+    global _coding_tiers
+    if _coding_tiers is None:
+        _coding_tiers = coding_ladder.load_coding_tiers(get_base_dir())
+    return _coding_tiers
+
+
+def _default_coding_model() -> str:
+    """The ladder's first enabled tier: what this coordinator serves when nothing names a model."""
+    tier = coding_ladder.default_tier(_coding_ladder())
+    return tier["file"] if tier else ""
+
+
+# DEFAULT_MODEL in config.txt wins; a fresh coordinator starts on the ladder's first tier.
+global_active_model: str = canonical_model_tag(get_config().get("DEFAULT_MODEL") or _default_coding_model())
 cluster_status: str = "Waiting for Nodes"
 has_pulled_seed = False
 is_downloading_seed = False
@@ -1567,6 +1589,18 @@ async def get_admin_telemetry(request: Request):
     }
 
 
+def _may_choose_model(request: Request) -> bool:
+    """
+    Whether this caller may name the model its request runs on, or swap the cluster's: this
+    machine, holders of an operator-issued API key, or anyone on a cluster that does not
+    enforce the contribution clause. Everyone else gets the model the swarm is serving. A model
+    named by a public caller used to be started for them, swapping the live model out for
+    everybody when the pool was full (ops watch, launch night); extension 1.2.4 and older name
+    one on every request.
+    """
+    return getattr(getattr(request, "state", None), "dlne_tier", None) in ("host", "key", "open")
+
+
 def _require_admin(request: Request) -> None:
     """
     Bearer gate for every /v1/admin/* endpoint (telemetry, stats, API keys, trial resets,
@@ -2141,7 +2175,8 @@ async def chat_completions(request: Request):
         body["frequency_penalty"] = 0.0
         body["presence_penalty"] = 0.0
 
-        model_path = canonical_model_tag(body.get("model") or global_active_model or "qwen2.5-coder-14b-instruct-q4_k_m.gguf")
+        requested = body.get("model") if _may_choose_model(request) else None
+        model_path = canonical_model_tag(requested or global_active_model or _default_coding_model())
         body["model"] = model_path
 
         # 1. Grab planned workers based on sharding policy and calculate resources
@@ -2493,8 +2528,16 @@ async def chat_completions(request: Request):
                             await asyncio.sleep(0)
                             yield b"data: [DONE]\n\n"
                             return
+                        # The answer's last few KB carry llama-server's closing "timings", the
+                        # coding model's real speed (engine/coding_speed.py). Only a rolling tail
+                        # is kept and nothing is parsed per chunk; it is read once, at the end.
+                        tail = bytearray()
                         async for chunk in response.aiter_bytes():
+                            tail += chunk
+                            if len(tail) > 2 * coding_speed.TAIL_BYTES:
+                                del tail[:-coding_speed.TAIL_BYTES]
                             yield chunk
+                        _measure_coding_speed(model_path, tail)
             except Exception as stream_e:
                 # Report what the exception proves, and nothing beyond it. See
                 # _engine_failure_report for what the single fabricated message this
@@ -2592,7 +2635,7 @@ async def completions(request: Request):
             raise
 
     try:
-        model_path = body.get("model") or global_active_model
+        model_path = (body.get("model") if _may_choose_model(request) else None) or global_active_model
         if not model_path:
             raise HTTPException(status_code=400, detail="No model specified and no global active model.")
 
@@ -2686,22 +2729,73 @@ async def completions(request: Request):
 # Cluster Telemetry & API Key Management
 # ======================================================================================
 
-VRAM_TIERS = [
-    {"min_vram_gb": 44.0, "tier": "48GB+ Flagship (72B)", "model": "Qwen2.5-72B-Instruct-Q4_K_M.gguf", "alt_model": "DeepSeek-R1-Distill-Llama-70B-Q4_K_M.gguf"},
-    {"min_vram_gb": 40.0, "tier": "40GB-44GB Reasoning (70B)", "model": "DeepSeek-R1-Distill-Llama-70B-Q4_K_M.gguf", "alt_model": "Qwen2.5-72B-Instruct-Q4_K_M.gguf"},
-    {"min_vram_gb": 32.0, "tier": "32GB Big Guns (70B)", "model": "Llama-3.3-70B-Instruct-IQ3_M.gguf", "alt_model": "qwen2.5-coder-32b-instruct-q4_k_m.gguf"},
-    {"min_vram_gb": 28.0, "tier": "28GB-36GB Frontier (32B)", "model": "qwen2.5-coder-32b-instruct-q4_k_m.gguf", "alt_model": "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf"},
-    {"min_vram_gb": 12.0, "tier": "16GB-24GB Baseline (14B)", "model": "qwen2.5-coder-14b-instruct-q4_k_m.gguf", "alt_model": "Qwen_Qwen3-14B-Q6_K.gguf"},
-    {"min_vram_gb": 0.0,  "tier": "Entry (7B)", "model": "Qwen2.5-7B-Instruct-Q6_K.gguf", "alt_model": "Qwen2.5-7B-Instruct-Q6_K.gguf"},
-]
+# The coding pool's tiers come from the model ladder (engine/coding_ladder.py,
+# scripts/coding_models.json). Advisory: nothing here swaps a model; recommended_tier and
+# recommended_model say what the pool could hold.
+
+def _get_recommended_tier(total_vram_gb: float) -> Optional[Dict[str, Any]]:
+    """The biggest enabled tier the pool can hold; the ladder's first tier when it holds none."""
+    tiers = _coding_ladder()
+    return coding_ladder.tier_for_vram(tiers, total_vram_gb) or coding_ladder.default_tier(tiers)
 
 
-def _get_recommended_tier(total_vram_gb: float) -> dict:
-    """Returns the highest VRAM tier supported by the current aggregate VRAM pool."""
-    for entry in VRAM_TIERS:
-        if total_vram_gb >= entry["min_vram_gb"]:
-            return entry
-    return VRAM_TIERS[-1]
+def _measure_coding_speed(model_path: str, tail: bytearray) -> None:
+    """
+    Record a finished coding answer's decode rate (engine/coding_speed.py) from its last
+    bytes; the speed file is written off the event loop. Never raises: a measurement must
+    not be able to break an answer that has already been delivered.
+    """
+    try:
+        if coding_speed.meter.observe(canonical_model_tag(model_path), bytes(tail[-coding_speed.TAIL_BYTES:])):
+            spawn_background_task(asyncio.to_thread(coding_speed.meter.save), "coding-speed-save")
+    except Exception as exc:  # noqa: BLE001
+        log_warning(f"Could not record the coding model's speed ({type(exc).__name__}: {exc}).")
+
+
+async def _coding_status(running_names: List[str], total_vram_gb: float) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    ``coding_model`` and ``coding_tiers`` for /v1/cluster/status (websites and apps render
+    them as they are, so the shape is fixed):
+
+        coding_model: {file, name, context, tokens_per_second, speed_measured_at}
+        coding_tiers: [{id, name, min_vram_gb, enabled, unlocked, active}]
+
+    The model is the running engine's, or the one the next request will start. ``context`` is
+    the running engine's own (its snapshot's safe_context) and null while none runs; the
+    speed is the measured median for that model file only, null until one is measured.
+    """
+    tiers = _coding_ladder()
+    file = canonical_model_tag(running_names[0] if running_names else global_active_model) or None
+    context = None
+    if file and file in running_names:
+        snapshot = await manager.asnapshot_model(file)
+        value = (snapshot or {}).get("safe_context")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            context = value
+    tokens_per_second, measured_at = coding_speed.meter.speed(file)
+    active = coding_ladder.tier_for_file(tiers, file)
+    coding_model = {
+        "file": file,
+        "name": coding_ladder.display_name(file, tiers) or None,
+        "context": context,
+        "tokens_per_second": tokens_per_second,
+        "speed_measured_at": measured_at,
+    }
+    coding_tiers = [
+        {
+            "id": tier["id"],
+            "name": tier["name"],
+            "min_vram_gb": tier["min_vram_gb"],
+            "enabled": tier["enabled"],
+            "unlocked": total_vram_gb >= tier["min_vram_gb"],
+            "active": active is not None and tier["id"] == active["id"],
+        }
+        for tier in tiers
+    ]
+    return coding_model, coding_tiers
+
+
+_NO_CODING_MODEL = {"file": None, "name": None, "context": None, "tokens_per_second": None, "speed_measured_at": None}
 
 
 @app.get("/v1/cluster/status")
@@ -2717,13 +2811,22 @@ async def get_cluster_status(request: Request):
     active_model_name = running_names[0] if running_names else global_active_model
     rec = _get_recommended_tier(total_vram)
     loading_telemetry = await manager.aget_loading_telemetry(active_model_name)
+    try:
+        coding_model, coding_tiers = await _coding_status(running_names, total_vram)
+    except Exception as exc:  # noqa: BLE001 - the status must answer even if this part cannot
+        log_warning(f"Coding model status unavailable ({type(exc).__name__}: {exc}).")
+        coding_model, coding_tiers = dict(_NO_CODING_MODEL), []
 
     return {
         "status": cluster_status,
         "global_active_model": active_model_name,
         "running_models": running_names,
-        "recommended_tier": rec["tier"],
-        "recommended_model": rec["model"],
+        "recommended_tier": coding_ladder.tier_label(rec) if rec else None,
+        "recommended_model": rec["file"] if rec else None,
+        # The coding model as people should see it: its name, its real context and its
+        # measured speed (engine/coding_speed.py), and the ladder it sits on.
+        "coding_model": coding_model,
+        "coding_tiers": coding_tiers,
         "total_vram_gb": round(total_vram, 2),
         "total_sysram_gb": round(total_sysram, 2),
         "total_memory_gb": round(total_vram + total_sysram, 2),
@@ -2749,21 +2852,39 @@ async def get_cluster_status(request: Request):
 
 @app.get("/v1/cluster/tiers")
 async def get_cluster_tiers(request: Request):
-    """Returns the full VRAM tier matrix and current hardware eligibility."""
+    """
+    The coding pool's model ladder with the pool's eligibility, smallest tier first. Each row
+    keeps the fields this endpoint always had (min_vram_gb, tier, model, alt_model, unlocked,
+    cached_on_disk; alt_model is null now, the ladder names one model per tier) and adds the
+    ladder's own (id, name, context, enabled, blocked, size, parts).
+    """
     total_vram = registry.get_total_vram_gb()
     rec = _get_recommended_tier(total_vram)
     tiers_out = []
-    for t in VRAM_TIERS:
-        resolved = await manager.aresolve_model_path(t["model"])
+    for t in _coding_ladder():
+        cached = True
+        for part in t["files"]:
+            resolved = await manager.aresolve_model_path(part["file"])
+            cached = cached and bool(resolved and os.path.exists(resolved))
         tiers_out.append({
-            **t,
+            "id": t["id"],
+            "name": t["name"],
+            "min_vram_gb": t["min_vram_gb"],
+            "tier": coding_ladder.tier_label(t),
+            "model": t["file"],
+            "alt_model": None,
+            "context": t["context"],
+            "enabled": t["enabled"],
+            "blocked": t["blocked"],
+            "size": t["size"],
+            "parts": len(t["files"]),
             "unlocked": total_vram >= t["min_vram_gb"],
-            "cached_on_disk": bool(resolved and os.path.exists(resolved)),
+            "cached_on_disk": cached,
         })
     return {
         "total_vram_gb": round(total_vram, 2),
-        "recommended_tier": rec["tier"],
-        "recommended_model": rec["model"],
+        "recommended_tier": coding_ladder.tier_label(rec) if rec else None,
+        "recommended_model": rec["file"] if rec else None,
         "tiers": tiers_out,
     }
 
@@ -2776,10 +2897,15 @@ class SwapModelPayload(BaseModel):
 @app.post("/v1/cluster/swap", dependencies=[Depends(check_contrib_clause)])
 async def swap_cluster_model(payload: SwapModelPayload, request: Request):
     """
-    Hot-swap the cluster's active model from IDE clients or API consumers.
-    Stops currently running models (after draining active leases) and boots the requested model.
+    Hot-swap the cluster's active model. Stops currently running models (after draining
+    active leases) and boots the requested model. Operator only (this machine, an API key, or
+    the admin key): it changes the model for everyone, and until 2.3.6 a free-trial caller
+    could do it.
     """
     global global_active_model, is_swapping_models, cluster_status
+
+    if not _may_choose_model(request):
+        _require_admin(request)
 
     target_model = canonical_model_tag(payload.model or "")
     if not target_model:
@@ -4016,6 +4142,10 @@ async def startup_event():
     _apply_rpc_requirement()
     spawn_background_task(monitor_workers_async(), "monitor-workers")
     spawn_background_task(monitor_models_json_async(), "monitor-models-json")
+    log_coordinator("Coding model ladder: " + ", ".join(
+        f"{t['name']} ({t['min_vram_gb']} GB{'' if t['enabled'] else ', off'})" for t in _coding_ladder()) + ".")
+    # The saved speeds are read once, off the event loop, before the first status asks for them.
+    spawn_background_task(asyncio.to_thread(coding_speed.meter.load), "coding-speed-load")
     _load_app_tiers()
     if get_worker_limits().get("app_local_enabled", False) and app_pool.tiers:
         spawn_background_task(monitor_app_pool_async(), "app-pool")

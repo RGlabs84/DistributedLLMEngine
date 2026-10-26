@@ -18,10 +18,13 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from engine import chat_page, coordinator
+from engine.landing import OG_IMAGE_URL, PUBLIC_URL
 
 REMOTE = ("203.0.113.78", 40000)   # TEST-NET-3: a stranger, not the coordinator host
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 SUPPORT_LINKS = {chat_page.COFFEE_URL, chat_page.EXTENSION_URL}
+COMMUNITY_LINKS = {chat_page.WEBSITE_URL, chat_page.DISCORD_INVITE_URL}
+OUTSIDE_LINKS = SUPPORT_LINKS | COMMUNITY_LINKS   # every address the page may link to, and nothing else
 ICON_PATHS = [f"/chat/{name}" for name in chat_page.ICONS]
 
 
@@ -215,19 +218,52 @@ def test_the_page_loads_nothing_from_other_sites():
             value = attrs.get(key)
             if value is None:
                 continue
-            assert value in SUPPORT_LINKS or value.startswith("#") or (
+            assert value in OUTSIDE_LINKS or value.startswith("#") or (
                 value.startswith("/") and not value.startswith("//")), value
-    assert set(re.findall(r"https?://[^\s\"'<>)]+", page)) == SUPPORT_LINKS
+    # The link-preview card names the page's own public address (meta content, never loaded by
+    # the page itself).
+    preview = {f"{PUBLIC_URL}/chat", OG_IMAGE_URL}
+    assert set(re.findall(r"https?://[^\s\"'<>)]+", page)) == OUTSIDE_LINKS | preview
 
 
 def test_the_support_links_are_there_and_open_safely():
-    anchors = [a for a in _tags("a") if a.get("href") in SUPPORT_LINKS]
-    assert {a["href"] for a in anchors} == SUPPORT_LINKS
+    anchors = [a for a in _tags("a") if a.get("href") in OUTSIDE_LINKS]
+    assert {a["href"] for a in anchors} == OUTSIDE_LINKS
     for a in anchors:
-        assert "noopener" in a.get("rel", ""), a
+        assert a.get("target") == "_blank", a
+        assert a.get("rel") == "noopener noreferrer", a
     assert "Support DLNE: buy a coffee" in chat_page.CHAT_HTML
     assert "Donate compute at home" in chat_page.CHAT_HTML
     assert "Add to Home Screen" in chat_page.CHAT_HTML and "Install app" in chat_page.CHAT_HTML
+
+
+def test_the_website_and_the_discord_are_linked_from_the_menu_and_the_welcome_screen():
+    assert chat_page.WEBSITE_URL == "https://live.ravenirongames.com/#dlne"
+    assert chat_page.DISCORD_INVITE_URL == "https://discord.gg/RNxvxWn8cw"
+    page = chat_page.CHAT_HTML
+    # The menu: a "More from DLNE" section of two link rows, above "Support DLNE".
+    menu = page.split('<dialog id="menu"', 1)[1].split("</dialog>", 1)[0]
+    assert menu.index("<h3>More from DLNE</h3>") < menu.index("<h3>Support DLNE</h3>")
+    section = menu.split("<h3>More from DLNE</h3>", 1)[1].split("<h3>Support DLNE</h3>", 1)[0]
+    rows = re.findall(r'<a class="linkrow" href="([^"]+)"[^>]*>([^<]+)</a>', section)
+    assert rows == [(chat_page.WEBSITE_URL, "DLNE website"), (chat_page.DISCORD_INVITE_URL, "Discord")]
+    # The welcome screen's support line: short, and every item a link that opens in a new tab.
+    welcome = page.split('<section class="welcome"', 1)[1].split("</section>", 1)[0]
+    support = re.search(r'<p class="support">(.*?)</p>', welcome, re.S).group(1)
+    items = re.findall(r'<a href="([^"]+)" target="_blank" rel="noopener noreferrer">([^<]+)</a>', support)
+    assert items == [(chat_page.WEBSITE_URL, "Website"), (chat_page.DISCORD_INVITE_URL, "Discord"),
+                     (chat_page.COFFEE_URL, "Buy a coffee"), (chat_page.EXTENSION_URL, "Donate compute")]
+    assert re.sub(r"<[^>]+>", "", support).replace("&middot;", "·") == "Website · Discord · Buy a coffee · Donate compute"
+    # A link never breaks in two on a narrow phone, and the line balances when it has to wrap.
+    assert re.search(r"\.support a \{[^}]*white-space: nowrap", page) and "text-wrap: balance" in page
+
+
+def test_the_links_need_nothing_from_the_content_security_policy():
+    """Plain navigation is not a fetch: the policy still names no other site."""
+    assert chat_page.CSP == ("default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+                             "connect-src 'self'; img-src 'self' data:; manifest-src 'self'; worker-src 'self'; "
+                             "base-uri 'none'; frame-ancestors 'none'")
+    assert "http" not in chat_page.CSP and "navigate-to" not in chat_page.CSP and "form-action" not in chat_page.CSP
 
 
 def test_model_and_user_text_are_never_parsed_as_html():
@@ -445,6 +481,42 @@ out.report = C.reportPayload(msgs, msgs[3], 'wrong', '  ' + 'n'.repeat(600) + ' 
 out.report1 = C.reportPayload(msgs, msgs[1], 'harmful', '');
 out.badReason = C.reportPayload(msgs, msgs[1], 'spam', '');
 out.results = [200, 404, 405, 429, 500].map((s) => C.reportResult(s));
+
+// Server 2.3.5 takes an unsure answer back: {"dlne":{"event":"retract"}}. Everything shown so far
+// (text, sources, notes) goes, whatever else the message holds stays, and paint() redraws the rest.
+const shown = { role: 'assistant', content: 'I am not sure, but it was probably', sources: [recap],
+                lookupNotes: ['A note.'], searchNote: 'Dated.', reported: true };
+out.retractResult = C.applyData(shown, JSON.stringify({ dlne: { event: 'retract', text: 'extra fields are ignored' } }));
+out.retracted = shown;
+const untouched = { role: 'assistant', content: '' };
+out.retractFirst = [C.applyData(untouched, JSON.stringify({ dlne: { event: 'retract' } })), untouched];
+
+// The whole thing as it arrives: memory text, the retract, then the lookup and a fresh answer,
+// split at every awkward place. A page that shows a reply must never show the memory text again.
+const takeBack = [
+  { choices: [{ index: 0, delta: { content: "I don't have real-time information, " }, finish_reason: null }] },
+  { choices: [{ index: 0, delta: { content: 'but my guess is Team B.' }, finish_reason: null }] },
+  { dlne: { event: 'retract' } },
+  { dlne: { event: 'searching', tool: 'web_search', query: 'who won the game' } },
+  { dlne: { event: 'sources', sources: [recap] } },
+  { choices: [{ index: 0, delta: { content: 'Team A won [1].' }, finish_reason: null }] },
+  { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+];
+const takeBackBytes = new TextEncoder().encode(
+  takeBack.map((e) => 'data: ' + JSON.stringify(e) + '\n\n').join('') + 'data: [DONE]\n\n');
+function runTakeBack(size) {
+  const reply = { role: 'assistant', content: '' };
+  const states = [];
+  const reader = C.streamReader((data) => {
+    const result = C.applyData(reply, data);
+    if (result === 'changed') states.push(JSON.parse(JSON.stringify(reply)));
+    return result !== 'done';
+  });
+  for (let i = 0; i < takeBackBytes.length; i += size) reader.push(takeBackBytes.slice(i, i + size));
+  reader.end();
+  return { reply, states };
+}
+out.takeBack = [1, 3, 7, 64, takeBackBytes.length].map(runTakeBack);
 process.stdout.write(JSON.stringify(out));
 """
 
@@ -557,3 +629,28 @@ def test_a_report_carries_the_question_it_answered_cut_to_size(core_run):
     assert core_run["results"][0]["ok"] is True and texts[0] == "Thanks, we'll review it."
     assert texts[1] == texts[2] == "Reporting isn't available on this server."
     assert not any(r["ok"] for r in core_run["results"][1:])
+
+
+def test_a_retract_event_empties_the_answer_and_drops_its_sources_and_notes(core_run):
+    assert core_run["retractResult"] == "changed"   # the page repaints
+    # Text, sources, lookup notes and the dated-search note are gone; the rest of the message stays.
+    assert core_run["retracted"] == {"role": "assistant", "content": "", "reported": True}
+    # Nothing to take back yet (the event came first): still a clean, empty answer.
+    assert core_run["retractFirst"] == ["changed", {"role": "assistant", "content": ""}]
+
+
+def test_after_a_retract_the_lookup_and_a_fresh_answer_replace_the_memory_text(core_run):
+    first = core_run["takeBack"][0]
+    for run in core_run["takeBack"]:
+        assert run == first   # the same whatever the network pieces
+    memory = ["I don't have real-time information, ", "I don't have real-time information, but my guess is Team B."]
+    contents = [state["content"] for state in first["states"]]
+    assert contents == memory + ["", "", "", "Team A won [1]."]
+    retracted, searching, sourced = first["states"][2:5]
+    assert retracted == {"role": "assistant", "content": ""}
+    assert searching["searching"] == "Searching the web for “who won the game”…" and searching["content"] == ""
+    assert [s["n"] for s in sourced["sources"]] == [1] and "searching" not in sourced
+    # The answer that is kept is the fresh one alone, with the lookup's sources.
+    reply = first["reply"]
+    assert reply["content"] == "Team A won [1]." and [s["n"] for s in reply["sources"]] == [1]
+    assert "Team B" not in json.dumps(first["states"][2:]) and "real-time" not in json.dumps(first["states"][2:])

@@ -76,7 +76,7 @@ Play Console > **Create app**:
      (Console shows the exact command), then create a new, separate upload key.
 3. Upload `app-release.aab`. The R8 mapping file is embedded in the bundle, so crash reports
    in Console are de-obfuscated automatically.
-4. Release name: `1.0.1 (2)`. Release notes, e.g.: `First release of DLNE for Android.`
+4. Release name: `1.0.2 (3)`. Release notes, e.g.: `First release of DLNE for Android.`
 5. Add testers: create an email list (or a Google Group) with your testers, save, and share
    the opt-in link from the track page. Testers must open it and accept.
 6. Review and roll out the release to the track.
@@ -119,7 +119,7 @@ Take these, using harmless example questions (no personal data, no real names):
    under the title (or the "Checking the weather for …" line while it looks something up).
 4. **The chat list drawer** with three or four example conversations.
 5. **The first-run privacy notice** ("Before you start").
-6. **Settings**, showing the privacy section and the Support / Donate compute rows.
+6. **Settings**, showing the privacy section and the Website / Discord / Support / Donate compute rows.
 7. Optional: **the Report answer sheet** (shows reviewers the AI-content reporting).
 8. Optional: **sharing text into DLNE** from a browser (share sheet with DLNE selected, or the
    new chat with the shared text in the box).

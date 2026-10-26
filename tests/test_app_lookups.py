@@ -185,6 +185,14 @@ async def test_lookups_stop_after_the_last_round():
     ("What happened in the 2026 election?", True),
     ("Explain how a heat pump works.", False),
     ("What's 15% of 240?", False),
+    ("Who is the president of France?", True),
+    ("When does the next Zelda come out?", True),
+    ("How old is Keanu Reeves?", True),
+    ("Who is Wubarrk?", True),                    # launch night: answered from memory with a made-up place
+    ("who's Ada Lovelace", True),
+    ("Who is he?", False),
+    ("who are you?", False),
+    ("Explain who Ada Lovelace was.", False),
 ])
 async def test_questions_about_now_require_a_lookup(question, required):
     member = Member_(ANSWER)
@@ -230,6 +238,9 @@ async def test_a_model_that_skips_a_required_lookup_is_searched_for_anyway():
     question = "Who won the most recent Super Bowl? Cite your source."
     out, _ = await run(member, {"messages": [{"role": "user", "content": question}]}, WEB_TOOLS, run_tool)
     assert member.requests[0]["tool_choice"] == "required"
+    assert member.requests[0]["max_tokens"] == ap.HELD_PASS_TOKENS, \
+        "a held pass's talk is thrown away, so it is cut short (it took 28 s of a 36 s answer)"
+    assert member.requests[1]["max_tokens"] == ap.MAX_OUTPUT_TOKENS, "the real answer is not"
     assert seen == [("web_search", {"query": question})]
     assert "Chiefs" not in text(out) and "espn.example" not in text(out)
     assert text(out) == "It is sunny [1]."
@@ -245,7 +256,40 @@ async def test_without_a_web_search_tool_a_required_pass_answer_is_shown():
 
     out, _ = await run(member, {"messages": [{"role": "user", "content": "What's the latest news?"}]}, TOOLS, run_tool)
     assert member.requests[0]["tool_choice"] == "required"
+    assert member.requests[0]["max_tokens"] == ap.MAX_OUTPUT_TOKENS, "this answer may be shown, so it is not cut"
     assert text(out) == "It is sunny." and out.endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.anyio
+async def test_a_lookup_cut_off_by_the_held_pass_cap_becomes_a_search_for_the_question():
+    cut = (sse({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "c", "type": "function",
+                                                                   "function": {"name": "web_search", "arguments": "{\"qu"}}]},
+                             "finish_reason": None}]})
+           + sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}) + b"data: [DONE]\n\n")
+    member = Member_(cut, ANSWER)
+    seen = []
+
+    async def run_tool(name, arguments, first_n=1):
+        seen.append((name, arguments))
+        return Result(sources=[{"n": 1, "title": "t", "url": "https://x.example/", "host": "x", "age": ""}],
+                      context_text="[1] ...")
+
+    question = "Who won the most recent Super Bowl?"
+    out, _ = await run(member, {"messages": [{"role": "user", "content": question}]}, WEB_TOOLS, run_tool)
+    assert seen == [("web_search", {"query": question})]
+    assert text(out) == "It is sunny [1]."
+
+
+@pytest.mark.anyio
+async def test_the_members_file_path_and_timings_never_reach_the_phone():
+    leaky = (sse({"model": "/home/wubarrk/DLNEv2/models/Qwen3.6.gguf",
+                  "choices": [{"index": 0, "delta": {"content": "Hi."}, "finish_reason": None}]})
+             + sse({"model": "/home/wubarrk/DLNEv2/models/Qwen3.6.gguf", "timings": {"predicted_n": 2},
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+             + b"data: [DONE]\n\n")
+    out, _ = await run(Member_(leaky), BODY)
+    assert b"/home/" not in out and b"timings" not in out
+    assert text(out) == "Hi."
 
 
 @pytest.mark.anyio
@@ -257,6 +301,86 @@ async def test_a_search_note_is_passed_on():
 
     out, _ = await run(member, BODY, TOOLS, run_tool)
     assert {"event": "search_note", "note": "These results are from Wikipedia."} in dlne(out)
+
+
+UNSURE = content("I don't have real-time information, ") + content("but I think it was the Chiefs.") + b"data: [DONE]\n\n"
+
+
+@pytest.mark.anyio
+async def test_an_unsure_answer_is_taken_back_and_the_question_searched():
+    # The owner's phone test: the model answered from memory, saying it couldn't know, three
+    # times; "search the web" had to be typed to get a lookup.
+    member = Member_(UNSURE, ANSWER)
+    seen = []
+
+    async def run_tool(name, arguments, first_n=1):
+        seen.append((name, arguments))
+        return Result(sources=[{"n": 1, "title": "Engagement", "url": "https://en.wikipedia.org/wiki/X",
+                                "host": "en.wikipedia.org", "age": ""}], context_text="[1] ...")
+
+    question = "Is Taylor Swift engaged?"
+    out, pool = await run(member, {"messages": [{"role": "user", "content": question}]}, WEB_TOOLS, run_tool)
+    assert "tool_choice" not in member.requests[0], "not a question about now: the model was free to answer"
+    assert seen == [("web_search", {"query": question})]
+    kinds = [("dlne", e["dlne"]["event"]) if "dlne" in e else ("text", e["choices"][0]["delta"]["content"])
+             for e in events(out)]
+    assert kinds == [("text", "I don't have real-time information, "), ("dlne", "retract"), ("dlne", "searching"),
+                     ("dlne", "sources"), ("text", "It is "), ("text", "sunny [1].")], \
+        "the member is let go at the hedge, and the phone takes back what it was shown"
+    assert member.requests[1]["messages"][-1]["tool_call_id"] == "call_unsure"
+    assert pool._inflight == {}
+
+
+@pytest.mark.anyio
+async def test_an_answer_after_a_lookup_is_never_taken_back():
+    unsure_after = content("I'm not sure, ") + content("but it says sunny [1].") + b"data: [DONE]\n\n"
+    member = Member_(tool_call([("w", "weather", {"location": "Philadelphia"})]), unsure_after)
+
+    async def run_tool(name, arguments, first_n=1):
+        return Result(sources=[{"n": 1, "title": "t", "url": "https://x.example/", "host": "x", "age": ""}],
+                      context_text="[1] sunny")
+
+    out, _ = await run(member, BODY, WEB_TOOLS, run_tool)
+    assert "retract" not in [e["event"] for e in dlne(out)]
+    assert text(out) == "I'm not sure, but it says sunny [1]."
+
+
+@pytest.mark.anyio
+async def test_without_a_web_search_tool_an_unsure_answer_is_shown_whole():
+    member = Member_(UNSURE)
+
+    async def run_tool(*args, **kwargs):
+        return Result()
+
+    out, _ = await run(member, {"messages": [{"role": "user", "content": "Is Taylor Swift engaged?"}]},
+                       TOOLS, run_tool)
+    assert dlne(out) == [] and text(out) == "I don't have real-time information, but I think it was the Chiefs."
+
+
+@pytest.mark.parametrize("answer, unsure", [
+    ("As of my last update in 2024, the CEO was", True),
+    ("I don't have real-time access to scores.", True),
+    ("I’m not sure. It might be", True),
+    ("I'm not aware of any such release.", True),
+    ("I don't know, but", True),
+    ("I can't browse the internet.", True),
+    ("I'm unable to verify that.", True),
+    ("I don't have information about that event.", True),
+    ("Prices may have changed since then.", True),
+    ("There is no widely known person named Wubarrk.", True),
+    ("I couldn't find any information about that.", True),
+    ("It appears to be a misspelling of Wukar.", True),
+    ("Did you mean Wukar, a town in Nigeria?", True),
+    ("I'm not sure what you mean. Could you say more?", False),
+    ("I don't know which one you'd prefer, so here are both.", False),
+    ("If you don't know where to start, begin small.", False),
+    ("Training data is the set of examples a model learns from.", False),
+    ("```python\nprint(\"I don't know.\")\n```\nThat prints a line.", False),
+    ("I'm not sure", False),                      # the next word hasn't arrived yet
+    ("I don't know wh", False),
+])
+def test_answers_that_say_they_cannot_know(answer, unsure):
+    assert ap._hedges(answer) is unsure
 
 
 @pytest.mark.parametrize("pieces, expected", [

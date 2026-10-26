@@ -323,16 +323,212 @@ def app_tiers(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
     return tiers
 
 
+# ---------------------------------------------------------------------------------------
+# The GPU coding pool's model ladder (what /v1/chat/completions is answered with)
+# ---------------------------------------------------------------------------------------
+#
+# scripts/coding_models.json lists the tiers smallest first; engine/coding_ladder.py is what
+# the coordinator reads them through. Signed the same way as the CPU pool's tiers, as flat
+# text and integer fields only: "coding_tiers" lists the ids, and each id has
+# coding_<id>_{name,min_vram_gb,context,enabled,blocked,parts} plus
+# coding_<id>_part<k>_{file,url,sha256,size} for k = 1..parts.
+#
+# NEVER A BOOLEAN IN THE MANIFEST. The VS Code extension's verifier (engineRelease.ts
+# canonicalBytes) throws on any value that is not a string or an integer, so one `true` here
+# would make every extension in the field reject the whole release. "enabled" is signed as
+# 1 or 0 and read back as a bool.
+#
+# A tier is one GGUF file or a llama.cpp split set (<stem>-00001-of-0000N.gguf ...): very large
+# models are only published in parts, and llama.cpp loads part 1 and finds the rest by name.
+
+_CODING_URL_RE = re.compile(
+    r"^https://huggingface\.co/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/resolve/[0-9a-f]{40}/"
+    r"(?:[A-Za-z0-9_-][A-Za-z0-9._-]*/)?[A-Za-z0-9._-]+\.gguf$"   # at most one folder, never "." or ".."
+)
+_SPLIT_PART_RE = re.compile(r"^(?P<stem>.+)-(?P<part>\d{5})-of-(?P<count>\d{5})\.gguf$")
+_CODING_PART_KEYS = ("file", "url", "sha256", "size")
+_CODING_KEYS = {"id", "name", "min_vram_gb", "context", "enabled", "blocked", "files", *_CODING_PART_KEYS}
+CODING_MAX_PARTS = 16
+CODING_MAX_CONTEXT = 1 << 21          # 2M tokens: room for the 1M-context models being researched
+CODING_MAX_VRAM_GB = 4096
+
+
+def coding_field(tier_id: str, what: str) -> str:
+    """``coding_field("qwen36-a3b", "part1_sha256") == "coding_qwen36_a3b_part1_sha256"``."""
+    return f"coding_{tier_id.replace('-', '_')}_{what}"
+
+
+def _is_int(value: Any, low: int, high: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def _printable(value: Any, longest: int) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= longest and all(" " <= c <= "~" for c in value)
+
+
+def _coding_part(tier_id: str, part: Any) -> Dict[str, Any]:
+    if not isinstance(part, dict):
+        raise ReleaseError(f"tier {tier_id}: each file must be an object")
+    unknown = sorted(k for k in part if k not in _CODING_PART_KEYS)
+    if unknown:
+        raise ReleaseError(f"tier {tier_id}: unknown file field {unknown[0]!r}")
+    file, url = part.get("file"), part.get("url")
+    if not isinstance(file, str) or not _APP_FILE_RE.fullmatch(file):
+        raise ReleaseError(f"tier {tier_id}: bad file name")
+    if not isinstance(url, str) or not _CODING_URL_RE.fullmatch(url) or not url.endswith("/" + file):
+        raise ReleaseError(f"tier {tier_id}: the url must be a Hugging Face file pinned to a revision, ending in the file name")
+    if not isinstance(part.get("sha256"), str) or not _SHA256_RE.fullmatch(part["sha256"]):
+        raise ReleaseError(f"tier {tier_id}: bad sha256")
+    if not _is_int(part.get("size"), 1, 1 << 40):
+        raise ReleaseError(f"tier {tier_id}: bad size")
+    return {"file": file, "url": url, "sha256": part["sha256"], "size": part["size"]}
+
+
+def coding_tier(entry: Any) -> Dict[str, Any]:
+    """
+    One validated coding tier in the shape engine/coding_ladder.py hands out, from an entry of
+    scripts/coding_models.json. Raises ReleaseError (naming the tier) when anything is wrong.
+
+    An entry names its model either with file/url/sha256/size (one file) or with "files", a
+    list of such objects (a split set, in part order). Keys starting with "_" are comments.
+    The result always has both: "files" lists every part, "file"/"url"/"sha256" are part 1
+    (the file llama-server is pointed at) and "size" is the total of all parts.
+    """
+    if not isinstance(entry, dict):
+        raise ReleaseError("each tier must be an object")
+    tier_id = entry.get("id")
+    if not isinstance(tier_id, str) or not _APP_ID_RE.fullmatch(tier_id):
+        raise ReleaseError(f"bad tier id {tier_id!r}")
+    unknown = sorted(k for k in entry if k not in _CODING_KEYS and not str(k).startswith("_"))
+    if unknown:
+        raise ReleaseError(f"tier {tier_id}: unknown field {unknown[0]!r}")
+    if not _printable(entry.get("name"), 80):
+        raise ReleaseError(f"tier {tier_id}: name must be printable ASCII, 1 to 80 characters")
+    if not _is_int(entry.get("min_vram_gb"), 1, CODING_MAX_VRAM_GB):
+        raise ReleaseError(f"tier {tier_id}: bad min_vram_gb (a whole number of GB)")
+    if not _is_int(entry.get("context"), 1024, CODING_MAX_CONTEXT):
+        raise ReleaseError(f"tier {tier_id}: bad context")
+    if not isinstance(entry.get("enabled"), bool):
+        raise ReleaseError(f"tier {tier_id}: enabled must be true or false")
+    blocked = entry.get("blocked")
+    if blocked is not None and not _printable(blocked, 200):
+        raise ReleaseError(f"tier {tier_id}: blocked must be printable ASCII, 1 to 200 characters")
+    if entry["enabled"] and blocked:
+        raise ReleaseError(f"tier {tier_id}: enabled but still marked blocked ({blocked}); clear one of them")
+
+    has_single = any(key in entry for key in _CODING_PART_KEYS)
+    if "files" in entry:
+        if has_single:
+            raise ReleaseError(f"tier {tier_id}: give either file/url/sha256/size or files, not both")
+        raw_parts = entry["files"]
+        if not isinstance(raw_parts, list) or not 1 <= len(raw_parts) <= CODING_MAX_PARTS:
+            raise ReleaseError(f"tier {tier_id}: files must list 1 to {CODING_MAX_PARTS} parts")
+    else:
+        raw_parts = [{key: entry.get(key) for key in _CODING_PART_KEYS}]
+    parts = [_coding_part(tier_id, part) for part in raw_parts]
+    if len(parts) > 1:
+        # llama.cpp opens part 1 and derives the other names from it, so they must be exactly
+        # <stem>-0000k-of-0000N.gguf, in order, one stem.
+        stems = set()
+        for number, part in enumerate(parts, start=1):
+            match = _SPLIT_PART_RE.fullmatch(part["file"])
+            if not match or int(match["part"]) != number or int(match["count"]) != len(parts):
+                raise ReleaseError(f"tier {tier_id}: part {number} must be named <stem>-{number:05d}-of-{len(parts):05d}.gguf")
+            stems.add(match["stem"])
+        if len(stems) != 1:
+            raise ReleaseError(f"tier {tier_id}: every part must share one name stem")
+    return {
+        "id": tier_id,
+        "name": entry["name"],
+        "file": parts[0]["file"],
+        "url": parts[0]["url"],
+        "sha256": parts[0]["sha256"],
+        "size": sum(part["size"] for part in parts),
+        "min_vram_gb": entry["min_vram_gb"],
+        "context": entry["context"],
+        "enabled": entry["enabled"],
+        "blocked": blocked or None,
+        "files": parts,
+    }
+
+
+def check_coding_tiers(entries: Any) -> List[Dict[str, Any]]:
+    """Every entry through :func:`coding_tier`, then the list rules. Raises ReleaseError."""
+    if not isinstance(entries, list) or not entries:
+        raise ReleaseError("the coding model list is empty")
+    tiers = [coding_tier(entry) for entry in entries]
+    ids = [tier["id"] for tier in tiers]
+    if len(set(ids)) != len(ids):
+        raise ReleaseError("tier ids must be unique")
+    files = [part["file"].lower() for tier in tiers for part in tier["files"]]
+    if len(set(files)) != len(files):
+        raise ReleaseError("two tiers name the same file")
+    vram = [tier["min_vram_gb"] for tier in tiers]
+    if any(later < earlier for earlier, later in zip(vram, vram[1:])):
+        raise ReleaseError("tiers must be listed smallest first (min_vram_gb never decreasing)")
+    return tiers
+
+
+def _flatten_coding_tier(tier: Dict[str, Any]) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {
+        coding_field(tier["id"], "name"): tier["name"],
+        coding_field(tier["id"], "min_vram_gb"): tier["min_vram_gb"],
+        coding_field(tier["id"], "context"): tier["context"],
+        coding_field(tier["id"], "enabled"): 1 if tier["enabled"] else 0,   # never a bool, see above
+        coding_field(tier["id"], "blocked"): tier["blocked"] or "",
+        coding_field(tier["id"], "parts"): len(tier["files"]),
+    }
+    for number, part in enumerate(tier["files"], start=1):
+        for what in _CODING_PART_KEYS:
+            fields[coding_field(tier["id"], f"part{number}_{what}")] = part[what]
+    return fields
+
+
+def coding_tiers(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    The coding pool's tiers named by ``manifest``, validated, smallest first; [] when it names
+    none. Raises ReleaseError when the manifest names tiers that are malformed.
+    """
+    ids = manifest.get("coding_tiers")
+    if not isinstance(ids, str) or not ids:
+        return []
+    entries = []
+    for tier_id in ids.split(","):
+        enabled = manifest.get(coding_field(tier_id, "enabled"))
+        if not _is_int(enabled, 0, 1):
+            raise ReleaseError(f"tier {tier_id}: enabled must be signed as 1 or 0")
+        count = manifest.get(coding_field(tier_id, "parts"))
+        if not _is_int(count, 1, CODING_MAX_PARTS):
+            raise ReleaseError(f"tier {tier_id}: bad parts count")
+        blocked = manifest.get(coding_field(tier_id, "blocked"))
+        if not isinstance(blocked, str):
+            raise ReleaseError(f"tier {tier_id}: blocked must be text")
+        entries.append({
+            "id": tier_id,
+            "name": manifest.get(coding_field(tier_id, "name")),
+            "min_vram_gb": manifest.get(coding_field(tier_id, "min_vram_gb")),
+            "context": manifest.get(coding_field(tier_id, "context")),
+            "enabled": enabled == 1,
+            "blocked": blocked or None,
+            "files": [{what: manifest.get(coding_field(tier_id, f"part{number}_{what}")) for what in _CODING_PART_KEYS}
+                      for number in range(1, count + 1)],
+        })
+    return check_coding_tiers(entries)
+
+
 def make_manifest(version: str, archive_path: str, git_commit: str, built_at: str, notes: str = "",
                   rpc_zips: Optional[Dict[str, str]] = None, llama_build: Optional[str] = None,
                   rpc_proto: Optional[str] = None, server_llama: Optional[str] = None,
-                  app_models: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                  app_models: Optional[List[Dict[str, Any]]] = None,
+                  coding_models: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """
     The unsigned manifest for ``archive_path``. Every string is validated as printable ASCII.
 
     ``rpc_zips`` maps platform -> RPC zip; with it come ``llama_build`` (the upstream tag, e.g.
     "b11838") and ``rpc_proto`` (its RPC protocol, e.g. "8.0.1"). ``server_llama`` is the
     upstream Linux build the coordinator itself runs, installed by release_apply.
+    ``app_models`` and ``coding_models`` are the tier lists of scripts/app_models.json and
+    scripts/coding_models.json.
     """
     parse_version(version)
     manifest: Dict[str, Any] = {
@@ -374,6 +570,14 @@ def make_manifest(version: str, archive_path: str, git_commit: str, built_at: st
         if problem:
             raise ReleaseError(f"CPU pool model list: {problem}.")
         manifest["app_tiers"] = ",".join(ids)
+    if coding_models:
+        try:
+            tiers = check_coding_tiers(coding_models)
+        except ReleaseError as exc:
+            raise ReleaseError(f"Coding model list: {exc}.") from exc
+        for tier in tiers:
+            manifest.update(_flatten_coding_tier(tier))
+        manifest["coding_tiers"] = ",".join(tier["id"] for tier in tiers)
     for field in ("version", "file", "sha256", "git_commit", "built_at", "notes"):
         _require_printable_ascii(field, str(manifest[field]))
     return manifest
@@ -462,6 +666,12 @@ def verify_manifest(manifest: Any, pubkey_hex: Optional[str] = None) -> Tuple[bo
         problem = _check_tier_list(tiers)
         if problem:
             return (False, f"the manifest's CPU pool tiers are invalid: {problem}")
+    if "coding_tiers" in manifest:
+        try:
+            if not coding_tiers(manifest):
+                return (False, "the manifest's coding_tiers is empty")
+        except ReleaseError as exc:
+            return (False, f"the manifest's coding tiers are invalid: {exc}")
     signature = manifest.get("signature")
     if not isinstance(signature, str) or not signature:
         return (False, "the release manifest is not signed")

@@ -112,7 +112,7 @@ test('the sidebar webview shows the logo image and draws no mark of its own', ()
   assert.equal(images.length, 2, 'the card header and the welcome line');
   for (const img of images) assert.match(img, /src="[^"]*media\/dlne_logo\.png"/);
   assert.match(html, /<img class="logo"[^>]*>Compute Contribution/);
-  assert.match(html, /<img class="logo"[^>]*>DLNE Frontier Reasoning Agent/);
+  assert.match(html, /<img class="logo"[^>]*>DLNE Code Assistant/);
 });
 
 test('the sidebar loads the logo through the webview, from inside the extension folder', () => {

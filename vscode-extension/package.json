@@ -2,7 +2,7 @@
   "name": "dlne-code-assistant",
   "displayName": "DLNE Coding Assistant: Free AI Agent",
   "description": "A free AI coding agent and autocomplete, running on GPUs its users share. 100 free chats, no account or API key.",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "publisher": "dlne",
   "license": "MIT",
   "repository": {
@@ -21,8 +21,8 @@
   "keywords": [
     "dlne",
     "coding agent",
-    "deepseek",
     "qwen",
+    "free ai",
     "copilot",
     "autocomplete",
     "diff"
@@ -47,7 +47,7 @@
         {
           "type": "webview",
           "id": "dlne.chatView",
-          "name": "Frontier Coding Agent"
+          "name": "DLNE Code Assistant"
         }
       ]
     },
@@ -55,7 +55,7 @@
       {
         "id": "dlne.agent",
         "name": "dlne",
-        "fullName": "DLNE Frontier Agent",
+        "fullName": "DLNE Code Assistant",
         "description": "Free coding agent running on the DLNE community GPU swarm",
         "isSticky": true,
         "commands": [
@@ -81,7 +81,7 @@
           },
           {
             "name": "model",
-            "description": "Switch active cluster model tier (14b / 32b / r1 / 70b / r1-70b / 72b)"
+            "description": "Show the model the swarm is running (chosen automatically from the GPUs available)"
           }
         ]
       }
@@ -180,12 +180,12 @@
         "dlne.chatModel": {
           "type": "string",
           "default": "",
-          "description": "Target model for Agent Chat (leave empty to use cluster active model)"
+          "description": "Leave empty: the swarm serves the model it has active. Set a model file name only for a private coordinator you run. (The model names the old model picker saved here are ignored.)"
         },
         "dlne.fimModel": {
           "type": "string",
           "default": "",
-          "description": "Target model for Inline FIM Completion"
+          "description": "Leave empty: autocomplete uses the model the swarm has active. Set a model file name only for a private coordinator you run."
         },
         "dlne.enableInlineCompletion": {
           "type": "boolean",

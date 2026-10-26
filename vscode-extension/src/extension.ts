@@ -108,7 +108,7 @@ async function checkAndAutoUpdateExtension(context: vscode.ExtensionContext): Pr
       await installAndPromptReload();
     } else {
       const choice = await vscode.window.showInformationMessage(
-        `🚀 A new version of DLNE Frontier Coding Assistant (v${remoteVersion}) is available! (Current: v${currentVersion})`,
+        `🚀 A new version of DLNE Code Assistant (v${remoteVersion}) is available! (Current: v${currentVersion})`,
         'Update Now',
         'Later'
       );
@@ -146,7 +146,7 @@ export function activate(context: vscode.ExtensionContext) {
   );
   context.subscriptions.push(inlineDisposable);
 
-  // 3a. Frontier Reasoning Agent Sidebar Webview (Dedicated Toolbar Panel)
+  // 3a. DLNE Code Assistant sidebar webview (dedicated toolbar panel)
   const sidebarProvider = new SidebarProvider(context.extensionUri, client, workerManager, context);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('dlne.chatView', sidebarProvider)

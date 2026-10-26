@@ -60,12 +60,17 @@ class FakeRequest:
 
     ``client_host`` exists for the ``get_client_ip`` tests, which read ``request.client.host``
     and ``request.headers``.
+
+    ``state.dlne_tier`` is what the contribution middleware would have set: "host", so the
+    model these tests name is the one that runs (public callers get the live model instead,
+    tests/test_model_choice.py).
     """
 
     def __init__(self, body=None, headers=None, client_host="203.0.113.7"):
         self._body = body
         self.headers = headers or {}
         self.client = FakeClient(client_host) if client_host is not None else None
+        self.state = types.SimpleNamespace(dlne_tier="host")
 
     async def json(self):
         if isinstance(self._body, Exception):

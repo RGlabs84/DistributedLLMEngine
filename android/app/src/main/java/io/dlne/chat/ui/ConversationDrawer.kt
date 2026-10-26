@@ -26,6 +26,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -110,8 +111,13 @@ fun ConversationDrawer(
             icon = { Icon(painterResource(R.drawable.ic_settings), contentDescription = null) },
             selected = false,
             onClick = onSettings,
-            modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
+            modifier = Modifier.padding(horizontal = 12.dp),
         )
+        // Quiet footer: two small links, side by side so the chat list keeps its room.
+        Row(Modifier.padding(start = 12.dp, end = 12.dp, bottom = 8.dp)) {
+            DrawerLink(stringResource(R.string.settings_website), WEBSITE_URL)
+            DrawerLink(stringResource(R.string.settings_discord), DISCORD_URL)
+        }
     }
 
     confirmDelete?.let { id ->
@@ -128,6 +134,20 @@ fun ConversationDrawer(
             dismissButton = {
                 TextButton(onClick = { confirmDelete = null }) { Text(stringResource(R.string.cancel)) }
             },
+        )
+    }
+}
+
+/** A small text link in the drawer's footer that opens [url] in the browser. */
+@Composable
+private fun DrawerLink(label: String, url: String) {
+    val context = LocalContext.current
+    TextButton(onClick = { openInBrowser(context, url) }) {
+        Text(label, style = MaterialTheme.typography.labelLarge)
+        Icon(
+            painterResource(R.drawable.ic_open_in_new),
+            contentDescription = null,
+            modifier = Modifier.padding(start = 6.dp).size(14.dp),
         )
     }
 }

@@ -52,7 +52,7 @@ RUN YOUR OWN
 DLNE uses the public DLNE server at https://dlne.duckdns.org unless you say otherwise. DLNE is open source under the MIT license. If you run your own DLNE server, enter its address in Settings.
 
 HELP DLNE GROW
-The more computers people lend, the bigger and faster the models DLNE can offer. Anyone with a PC can donate spare computing power with the free DLNE extension for VS Code and VSCodium. You can also support the project with a coffee from the app's Settings.
+The more computers people lend, the bigger and faster the models DLNE can offer. Anyone with a PC can donate spare computing power with the free DLNE extension for VS Code and VSCodium. You can also support the project with a coffee from the app's Settings, which also links to the DLNE website and the DLNE Discord for news and help.
 
 Source code: https://github.com/RGlabs84/DistributedLLMEngine
 ```

@@ -103,6 +103,11 @@
     <string name="settings_delete_all">Delete all chats</string>
     <string name="settings_delete_all_title">Delete all chats?</string>
     <string name="settings_delete_all_body">Every chat stored on this phone will be removed. This can\'t be undone.</string>
+    <string name="settings_community_title">Website and community</string>
+    <string name="settings_website">DLNE website</string>
+    <string name="settings_website_sub">live.ravenirongames.com/#dlne</string>
+    <string name="settings_discord">Discord</string>
+    <string name="settings_discord_sub">News and help: discord.gg/RNxvxWn8cw</string>
     <string name="settings_support_title">Support DLNE</string>
     <string name="settings_coffee">Support DLNE: buy a coffee</string>
     <string name="settings_coffee_sub">buymeacoffee.com/wubarrk</string>

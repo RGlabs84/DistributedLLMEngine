@@ -196,3 +196,35 @@ def test_without_gitleaks_nothing_is_published(monkeypatch, capsys):
     monkeypatch.setattr(pub.shutil, "which", lambda name: None)
     assert pub.main([]) == 2
     assert "gitleaks is required" in capsys.readouterr().err
+
+
+def test_retired_and_misleading_files_stay_in_the_repository_but_not_on_github(repos, fake_gitleaks):
+    src, public, tmp = repos
+    leftovers = [
+        "ABOUT-DLNE/index.html",                  # placeholder page
+        "discord/channels/faq.md",                # the retired v1.0 product's texts and scripts
+        "discord/adverts/announcement.md",
+        "discord/scripts/setup_server.py",
+        "download_dlne_models.sh",                # legacy downloader
+        "wallpapers/dlne_background_1440p_16_9_with_logos.png",   # shows another app's icon
+        "wallpapers/dlne_background_1440p_16_9.png",              # the DLNE one stays
+        "scripts/dlne_discord_tile.py",           # lives in scripts/, so it is not discord/
+    ]
+    for name in leftovers:
+        path = src / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n")
+    git(src, "add", "-A")
+    git(src, "commit", "-q", "-m", "add files")
+
+    assert _publish(src, public, fake_gitleaks, tmp / "none.txt")[0]
+    assert git(public, "ls-tree", "-r", "--name-only", "main").splitlines() == [
+        "app.py", "scripts/dlne_discord_tile.py", "wallpapers/dlne_background_1440p_16_9.png"]
+    # Nothing was deleted from the private repository.
+    assert set(leftovers) <= set(git(src, "ls-files").splitlines())
+
+
+def test_the_exclusions_are_what_the_maintainer_asked_for():
+    assert set(pub.EXCLUDED_DIRS) == {"builder", "ABOUT-DLNE", "discord"}
+    assert set(pub.EXCLUDED_FILES) == {"download_dlne_models.sh",
+                                       "wallpapers/dlne_background_1440p_16_9_with_logos.png"}

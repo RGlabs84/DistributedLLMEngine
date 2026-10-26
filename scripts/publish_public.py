@@ -36,8 +36,19 @@ AUTHOR_NAME = "Ross"
 AUTHOR_EMAIL = "51202846+RGlabs84@users.noreply.github.com"
 DENY_FILE = os.path.expanduser("~/.config/dlne/publish-deny.txt")
 
-# Left out of every snapshot: the old desktop build tooling (including the obfuscator).
-EXCLUDED_DIRS = ("builder",)
+# Left out of every snapshot (they stay in the repository, just not on GitHub):
+#   builder/       the old desktop build tooling, including the obfuscator;
+#   ABOUT-DLNE/    a placeholder page ("John Doe", a made-up company), never true;
+#   discord/       the retired v1.0 product's channel texts and bot scripts (discord/adverts/ too).
+EXCLUDED_DIRS = ("builder", "ABOUT-DLNE", "discord")
+
+# Single files left out, as paths from the repository root with "/" separators:
+#   download_dlne_models.sh   a legacy model downloader whose file names do not match what they download;
+#   the wallpaper with logos  it shows another app's icon beside DLNE's, and DLNE has one icon only.
+EXCLUDED_FILES = (
+    "download_dlne_models.sh",
+    "wallpapers/dlne_background_1440p_16_9_with_logos.png",
+)
 
 # Never public, wherever they turn up in the tree.
 FORBIDDEN_PATTERNS = (
@@ -72,7 +83,7 @@ def _run(args: List[str], cwd: Optional[str] = None, env: Optional[dict] = None)
 # --------------------------------------------------------------------------------------
 
 def make_snapshot(repo: str, ref: str, dest: str) -> None:
-    """The committed tree at ``ref`` (never the working tree), minus EXCLUDED_DIRS."""
+    """The committed tree at ``ref`` (never the working tree), minus EXCLUDED_DIRS and EXCLUDED_FILES."""
     os.makedirs(dest, exist_ok=True)
     archive = subprocess.run(["git", "-C", repo, "archive", ref], capture_output=True)
     if archive.returncode != 0:
@@ -80,6 +91,11 @@ def make_snapshot(repo: str, ref: str, dest: str) -> None:
     subprocess.run(["tar", "-x", "-C", dest], input=archive.stdout, check=True)
     for name in EXCLUDED_DIRS:
         shutil.rmtree(os.path.join(dest, name), ignore_errors=True)
+    for name in EXCLUDED_FILES:
+        try:
+            os.remove(os.path.join(dest, *name.split("/")))
+        except FileNotFoundError:
+            pass
 
 
 def _files(root: str) -> Iterable[str]:

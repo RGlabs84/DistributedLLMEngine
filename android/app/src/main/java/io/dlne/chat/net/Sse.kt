@@ -49,6 +49,13 @@ sealed interface StreamEvent {
      */
     data class SearchUnavailable(val reason: String) : StreamEvent
 
+    /**
+     * The model began answering from memory while unsure, and the server takes that text
+     * back to look the question up instead. The reply so far is cleared (the bubble stays,
+     * and any sources it held are dropped); `searching`, `sources` and a fresh answer follow.
+     */
+    data object Retract : StreamEvent
+
     /** `data: [DONE]`: the answer is complete. */
     data object Done : StreamEvent
 }

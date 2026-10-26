@@ -29,6 +29,9 @@ type `@dlne` in the chat panel.
 The coordinator's `/` is a small public page that points at the extension and shows live
 swarm status. The OpenAI-compatible API lives under `/v1/*`.
 
+The public swarm's coding model is Qwen3.6-35B-A3B (a UD-IQ3_S quant) on two 8 GB AMD GPUs,
+with a 65,536-token context; bigger models unlock automatically as more GPUs join.
+
 ## Run the tests
 
 ```bash
@@ -67,9 +70,11 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Six groups matter for most o
   with `APP_LOCAL_ENABLED=true`, `APP_LOCAL_THREADS`, `APP_LOCAL_RAM_GB` and
   `APP_LOCAL_CPU_MASK` (hex, one thread pinned per logical CPU; the public swarm uses cores
   2-5 of a Ryzen 5 7600X: `0xf3c` with 8 threads and 16 GB). The model files go in the models
-  folder. The phone page is `/chat` (installable from Safari or Chrome); the Android app is in
-  `android/`. Reported answers (`POST /v1/app/report`) are kept in
-  `config/app_reports.jsonl` and read with `GET /v1/admin/app_reports`.
+  folder. The phone page is `/chat` (installable from Chrome, or on an iPhone from Safari:
+  Share, Add to Home Screen); the Android app is in `android/` (the APK is on the
+  [website](https://live.ravenirongames.com/#dlne); it is not on Google Play yet). Reported
+  answers (`POST /v1/app/report`) are kept in `config/app_reports.jsonl` and read with
+  `GET /v1/admin/app_reports`.
 
 - **Lookups (the phone model's search)**: the model is told today's date and may look things
   up when it is unsure (`engine/search.py`): weather (Open-Meteo), Wikipedia (with Wikidata),
@@ -103,8 +108,11 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Six groups matter for most o
   model a draft companion (`<model>_dflash.gguf` beside it) and set, for example,
   `SPEC_TYPE=draft-simple` and `SPEC_DRAFT_N_MAX=4`. `SPEC_DRAFT_N_MIN` and `SPEC_DRAFT_P_MIN`
   are also read, as are the ngram types (`SPEC_TYPE=ngram-mod`, no draft model needed).
-  Measure before and after: on the public swarm's two 8 GB cards, 4-token drafts gave 45 tok/s
-  against 39 without, while 8 and 16-token drafts were slower than none.
+  Measure before and after: with the swarm's earlier model (Qwen2.5-Coder 14B and a 0.5B
+  draft) on its two 8 GB cards, 4-token drafts gave 45 tok/s against 39 without, while 8 and
+  16-token drafts were slower than none. The public swarm now runs Qwen3.6-35B-A3B, which has
+  no draft model, so it runs without speculative decoding (38.5 tok/s for one user, about 27
+  each for two).
 
 ## Releases
 
@@ -129,6 +137,7 @@ their llama.cpp RPC protocol, and the coordinator only routes to workers that sp
 
 Contribute a GPU (or a fast CPU) from the extension's sidebar, or
 [buy a coffee](https://buymeacoffee.com/wubarrk) toward the coordinator's power and hardware.
+Questions and news are in the [Discord](https://discord.gg/RNxvxWn8cw).
 
 ## License
 

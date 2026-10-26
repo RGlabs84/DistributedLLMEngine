@@ -1,53 +1,17 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { DlneClient, formatLoadingTelemetry } from '../client/dlneClient';
+import { SWARM_AUTO_LABEL } from '../client/modelChoice';
 import { WorkerManager } from '../worker/workerManager';
 import { CPU_POOL_HEADLINE, CPU_POOL_PERK } from '../worker/contribution';
 import { AgentLoop } from '../agent/agentLoop';
 import { ToolCallResult } from '../agent/tools';
 
-const TIER_MODELS: Record<string, { file: string; label: string; vram: string }> = {
-  'qwen3': {
-    file: 'qwen3-coder-30b-instruct-q4_k_m.gguf',
-    label: 'Qwen3 Coder 30B MoE (256K Context Tier)',
-    vram: '24GB'
-  },
-  '1m': {
-    file: 'qwen2.5-14b-1m.gguf',
-    label: 'Qwen 2.5 14B 1M (1 Million Context Tier)',
-    vram: '16GB'
-  },
-  '32b': {
-    file: 'qwen2.5-coder-32b-instruct-q4_k_m.gguf',
-    label: 'Qwen 2.5 Coder 32B (24GB Frontier Coder Tier)',
-    vram: '24GB'
-  },
-  '14b': {
-    file: 'qwen2.5-coder-14b-instruct-q4_k_m.gguf',
-    label: 'Qwen 2.5 Coder 14B (16GB Baseline Tier)',
-    vram: '16GB'
-  },
-  'r1': {
-    file: 'DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf',
-    label: 'DeepSeek-R1 Distill Qwen 32B (24GB Reasoning Tier)',
-    vram: '24GB'
-  },
-  '70b': {
-    file: 'Llama-3.3-70B-Instruct-IQ3_M.gguf',
-    label: 'Llama 3.3 70B Instruct (128K Big Guns Tier)',
-    vram: '32GB'
-  },
-  'r1-70b': {
-    file: 'DeepSeek-R1-Distill-Llama-70B-Q4_K_M.gguf',
-    label: 'DeepSeek-R1 Distill Llama 70B (42GB Flagship Reasoning)',
-    vram: '42GB'
-  },
-  '72b': {
-    file: 'Qwen2.5-72B-Instruct-Q4_K_M.gguf',
-    label: 'Qwen 2.5 72B Instruct (44GB Flagship Omnimodal/Code)',
-    vram: '44GB'
-  }
-};
+/**
+ * The one entry the swarm adds to VS Code's Chat model picker. It names no model: the coordinator
+ * serves whichever one its ladder has active, so a request leaves `model` out (see modelChoice.ts).
+ */
+const SWARM_MODEL = { id: 'dlne-auto', label: SWARM_AUTO_LABEL };
 
 export function registerNativeChatParticipant(
   context: vscode.ExtensionContext,
@@ -147,7 +111,7 @@ export function registerNativeChatParticipant(
         );
       } else if (updated.state === 'contributing') {
         stream.markdown(
-          `### ⚡ Compute Contribution Active!\nContributing **${updated.vramContributedGb} GB VRAM** (${updated.gpu.name}) via **${updated.gpu.api.toUpperCase()}** to the DLNE cluster. Frontier inference unlocked!`
+          `### ⚡ Compute Contribution Active!\nContributing **${updated.vramContributedGb} GB VRAM** (${updated.gpu.name}) via **${updated.gpu.api.toUpperCase()}** to the DLNE cluster. Your GPU powers the coding agent, and you are first in line.`
         );
       } else {
         stream.markdown(`### ⏹️ Compute Contribution Stopped\nYour local worker is now idle.`);
@@ -158,7 +122,7 @@ export function registerNativeChatParticipant(
     // 3. /clear or /reset command
     if (cmd === 'clear' || cmd === 'reset') {
       agentLoop.clearHistory();
-      stream.markdown('🧹 **Agent conversation history cleared.** DLNE Frontier Agent context is fresh and ready for your next prompt.');
+      stream.markdown('🧹 **Agent conversation history cleared.** DLNE Code Assistant context is fresh and ready for your next prompt.');
       return { metadata: { command: cmd } };
     }
 
@@ -167,9 +131,9 @@ export function registerNativeChatParticipant(
       stream.progress('Checking Swarm Auto-Tiering status...');
       const detailed = await client.getClusterStatusDetailed();
       const status = detailed.data;
-      const activeModel = status?.global_active_model || 'qwen2.5-coder-14b-instruct-q4_k_m.gguf';
-      const vram = status?.total_vram_gb || 24.0;
-      const nodes = status?.active_workers_count || 2;
+      const activeModel = status?.global_active_model || 'not reported';
+      const vram = status?.total_vram_gb ?? '?';
+      const nodes = status?.active_workers_count ?? '?';
 
       const lines = [
         `### 🤖 DLNE Swarm Auto-Tiering Active`,
@@ -178,15 +142,14 @@ export function registerNativeChatParticipant(
         `| Metric | Current Swarm State |`,
         `| :--- | :--- |`,
         `| **Active Model** | \`${activeModel}\` |`,
-        `| **Active Tier** | **${status?.recommended_tier || '16GB-24GB Baseline (14B)'}** |`,
+        `| **Active Tier** | **${status?.recommended_tier || 'not reported'}** |`,
         `| **Pooled Hardware** | **${vram} GB VRAM** across ${nodes} worker node(s) |`,
         ``,
-        `#### 📈 Dynamic Auto-Scaling Thresholds:`,
-        `- **14B Coder Tier** (16–24 GB VRAM) → ✅ **Active Now** (fastest, optimized with FlashAttention & speculative decoding)`,
-        `- **32B Frontier Coder Tier** (≥ 28 GB VRAM) → 🔒 Unlocks automatically when 3+ nodes contribute (e.g. RTX 5070/4060+)`,
-        `- **70B / 72B Flagship Tier** (≥ 44 GB VRAM) → 🔒 Unlocks automatically when cluster expands`,
+        `#### 📈 Dynamic Auto-Scaling:`,
+        `- **Now**: the model above, on the GPUs contributors have lent.`,
+        `- **Later**: bigger models unlock automatically as more GPUs join.`,
         ``,
-        `> **Zero Configuration Needed**: Whenever nodes join or leave, DLNE automatically adapts the model tier to match the exact VRAM envelope—preventing out-of-memory crashes.`
+        `> **Zero Configuration Needed**: Whenever nodes join or leave, DLNE automatically adapts the model to match the exact VRAM envelope—preventing out-of-memory crashes.`
       ];
       stream.markdown(lines.join('\n'));
       return { metadata: { command: 'model' } };
@@ -335,55 +298,50 @@ export function registerNativeChatParticipant(
         : null;
 
     if (registerFn) {
-      for (const [tierKey, info] of Object.entries(TIER_MODELS)) {
-        try {
-          const disp = registerFn(
-            `dlne-${tierKey}`,
-            {
-              async provideLanguageModelResponse(
-                messages: any[],
-                _options: any,
-                _extensionId: string,
-                progress: any,
-                token: vscode.CancellationToken
-              ) {
-                await vscode.workspace
-                  .getConfiguration('dlne')
-                  .update('chatModel', info.file, vscode.ConfigurationTarget.Global);
-                const mapped = messages.map((m: any) => ({
-                  role: (m.role === 1 || m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
-                  content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
-                }));
-                await client.streamChat(
-                  mapped,
-                  [],
-                  (delta: string) => {
-                    if (delta && progress && typeof progress.report === 'function') {
-                      progress.report({ index: 0, part: delta });
-                    }
-                  },
-                  undefined,
-                  undefined
-                );
-              },
-              async provideTokenCount(_text: string) {
-                return Math.ceil((_text || '').length / 4);
-              }
+      try {
+        const disp = registerFn(
+          SWARM_MODEL.id,
+          {
+            async provideLanguageModelResponse(
+              messages: any[],
+              _options: any,
+              _extensionId: string,
+              progress: any,
+              token: vscode.CancellationToken
+            ) {
+              const mapped = messages.map((m: any) => ({
+                role: (m.role === 1 || m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
+                content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+              }));
+              await client.streamChat(
+                mapped,
+                [],
+                (delta: string) => {
+                  if (delta && progress && typeof progress.report === 'function') {
+                    progress.report({ index: 0, part: delta });
+                  }
+                },
+                undefined,
+                undefined
+              );
             },
-            {
-              vendor: 'dlne',
-              name: info.label,
-              family: 'dlne-vulkan',
-              version: '1.0.3',
-              maxInputTokens: 32768,
-              maxOutputTokens: 4096,
-              isDefault: tierKey === '14b',
-              isUserSelectable: true
+            async provideTokenCount(_text: string) {
+              return Math.ceil((_text || '').length / 4);
             }
-          );
-          if (disp) context.subscriptions.push(disp);
-        } catch {}
-      }
+          },
+          {
+            vendor: 'dlne',
+            name: SWARM_MODEL.label,
+            family: 'dlne-swarm',
+            version: '1.0.3',
+            maxInputTokens: 32768,
+            maxOutputTokens: 4096,
+            isDefault: true,
+            isUserSelectable: true
+          }
+        );
+        if (disp) context.subscriptions.push(disp);
+      } catch {}
     }
   }
 }

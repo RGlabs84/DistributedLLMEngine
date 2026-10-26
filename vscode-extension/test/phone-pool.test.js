@@ -332,7 +332,7 @@ test('the phone chat page is on the configured coordinator', () => {
   assert.equal(phoneChatUrl(config('http://192.168.1.50:11435/')), 'http://192.168.1.50:11435/chat');
   // The coordinator really serves it there (engine/chat_page.py).
   const chatPy = fs.readFileSync(path.join(ROOT, '..', 'engine', 'chat_page.py'), 'utf8');
-  assert.match(chatPy, /@chat_router\.get\("\/chat", include_in_schema=False\)/);
+  assert.match(chatPy, /@chat_router\.(?:get\("\/chat"|api_route\("\/chat", methods=\["GET", "HEAD"\]), include_in_schema=False\)/);
 });
 
 test('every command the manifest contributes is registered, including the phone link', () => {

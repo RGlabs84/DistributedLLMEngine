@@ -233,6 +233,30 @@ ENGINE_ARG_FLAGS_WITH_VALUE = frozenset({
     "--reasoning-format", "--ctx-checkpoints", "--checkpoint-min-step",
 })
 ENGINE_ARG_FLAGS = frozenset({"--swa-full", "--no-mmap"})
+# Where the model's weights go on this host's own cards. Written for those cards, they are wrong
+# once volunteers' GPUs join over RPC, so only these are left out then; the rest (threads, CPU
+# pinning, and above all the chat settings such as thinking off) apply wherever the model runs.
+ENGINE_PLACEMENT_FLAGS = frozenset({
+    "--n-cpu-moe", "-ncmoe", "-ts", "--tensor-split", "-ot", "--override-tensor", "-sm", "--split-mode",
+    "-mg", "--main-gpu",
+})
+
+
+def engine_args_without_placement(args) -> List[str]:
+    """ENGINE_EXTRA_ARGS (already parsed) minus the placement flags and their values."""
+    out: List[str] = []
+    i = 0
+    args = list(args)
+    while i < len(args):
+        if args[i] in ENGINE_PLACEMENT_FLAGS:
+            i += 2
+        elif args[i] in ENGINE_ARG_FLAGS_WITH_VALUE:
+            out += args[i:i + 2]
+            i += 2
+        else:
+            out.append(args[i])
+            i += 1
+    return out
 
 
 def parse_engine_args(raw: str) -> List[str]:

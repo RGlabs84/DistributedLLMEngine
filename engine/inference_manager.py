@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from engine import gguf
-from engine.config import SPEC_DEFAULTS, get_base_dir, get_worker_limits
+from engine.config import SPEC_DEFAULTS, engine_args_without_placement, get_base_dir, get_worker_limits
 from engine.downloader import download_and_extract_engine
 from engine.logger import log_coordinator, log_error, log_warning
 
@@ -1746,14 +1746,19 @@ class InferenceManager:
 
             limits = get_worker_limits()
             # The operator's extra flags (ENGINE_EXTRA_ARGS, allow-listed in config.py), placed
-            # after the defaults so they win. Only on this host's own GPUs: a card split or an
-            # expert placement written for them is wrong once volunteers' GPUs join over RPC.
+            # after the defaults so they win. A card split or an expert placement written for
+            # this host's own GPUs is wrong once volunteers' GPUs join over RPC, so those are left
+            # out then; the rest stay (dropping them all turned the coding model's thinking back
+            # on whenever a volunteer joined).
             extra = list(limits.get("engine_extra_args") or ())
-            if extra and not remote_rpc_endpoints:
+            if remote_rpc_endpoints:
+                kept = engine_args_without_placement(extra)
+                if len(kept) < len(extra):
+                    log_warning("ENGINE_EXTRA_ARGS card placement left out: the engine is running across volunteers' GPUs.")
+                extra = kept
+            if extra:
                 cmd.extend(extra)
                 log_coordinator(f"Engine extra arguments: {' '.join(extra)}")
-            elif extra:
-                log_warning("ENGINE_EXTRA_ARGS left out: the engine is running across volunteers' GPUs.")
 
             # Speculative decoding, with the model's draft companion when it has one.
             dflash_path = resolved_path.replace(".gguf", "_dflash.gguf")

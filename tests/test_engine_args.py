@@ -44,3 +44,12 @@ def test_engine_context_is_bounded(monkeypatch, raw, expected):
 
 def test_engine_extra_args_reach_the_limits(monkeypatch):
     assert _limits(monkeypatch, {"ENGINE_EXTRA_ARGS": THEWALL})["engine_extra_args"][:2] == ["--n-cpu-moe", "5"]
+
+
+def test_across_volunteers_gpus_only_the_card_placement_is_left_out():
+    # Leaving out everything turned the coding model's thinking back on whenever a volunteer's
+    # GPU joined (ladder research, 2026-10-26).
+    assert engine_config.engine_args_without_placement(parse_engine_args(THEWALL)) == [
+        "--threads", "4", "--threads-batch", "4", "--cpu-mask", "0xc3", "--cpu-strict", "1",
+        "--chat-template-kwargs", '{"enable_thinking":false}']
+    assert engine_config.engine_args_without_placement(["-ot", "exps=CPU", "--no-mmap", "-sm", "row"]) == ["--no-mmap"]

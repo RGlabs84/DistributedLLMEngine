@@ -50,7 +50,7 @@ test('a chat turn reuses a recent status answer instead of asking again', async 
     await chat(client);
     await chat(client);
     assert.equal(c.hits.status, 1);
-    assert.equal(c.hits.chat[1].model, 'served.gguf', 'the model still comes from the status answer');
+    assert.ok(!('model' in c.hits.chat[1]), 'no model is named: the coordinator serves the one it has active');
   } finally {
     c.close();
   }
@@ -63,7 +63,7 @@ test('without a recent answer, the chat asks once itself', async () => {
   try {
     await chat(new DlneClient());
     assert.equal(c.hits.status, 1);
-    assert.equal(c.hits.chat[0].model, 'served.gguf');
+    assert.ok(!('model' in c.hits.chat[0]));
   } finally {
     c.close();
   }

@@ -96,7 +96,7 @@ upload key can be reset through Play Console support.
 
 1. In `app/build.gradle.kts`, raise `versionCode` by 1 (Play rejects any upload whose
    versionCode is not higher than every earlier one) and set `versionName` (what people see,
-   e.g. `1.0.1`).
+   e.g. `1.0.2`).
 2. `./gradlew :app:testDebugUnitTest assembleRelease bundleRelease`
 3. Upload `app/build/outputs/bundle/release/app-release.aab` to Play Console. The R8
    mapping file (`app/build/outputs/mapping/release/mapping.txt`) is embedded in the bundle,
@@ -162,12 +162,20 @@ the Play icon is not exactly the official logo as a 512 x 512 32-bit PNG.
   news, web search) and says so in-band with `data: {"dlne": {...}}` lines:
   `searching` (tool + query; the latest is shown as "Checking the weather for “…”" etc.
   until the answer text starts), `sources` (the whole list so far, replacing the previous
-  one), `search_note` and `search_unavailable` (muted lines under the sources). Unknown
-  `dlne` events are dropped, never shown. Source titles, hosts and URLs are treated as
+  one), `search_note` and `search_unavailable` (muted lines under the sources), and
+  `retract` (server 2.3.5+: the model began answering from memory while unsure, so the
+  server takes that text back and looks the question up; the app empties the reply, keeps
+  its bubble and drops any sources held for it, and the usual `searching`, `sources` and a
+  fresh answer follow). Unknown `dlne` events are dropped, never shown. Source titles, hosts and URLs are treated as
   hostile: flattened to one plain line without control or bidi characters, capped, only
   http(s) URLs become links, and the host shown is the one the link really opens. `[n]` in
   the answer becomes a tappable superscript only when n is in that answer's list. Saved
   chats keep their sources and notes.
+- **Links.** Settings > "Website and community" opens the DLNE website
+  (`https://live.ravenirongames.com/#dlne`) and the DLNE Discord for news and help
+  (`https://discord.gg/RNxvxWn8cw`), and the chat drawer has the same two links under
+  Settings. They open in the browser through `openInBrowser`, like the coffee link; the URLs
+  are the `WEBSITE_URL` and `DISCORD_URL` constants in `ui/SettingsScreen.kt`.
 - **Report answer.** The flag under each answer opens a sheet (reason + optional note,
   ≤ 500 characters) and sends `POST /v1/app/report` with the answer (≤ 8,000 characters)
   and the question it answered (≤ 4,000). 404 shows "Reporting isn't available on this

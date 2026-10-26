@@ -50,7 +50,15 @@ data class PendingReply(
     val lookup: Lookup? = null,
     val sources: List<Source> = emptyList(),
     val searchNotes: List<String> = emptyList(),
-)
+) {
+    /**
+     * The server took back what it had streamed (`retract`): the text is emptied and the
+     * sources held for it are dropped, while the bubble itself (this object) stays and the
+     * lookup, notes and notice are left as they were. The lookup events and a fresh answer
+     * that follow fill it in again.
+     */
+    fun retracted(): PendingReply = copy(text = "", sources = emptyList())
+}
 
 /** The open "Report answer" sheet: which answer, and how sending is going. */
 data class ReportUiState(val messageId: String, val sending: Boolean = false, val error: String? = null)
@@ -229,6 +237,9 @@ class ChatViewModel(application: Application, private val savedState: SavedState
                         is StreamEvent.SearchNote -> updatePending { it.withSearchNote(event.note) }
                         is StreamEvent.SearchUnavailable ->
                             updatePending { it.withSearchNote(event.reason.ifBlank { text(R.string.search_unavailable_default) }) }
+                        // The model answered from memory while unsure; the server takes that text
+                        // back and looks the question up. Start the reply over, keeping the bubble.
+                        StreamEvent.Retract -> updatePending { it.retracted() }
                         StreamEvent.Done -> Unit
                     }
                 }
