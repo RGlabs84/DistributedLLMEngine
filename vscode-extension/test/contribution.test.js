@@ -52,7 +52,7 @@ test('a missing or broken RAM setting counts as below the floor', () => {
 test('the floor matches the coordinator and the setting', () => {
   assert.equal(CPU_MIN_RAM_GB, 8);
   const device = pkg.contributes.configuration.properties['dlne.worker.device'];
-  assert.deepEqual(device.enum, ['auto', 'gpu', 'cpu']);
+  assert.deepEqual(device.enum, ['auto', 'gpu', 'cpu', 'both']);
   assert.equal(device.default, 'auto');
   const configPy = fs.readFileSync(path.join(__dirname, '..', '..', 'engine', 'config.py'), 'utf8');
   assert.match(configPy, /"cpu_min_ram_gb": 8\.0/);

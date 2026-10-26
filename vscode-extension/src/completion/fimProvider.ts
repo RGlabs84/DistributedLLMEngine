@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { DlneClient } from '../client/dlneClient';
+import { REDACTION_MARK, isExcludedFile, redactSecrets } from '../privacy';
 
 // Prompt budget. Prefill is the cost a completion pays before its first token (measured ~250
 // tokens/s on the public swarm), and the old 100 + 40 lines made a cold completion take 3-4 s.
@@ -9,14 +10,26 @@ const PREFIX_CHARS = 4000;
 const SUFFIX_LINES = 10;
 const SUFFIX_CHARS = 600;
 const MAX_TOKENS = 48;
+// The prompt's first line moves once per this many lines typed, not once per line. The model's cache can reuse a
+// prompt only up to the first token that changed, so a front that moves on every new line re-reads the whole
+// prompt each time (measured: 654 tokens on TheWall instead of about 5).
+const PREFIX_BLOCK = 8;
+
+// Stands for the cursor while the text around it is redacted (U+2063 INVISIBLE SEPARATOR: code has no reason to hold it).
+const CURSOR_MARK = '⁣';
 
 const MIN_DELAY_MS = 75;
 const MAX_DELAY_MS = 2000;
 
 /** The prompt pieces for a completion at `position`, trimmed to the budget above. */
 export function buildFimContext(document: vscode.TextDocument, position: vscode.Position): { prefix: string; suffix: string; midLine: boolean } {
-  const startLine = Math.max(0, position.line - PREFIX_LINES);
+  let startLine = Math.floor(Math.max(0, position.line - PREFIX_LINES) / PREFIX_BLOCK) * PREFIX_BLOCK;
   let prefix = document.getText(new vscode.Range(new vscode.Position(startLine, 0), position));
+  // Over the character budget: drop whole blocks from the top (not single characters), so the front still holds still.
+  while (prefix.length > PREFIX_CHARS && startLine < position.line) {
+    startLine = Math.min(position.line, startLine + PREFIX_BLOCK);
+    prefix = document.getText(new vscode.Range(new vscode.Position(startLine, 0), position));
+  }
   if (prefix.length > PREFIX_CHARS) {
     prefix = prefix.slice(prefix.length - PREFIX_CHARS);
   }
@@ -47,6 +60,20 @@ export class DlneFimProvider implements vscode.InlineCompletionItemProvider {
   ): Promise<vscode.InlineCompletionItem[] | null> {
     // Only run FIM on real workspace source files — NEVER on VS Code Chat inputs, Output panels, or virtual buffers
     if (document.uri.scheme !== 'file') {
+      return null;
+    }
+    // A file whose contents never leave the editor (.gitignore'd, .dlneignore, .env, keys) gets no
+    // suggestions: completing it would send its text, and its neighbours, to the swarm.
+    if (isExcludedFile(document.uri)) {
+      return null;
+    }
+
+    // The folder this file belongs to decides its privacy mode (a public repository in a multi-root
+    // workspace does not make its private neighbour public). A file in none of the open folders has no
+    // mode of its own: with no folder named, the policy falls back to "the workspace's only folder", and a
+    // public repository there would make this file's text public too. So: no suggestion.
+    const folder = vscode.workspace.getWorkspaceFolder?.(document.uri);
+    if (!folder && typeof vscode.workspace.getWorkspaceFolder === 'function' && (vscode.workspace.workspaceFolders?.length ?? 0) > 0) {
       return null;
     }
 
@@ -88,7 +115,21 @@ export class DlneFimProvider implements vscode.InlineCompletionItemProvider {
     }
 
     // Standard Qwen2.5-Coder / DeepSeek FIM formatting
-    const fimPrompt = `<|fim_prefix|>${prefix}<|fim_suffix|>${suffix}<|fim_middle|>`;
+    const fileName = document.uri.fsPath;
+    // Redacted as ONE text with a marker where the cursor is, then cut again at the marker. Redacting the two
+    // halves apart missed a quoted secret the cursor sits in: while a password is being typed between quotes
+    // (the editor closes the quote for you) the opening quote is in one half and the closing one in the
+    // other, so neither half looked like an assignment and the half-typed password went out. If the marker
+    // does not survive, the cursor is inside a secret: no suggestion, nothing sent.
+    if (prefix.includes(CURSOR_MARK) || suffix.includes(CURSOR_MARK)) {
+      return null;     // the file already holds the marker character: the cut below could not be trusted
+    }
+    const redacted = redactSecrets(prefix + CURSOR_MARK + suffix, fileName).text;
+    const cut = redacted.indexOf(CURSOR_MARK);
+    if (cut < 0) {
+      return null;
+    }
+    const fimPrompt = `<|fim_prefix|>${redacted.slice(0, cut)}<|fim_suffix|>${redacted.slice(cut + CURSOR_MARK.length)}<|fim_middle|>`;
     const stopTokens = ['<|fim_pad|>', '<|file_separator|>', '<|im_end|>', '\n\n\n'];
     if (midLine) {
       stopTokens.push('\n'); // completing inside a line: the rest of that line is all that fits
@@ -99,8 +140,13 @@ export class DlneFimProvider implements vscode.InlineCompletionItemProvider {
     this.inFlight = controller;
     const cancel = token.onCancellationRequested(() => controller.abort());
     try {
-      const completionText = await this.client.getCompletion(fimPrompt, MAX_TOKENS, stopTokens, controller.signal);
+      // `folder` (above) decides the privacy mode. Session and redaction are the client's.
+      const completionText = await this.client.getCompletion(fimPrompt, MAX_TOKENS, stopTokens, controller.signal, { workspaceFolder: folder });
       if (!completionText || token.isCancellationRequested || controller.signal.aborted) {
+        return null;
+      }
+      // The model saw [REDACTED] where a secret is; echoing it would put the marker into the user's code.
+      if (completionText.includes(REDACTION_MARK)) {
         return null;
       }
 

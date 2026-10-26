@@ -75,6 +75,7 @@ hello_world.rs
 
 # --- Binaries & Extension Builds ---
 bin/
+.dlne_rpc_bin.json
 rpc_cache/
 *.vsix
 node_modules/

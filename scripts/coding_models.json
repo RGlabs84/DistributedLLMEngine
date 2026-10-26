@@ -1,6 +1,6 @@
 {
   "_comment": "The GPU coding pool's model ladder, smallest first, signed into every release (engine/release.py coding_tiers) and read by the coordinator through engine/coding_ladder.py. min_vram_gb is the pooled VRAM a tier needs (the research estimate with headroom, see PROPOSAL.md 6.1, not the marketing size); context is the total engine context the tier is meant to run with. A tier is used only while enabled is true; blocked says why one is held back and must be cleared before it is enabled. Each file comes from a pinned Hugging Face revision with its exact size and SHA-256. A model published in parts lists them under files, in order (llama.cpp loads part 1 and finds the rest by name).",
-  "_sources": "Research 2026-10-25 (/tmp/claude-1000/model-ladder/PROPOSAL.md and models.proposed.json): revisions, sizes and hashes read from the Hugging Face API at the pinned commit. The 16 GB tier is the file live on TheWall since 2026-10-25 (same entry as scripts/app_models.json qwen36-a3b). Owner approved the 24, 32 and 48 GB tiers on 2026-10-25.",
+  "_sources": "Research 2026-10-25 (/tmp/claude-1000/model-ladder/PROPOSAL.md and models.proposed.json): revisions, sizes and hashes read from the Hugging Face API at the pinned commit. The 16 GB tier is the file live on TheWall since 2026-10-25 (same entry as scripts/app_models.json qwen36-a3b). Owner approved the 24, 32 and 48 GB tiers on 2026-10-25. Qwen3-Coder-Next UD-IQ4_XS (49 GB) was added the same day, disabled: pinned from unsloth/Qwen3-Coder-Next-GGUF commit ce09c67b (size and SHA-256 read from the Hugging Face API at that commit) and not yet measured.",
   "_placeholders": "The 64 GB and larger tiers are placeholders, not decisions: Qwen3.8 Flash-Next is under the Qwen Community License 1.0, whose commercial clause needs the owner's decision, the owner wants other heavyweight (1M-context) models researched first, and the coordinator's model download cannot fetch a model in parts yet. Replace or remove them freely.",
   "tiers": [
     {
@@ -46,6 +46,19 @@
       "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q6_K.gguf",
       "sha256": "4fe53b148b46f9b88830e2a3055c5b15c3a4d1e3ddc9a1384a108d8b9d59f043",
       "size": 29308320736
+    },
+    {
+      "id": "qwen3-coder-next-iq4xs",
+      "name": "Qwen3-Coder-Next 80B-A3B",
+      "min_vram_gb": 49,
+      "context": 65536,
+      "enabled": false,
+      "blocked": "not measured on the DLNE coding suite, and its published scores are below Qwen3.6-35B-A3B; enable only if tasks v2 puts it ahead",
+      "file": "Qwen3-Coder-Next-UD-IQ4_XS.gguf",
+      "url": "https://huggingface.co/unsloth/Qwen3-Coder-Next-GGUF/resolve/ce09c67b53bc8739eef83fe67b2f5d293c270632/Qwen3-Coder-Next-UD-IQ4_XS.gguf",
+      "sha256": "abf56d7fe8a0a99c15d220c13de4aa57b69cfba6ef4c2a007b56e34d7b40cd11",
+      "size": 38429272064,
+      "_note": "Unsloth Dynamic IQ4_XS (experts mostly IQ3_S with a third IQ4_XS, attention/SSM/shared Q8_0, output Q6_K). 48 layers, 12 attention. ESTIMATES, not measurements: needs a pool of about 46.5 GiB at 5 percent headroom, and the coordinator's 1.2x VRAM-only admission rule needs 48.3 GiB; 49 is the larger of the two. Published SWE-bench Verified 70.6 vs 73.4 for Qwen3.6-35B-A3B. Apache-2.0. Keep ENGINE_CONTEXT=65536 (the KV sizer counts all 48 layers, only 12 cache anything)."
     },
     {
       "id": "qwen38-flash-next-q2",

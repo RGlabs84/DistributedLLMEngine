@@ -3,6 +3,13 @@ import * as http from 'http';
 import * as https from 'https';
 import { resolveServerUrl } from '../serverUrl';
 import { requestedModel } from './modelChoice';
+import {
+  MemberAnswerError, PreparedRequest, PipelineEnv, SealedAnswer, openWholeAnswer, plainRequest, prepareRequest,
+} from './pipeline';
+import { QueueInfo, QueueUpdate, parseCodingQueue, parseQueueInfo, queueFromBody, queueProgressLine } from './queue';
+import { RouteLookup, rerouteReason } from './route';
+import { editorSessionId } from './session';
+import { DEFAULT_WAIT_TIMING, WaitTiming, WaitWatcher } from './waitWatcher';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -38,6 +45,19 @@ export interface ClusterStatus {
   is_swapping_models?: boolean;
   model_loading?: ModelLoadingTelemetry;
   server_version: string;
+  /** The coding engine's slots and who waits for them (counts only). */
+  coding_queue?: { slots: number; in_use: number; waiting: number; waiting_by_priority?: Record<string, number> };
+  /** Coding members (docs/coding-members.md section 5); absent on a coordinator that predates them. */
+  coding_members?: { enabled: boolean; members?: number; ready?: number; slots?: number; busy?: number };
+}
+
+/**
+ * Whether a coding member may serve a request, as far as a status answer says: only when the coordinator
+ * reports coding members as enabled. A coordinator that does not mention them (an older one), one that has
+ * them off, and an unknown status all mean the plain path, with no route lookup at all.
+ */
+export function codingMembersMayServe(status: ClusterStatus | null | undefined): boolean {
+  return status?.coding_members?.enabled === true;
 }
 
 export function formatLoadingTelemetry(ml?: ModelLoadingTelemetry): string {
@@ -118,10 +138,42 @@ export interface ClusterStatusResult {
  */
 /** A chat request the coordinator refused, with its HTTP status kept for callers to branch on. */
 export class ServerRefusal extends Error {
+  /** Set when the coordinator answered a sealed request with `dlne_reroute` (its reason): ask for a new route. */
+  public reroute?: string;
+
   constructor(public readonly status: number | undefined, message: string) {
     super(message);
     this.name = 'ServerRefusal';
   }
+}
+
+/**
+ * "Every coding slot is taken, come back": a 503 (or 429) whose body carries a `dlne_queue` object
+ * (see queue.ts). Not a failure; the client shows the place in line and tries again.
+ */
+export class ServerBusy extends Error {
+  constructor(public readonly queue: QueueInfo, public readonly retryAfterMs: number | undefined) {
+    super('The swarm is busy.');
+    this.name = 'ServerBusy';
+  }
+}
+
+/** What a streamChat caller can pass besides the messages. */
+export interface StreamChatOptions {
+  /** `X-DLNE-Session` for this conversation (an AgentLoop makes one per conversation). */
+  sessionId?: string;
+  workspaceFolder?: vscode.WorkspaceFolder;
+  /**
+   * Called with the place in line while every coding slot is taken, and with null once the answer starts.
+   * A caller that passes this gets queue news here and not as a line of `onLoadingProgress`.
+   */
+  onQueue?: (queue: QueueUpdate | null) => void;
+}
+
+/** A refusal that means "that coding member did not serve it", and a plain retry can: gone, moved, or down. */
+function isMemberFailure(err: any): boolean {
+  return err instanceof MemberAnswerError
+    || (err instanceof ServerRefusal && ([404, 410, 421, 502, 504].includes(err.status ?? 0) || err.reroute !== undefined));
 }
 
 export function serverErrorMessage(status: number | undefined, body: string): string {
@@ -153,6 +205,59 @@ export class DlneClient {
 
   public setWorkerManager(wm: any): void {
     this.workerManager = wm;
+  }
+
+  // ---- coding members and the queue (docs/coding-members.md section 10) -----------------------------
+
+  private routes = new RouteLookup();
+  private queueListeners: Array<(queue: QueueUpdate | null) => void> = [];
+  private queueNow: QueueUpdate | null = null;
+  /** Silence before the first "waiting" message and the gap after it; tests shorten them. */
+  static waitTiming: WaitTiming = { ...DEFAULT_WAIT_TIMING };
+
+  /**
+   * Called whenever a request's place in line changes, and with null once nobody is queued, so the status
+   * bar can show it without being asked. Returns the unsubscribe.
+   */
+  onQueue(listener: (queue: QueueUpdate | null) => void): () => void {
+    this.queueListeners.push(listener);
+    return () => {
+      this.queueListeners = this.queueListeners.filter((l) => l !== listener);
+    };
+  }
+
+  /** The place in line of the request that is waiting now, if one is. */
+  currentQueue(): QueueUpdate | null {
+    return this.queueNow;
+  }
+
+  private publishQueue(update: QueueUpdate | null, perCall?: (queue: QueueUpdate | null) => void, progress?: (text: string) => void): void {
+    this.queueNow = update;
+    for (const listener of this.queueListeners) {
+      try { listener(update); } catch {}
+    }
+    if (perCall) {
+      try { perCall(update); } catch {}
+    } else if (update && progress) {
+      progress(queueProgressLine(update));
+    }
+  }
+
+  /**
+   * Where this user's requests rank at the coordinator, as far as the client can tell: 0 for an API key or
+   * a GPU contributor, 1 for a CPU contributor, 2 for the free trial (engine/priority.py). Only used to
+   * estimate a place in line from the status' counts.
+   */
+  private queuePriority(): number {
+    const wm = this.workerManager;
+    if (wm?.isContributing?.()) {
+      return wm.getStatus?.()?.cpuPool ? 1 : 0;
+    }
+    return vscode.workspace.getConfiguration('dlne').get<string>('apiKey', '').trim() ? 0 : 2;
+  }
+
+  private pipelineEnv(base: string, agent?: http.Agent): PipelineEnv {
+    return { base, headers: () => this.getHeaders(), routes: this.routes, agent };
   }
 
   public getServerUrl(): string {
@@ -310,19 +415,24 @@ export class DlneClient {
     onDelta: (delta: string, reasoningDelta?: string) => void,
     onToolCallStart?: (name: string) => void,
     signal?: AbortSignal,
-    onLoadingProgress?: (statusText: string) => void
+    onLoadingProgress?: (statusText: string) => void,
+    options: StreamChatOptions = {}
   ): Promise<StreamChatResult> {
     const base = this.getServerUrl();
     const config = vscode.workspace.getConfiguration('dlne');
     // No `model` unless the user set one: the coordinator then serves the model it has active. Naming
     // one (even the active one, from a status answer a few seconds old) can make it swap models.
     const model = requestedModel(config.get<string>('chatModel', ''));
+    let cluster: ClusterStatus | null = null;
     try {
-      const cluster = await this.recentClusterStatus();
+      cluster = await this.recentClusterStatus();
       if (cluster?.model_loading?.is_loading || cluster?.is_swapping_models) {
         await this.waitUntilModelReady(onLoadingProgress, signal);
       }
     } catch {}
+    // A coordinator that says it has no coding members is not asked for a route at all.
+    const membersMayServe = codingMembersMayServe(cluster);
+    const sessionId = options.sessionId ?? editorSessionId();
 
     const payload: Record<string, any> = {
       messages,
@@ -339,12 +449,33 @@ export class DlneClient {
 
     let forbiddenRetries = 0;
     let networkRetries = 0;
+    let memberFailures = 0;         // coding members that did not serve it; after two, the coordinator's own engine
+    let ticket: string | undefined; // the place in line a busy answer promised to keep
+    let busySince: number | null = null;
+    // Whatever way this call ends, a place in line it showed is taken down.
+    const clearBusy = () => {
+      if (busySince !== null) {
+        busySince = null;
+        this.publishQueue(null, options.onQueue);
+      }
+    };
     for (let attempt = 0; attempt < 180; attempt++) {
       if (signal?.aborted) {
+        clearBusy();
         return { content: '', toolCalls: [] };
       }
       let attemptResult: { content: string; toolCalls: StreamedToolCall[]; stillLoading: boolean };
+      let prepared: PreparedRequest | undefined;
       try {
+        // Sealed afresh on every attempt: a key and nonce must never serve two requests.
+        prepared = await prepareRequest(this.pipelineEnv(base), payload, {
+          sessionId,
+          membersEnabled: membersMayServe,
+          forcePlain: memberFailures >= DlneClient.MEMBER_TRIES,
+          ticket,
+          folder: options.workspaceFolder,
+          routeTtlMs: 0,
+        });
         attemptResult = await this.executeSingleStreamAttempt(
           base,
           payload,
@@ -352,9 +483,49 @@ export class DlneClient {
           onToolCallStart,
           signal,
           onLoadingProgress,
-          forbiddenRetries > 0
+          forbiddenRetries > 0,
+          prepared,
+          { onQueue: options.onQueue, priority: this.queuePriority() }
         );
       } catch (err: any) {
+        // Every slot is taken and the coordinator said so (with the place in line): show it, wait, ask
+        // again holding the ticket. This is not a failed attempt, so it does not use one up.
+        if (err instanceof ServerBusy) {
+          busySince = busySince ?? Date.now();
+          if (Date.now() - busySince > DlneClient.busyGiveUpMs) {
+            clearBusy();
+            throw new ServerRefusal(503, 'The swarm has stayed busy for 15 minutes. Try again in a few minutes, or lend your GPU to go first.');
+          }
+          ticket = err.queue.ticket ?? ticket;
+          this.publishQueue(
+            { ...err.queue, source: 'response', waitedMs: Date.now() - busySince, priority: this.queuePriority() },
+            options.onQueue,
+            onLoadingProgress
+          );
+          // (Stop must not wait out the pause.)
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, Math.min(15000, Math.max(1000, err.retryAfterMs ?? 3000)));
+            signal?.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+          });
+          attempt--;
+          continue;
+        }
+        // The member the coordinator picked did not serve it (gone, moved, or its answer failed the
+        // integrity check). Nothing of the answer had reached the user yet, so the request is asked
+        // for again: a new route lookup (it may name another member) and a new seal, because an
+        // envelope is good for one send and is never resent. After two such failures, the coordinator's
+        // own engine in plain. An answer that was already partly shown cannot be quietly redone; it is
+        // reported (the agent shows the user the error and does not record the half answer).
+        if (prepared?.route && memberFailures < DlneClient.MEMBER_TRIES && isMemberFailure(err) && !(err instanceof MemberAnswerError && err.partial)) {
+          memberFailures++;
+          this.routes.invalidate(base);
+          onLoadingProgress?.(
+            memberFailures >= DlneClient.MEMBER_TRIES
+              ? 'The coding member did not answer. Retrying on the main coding engine...'
+              : 'The coding member did not answer. Asking the swarm for another one...'
+          );
+          continue;
+        }
         // A 403 right after the local worker (re)starts or rotates its ephemeral token is
         // a race, not a ban: the Coordinator registers the token on the next heartbeat
         // (every 5 s). Re-read the token and retry briefly before surfacing the error.
@@ -370,6 +541,7 @@ export class DlneClient {
             await new Promise((r) => setTimeout(r, 2000));
             continue;
           }
+          clearBusy();
           throw err;
         }
         // Transient socket failures (stale keep-alive, WAN blip, coordinator restart):
@@ -398,6 +570,7 @@ export class DlneClient {
           delete payload.model;
           continue;
         }
+        clearBusy();
         throw err;
       }
       if (attemptResult.stillLoading) {
@@ -416,14 +589,21 @@ export class DlneClient {
         await this.waitUntilModelReady(onLoadingProgress, signal);
         continue;
       }
+      clearBusy();
       return {
         content: attemptResult.content,
         toolCalls: attemptResult.toolCalls
       };
     }
 
+    clearBusy();
     return { content: '', toolCalls: [] };
   }
+
+  /** How long a request keeps asking while the coordinator answers "busy" before giving up (tests shorten it). */
+  static busyGiveUpMs = 15 * 60 * 1000;
+  /** Coding members tried for one request before it goes to the coordinator's own engine. */
+  private static readonly MEMBER_TRIES = 2;
 
   private executeSingleStreamAttempt(
     base: string,
@@ -432,48 +612,54 @@ export class DlneClient {
     onToolCallStart?: (name: string) => void,
     signal?: AbortSignal,
     onLoadingProgress?: (statusText: string) => void,
-    forceWorkerToken: boolean = false
+    forceWorkerToken: boolean = false,
+    prepared?: PreparedRequest,
+    wait?: { onQueue?: (queue: QueueUpdate | null) => void; priority: number }
   ): Promise<{ content: string; toolCalls: StreamedToolCall[]; stillLoading: boolean }> {
     return new Promise((resolve, reject) => {
       const url = new URL(`${base}/v1/chat/completions`);
       const client = url.protocol === 'https:' ? https : http;
+      // Called directly (not through streamChat), the request goes exactly as given.
+      const request = prepared ?? plainRequest(payload);
       const headers = this.getHeaders(forceWorkerToken);
       headers['Accept'] = 'text/event-stream';
+      Object.assign(headers, request.headers);
 
-      const postData = JSON.stringify(payload);
+      const postData = request.body;
       headers['Content-Length'] = Buffer.byteLength(postData).toString();
+      const sealedAnswer = request.respKey ? new SealedAnswer(request.respKey) : null;
 
       let fullContent = '';
       let stillLoading = false;
       const toolCallsMap: Map<number, StreamedToolCall> = new Map();
       const notifiedToolStarts = new Set<string>();
 
-      let progressTimer: NodeJS.Timeout | null = null;
-      let firstChunkReceived = false;
-
-      const clearTimer = () => {
-        if (progressTimer) {
-          clearInterval(progressTimer);
-          progressTimer = null;
+      // Until the first word of the answer arrives the user is told what the wait is: their place in
+      // line if every coding slot is taken, otherwise that the swarm is working on it.
+      let queueShown = false;
+      const showQueue = (update: QueueUpdate | null) => {
+        queueShown = update !== null;
+        this.publishQueue(update, wait?.onQueue, onLoadingProgress);
+      };
+      const watcher = new WaitWatcher({
+        fetchQueue: async () => parseCodingQueue(await this.getClusterStatus()),
+        priority: wait?.priority ?? 2,
+        progress: onLoadingProgress,
+        queue: showQueue,
+        timing: DlneClient.waitTiming,
+      });
+      let answerStarted = false;
+      let sealedFrames = 0;
+      let unsealedAnswerFrames = 0;
+      let failure: Error | null = null;
+      const stopWaiting = () => {
+        watcher.stop();
+        if (queueShown) {
+          showQueue(null);
         }
       };
-
-      if (onLoadingProgress) {
-        let elapsed = 0;
-        progressTimer = setInterval(() => {
-          elapsed += 2;
-          if (firstChunkReceived) {
-            clearTimer();
-            return;
-          }
-          if (elapsed === 2) {
-            onLoadingProgress('Evaluating prompt across distributed Vulkan GPU cluster...');
-          } else if (elapsed === 6) {
-            onLoadingProgress('⚡ Distributing activation tensors across 3 GPUs (24 GB VRAM pool)...');
-          } else if (elapsed >= 10 && elapsed % 4 === 0) {
-            onLoadingProgress(`⚡ Pipelining inference across 3 GPUs (elapsed: ${elapsed}s)...`);
-          }
-        }, 2000);
+      if (onLoadingProgress || wait?.onQueue) {
+        watcher.start();
       }
 
       const req = client.request(url, {
@@ -486,24 +672,49 @@ export class DlneClient {
         timeout: 120000
       }, (res) => {
         this.noteQuota(res);
-        if (res.statusCode === 503) {
-          clearTimer();
-          res.resume();
-          resolve({ content: '', toolCalls: [], stillLoading: true });
-          return;
-        }
+        res.on('error', (err) => {
+          stopWaiting();
+          if (answerStarted && !failure) {
+            // Part of the answer is already on the user's screen, so the request is not quietly redone:
+            // the answer is reported as cut off.
+            const cut = new MemberAnswerError('The answer stopped part-way because the connection dropped, so DLNE is not treating it as finished.');
+            cut.partial = true;
+            reject(cut);
+          } else {
+            reject(err);
+          }
+        });
         if (res.statusCode !== 200) {
-          clearTimer();
+          // The refusal is read in full: a 503 or 429 that carries a `dlne_queue` is "busy, here is your
+          // place" and not a failure; any other 503 means the model is still loading.
           let errBody = '';
           res.on('data', (c) => errBody += c);
-          res.on('end', () => reject(new ServerRefusal(res.statusCode, serverErrorMessage(res.statusCode, errBody))));
+          res.on('end', () => {
+            stopWaiting();
+            // Refusals and busy answers are never sealed (contract section 6, item 7).
+            const text = errBody;
+            const queue = res.statusCode === 503 || res.statusCode === 429 ? queueFromBody(text) : null;
+            const reroute = res.statusCode === 503 && request.respKey ? rerouteReason(text) : null;
+            if (queue) {
+              const retryAfter = parseInt(String(res.headers['retry-after'] ?? ''), 10);
+              reject(new ServerBusy(queue, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : undefined));
+            } else if (reroute !== null) {
+              // The coordinator could not hand the sealed body to its member (gone, full, failed, not allowed, route
+              // expired). That is a member failure, not "the model is loading": ask for a route and seal again.
+              const refusal = new ServerRefusal(503, 'The coding member could not take the request.');
+              refusal.reroute = reroute;
+              reject(refusal);
+            } else if (res.statusCode === 503) {
+              resolve({ content: '', toolCalls: [], stillLoading: true });
+            } else {
+              reject(new ServerRefusal(res.statusCode, serverErrorMessage(res.statusCode, text)));
+            }
+          });
           return;
         }
 
         let buffer = '';
         res.on('data', (chunk: Buffer) => {
-          firstChunkReceived = true;
-          clearTimer();
           buffer += chunk.toString('utf-8');
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
@@ -515,9 +726,35 @@ export class DlneClient {
 
             if (trimmed.startsWith('data: ')) {
               try {
-                const parsed = JSON.parse(trimmed.slice(6));
+                let parsed = JSON.parse(trimmed.slice(6));
+                // The coordinator, while the request waits for a slot: where it stands.
+                if (parsed && typeof parsed === 'object' && 'dlne_queue' in parsed) {
+                  const info = parseQueueInfo(parsed.dlne_queue);
+                  if (info && !answerStarted) watcher.report(info, 'stream');
+                  continue;
+                }
+                // A sealed answer is opened frame by frame; one that fails to authenticate, or that
+                // should have been sealed and was not, ends the attempt (the caller retries in plain).
+                if (sealedAnswer) {
+                  const opened = sealedAnswer.handle(parsed);
+                  if (opened.kind === 'plain-content') {
+                    unsealedAnswerFrames++;
+                    continue;
+                  }
+                  if (opened.kind === 'ignore') continue;
+                  if (opened.kind === 'end') {
+                    sealedFrames++;
+                    continue; // sealedAnswer.finished is now true
+                  }
+                  sealedFrames++;
+                  parsed = opened.chunk;
+                }
                 const choice = parsed.choices?.[0];
                 if (!choice) continue;
+                if (!answerStarted) {
+                  answerStarted = true;
+                  stopWaiting();
+                }
 
                 const deltaContent = choice.delta?.content || '';
                 const deltaReasoning =
@@ -561,7 +798,15 @@ export class DlneClient {
                     toolCallsMap.set(idx, existing);
                   }
                 }
-              } catch {
+              } catch (err) {
+                if (err instanceof MemberAnswerError) {
+                  err.partial = answerStarted;
+                  failure = err;
+                  stopWaiting();
+                  reject(err);
+                  req.destroy();
+                  return;
+                }
                 // Ignore partial JSON chunks
               }
             }
@@ -569,7 +814,24 @@ export class DlneClient {
         });
 
         res.on('end', () => {
-          clearTimer();
+          stopWaiting();
+          if (failure) return;
+          // A member that answers in plain when the request was sealed has broken the contract; what it
+          // said is not shown.
+          if (sealedAnswer && sealedFrames === 0 && unsealedAnswerFrames > 0) {
+            reject(new MemberAnswerError('A coding member answered without encrypting, so DLNE discarded the answer.'));
+            return;
+          }
+          // A sealed answer is complete only at its sealed end. A plain [DONE] or a closed connection
+          // before it is a stream that was cut, and it is not passed off as a finished answer.
+          if (sealedAnswer && !sealedAnswer.finished) {
+            const cut = new MemberAnswerError(
+              'The coding member\'s answer stopped before it was complete (the connection was cut), so DLNE is not treating it as finished.'
+            );
+            cut.partial = answerStarted;
+            reject(cut);
+            return;
+          }
           resolve({
             content: fullContent,
             toolCalls: Array.from(toolCallsMap.values()),
@@ -580,7 +842,7 @@ export class DlneClient {
 
       if (signal) {
         signal.addEventListener('abort', () => {
-          clearTimer();
+          stopWaiting();
           req.destroy();
           resolve({
             content: fullContent,
@@ -591,7 +853,7 @@ export class DlneClient {
       }
 
       req.on('error', (err) => {
-        clearTimer();
+        stopWaiting();
         reject(err);
       });
       req.write(postData);
@@ -606,7 +868,13 @@ export class DlneClient {
    * fails before any response byte, and such a request is retried once on a fresh socket.
    * That is safe here because autocomplete never spends the free-trial quota.
    */
-  async getCompletion(prompt: string, maxTokens: number = 64, stop: string[] = [], signal?: AbortSignal): Promise<string> {
+  async getCompletion(
+    prompt: string,
+    maxTokens: number = 64,
+    stop: string[] = [],
+    signal?: AbortSignal,
+    options: { sessionId?: string; workspaceFolder?: vscode.WorkspaceFolder } = {}
+  ): Promise<string> {
     const base = this.getServerUrl();
     const config = vscode.workspace.getConfiguration('dlne');
     const model = requestedModel(config.get<string>('fimModel', ''));
@@ -621,67 +889,109 @@ export class DlneClient {
     if (model) {
       payload.model = model;
     }
-    const postData = JSON.stringify(payload);
     const url = new URL(`${base}/v1/completions`);
+    const isHttps = url.protocol === 'https:';
+    const agent = isHttps ? DlneClient.fimHttpsAgent : DlneClient.fimHttpAgent;
+    // Autocomplete asks about coding members only when the last status the status bar polled says the
+    // coordinator has them: it must not pay a round trip per keystroke to find out that it has none.
+    const membersMayServe = codingMembersMayServe(this.lastKnownClusterStatus());
+    const sessionId = options.sessionId ?? editorSessionId();
 
-    const attempt = (retried: boolean): Promise<string> => new Promise((resolve) => {
+    const attempt = async (retried: boolean, memberFailures: number): Promise<string> => {
       if (signal?.aborted) {
-        resolve('');
-        return;
+        return '';
       }
-      const isHttps = url.protocol === 'https:';
-      const headers = this.getHeaders();
-      headers['Content-Length'] = Buffer.byteLength(postData).toString();
-      let answered = false;
+      // Sealed afresh on every attempt, including a retry on a new socket: an envelope is never resent.
+      const prepared = await prepareRequest(this.pipelineEnv(base, agent), payload, {
+        sessionId,
+        membersEnabled: membersMayServe,
+        forcePlain: memberFailures >= DlneClient.MEMBER_TRIES,
+        folder: options.workspaceFolder,
+        routeTtlMs: DlneClient.FIM_ROUTE_TTL_MS,
+      });
+      if (signal?.aborted) {
+        return '';
+      }
+      return new Promise<string>((resolve) => {
+        const headers = this.getHeaders();
+        Object.assign(headers, prepared.headers);
+        headers['Content-Length'] = Buffer.byteLength(prepared.body).toString();
+        let answered = false;
+        // The member did not serve it: ask for a route again and seal again (twice at most, then the
+        // coordinator's own engine in plain).
+        const retryOnAnotherMember = () => {
+          this.routes.invalidate(base);
+          resolve(attempt(retried, memberFailures + 1));
+        };
 
-      const req = (isHttps ? https : http).request(url, {
-        method: 'POST',
-        headers,
-        agent: isHttps ? DlneClient.fimHttpsAgent : DlneClient.fimHttpAgent,
-        timeout: 10000
-      }, (res) => {
-        answered = true;
-        this.noteQuota(res);
-        if (res.statusCode !== 200) {
-          res.resume();
-          resolve('');
-          return;
-        }
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
-        res.on('end', () => {
-          try {
-            const parsed = JSON.parse(data);
-            resolve(parsed.choices?.[0]?.text || '');
-          } catch {
-            resolve('');
+        const req = (isHttps ? https : http).request(url, {
+          method: 'POST',
+          headers,
+          agent,
+          timeout: 10000
+        }, (res) => {
+          answered = true;
+          this.noteQuota(res);
+          if (res.statusCode !== 200) {
+            if (prepared.route && [404, 410, 421, 502, 504].includes(res.statusCode ?? 0)) {
+              res.resume();
+              retryOnAnotherMember();
+            } else if (prepared.route && res.statusCode === 503) {
+              // 503 is the coordinator's "ask for a new route" for a sealed request (dlne_reroute); any other 503
+              // is not about the member and autocomplete simply gives up this time.
+              let refusal = '';
+              res.on('data', (chunk) => { if (refusal.length < 4096) refusal += chunk; });
+              res.on('end', () => (rerouteReason(refusal) !== null ? retryOnAnotherMember() : resolve('')));
+              res.on('error', () => resolve(''));
+            } else {
+              res.resume();
+              resolve('');
+            }
+            return;
           }
+          let data = '';
+          res.on('data', (chunk) => data += chunk);
+          res.on('end', () => {
+            try {
+              const parsed = prepared.respKey ? openWholeAnswer(data, prepared.respKey) : JSON.parse(data);
+              resolve(parsed.choices?.[0]?.text || '');
+            } catch (err) {
+              if (err instanceof MemberAnswerError && prepared.route) {
+                retryOnAnotherMember();
+              } else {
+                resolve('');
+              }
+            }
+          });
+          res.on('error', () => resolve(''));
         });
-        res.on('error', () => resolve(''));
-      });
 
-      const onAbort = () => req.destroy();
-      signal?.addEventListener('abort', onAbort, { once: true });
-      req.on('close', () => signal?.removeEventListener('abort', onAbort));
-      req.on('error', (err: any) => {
-        const staleSocket = req.reusedSocket && !answered && !signal?.aborted &&
-          (err?.code === 'ECONNRESET' || err?.code === 'EPIPE');
-        if (staleSocket && !retried) {
-          resolve(attempt(true));
-          return;
-        }
-        resolve('');
+        const onAbort = () => req.destroy();
+        signal?.addEventListener('abort', onAbort, { once: true });
+        req.on('close', () => signal?.removeEventListener('abort', onAbort));
+        req.on('error', (err: any) => {
+          const staleSocket = req.reusedSocket && !answered && !signal?.aborted &&
+            (err?.code === 'ECONNRESET' || err?.code === 'EPIPE');
+          if (staleSocket && !retried) {
+            resolve(attempt(true, memberFailures));
+            return;
+          }
+          resolve('');
+        });
+        req.on('timeout', () => {
+          req.destroy();
+          resolve('');
+        });
+        req.write(prepared.body);
+        req.end();
       });
-      req.on('timeout', () => {
-        req.destroy();
-        resolve('');
-      });
-      req.write(postData);
-      req.end();
-    });
+    };
 
-    return attempt(false);
+    return attempt(false, 0);
   }
+
+  /** A route answer is reused for this long by autocomplete (chat asks every turn). */
+  private static readonly FIM_ROUTE_TTL_MS = 20_000;
 
   // Shared by every completion request. Idle sockets are dropped after 30 s, inside the
   // coordinator's 75 s keep-alive (a 2.0.0 coordinator closes after 5 s; the retry above

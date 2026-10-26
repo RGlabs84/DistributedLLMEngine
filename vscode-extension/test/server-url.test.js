@@ -66,6 +66,23 @@ test('no source file hardcodes the old address any more', () => {
   assert.deepEqual(offenders, []);
 });
 
+test('no source file looks for an engine in the maintainer\'s own folders', () => {
+  // A path like ~/DLNEv2 or the development checkout ships to every user, names the maintainer's machines,
+  // and on the maintainer's own laptop makes any DLNE install run the development tree.
+  const offenders = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith('.ts') && /WubarrkCODING|DLNEv2|valheim-testbed|archserver/.test(fs.readFileSync(full, 'utf8'))) {
+        offenders.push(full);
+      }
+    }
+  };
+  walk(path.join(__dirname, '..', 'src'));
+  assert.deepEqual(offenders, []);
+});
+
 test('a refused chat shows the coordinator\'s sentence, not raw JSON', () => {
   const { serverErrorMessage } = require('../dist/client/dlneClient');
   const detail = "You've used all 300 coding chats for this 5-hour window (the allowance for CPU contributors). The next one frees up in 42 minutes. Contributing a GPU removes the limit.";

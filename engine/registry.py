@@ -142,6 +142,19 @@ def is_app_member(hardware: Any) -> bool:
     return _as_profile(hardware).get("pool") == "app"
 
 
+def is_companion(hardware: Any) -> bool:
+    """The CPU half of a machine that also has a GPU node of its own (``"companion_of": <that node's id>`` in its
+    signed hardware profile, engine/companion.py): a phone-pool member that is not a machine of its own."""
+    value = _as_profile(hardware).get("companion_of")
+    return isinstance(value, str) and bool(value)
+
+
+def is_coding_member(hardware: Any) -> bool:
+    """A coding member (it reports ``"pool": "coding"``): a volunteer's machine running a whole
+    coding model on its own (docs/coding-members.md). Like a CPU pool member it has no rpc-server."""
+    return _as_profile(hardware).get("pool") == "coding"
+
+
 def _gpu_section(hardware: Any) -> Dict[str, Any]:
     """
     Return a worker's ``gpu`` sub-dictionary, or an empty dict.
@@ -197,10 +210,11 @@ class WorkerRegistry:
         Whether a worker can serve this Coordinator's 14B engine over RPC: its rpc-server
         protocol matches, and it is not a CPU pool member. A CPU pool member (2.3.0) runs a
         whole small model for phone requests and has no rpc-server at all; counting it here
-        would put its RAM in the 14B memory budget and its address in --rpc. Every endpoint
-        list and memory total below goes through this one check.
+        would put its RAM in the 14B memory budget and its address in --rpc. A coding member
+        is the same: it runs a whole coding model of its own. Every endpoint list and memory
+        total below goes through this one check.
         """
-        if is_app_member(hardware):
+        if is_app_member(hardware) or is_coding_member(hardware):
             return False
         if self.required_rpc_major is None:
             return True
@@ -379,9 +393,10 @@ class WorkerRegistry:
             return dict(self.workers)
 
     def count(self) -> int:
-        """Number of currently registered workers, read under the lock."""
+        """Number of currently registered workers, read under the lock. A machine that lends its CPU to the phone pool
+        next to its GPU's own job registers a second, companion node (engine/companion.py); the machine counts once."""
         with self._lock:
-            return len(self.workers)
+            return sum(1 for data in self.workers.values() if not is_companion(data.get("hardware", {})))
 
     def find_by_token(self, token: str) -> Any:
         """
@@ -516,7 +531,9 @@ class WorkerRegistry:
         there would be nothing left to run on at all.
 
         Args:
-            required_gb: the model's estimated footprint.
+            required_gb: the model's estimated footprint. Remote GPUs are added until the
+                raw pool VRAM covers ``required_gb / POOL_SAFETY_FRACTION``, because
+                admission will only spend that fraction of the pool.
             policy: ``"auto"`` for the above, ``"always"`` for the pre-1.1.0 behaviour of
                 using everything. ``"always"`` exists so the sharding path can be exercised
                 deliberately on hardware where it would not otherwise engage.
@@ -564,16 +581,27 @@ class WorkerRegistry:
         if policy == "always":
             return [c["endpoint"] for c in candidates]
 
+        # ``budget`` is the pool's RAW VRAM, but the engine's admission only ever lets a model
+        # claim POOL_SAFETY_FRACTION of what the pool reports (inference_manager). Stopping at
+        # raw VRAM >= required_gb planned a pool admission would then refuse: a 14.5 GB model
+        # on 16 GB of cards "fits" raw but not inside 0.9 x 16 = 14.4. So the planner keeps
+        # adding GPUs until the part admission may actually use covers the model. Imported
+        # here, not at the top: the engine module is far heavier than this one.
+        from engine.inference_manager import POOL_SAFETY_FRACTION
+        needed_gb = required_gb / POOL_SAFETY_FRACTION
+
         selected: List[str] = []
         budget = 0.0
         for candidate in candidates:
             is_local = candidate["class"] == "local"
-            if is_local or budget < required_gb:
+            if is_local or budget < needed_gb:
                 selected.append(candidate["endpoint"])
                 budget += candidate["vram"]
 
-        # Nothing local and nothing needed still has to run somewhere.
-        if not selected:
+        # Nothing local and nothing needed still has to run somewhere. ``candidates`` is never
+        # empty here (the early return above), but the fallback is guarded on its own so that a
+        # later change to the filters cannot turn "no endpoints" into an IndexError.
+        if not selected and candidates:
             selected.append(candidates[0]["endpoint"])
 
         return selected
@@ -615,7 +643,7 @@ class WorkerRegistry:
             total = 0
             for w_id, data in self.workers.items():
                 hardware = data.get("hardware", {})
-                if hardware.get("is_yielding", False) or is_app_member(hardware):
+                if hardware.get("is_yielding", False) or is_app_member(hardware) or is_coding_member(hardware):
                     continue
                 total += _as_int(hardware.get("cpu_cores", 0))
             return total
@@ -627,7 +655,7 @@ class WorkerRegistry:
             total = 0
             for w_id, data in self.workers.items():
                 hardware = data.get("hardware", {})
-                if hardware.get("is_yielding", False) or is_app_member(hardware):
+                if hardware.get("is_yielding", False) or is_app_member(hardware) or is_coding_member(hardware):
                     continue
                 total += _as_int(hardware.get("cpu_threads", 0))
             return total
@@ -638,4 +666,13 @@ class WorkerRegistry:
             self.prune_dead_workers()
             return [dict(data) for data in self.workers.values()
                     if is_app_member(data.get("hardware", {}))
+                    and not _as_profile(data.get("hardware", {})).get("is_yielding", False)]
+
+    def coding_members(self) -> List[Dict[str, Any]]:
+        """Live coding members (worker records), for engine/coding_router.py. A member that has
+        handed its machine back to its owner (Gaming Mode) is left out."""
+        with self._lock:
+            self.prune_dead_workers()
+            return [dict(data) for data in self.workers.values()
+                    if is_coding_member(data.get("hardware", {}))
                     and not _as_profile(data.get("hardware", {})).get("is_yielding", False)]

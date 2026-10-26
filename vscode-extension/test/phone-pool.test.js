@@ -350,8 +350,11 @@ test('the version is the same in the manifest and the lockfile, and the CHANGELO
   assert.equal(lock.version, pkg.version);
   assert.equal(lock.packages[''].version, pkg.version);
   const changelog = fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8');
-  assert.equal(changelog.match(/^## \[([^\]]+)\]/m)[1], pkg.version, 'the newest CHANGELOG entry is this version');
-  assert.match(changelog, new RegExp(`^## \\[${pkg.version.replace(/\./g, '\\.')}\\] - \\d{4}-\\d{2}-\\d{2}\\n\\nPairs with DLNE coordinator \\*\\*2\\.3\\.0\\*\\*`, 'm'));
+  // (An "Unreleased" section above it is work waiting for its release; it is not a version.)
+  const releases = [...changelog.matchAll(/^## \[([^\]]+)\]/gm)].map((m) => m[1]).filter((v) => v !== 'Unreleased');
+  assert.equal(releases[0], pkg.version, 'the newest released CHANGELOG entry is this version');
+  // 1.3.0's coding members, sealed requests and privacy modes need coordinator 2.4.0.
+  assert.match(changelog, new RegExp(`^## \\[${pkg.version.replace(/\./g, '\\.')}\\] - \\d{4}-\\d{2}-\\d{2}\\n\\nPairs with DLNE coordinator \\*\\*2\\.4\\.0\\*\\*`, 'm'));
 });
 
 test('no text in the extension says contributors get unlimited chats or that a CPU runs the coding model', () => {

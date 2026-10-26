@@ -1,6 +1,9 @@
 import { DlneClient, ChatMessage } from '../client/dlneClient';
+import { QueueUpdate } from '../client/queue';
+import { newSessionId } from '../client/session';
 import { ToolRegistry } from './tools';
 import { CPU_POOL_PERK } from '../worker/contribution';
+import { redactSecrets } from '../privacy';
 
 export interface AgentCallbacks {
   onThinkingDelta: (delta: string) => void;
@@ -8,6 +11,11 @@ export interface AgentCallbacks {
   onToolStart: (toolName: string, args: Record<string, any>) => void;
   onToolEnd: (result: any) => void;
   onLoadingProgress?: (statusText: string) => void;
+  /**
+   * The place in line while every coding slot is taken, and null once the answer starts. A caller that
+   * leaves this out is told the same thing as a line of onLoadingProgress.
+   */
+  onQueue?: (queue: QueueUpdate | null) => void;
   onError?: (error: any) => void;
 }
 
@@ -46,9 +54,16 @@ export function refusalNotice(status: number | undefined, errMsg: string): strin
 export class AgentLoop {
   private messages: ChatMessage[] = [];
   private abortController: AbortController | null = null;
+  // One random id per conversation (X-DLNE-Session): the coordinator sends the conversation back to the
+  // coding member that already read its prompt. A cleared conversation is a new one.
+  private sessionId: string = newSessionId();
 
   constructor(private client: DlneClient) {
     this.initSystemPrompt();
+  }
+
+  public getSessionId(): string {
+    return this.sessionId;
   }
 
   private initSystemPrompt() {
@@ -65,6 +80,8 @@ Use your tools to do the work rather than telling the user to do it:
 
 Paths are relative to the workspace root. The user approves edits, commands, and anything outside the workspace; if a tool result says the user declined, do not retry it - ask or take another approach. After acting, check the result and say briefly what you changed.
 
+Secrets (keys, tokens, passwords) in files and output are shown to you as [REDACTED], and some files (.env, key files, anything in .gitignore or .dlneignore) cannot be read at all. Never write [REDACTED] into a file or put it in a search_block; if you need such a value, ask the user to supply it.
+
 If your output cannot carry native tool calls, emit one as a JSON block:
 \`\`\`json
 {"name": "read_file", "arguments": {"path": "src/index.ts"}}
@@ -77,6 +94,7 @@ Begin with a short <think> plan.`
 
   public clearHistory() {
     this.initSystemPrompt();
+    this.sessionId = newSessionId();
     ToolRegistry.resetApprovals();
   }
 
@@ -246,7 +264,7 @@ Begin with a short <think> plan.`
     this.abort();
     this.abortController = new AbortController();
 
-    this.messages.push({ role: 'user', content: userPrompt });
+    this.messages.push({ role: 'user', content: redactSecrets(userPrompt).text }); // secrets never leave the editor
     const tools = ToolRegistry.getToolDefinitions();
 
     let turns = 0;
@@ -370,7 +388,8 @@ Begin with a short <think> plan.`
           },
           undefined,
           this.abortController.signal,
-          callbacks.onLoadingProgress
+          callbacks.onLoadingProgress,
+          { sessionId: this.sessionId, onQueue: callbacks.onQueue }
         );
 
         if (inThinking && buffer) {

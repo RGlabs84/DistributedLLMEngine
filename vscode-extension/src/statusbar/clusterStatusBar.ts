@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { DlneClient, formatLoadingTelemetry } from '../client/dlneClient';
 import { WorkerManager } from '../worker/workerManager';
+import { QueueUpdate, queueDetail, queueHeadline, queueStatusText } from '../client/queue';
 import { CPU_POOL_HEADLINE, CPU_POOL_PERK, contributionTooltip } from '../worker/contribution';
 
 export class ClusterStatusBar {
@@ -21,6 +22,20 @@ export class ClusterStatusBar {
     this.workerManager.onStatusChange(() => {
       this.updateStatus();
     });
+    // While a request waits for a coding slot the item says where it stands, and goes back when it is served.
+    this.stopFollowingQueue = this.client.onQueue?.((queue) => this.showQueue(queue));
+  }
+
+  private stopFollowingQueue?: () => void;
+
+  /** Puts the place in line on the item, or (null) puts the usual status back. */
+  private showQueue(queue: QueueUpdate | null): void {
+    if (queue) {
+      this.statusBarItem.text = `$(clock) DLNE: ${queueStatusText(queue)}`;
+      this.statusBarItem.tooltip = `${queueHeadline(queue)}\n${queueDetail(queue)}`;
+    } else {
+      void this.updateStatus();
+    }
   }
 
   startPolling() {
@@ -36,6 +51,15 @@ export class ClusterStatusBar {
   }
 
   async updateStatus() {
+    await this.render();
+    // A request that is waiting for a coding slot keeps the item until it is served.
+    const queue = this.client.currentQueue?.();
+    if (queue) {
+      this.showQueue(queue);
+    }
+  }
+
+  private async render() {
     const detailed = await this.client.getClusterStatusDetailed();
     const workerStatus = this.workerManager.getStatus();
     const extVersion =
@@ -83,7 +107,11 @@ export class ClusterStatusBar {
 
     const quota = this.client.getQuotaRemaining();
     const contribTag = workerStatus.state === 'contributing'
-      ? workerStatus.cpuPool ? ` [Phone app ${workerStatus.vramContributedGb}GB]` : ` [Contributing ${workerStatus.vramContributedGb}GB]`
+      ? workerStatus.cpuPool
+        ? ` [Phone app ${workerStatus.vramContributedGb}GB]`
+        : workerStatus.role === 'coding'
+        ? ` [Coding member ${workerStatus.vramContributedGb}GB${workerStatus.alsoCpu ? ' + Phone app' : ''}]`
+        : ` [Contributing ${workerStatus.vramContributedGb}GB${workerStatus.alsoCpu ? ' + Phone app' : ''}]`
       : quota !== null ? ` [Free trial: ${quota} chats left]` : '';
     if (status.model_loading?.is_loading) {
       const ml = status.model_loading;
@@ -109,6 +137,7 @@ export class ClusterStatusBar {
 
   dispose() {
     this.stopPolling();
+    this.stopFollowingQueue?.();
     this.statusBarItem.dispose();
   }
 }

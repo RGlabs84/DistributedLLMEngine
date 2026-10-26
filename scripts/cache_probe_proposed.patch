@@ -1,0 +1,248 @@
+--- a/vscode-extension/src/completion/fimProvider.ts
++++ b/vscode-extension/src/completion/fimProvider.ts
+@@ -10,14 +10,23 @@
+ const SUFFIX_LINES = 10;
+ const SUFFIX_CHARS = 600;
+ const MAX_TOKENS = 48;
++// The prompt's first line moves once per this many lines typed, not once per line. The model's cache can reuse a
++// prompt only up to the first token that changed, so a front that moves on every new line re-reads the whole
++// prompt each time (measured: 654 tokens on TheWall instead of about 5).
++const PREFIX_BLOCK = 8;
+ 
+ const MIN_DELAY_MS = 75;
+ const MAX_DELAY_MS = 2000;
+ 
+ /** The prompt pieces for a completion at `position`, trimmed to the budget above. */
+ export function buildFimContext(document: vscode.TextDocument, position: vscode.Position): { prefix: string; suffix: string; midLine: boolean } {
+-  const startLine = Math.max(0, position.line - PREFIX_LINES);
++  let startLine = Math.floor(Math.max(0, position.line - PREFIX_LINES) / PREFIX_BLOCK) * PREFIX_BLOCK;
+   let prefix = document.getText(new vscode.Range(new vscode.Position(startLine, 0), position));
++  // Over the character budget: drop whole blocks from the top (not single characters), so the front still holds still.
++  while (prefix.length > PREFIX_CHARS && startLine < position.line) {
++    startLine = Math.min(position.line, startLine + PREFIX_BLOCK);
++    prefix = document.getText(new vscode.Range(new vscode.Position(startLine, 0), position));
++  }
+   if (prefix.length > PREFIX_CHARS) {
+     prefix = prefix.slice(prefix.length - PREFIX_CHARS);
+   }
+--- a/vscode-extension/test/fim.test.js
++++ b/vscode-extension/test/fim.test.js
+@@ -41,14 +41,36 @@
+ 
+ // --- the prompt -----------------------------------------------------------------------------
+ 
+-test('the prefix is the last 50 lines and the suffix the next 10', () => {
++test('the prefix is 50 to 57 lines (its first line moves in blocks of 8) and the suffix the next 10', () => {
+   const text = Array.from({ length: 200 }, (_, i) => `line ${i}`).join('\n');
+   const { prefix, suffix } = buildFimContext(doc(text), pos(100, 0));
+-  assert.equal(prefix.split('\n')[0], 'line 50');
+-  assert.equal(prefix.split('\n').length, 51);
++  assert.equal(prefix.split('\n')[0], 'line 48');
++  assert.equal(prefix.split('\n').length, 53);
+   assert.equal(suffix.split('\n').pop(), 'line 110');
+ });
+ 
++test('the front of the prompt holds still while lines are typed, so the model can reuse what it read', () => {
++  const text = Array.from({ length: 300 }, (_, i) => `line ${i}`).join('\n');
++  const firstLine = (line) => buildFimContext(doc(text), pos(line, 0)).prefix.split('\n')[0];
++  const firsts = new Set();
++  for (let line = 202; line < 210; line++) firsts.add(firstLine(line));
++  assert.equal(firsts.size, 1);                                    // eight lines typed, one front (50..57 lines above the cursor)
++  assert.notEqual(firstLine(202), firstLine(218));                 // it does move, in steps of 8
++  for (let line = 120; line < 220; line++) {
++    const n = buildFimContext(doc(text), pos(line, 0)).prefix.split('\n').length - 1;
++    assert.ok(n >= 50 && n < 58, `line ${line} sends ${n} lines above the cursor`);
++  }
++});
++
++test('over the character budget whole blocks are dropped from the top, so the front still moves in steps', () => {
++  const fat = Array.from({ length: 300 }, (_, i) => `${'x'.repeat(150)} ${String(i).padStart(3, '0')}`).join('\n');
++  const first = (line) => buildFimContext(doc(fat), pos(line, 154)).prefix.split('\n')[0].slice(-3);
++  const fronts = new Set();
++  for (let line = 200; line < 208; line++) fronts.add(first(line));
++  assert.ok(fronts.size <= 2, `${[...fronts]}`);
++  assert.ok(buildFimContext(doc(fat), pos(207, 154)).prefix.length <= 4000);
++});
++
+ test('very long lines are capped by characters too', () => {
+   const long = 'x'.repeat(10000);
+   const { prefix, suffix } = buildFimContext(doc(`${long}\n${long}`), pos(1, 5000));
+--- a/engine/coordinator.py
++++ b/engine/coordinator.py
+@@ -1922,6 +1922,24 @@
+ # chat and completion path passes to astart_model). Autocomplete only runs while one is free.
+ FIM_ENGINE_SLOTS = 2
+ 
++# Ghost text on the hybrid coding model (Qwen3.6: recurrent layers that cannot be rolled back to the middle of a
++# prompt). llama-server keeps its checkpoints near the END of a prompt, which for <|fim_prefix|>P<|fim_suffix|>S
++# <|fim_middle|> is inside S, past the point where the next keystroke's prompt starts to differ, so every
++# completion re-read about 500 tokens (measured on TheWall). Sending the text before the cursor as a request of its
++# own first (no tokens generated) parks the engine's state exactly there: the real request then reads only S.
++# The warm-up is best effort and changes nothing the real request returns.
++FIM_PREFIX_TOKEN = "<|fim_prefix|>"
++FIM_SUFFIX_TOKEN = "<|fim_suffix|>"
++
++
++def fim_warm_body(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
++    """The prefix-only request that goes ahead of a fill-in-the-middle completion, or None if `body` is not one."""
++    prompt = body.get("prompt")
++    if not isinstance(prompt, str) or not prompt.startswith(FIM_PREFIX_TOKEN) or FIM_SUFFIX_TOKEN not in prompt:
++        return None
++    return {"prompt": prompt.split(FIM_SUFFIX_TOKEN, 1)[0], "max_tokens": 0, "temperature": 0.0, "stream": False}
++
++
+ # Bound at import, deliberately: the test-suite replaces ``coordinator.httpx`` wholesale with
+ # a stub namespace, and an ``except httpx.ReadTimeout`` resolved at raise-time against that
+ # stub would fail with AttributeError while handling another exception. These names are
+@@ -2735,6 +2753,15 @@
+ 
+         forwarded_headers = {"Content-Type": "application/json"}
+ 
++        warm = fim_warm_body(body)
++        if warm is not None:
++            try:
++                async with engine_client() as client:
++                    await client.post(llama_url, json=warm, headers=forwarded_headers,
++                                      timeout=httpx.Timeout(20.0, connect=ENGINE_CONNECT_TIMEOUT_SECONDS))
++            except Exception:  # noqa: BLE001 - best effort; the real request below is complete without it
++                pass
++
+         if is_stream:
+             async def stream_generator():
+                 try:
+--- a/engine/config.py
++++ b/engine/config.py
+@@ -231,6 +231,7 @@
+     "-mg", "--main-gpu", "-t", "--threads", "-tb", "--threads-batch", "-C", "--cpu-mask", "--cpu-strict",
+     "-Cb", "--cpu-mask-batch", "--cpu-strict-batch", "--chat-template-kwargs", "--reasoning-budget",
+     "--reasoning-format", "--ctx-checkpoints", "--checkpoint-min-step",
++    "--cache-ram",          # host-memory prompt cache, MiB (llama-server defaults to 8192); a slot's saved conversation
+ })
+ ENGINE_ARG_FLAGS = frozenset({"--swa-full", "--no-mmap"})
+ # Where the model's weights go on this host's own cards. Written for those cards, they are wrong
+--- a/tests/test_engine_args.py
++++ b/tests/test_engine_args.py
+@@ -16,6 +16,12 @@
+         "--cpu-strict", "1", "--chat-template-kwargs", '{"enable_thinking":false}']
+ 
+ 
++def test_the_prompt_cache_and_checkpoint_limits_can_be_set():
++    # what a slot keeps for a conversation it is not running: checkpoints (62.8 MiB each on Qwen3.6 35B-A3B) and saved states
++    assert parse_engine_args("--ctx-checkpoints 6 --cache-ram 2048") == ["--ctx-checkpoints", "6", "--cache-ram", "2048"]
++    assert parse_engine_args("--cache-ram 0") == ["--cache-ram", "0"]
++
++
+ @pytest.mark.parametrize("raw", [
+     "--rpc 203.0.113.9:50052",          # not on the list: the engine's RPC wiring is the coordinator's
+     "--n-cpu-moe 5 --model /etc/passwd",
+--- /dev/null
++++ b/tests/test_fim_warm.py
+@@ -0,0 +1,108 @@
++"""
++Ghost text on the hybrid coding model: the coordinator sends the text before the cursor to the engine as a request of
++its own (nothing generated) ahead of the completion, so the engine's state is parked at the cursor and the completion
++reads only what follows it. Measured on TheWall: about 500 tokens re-read per keystroke without it, about 110 with it.
++"""
++
++import http.server
++import json
++import threading
++
++import pytest
++from httpx import ASGITransport, AsyncClient
++
++from engine import coordinator
++from engine.lease import lease_manager
++
++
++def test_only_a_fill_in_the_middle_prompt_gets_a_warm_up():
++    prompt = "<|fim_prefix|>def f(x):\n    return <|fim_suffix|>\n\nprint(f(1))<|fim_middle|>"
++    warm = coordinator.fim_warm_body({"prompt": prompt, "max_tokens": 48, "stop": ["\n"]})
++    assert warm == {"prompt": "<|fim_prefix|>def f(x):\n    return ", "max_tokens": 0, "temperature": 0.0, "stream": False}
++    for plain in ("def f(", "<|fim_prefix|>no suffix marker", "x<|fim_prefix|>a<|fim_suffix|>b", None, 7, ["<|fim_prefix|>a<|fim_suffix|>"]):
++        assert coordinator.fim_warm_body({"prompt": plain}) is None
++    assert coordinator.fim_warm_body({}) is None
++
++
++class FakeEngine(http.server.BaseHTTPRequestHandler):
++    seen = []
++    drop_warm = False
++
++    def log_message(self, *args):
++        pass
++
++    def do_POST(self):
++        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
++        FakeEngine.seen.append(body)
++        if FakeEngine.drop_warm and body.get("max_tokens") == 0:
++            self.close_connection = True
++            self.connection.shutdown(2)
++            return
++        data = json.dumps({"choices": [{"text": "pass", "index": 0}]}).encode()
++        self.send_response(200)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(data)))
++        self.end_headers()
++        self.wfile.write(data)
++
++
++@pytest.fixture
++def engine(monkeypatch):
++    FakeEngine.seen = []
++    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeEngine)
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++
++    async def fake_start(model_path, *args, **kwargs):
++        return (True, server.server_address[1], "")
++
++    async def fake_estimate(_model):
++        return 1.0
++
++    async def ready(_port):
++        return True
++
++    monkeypatch.setattr(coordinator.manager, "astart_model", fake_start)
++    monkeypatch.setattr(coordinator.manager, "aestimate_model_vram_gb", fake_estimate)
++    monkeypatch.setattr(coordinator, "_probe_engine_port", ready)
++    monkeypatch.setattr(coordinator, "is_swapping_models", False)
++    monkeypatch.setattr(coordinator, "is_recalculating_queue", False)
++    with lease_manager._lock:
++        lease_manager._leases.clear()
++    yield FakeEngine
++    server.shutdown()
++    with lease_manager._lock:
++        lease_manager._leases.clear()
++
++
++async def _complete(prompt):
++    transport = ASGITransport(app=coordinator.app, client=("127.0.0.1", 5000))
++    async with AsyncClient(transport=transport, base_url="http://test") as client:
++        return await client.post("/v1/completions", json={"prompt": prompt, "model": "m.gguf", "max_tokens": 48, "stop": ["\n"]})
++
++
++@pytest.mark.anyio
++async def test_the_engine_sees_the_prefix_alone_and_then_the_unchanged_request(engine):
++    prompt = "<|fim_prefix|>x = 1\ny = <|fim_suffix|>\nprint(y)<|fim_middle|>"
++    resp = await _complete(prompt)
++    assert resp.status_code == 200 and resp.json()["choices"][0]["text"] == "pass"
++    warm, real = engine.seen
++    assert warm["prompt"] == "<|fim_prefix|>x = 1\ny = " and warm["max_tokens"] == 0
++    assert real["prompt"] == prompt and real["max_tokens"] == 48 and real["stop"] == ["\n"]
++
++
++@pytest.mark.anyio
++async def test_an_ordinary_completion_is_sent_once(engine):
++    resp = await _complete("def f(")
++    assert resp.status_code == 200
++    assert [b["prompt"] for b in engine.seen] == ["def f("]
++
++
++@pytest.mark.anyio
++async def test_a_warm_up_that_fails_does_not_fail_the_completion(engine):
++    engine.drop_warm = True            # the engine hangs up on the warm-up request
++    try:
++        resp = await _complete("<|fim_prefix|>a<|fim_suffix|>b<|fim_middle|>")
++    finally:
++        engine.drop_warm = False
++    assert resp.status_code == 200 and resp.json()["choices"][0]["text"] == "pass"
++    assert [b["max_tokens"] for b in engine.seen] == [0, 48]

@@ -9,9 +9,18 @@ import * as https from 'https';
 import { EngineVerificationError, FetchResult, RELEASE_PUBKEY_HEX, fetchVerifiedEngine, fetchVerifiedRpcBin, hostRpcPlatform } from './engineRelease';
 import { resolveServerUrl } from '../serverUrl';
 import {
-  CPU_BELOW_MINIMUM_EXIT_CODE, CPU_MIN_RAM_GB, CPU_POOL_HEADLINE, ContributionPlan, cpuReason, installedRamGb, lendLabel,
-  parseRefusal, parseVulkanSummary, pickVulkanGpu, planContribution, ramChoices, ramOfferText, ramTooSmallText, workerStartedNotice,
+  CODING_MEMBER_ALLOWED_KEY, CODING_MEMBER_NOTICE, CPU_BELOW_MINIMUM_EXIT_CODE, CPU_MIN_RAM_GB, CPU_POOL_HEADLINE,
+  codingMaxRamGb, ALSO_CPU_REASON, ALSO_CPU_RAM_KEY, LEND_BOTH, alsoCpuConfigUpdate, bothRamTooSmallText, parseAlso,
+  ContributionPlan, LEND_CPU_ONLY, LEND_GPU, RoleAssignment, RoleDetail, WorkerRole, cpuReason, installedRamGb,
+  lendGpuPrompt, lendLabel, parseRefusal, parseRole, parseVulkanSummary, pickVulkanGpu, planContribution, ramChoices,
+  ramOfferText, ramTooSmallText, setConfigValue, workerStartedNotice, powershellExpandCommand, quoteIfSpaced,
+  isRpcExecutablePlatform, takeCompleteLines,
 } from './contribution';
+
+/** Remembered in the editor's global state: the GPU owner has been told what lending a GPU means. */
+const LEND_NOTICE_KEY = 'dlne.lendGpuNoticeSeen';
+/** Remembered likewise: the owner has been told their GPU became a coding member. */
+const CODING_NOTICE_KEY = 'dlne.codingMemberNoticeSeen';
 
 function downloadFile(urlStr: string, destPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -45,6 +54,8 @@ function downloadFile(urlStr: string, destPath: string): Promise<void> {
   });
 }
 
+// How long a stopped worker has to shut its coding model server down before it is killed (macOS and Linux).
+const WORKER_STOP_GRACE_MS = 8000;
 // The engine exits with this code when the coordinator runs a different version (engine/worker.py).
 const VERSION_MISMATCH_EXIT_CODE = 75;
 // Two automatic re-syncs within ten minutes; after that a mismatch is reported instead of looped on.
@@ -101,6 +112,17 @@ export interface WorkerStatus {
   /** This machine contributes (or would) its CPU, which powers the DLNE phone app, not a GPU. */
   cpuPool: boolean;
   message?: string;
+  /**
+   * The job the coordinator gave this machine, once the worker has said (a CPU machine is always `app`).
+   * Undefined while the worker is not running, and for an engine that does not report one.
+   */
+  role?: WorkerRole;
+  roleDetail?: RoleDetail;
+  /**
+   * "Both": the worker says its CPU also serves the phone app's pool next to the GPU's own job (`role` is still the
+   * GPU's job). Undefined on every other machine, and while the worker is not running.
+   */
+  alsoCpu?: boolean;
 }
 
 export class WorkerManager {
@@ -113,6 +135,7 @@ export class WorkerManager {
   private onStatusChangeEmitter = new vscode.EventEmitter<WorkerStatus>();
   public readonly onStatusChange = this.onStatusChangeEmitter.event;
   private pollInterval: NodeJS.Timeout | null = null;
+  private disposed = false;
   private failedChecksCount = 0;
 
   constructor(
@@ -128,12 +151,95 @@ export class WorkerManager {
       this.vramContributed = 8.0;
       this.statusMessage = 'Actively contributing 8.0 GB via VULKAN (system service)!';
     }
+    // The owner's coding-member switch reaches a worker that is already running through the engine's
+    // config.txt, which the worker re-reads: writing it when the setting changes needs no restart.
+    if (typeof vscode.workspace.onDidChangeConfiguration === 'function') {
+      this.settingListener = vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration('dlne.worker.allowCodingMember')) {
+          this.syncCodingMemberSetting();
+        }
+      });
+    }
     this.init();
+  }
+
+  private settingListener: vscode.Disposable | undefined;
+
+  /**
+   * Write `dlne.worker.allowCodingMember` into the installed engine's config.txt as
+   * `CODING_MEMBER_ALLOWED=true|false` (engine/config.py: only the literal `true` is true). The
+   * switch is off unless the setting is exactly `true`, so a setting that is somehow not a boolean
+   * fails in the direction that keeps the GPU out of the coding job. Never throws: a config that
+   * cannot be written leaves the engine's own default (allowed) and is logged.
+   */
+  /**
+   * "Both": the engine reads the RAM the CPU lends to the phone pool from ALSO_CPU_RAM_GB in config.txt (a worker the
+   * editor does not spawn, the systemd service, has no command line to carry it). A machine that lends both writes
+   * the amount; any other machine only clears a leftover positive value, and a config without the key is not touched.
+   */
+  private syncAlsoCpuSetting(plan: ContributionPlan, engineRoot?: string): void {
+    const root = engineRoot ?? (this.findEngineScript() ? path.dirname(this.findEngineScript()) : '');
+    if (!root) {
+      return;
+    }
+    const ram = vscode.workspace.getConfiguration('dlne').get<number>('worker.alsoCpuRamGb') ?? 0;
+    const file = path.join(root, 'config', 'config.txt');
+    try {
+      const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
+      const next = alsoCpuConfigUpdate(current, plan.alsoCpu === true && ram > 0, ram);
+      if (next === null) {
+        return;
+      }
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const scratch = `${file}.${process.pid}.tmp`;
+      try {
+        fs.writeFileSync(scratch, next, 'utf-8');
+        fs.renameSync(scratch, file);
+      } catch {
+        try { fs.unlinkSync(scratch); } catch {}
+        fs.writeFileSync(file, next, 'utf-8');
+      }
+      this.outputChannel.appendLine(`[DLNE] ${ALSO_CPU_RAM_KEY} updated in ${file}`);
+    } catch (e: any) {
+      this.outputChannel.appendLine(`[DLNE] Could not update ${ALSO_CPU_RAM_KEY} in ${file}: ${e?.message ?? e}`);
+    }
+  }
+
+  private syncCodingMemberSetting(engineRoot?: string): void {
+    const root = engineRoot ?? (this.findEngineScript() ? path.dirname(this.findEngineScript()) : '');
+    if (!root) {
+      return; // no engine installed yet: the first start writes it
+    }
+    const allow = vscode.workspace.getConfiguration('dlne').get<boolean>('worker.allowCodingMember', true) === true;
+    const file = path.join(root, 'config', 'config.txt');
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
+      const next = setConfigValue(current, CODING_MEMBER_ALLOWED_KEY, allow ? 'true' : 'false');
+      if (next === current) {
+        return;
+      }
+      // Beside the real file and then renamed over it, so the worker never reads half a config.
+      const scratch = `${file}.${process.pid}.tmp`;
+      try {
+        fs.writeFileSync(scratch, next, 'utf-8');
+        fs.renameSync(scratch, file);
+      } catch {
+        try { fs.unlinkSync(scratch); } catch {}
+        fs.writeFileSync(file, next, 'utf-8'); // Windows refuses a rename over a file another program has open
+      }
+      this.outputChannel.appendLine(`[DLNE] ${CODING_MEMBER_ALLOWED_KEY}=${allow ? 'true' : 'false'} written to ${file}`);
+    } catch (e: any) {
+      this.outputChannel.appendLine(`[DLNE] Could not write ${CODING_MEMBER_ALLOWED_KEY} to ${file}: ${e?.message ?? e}`);
+    }
   }
 
   private async init() {
     await this.detectLocalGpu();
     await this.refreshWorkerState();
+    // Disposed while the probes ran (VS Code shutting down during startup): start no worker and no timer, which
+    // nothing would ever clear.
+    if (this.disposed) return;
 
     // Only auto-resume if the user explicitly enabled worker.autoStart
     const autoStart = vscode.workspace.getConfiguration('dlne').get<boolean>('worker.autoStart', false);
@@ -149,13 +255,128 @@ export class WorkerManager {
   }
 
   public getStatus(): WorkerStatus {
-    return {
+    const cpuPool = this.contributesCpu();
+    const running = this.currentState === 'contributing' || this.currentState === 'starting';
+    const status: WorkerStatus = {
       state: this.currentState,
       gpu: this.localGpu,
       vramContributedGb: this.vramContributed,
-      cpuPool: this.contributesCpu(),
+      cpuPool,
       message: this.statusMessage
     };
+    // Only a worker that is running has a job, and a CPU machine's is always the phone app.
+    if (running && cpuPool) {
+      status.role = 'app';
+    } else if (running && this.assignedRole) {
+      status.role = this.assignedRole.role;
+      const { role: _role, ...detail } = this.assignedRole;
+      if (Object.keys(detail).length > 0) status.roleDetail = detail;
+    }
+    if (running && !cpuPool && this.alsoCpuRunning) {
+      status.alsoCpu = true;
+    }
+    return status;
+  }
+
+  /** What the running worker last said its job is (a DLNE_ROLE line); cleared when the worker stops. */
+  private assignedRole: RoleAssignment | null = null;
+  /** The running worker's last DLNE_ALSO line says the CPU serves the phone pool too; cleared when it stops. */
+  private alsoCpuRunning = false;
+  private codingNoticeShown = false;
+
+  /** The unfinished last line of each stream of the running worker (a pipe may cut a line in two chunks). */
+  private outputTail: { stdout: string; stderr: string } = { stdout: '', stderr: '' };
+
+  /**
+   * Read what the worker prints: the coordinator's refusal of this machine, and the job it was given.
+   * Given the stream it came from, only whole lines are read (a line that arrives in two pieces is read
+   * when it is complete; Windows ends lines with CRLF, which the parsers accept); without one, `text` is
+   * taken as it is.
+   */
+  private noteWorkerOutput(text: string, stream?: 'stdout' | 'stderr'): void {
+    if (stream) {
+      const { complete, rest } = takeCompleteLines(this.outputTail[stream], text);
+      this.outputTail[stream] = rest;
+      text = complete;
+      if (!text) {
+        return;
+      }
+    }
+    this.lastRefusal = parseRefusal(text) ?? this.lastRefusal;
+    const assignment = parseRole(text);
+    if (assignment) {
+      this.applyRole(assignment);
+    }
+    const also = parseAlso(text);
+    if (also !== null && also !== this.alsoCpuRunning) {
+      this.alsoCpuRunning = also;
+      this.emitChange();
+    }
+  }
+
+  private applyRole(assignment: RoleAssignment): void {
+    const before = JSON.stringify(this.assignedRole);
+    this.assignedRole = assignment;
+    if (JSON.stringify(assignment) === before) {
+      return;
+    }
+    this.emitChange();
+    if (assignment.role === 'coding') {
+      this.tellCodingMember();
+    }
+  }
+
+  /** Once per install: the owner is told their GPU now answers other people's requests, and what protects them. */
+  private tellCodingMember(): void {
+    const state = this.context.globalState;
+    if (state ? state.get<boolean>(CODING_NOTICE_KEY, false) : this.codingNoticeShown) {
+      return;
+    }
+    this.codingNoticeShown = true;
+    void Promise.resolve(state?.update(CODING_NOTICE_KEY, true)).catch(() => {});
+    void vscode.window.showInformationMessage(CODING_MEMBER_NOTICE, 'Stop contributing').then((choice) => {
+      if (choice === 'Stop contributing') {
+        void this.stopWorker();
+      }
+    });
+  }
+
+  /**
+   * The first time a GPU owner clicks to contribute: what the swarm may do with the GPU, and a choice
+   * between lending it and lending only the CPU. Resolves false when the owner closes the dialog (nothing
+   * starts). Only asked for a GPU machine, from a click (never when a worker resumes by itself), and only once.
+   */
+  private async confirmLendingGpu(): Promise<boolean> {
+    const state = this.context.globalState;
+    if (state?.get<boolean>(LEND_NOTICE_KEY, false)) {
+      return true;
+    }
+    const config = vscode.workspace.getConfiguration('dlne');
+    if (config.get<string>('worker.device') === 'cpu') {
+      return true; // the owner already keeps the GPU out of it
+    }
+    const gpu = this.localGpu.name === 'Probing GPU...' ? await this.detectLocalGpu() : this.localGpu;
+    if (!gpu.hasGpu) {
+      return true; // a CPU machine has its own dialog (the RAM offer)
+    }
+    const { message, detail, buttons } = lendGpuPrompt(gpu.name);
+    const choice = await vscode.window.showWarningMessage(message, { modal: true, detail }, ...buttons);
+    if (choice !== LEND_GPU && choice !== LEND_CPU_ONLY && choice !== LEND_BOTH) {
+      return false;
+    }
+    if (choice === LEND_CPU_ONLY) {
+      await config.update('worker.device', 'cpu', vscode.ConfigurationTarget.Global);
+    } else if (choice === LEND_BOTH) {
+      await config.update('worker.device', 'both', vscode.ConfigurationTarget.Global);
+    } else if (config.get<string>('worker.device') === 'both') {
+      await config.update('worker.device', 'gpu', vscode.ConfigurationTarget.Global);   // "Lend my GPU": the GPU alone
+    }
+    try {
+      await state?.update(LEND_NOTICE_KEY, true);
+    } catch {
+      // asked again next time; never fatal
+    }
+    return true;
   }
 
   /**
@@ -226,7 +447,8 @@ export class WorkerManager {
   private isProcessActive(): boolean {
     try {
       if (process.platform === 'win32') {
-        const out = child_process.execSync('tasklist', { encoding: 'utf-8', timeout: 2000 });
+        // windowsHide: the editor has no console, so a console program (this runs every 5 s) would flash a window.
+        const out = child_process.execSync('tasklist', { encoding: 'utf-8', timeout: 2000, windowsHide: true });
         return out.includes('ggml-rpc-server') || out.includes('dlne');
       } else {
         const out = child_process.execSync('pgrep -f "ggml-rpc-server|dlne_server.py worker"', {
@@ -281,7 +503,7 @@ export class WorkerManager {
       const smiCmd = isWin
         ? 'nvidia-smi.exe --query-gpu=name,memory.total --format=csv,noheader,nounits'
         : 'nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits';
-      const out = child_process.execSync(smiCmd, { encoding: 'utf-8', timeout: 2500 });
+      const out = child_process.execSync(smiCmd, { encoding: 'utf-8', timeout: 2500, windowsHide: true });
       const lines = out.trim().split('\n');
       if (lines.length > 0 && lines[0].includes(',')) {
         const [name, mem] = lines[0].split(',').map((s) => s.trim());
@@ -297,7 +519,7 @@ export class WorkerManager {
     let integratedGpu: string | undefined;
     try {
       const vkCmd = isWin ? 'vulkaninfo.exe --summary' : 'vulkaninfo --summary';
-      const out = child_process.execSync(vkCmd, { encoding: 'utf-8', timeout: 3000 });
+      const out = child_process.execSync(vkCmd, { encoding: 'utf-8', timeout: 3000, windowsHide: true });
       const picked = pickVulkanGpu(parseVulkanSummary(out));
       integratedGpu = picked.integratedGpu;
 
@@ -308,7 +530,7 @@ export class WorkerManager {
           try {
             const psCmd =
               'powershell -NoProfile -Command "Get-ChildItem \'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\' -ErrorAction SilentlyContinue | Get-ItemProperty -Name \'HardwareInformation.qwMemorySize\' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty \'HardwareInformation.qwMemorySize\'"';
-            const ramBytes = child_process.execSync(psCmd, { encoding: 'utf-8', timeout: 3000 }).trim();
+            const ramBytes = child_process.execSync(psCmd, { encoding: 'utf-8', timeout: 3000, windowsHide: true }).trim();
             let maxBytes = 0;
             for (const line of ramBytes.split('\n')) {
               const val = parseInt(line.trim(), 10);
@@ -387,8 +609,6 @@ export class WorkerManager {
       path.join(homeDir, '.venvs', 'dlne', 'bin', 'python'),
       path.join(homeDir, '.venvs', 'dlne', 'Scripts', 'python.exe'),
       // Never the open workspace's .venv: any cloned repository could ship one.
-      path.join(homeDir, 'DLNEv2', '.venv', 'bin', 'python'),
-      path.join(homeDir, 'DLNEv2', '.venv', 'Scripts', 'python.exe'),
       path.join(localAppData, 'Programs', 'Python', 'Python311', 'python.exe'),
       path.join(localAppData, 'Programs', 'Python', 'Python312', 'python.exe'),
       path.join(localAppData, 'Programs', 'Python', 'Python310', 'python.exe'),
@@ -405,19 +625,17 @@ export class WorkerManager {
     return process.platform === 'win32' ? 'python' : 'python3';
   }
 
-  private resolveNetworkKey(configuredKey: string, rootWorkspace?: string): string {
+  private resolveNetworkKey(configuredKey: string): string {
     if (configuredKey) return configuredKey;
 
+    // Only the installed engine's config: never the open workspace's, which any cloned repository could ship.
     const homeDir = process.env.HOME || process.env.USERPROFILE || '';
     const localAppData = process.env.LOCALAPPDATA || '';
     const configPaths = [
-      path.join(rootWorkspace || '', 'config', 'config.txt'),
       localAppData ? path.join(localAppData, 'DLNE', 'runtime', 'config', 'config.txt') : '',
       localAppData ? path.join(localAppData, 'DLNE', 'runtime', 'DistributedLLMEngine-main', 'config', 'config.txt') : '',
       path.join(homeDir, '.dlne', 'runtime', 'config', 'config.txt'),
       path.join(homeDir, '.dlne', 'runtime', 'DistributedLLMEngine-main', 'config', 'config.txt'),
-      path.join(homeDir, 'DLNEv2', 'config', 'config.txt'),
-      path.join(homeDir, 'WubarrkCODING', 'WindowsDEV', 'DistributedLLMEngine', 'config', 'config.txt'),
     ];
 
     for (const cp of configPaths) {
@@ -449,8 +667,6 @@ export class WorkerManager {
       localAppData ? path.join(localAppData, 'DLNE', 'runtime', 'dlne_server.py') : '',
       path.join(homeDir, '.dlne', 'runtime', 'dlne_server.py'),
       path.join(homeDir, 'DistributedLLMEngine', 'dlne_server.py'),
-      path.join(homeDir, 'DLNEv2', 'dlne_server.py'),
-      path.join(homeDir, 'WubarrkCODING', 'WindowsDEV', 'DistributedLLMEngine', 'dlne_server.py'),
       'C:\\Program Files\\DLNE\\dlne_server.py'
     ];
     return candidates.find((c) => c && fs.existsSync(c)) || '';
@@ -548,14 +764,16 @@ export class WorkerManager {
         progress.report({ message: '2/4 Configuring Python environment...', increment: 20 });
         let sysPython = '';
         const pythonCandidates = isWin
-          ? ['py -3', 'python', 'python3', path.join(localAppData, 'Programs', 'Python', 'Python311', 'python.exe')]
+          // A path is quoted: "C:\Users\Jane Doe\AppData\..." would otherwise run "C:\Users\Jane".
+          ? ['py -3', 'python', 'python3', quoteIfSpaced(path.join(localAppData, 'Programs', 'Python', 'Python311', 'python.exe'))]
           : ['python3', 'python'];
 
         for (const cand of pythonCandidates) {
           try {
             const ver = child_process.execSync(`${cand} -c "import sys; print('%d.%d' % sys.version_info[:2])"`, {
               encoding: 'utf-8',
-              timeout: 3000
+              timeout: 3000,
+              windowsHide: true
             }).trim();
             const [major, minor] = ver.split('.').map(Number);
             if (major === 3 && minor >= 10) {
@@ -571,7 +789,7 @@ export class WorkerManager {
           try {
             child_process.execSync(
               'winget install --id Python.Python.3.11 -e --silent --accept-package-agreements --accept-source-agreements',
-              { timeout: 120000, stdio: 'ignore' }
+              { timeout: 120000, stdio: 'ignore', windowsHide: true }
             );
             sysPython = 'python';
           } catch {}
@@ -660,7 +878,7 @@ export class WorkerManager {
     return new Promise((resolve) => {
       this.outputChannel.appendLine(`[DLNE Setup] ${label}: ${command}`);
       const lines: string[] = [];
-      const child = child_process.spawn(command, { shell: true });
+      const child = child_process.spawn(command, { shell: true, windowsHide: true });
       let timedOut = false;
       const timer = setTimeout(() => {
         timedOut = true;
@@ -697,7 +915,7 @@ export class WorkerManager {
   private async extractArchive(zipPath: string, destDir: string): Promise<{ ok: boolean; tail: string }> {
     const attempts = process.platform === 'win32'
       ? [
-          `powershell -NoProfile -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${destDir}' -Force"`,
+          powershellExpandCommand(zipPath, destDir),
           `tar -xf "${zipPath}" -C "${destDir}"`
         ]
       : [
@@ -827,7 +1045,7 @@ export class WorkerManager {
       this.outputChannel.appendLine(`[DLNE] DLNE ships no GPU engine for ${process.platform}/${process.arch}; contributing is not available on this machine.`);
       return;
     }
-    const exeName = platform === 'win-x64' ? 'ggml-rpc-server.exe' : 'ggml-rpc-server';
+    const exeName = isRpcExecutablePlatform(platform) ? 'ggml-rpc-server.exe' : 'ggml-rpc-server';
     const rpcExe = path.join(engineRoot, 'bin', exeName);
     const present = fs.existsSync(rpcExe);
     const cleanServer = serverUrl.replace(/\/+$/, '');
@@ -850,7 +1068,7 @@ export class WorkerManager {
           this.outputChannel.appendLine(`[DLNE] Could not unpack the GPU engine binaries: ${extracted.tail}`);
           return;
         }
-        if (platform !== 'win-x64') {
+        if (!isRpcExecutablePlatform(platform)) {
           // Not every extractor keeps the executable bit (Python's zipfile does not).
           try { fs.chmodSync(rpcExe, 0o755); } catch {}
         }
@@ -890,7 +1108,7 @@ export class WorkerManager {
   private detectDiscreteVulkanIndices(): string {
     try {
       const vkCmd = process.platform === 'win32' ? 'vulkaninfo.exe --summary' : 'vulkaninfo --summary';
-      const out = child_process.execSync(vkCmd, { encoding: 'utf-8', timeout: 3000 });
+      const out = child_process.execSync(vkCmd, { encoding: 'utf-8', timeout: 3000, windowsHide: true });
       const discrete: string[] = [];
       const integrated: string[] = [];
       let currentIdx = '';
@@ -912,7 +1130,15 @@ export class WorkerManager {
     return '';
   }
 
-  public async startWorker(): Promise<boolean> {
+  /**
+   * @param options.interactive the owner asked for this (a click or a command), so a GPU owner who has not
+   *   yet been told what lending a GPU means is told now, and may keep the GPU out of it. A worker that
+   *   resumes by itself, or restarts after a version change, never asks.
+   */
+  public async startWorker(options: { interactive?: boolean } = {}): Promise<boolean> {
+    if (options.interactive && !(await this.confirmLendingGpu())) {
+      return false;
+    }
     try {
       await vscode.workspace.getConfiguration('dlne').update('worker.autoStart', true, vscode.ConfigurationTarget.Global);
     } catch {}
@@ -935,6 +1161,10 @@ export class WorkerManager {
       return false;
     }
     this.contributionPlan = plan;
+    // An engine that is already installed (and the systemd service, which starts it below) reads the owner's
+    // coding-member switch from its config.txt; a first-time install gets it written before the spawn.
+    this.syncCodingMemberSetting();
+    this.syncAlsoCpuSetting(plan);
 
     // 1. Check if systemd user service exists on Linux
     const homeDir = process.env.HOME || '';
@@ -967,11 +1197,13 @@ export class WorkerManager {
     const rootWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
     const rawKey = config.get<string>('worker.networkKey') || '';
-    const networkKey = this.resolveNetworkKey(rawKey, rootWorkspace);
+    const networkKey = this.resolveNetworkKey(rawKey);
 
     const allowedGpus: string = plan.allowedGpus;
     const maxVram: number = config.get<number>('worker.maxVramGb') || -1;
     const maxRam: number = config.get<number>('worker.maxRamGb') || 4.0;
+    // The coding job is not held to that default (it is the RPC job's, and small): only to a value the user set.
+    const codingMaxRam: number = codingMaxRamGb(config.inspect<number>('worker.maxRamGb')?.globalValue);
 
     // The full URL, scheme included: dlne_server.py only adds http:// to a bare host, so
     // stripping https:// here sent workers to port 80, where the proxy answers with a redirect.
@@ -1003,6 +1235,8 @@ export class WorkerManager {
     if (autoUpdate && (scriptPath.includes(path.join('DLNE', 'runtime')) || scriptPath.includes(path.join('.dlne', 'runtime')))) {
       await this.syncEngineSource(path.dirname(scriptPath), serverUrl);
     }
+    this.syncCodingMemberSetting(path.dirname(scriptPath));
+    this.syncAlsoCpuSetting(plan, path.dirname(scriptPath));
 
     const spawnCmd = pythonPath;
     const args = [scriptPath, 'worker', '--coordinator', coordinatorArg];
@@ -1011,6 +1245,21 @@ export class WorkerManager {
     if (allowedGpus) args.push('--allowed-gpus', allowedGpus);
     if (maxVram > 0) args.push('--max-vram', maxVram.toString());
     if (maxRam > 0) args.push('--max-ram', maxRam.toString());
+    // An engine older than 2.4.0 refuses arguments it does not know (and then never starts), so the flag goes only
+    // to an engine that reads it; an older one keeps holding the coding job to --max-ram, as it always did.
+    let engineSource = '';
+    try { engineSource = fs.readFileSync(scriptPath, 'utf8'); } catch {}
+    if (engineSource.includes('--coding-max-ram')) args.push('--coding-max-ram', codingMaxRam.toString());
+    // "Both": the RAM the CPU lends to the phone pool next to the GPU's job, for an engine that reads it (the same
+    // guard: an older one refuses unknown arguments). Nothing is added for a machine that lends one thing only.
+    const alsoCpuRam: number = config.get<number>('worker.alsoCpuRamGb') ?? 0;
+    if (plan.alsoCpu && alsoCpuRam > 0) {
+      if (engineSource.includes('--also-cpu-ram')) {
+        args.push('--also-cpu-ram', alsoCpuRam.toString());
+      } else {
+        this.outputChannel.appendLine('[DLNE] This engine is too old to lend the CPU next to the GPU; the GPU is lent alone.');
+      }
+    }
 
     this.outputChannel.show(true);
     const safeArgs = args.map((a, idx) => (idx > 0 && args[idx - 1] === '--network-key' ? '***' : a));
@@ -1033,16 +1282,24 @@ export class WorkerManager {
         }
       }
 
+      // Windows: python.exe is a console program and this process has no console, so without windowsHide it
+      // would sit in a black window for as long as the worker runs. And the worker's output is UTF-8
+      // whatever the console code page is, so a log line with an accented letter cannot raise in a pipe.
+      spawnEnv.PYTHONIOENCODING = 'utf-8';
       this.workerProcess = child_process.spawn(spawnCmd, args, {
         cwd,
-        env: spawnEnv
+        env: spawnEnv,
+        windowsHide: true
       });
 
       this.lastRefusal = null;
+      this.assignedRole = null;
+      this.alsoCpuRunning = false;
+      this.outputTail = { stdout: '', stderr: '' };
       this.workerProcess.stdout?.on('data', (data) => {
         const text = data.toString();
         this.outputChannel.append(text);
-        this.lastRefusal = parseRefusal(text) ?? this.lastRefusal;
+        this.noteWorkerOutput(text, 'stdout');
         if (text.includes('Heartbeat OK') || text.includes('Heartbeat ACK:') || text.includes('RPC Server started')) {
           this.markContributing();
         }
@@ -1051,7 +1308,7 @@ export class WorkerManager {
       this.workerProcess.stderr?.on('data', (data) => {
         const text = data.toString();
         this.outputChannel.append(text);
-        this.lastRefusal = parseRefusal(text) ?? this.lastRefusal;
+        this.noteWorkerOutput(text, 'stderr');
         if (text.includes('Heartbeat OK') || text.includes('Heartbeat ACK:')) {
           this.markContributing();
         }
@@ -1085,6 +1342,8 @@ export class WorkerManager {
   private onWorkerExit(code: number | null): void {
     this.outputChannel.appendLine(`[DLNE] Worker process exited with code ${code}`);
     this.currentState = 'idle';
+    this.assignedRole = null;
+    this.alsoCpuRunning = false;
     this.vramContributed = 0;
     this.statusMessage = `Worker stopped (code ${code})`;
     this.workerProcess = null;
@@ -1134,7 +1393,8 @@ export class WorkerManager {
       gpu.hasGpu,
       config.get<string>('worker.allowedGpus') || '',
       config.get<number>('worker.maxRamGb') ?? 4.0,
-      gpu.integratedGpu
+      gpu.integratedGpu,
+      config.get<number>('worker.alsoCpuRamGb') ?? 0
     );
     if (plan.error) {
       this.currentState = 'idle';
@@ -1147,6 +1407,13 @@ export class WorkerManager {
       // The amounts follow the pool's model ladder and what this machine can spare (contribution.ts).
       const totalGb = installedRamGb(os.totalmem());
       const choices = ramChoices(totalGb);
+      if (choices.length === 0 && plan.alsoCpu) {
+        // "Both" on a machine too small to lend the CPU as well: the GPU is lent alone, and the owner is told.
+        void vscode.window.showWarningMessage(bothRamTooSmallText(totalGb));
+        plan.alsoCpu = false;
+        plan.needsMoreRam = false;
+        return plan;
+      }
       if (choices.length === 0) {
         this.currentState = 'idle';
         this.statusMessage = 'Not started: not enough RAM to power the DLNE phone app';
@@ -1155,16 +1422,19 @@ export class WorkerManager {
         return null;
       }
       const labels = choices.map((c, i) => lendLabel(c, i === 0 && choices.length > 1));
-      const { message, detail } = ramOfferText(cpuReason(gpu.hasGpu, gpu.integratedGpu), choices);
+      const { message, detail } = ramOfferText(
+        plan.alsoCpu ? ALSO_CPU_REASON : cpuReason(gpu.hasGpu, gpu.integratedGpu), choices,
+        plan.alsoCpu ? 'dlne.worker.alsoCpuRamGb' : undefined);
       const picked = await vscode.window.showWarningMessage(message, { modal: true, detail }, ...labels);
       const chosen = picked === undefined ? -1 : labels.indexOf(picked);
       if (chosen < 0) {
         this.currentState = 'idle';
-        this.statusMessage = 'Not started: a CPU-only machine needs more RAM lent';
+        this.statusMessage = plan.alsoCpu ? 'Not started: say how much RAM the CPU lends, or lend the GPU alone' : 'Not started: a CPU-only machine needs more RAM lent';
         this.emitChange();
         return null;
       }
-      await config.update('worker.maxRamGb', choices[chosen].gb, vscode.ConfigurationTarget.Global);
+      // The amount for the CPU half of "both" is its own setting: dlne.worker.maxRamGb stays the GPU job's limit.
+      await config.update(plan.alsoCpu ? 'worker.alsoCpuRamGb' : 'worker.maxRamGb', choices[chosen].gb, vscode.ConfigurationTarget.Global);
     }
     return plan;
   }
@@ -1221,25 +1491,32 @@ export class WorkerManager {
 
     // Stop child process if active
     if (this.workerProcess) {
-      this.workerProcess.kill('SIGTERM');
+      // macOS and Linux: SIGTERM lets the worker stop its coding model server (that takes a few seconds), so
+      // the kill waits longer there. Windows has no such signal: kill() is TerminateProcess either way, and
+      // the model server is in a job object that dies with the worker (engine/coding_member.py).
+      const stopping = this.workerProcess;
+      stopping.kill('SIGTERM');
       setTimeout(() => {
-        if (this.workerProcess) {
-          this.workerProcess.kill('SIGKILL');
+        // Only this process: a worker started again in the meantime is not ours to kill.
+        if (this.workerProcess === stopping) {
+          stopping.kill('SIGKILL');
           this.workerProcess = null;
         }
-      }, 800);
+      }, process.platform === 'win32' ? 800 : WORKER_STOP_GRACE_MS);
     }
 
     // Ensure no orphaned ggml-rpc-server remains bound to port 50052
     try {
       if (process.platform === 'win32') {
-        child_process.execSync('taskkill /F /IM ggml-rpc-server.exe', { timeout: 2000 });
+        child_process.execSync('taskkill /F /IM ggml-rpc-server.exe', { timeout: 2000, windowsHide: true });
       } else {
         child_process.execSync('killall -9 ggml-rpc-server 2>/dev/null || true', { timeout: 2000 });
       }
     } catch {}
 
     this.currentState = 'idle';
+    this.assignedRole = null;
+    this.alsoCpuRunning = false;
     this.vramContributed = 0;
     this.statusMessage = 'Worker stopped.';
     this.emitChange();
@@ -1252,7 +1529,7 @@ export class WorkerManager {
       await this.stopWorker();
       return false;
     } else {
-      return await this.startWorker();
+      return await this.startWorker({ interactive: true });
     }
   }
 
@@ -1261,10 +1538,13 @@ export class WorkerManager {
   }
 
   public dispose() {
+    this.disposed = true;
     if (this.pollInterval) {
       clearInterval(this.pollInterval);
       this.pollInterval = null;
     }
+    this.settingListener?.dispose();
+    this.settingListener = undefined;
     // Retain worker across window reloads: do NOT call stopWorker() on dispose.
     // Background compute should remain active unless the user explicitly stops it.
     this.outputChannel.dispose();

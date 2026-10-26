@@ -3,13 +3,14 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as https from 'https';
-import { DlneClient } from './client/dlneClient';
+import { DlneClient, codingMembersMayServe } from './client/dlneClient';
+import { PrivacyStatusGate } from './privacy';
 import { DlneFimProvider } from './completion/fimProvider';
 import { SidebarProvider } from './views/sidebarProvider';
 import { registerNativeChatParticipant } from './views/nativeChatParticipant';
 import { ClusterStatusBar } from './statusbar/clusterStatusBar';
 import { WorkerManager } from './worker/workerManager';
-import { CPU_POOL_HEADLINE, CPU_POOL_PERK, workerStartedNotice } from './worker/contribution';
+import { CPU_POOL_HEADLINE, CPU_POOL_PERK, ROLE_LABEL, workerStartedNotice } from './worker/contribution';
 import { phoneChatUrl } from './serverUrl';
 
 function isNewerVersion(current: string, remote: string): boolean {
@@ -138,6 +139,14 @@ export function activate(context: vscode.ExtensionContext) {
   statusBar.startPolling();
   context.subscriptions.push(statusBar);
 
+  // 1b. The privacy-mode item (Public / Trusted / Any machine), only while the coordinator has coding
+  // members: with none, the mode means nothing, and no public-repository lookup is made.
+  const privacyStatus = new PrivacyStatusGate();
+  context.subscriptions.push(privacyStatus);
+  context.subscriptions.push({
+    dispose: client.onClusterStatus((status) => privacyStatus.update(codingMembersMayServe(status))),
+  });
+
   // 2. FIM Inline Completion Provider (All programming languages)
   const fimProvider = new DlneFimProvider(client);
   const inlineDisposable = vscode.languages.registerInlineCompletionItemProvider(
@@ -191,7 +200,7 @@ export function activate(context: vscode.ExtensionContext) {
           'Later'
         );
         if (startNow === 'Start Contributing (Recommended)') {
-          await workerManager.startWorker();
+          await workerManager.startWorker({ interactive: true });
         }
       }
     })
@@ -220,7 +229,9 @@ export function activate(context: vscode.ExtensionContext) {
           label: isContrib ? '$(debug-stop) Stop Contributing Compute' : '$(zap) Start Contributing Local Compute',
           description: workerStatus.cpuPool
             ? isContrib ? `Powering the DLNE phone app with ${workerStatus.vramContributedGb}GB of RAM` : CPU_POOL_HEADLINE
-            : isContrib ? `Actively contributing ${workerStatus.vramContributedGb}GB` : `Join ${workerStatus.gpu.name} to pool`,
+            : isContrib
+            ? `Actively contributing ${workerStatus.vramContributedGb}GB${workerStatus.role ? ` as a ${ROLE_LABEL[workerStatus.role]}` : ''}${workerStatus.alsoCpu ? ' and powering the phone app with the CPU' : ''}`
+            : `Lend ${workerStatus.gpu.name} to the swarm`,
           detail: workerStatus.cpuPool
             ? `You get ${CPU_POOL_PERK}.`
             : 'Core Rule: You must give compute to receive compute.'

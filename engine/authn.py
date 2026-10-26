@@ -88,6 +88,7 @@ acceptable by construction: the version check already requires the whole network
 in lockstep.
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -742,6 +743,7 @@ _BOOLEAN_FIELDS = (
     (None, "is_yielding"),
     ("gpu", "has_gpu"),
     (None, "has_gpu"),      # tolerated at the top level too; older probes put it there
+    (None, "coding_ok"),    # the volunteer allows the coding-member job (CODING_MEMBER_ALLOWED)
 )
 
 
@@ -877,12 +879,24 @@ def validate_hardware_profile(hw: dict) -> Tuple[bool, str]:
     if arch is not None and not (isinstance(arch, str) and len(arch) <= _MAX_NAME_LENGTH):
         return (False, "cpu_arch must be a short name")
 
-    # A CPU pool member (2.3.0) says so, and reports what it serves.
+    # A CPU pool member (2.3.0) says so, and reports what it serves. A coding member (see
+    # docs/coding-members.md) says "coding" and reports its model and speeds in a "coding" block.
+    # A worker is one or the other, never both.
     pool = hw.get("pool")
-    if pool is not None and pool != "app":
-        return (False, "pool must be \"app\" when present")
+    if pool is not None and pool not in ("app", "coding"):
+        return (False, "pool must be \"app\" or \"coding\" when present")
+    # The CPU half of a machine that also has a GPU node (engine/companion.py) names that node. It is a CPU pool
+    # member, nothing else, and the id is the one ``<id>-cpu`` the companion registers under.
+    companion_of = hw.get("companion_of")
+    if companion_of is not None:
+        if not (isinstance(companion_of, str) and 0 < len(companion_of) <= _MAX_NAME_LENGTH * 2):
+            return (False, "companion_of must be a short worker id")
+        if pool != "app":
+            return (False, "only a CPU pool member can be the companion of another node")
     app = hw.get("app")
     if app is not None:
+        if pool == "coding":
+            return (False, "a coding member has no app section")
         if not isinstance(app, dict) or set(app) - {"model", "ready", "slots"}:
             return (False, "app must be an object with model, ready and slots")
         model = app.get("model")
@@ -894,4 +908,79 @@ def validate_hardware_profile(hw: dict) -> Tuple[bool, str]:
         if slots is not None and (isinstance(slots, bool) or not isinstance(slots, int) or not 1 <= slots <= 64):
             return (False, "app.slots must be a whole number from 1 to 64")
 
+    coding = hw.get("coding")
+    if coding is not None:
+        problem = _check_coding_block(coding) if pool == "coding" else "coding is only valid for pool \"coding\""
+        if problem:
+            return (False, problem)
+
     return (True, "ok")
+
+
+# What a coding member may say about itself (docs/coding-members.md section 2). Strings are
+# short, numbers finite and in range, and anything not listed is refused, like the app block.
+_CODING_KEYS = frozenset({"model", "tier", "ready", "slots", "busy", "decode_tps", "prefill_tps", "pubkey", "no_trace",
+                          "identity", "signed_at", "sig"})
+_MAX_CODING_STRING = 128
+_MAX_CODING_SLOTS = 64
+_MAX_CODING_BUSY = 1024
+_MAX_CODING_TPS = 100000.0
+_MAX_SIGNED_AT = 4102444800          # 2100-01-01: a unix time in seconds, not a millisecond count
+_ED25519_KEY_BYTES = 32
+_ED25519_SIGNATURE_BYTES = 64
+
+
+def _check_coding_block(coding: Any) -> Optional[str]:
+    """Why a heartbeat's ``coding`` block is refused, or None when it is acceptable."""
+    if not isinstance(coding, dict) or set(coding) - _CODING_KEYS:
+        return ("coding must be an object with only model, tier, ready, slots, busy, decode_tps, prefill_tps, "
+                "pubkey, no_trace, identity, signed_at and sig")
+    for key in ("model", "tier"):
+        value = coding.get(key)
+        if value is not None and not (isinstance(value, str) and 0 < len(value) <= _MAX_CODING_STRING
+                                      and value.isprintable()):
+            return f"coding.{key} must be a short name"
+    for key in ("ready", "no_trace"):
+        if key in coding and not isinstance(coding[key], bool):
+            return f"coding.{key} must be true or false"
+    slots = coding.get("slots")
+    if slots is not None and (isinstance(slots, bool) or not isinstance(slots, int)
+                              or not 0 <= slots <= _MAX_CODING_SLOTS):
+        return f"coding.slots must be a whole number from 0 to {_MAX_CODING_SLOTS}"
+    # 0 slots is a member stepping aside (its owner is gaming): only while it says it is not ready.
+    if slots == 0 and coding.get("ready") is not False:
+        return "coding.slots may be 0 only while coding.ready is false"
+    busy = coding.get("busy")
+    if busy is not None and (isinstance(busy, bool) or not isinstance(busy, int)
+                             or not 0 <= busy <= _MAX_CODING_BUSY):
+        return f"coding.busy must be a whole number from 0 to {_MAX_CODING_BUSY}"
+    for key in ("decode_tps", "prefill_tps"):
+        if key in coding:
+            problem = _check_bounded_value(f"coding.{key}", coding[key], (0.0, _MAX_CODING_TPS))
+            if problem:
+                return problem
+    pubkey = coding.get("pubkey")
+    if pubkey is not None and not _is_canonical_b64(pubkey, 32):
+        return "coding.pubkey must be a base64 X25519 public key (32 bytes)"
+    identity = coding.get("identity")
+    if identity is not None and not _is_canonical_b64(identity, _ED25519_KEY_BYTES):
+        return "coding.identity must be a base64 Ed25519 public key (32 bytes)"
+    sig = coding.get("sig")
+    if sig is not None and not _is_canonical_b64(sig, _ED25519_SIGNATURE_BYTES):
+        return "coding.sig must be a base64 Ed25519 signature (64 bytes)"
+    signed_at = coding.get("signed_at")
+    if signed_at is not None and (isinstance(signed_at, bool) or not isinstance(signed_at, int)
+                                  or not 0 <= signed_at <= _MAX_SIGNED_AT):
+        return "coding.signed_at must be a whole number of seconds"
+    return None
+
+
+def _is_canonical_b64(value: Any, size: int) -> bool:
+    """Standard base64, padded and canonical (what ``base64.b64encode`` returns), of exactly ``size`` bytes."""
+    if not isinstance(value, str) or len(value) != 4 * ((size + 2) // 3):
+        return False
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (ValueError, TypeError):
+        return False
+    return len(raw) == size and base64.b64encode(raw).decode() == value

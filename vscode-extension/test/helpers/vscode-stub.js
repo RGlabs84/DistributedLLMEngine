@@ -17,6 +17,7 @@ const state = {
   channels: [],          // every output channel created, with its recorded lines
   statusBarItems: [],
   commands: [],          // [id, ...args] for every vscode.commands.executeCommand()
+  clipboard: undefined,  // the last text written through vscode.env.clipboard
 };
 
 function reset() {
@@ -31,6 +32,7 @@ function reset() {
   state.channels = [];
   state.statusBarItems = [];
   state.commands = [];
+  state.clipboard = undefined;
 }
 
 class EventEmitter {
@@ -84,6 +86,16 @@ const vscode = {
       const text = [base.fsPath, ...parts].join('/');
       return { fsPath: text, toString: () => text };
     },
+    file(fsPath) {
+      return { scheme: 'file', fsPath, path: fsPath, toString: () => `file://${fsPath}` };
+    },
+  },
+  env: {
+    clipboard: {
+      async writeText(text) {
+        state.clipboard = text;
+      },
+    },
   },
   extensions: { getExtension: () => undefined },
   commands: {
@@ -102,6 +114,11 @@ const vscode = {
         async update(key, value) {
           state.updates.push([`${section}.${key}`, value]);
           state.settings[`${section}.${key}`] = value;
+        },
+        // A setting the test put in state.settings counts as one the user set (its global value).
+        inspect(key) {
+          const full = `${section}.${key}`;
+          return Object.prototype.hasOwnProperty.call(state.settings, full) ? { key: full, globalValue: state.settings[full] } : { key: full };
         },
       };
     },

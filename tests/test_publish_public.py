@@ -227,4 +227,29 @@ def test_retired_and_misleading_files_stay_in_the_repository_but_not_on_github(r
 def test_the_exclusions_are_what_the_maintainer_asked_for():
     assert set(pub.EXCLUDED_DIRS) == {"builder", "ABOUT-DLNE", "discord"}
     assert set(pub.EXCLUDED_FILES) == {"download_dlne_models.sh",
-                                       "wallpapers/dlne_background_1440p_16_9_with_logos.png"}
+                                       "wallpapers/dlne_background_1440p_16_9_with_logos.png",
+                                       # "dont push the fakers": invented credentials and the tests that read them
+                                       "tests/fixtures/e2e_vectors.json",
+                                       "tests/test_e2e.py",
+                                       "vscode-extension/test/privacy-e2e.test.js",
+                                       "vscode-extension/test/redact.test.js",
+                                       "vscode-extension/test/helpers/fake-secrets.js",
+                                       "vscode-extension/test/privacy-hooks.test.js",
+                                       "vscode-extension/test/security-review.test.js"}
+
+
+def test_the_fakes_stay_in_the_repository_but_not_on_github(repos, fake_gitleaks):
+    src, public, tmp = repos
+    fakes = ["tests/fixtures/e2e_vectors.json", "tests/test_e2e.py", "vscode-extension/test/redact.test.js",
+             "vscode-extension/test/helpers/fake-secrets.js"]
+    for name in fakes:
+        path = src / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n")
+    git(src, "add", "-A")
+    git(src, "commit", "-q", "-m", "add fakes")
+
+    assert _publish(src, public, fake_gitleaks, tmp / "none.txt")[0]
+    published = git(public, "ls-tree", "-r", "--name-only", "main").splitlines()
+    assert not set(fakes) & set(published)
+    assert set(fakes) <= set(git(src, "ls-files").splitlines())

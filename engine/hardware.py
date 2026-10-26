@@ -454,6 +454,89 @@ def _detect_gpu_type() -> str:
 
     return "cpu"
 
+# The registry key where Windows keeps one numbered subkey ("0000", "0001", ...) per display
+# adapter. The driver writes the card's memory size there as a 64-bit number, which is the only
+# honest figure on Windows: Win32_VideoController.AdapterRAM is 32 bits wide and reads 4 GB for
+# every card that has more, and vulkaninfo (which would say) is not installed on most PCs.
+_DISPLAY_CLASS_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+
+
+def _registry_size(value: Any) -> int:
+    """A memory size as drivers write it: a number (REG_QWORD / REG_DWORD) or little-endian bytes (REG_BINARY)."""
+    if isinstance(value, (bytes, bytearray)):
+        return int.from_bytes(bytes(value), "little")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return 0
+
+
+def _windows_registry_adapters() -> List[Tuple[str, int]]:
+    """
+    ``(driver description, bytes of video memory)`` for each display adapter whose driver wrote its size
+    to the registry (``HardwareInformation.qwMemorySize``, 64-bit; the older 32-bit
+    ``HardwareInformation.MemorySize`` only when the 64-bit one is missing). Empty off Windows and when
+    the registry cannot be read. Never raises.
+    """
+    try:
+        import winreg
+    except ImportError:
+        return []
+    found: List[Tuple[str, int]] = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _DISPLAY_CLASS_KEY) as root:
+            index = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(root, index)
+                except OSError:
+                    break           # past the last subkey
+                index += 1
+                if not sub.isdigit():
+                    continue        # "Configuration", "Properties": not adapters
+                try:
+                    with winreg.OpenKey(root, sub) as adapter:
+                        size = 0
+                        for field in ("HardwareInformation.qwMemorySize", "HardwareInformation.MemorySize"):
+                            try:
+                                size = _registry_size(winreg.QueryValueEx(adapter, field)[0])
+                            except OSError:
+                                continue
+                            if size > 0:
+                                break
+                        if size <= 0:
+                            continue
+                        try:
+                            desc = str(winreg.QueryValueEx(adapter, "DriverDesc")[0])
+                        except OSError:
+                            desc = ""
+                        found.append((desc, size))
+                except OSError:
+                    continue        # an adapter key this user cannot read
+    except Exception:  # noqa: BLE001 - detection falls back to the next method
+        return found
+    return found
+
+
+def _adapter_name_key(name: str) -> str:
+    """A GPU name reduced to lower-case letters and digits, so "AMD Radeon(TM) RX 6800 XT" matches "AMD Radeon RX 6800 XT"."""
+    return re.sub(r"[^a-z0-9]", "", re.sub(r"\((?:tm|r)\)", "", str(name).lower()))
+
+
+def _adapter_bytes(name: str, adapters: List[Tuple[str, int]]) -> Optional[int]:
+    """The registry's memory size for the adapter called ``name``: an exact match first, then one name containing the other."""
+    wanted = _adapter_name_key(name)
+    if not wanted:
+        return None
+    keyed = [(_adapter_name_key(desc), size) for desc, size in adapters]
+    for key, size in keyed:
+        if key and key == wanted:
+            return size
+    for key, size in keyed:
+        if key and len(min(key, wanted, key=len)) >= 6 and (key in wanted or wanted in key):
+            return size
+    return None
+
+
 def get_all_gpus() -> List[Dict[str, Any]]:
     """
     Returns a raw list of all detected GPUs on the system, cached (see the TTLs above).
@@ -531,12 +614,12 @@ def _probe_all_gpus() -> Tuple[List[Dict[str, Any]], bool]:
                 integrated = []
 
             gb = 0.0
+            windows_adapters: List[Tuple[str, int]] = []
             if os_name == "Windows":
-                ps_cmd = "Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction SilentlyContinue | Get-ItemProperty -Name 'HardwareInformation.qwMemorySize' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty 'HardwareInformation.qwMemorySize'"
-                res = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd], capture_output=True, text=True, **_hidden_process_kwargs())
-                for line in res.stdout.strip().split('\n'):
-                    if line.strip().isdigit():
-                        gb = max(gb, round(int(line.strip()) / (1024**3), 1))
+                # Each card's own size when its name is found in the registry, else the largest
+                # (the old behaviour); see _windows_registry_adapters.
+                windows_adapters = _windows_registry_adapters()
+                gb = max((round(size / (1024**3), 1) for _, size in windows_adapters), default=0.0)
             elif len(drm_cards) == len(gpu_names):
                 # Query vulkaninfo for PCI bus IDs so each sysfs card knows its corresponding
                 # Vulkan device index (GGML_VK_VISIBLE_DEVICES index).
@@ -591,7 +674,9 @@ def _probe_all_gpus() -> Tuple[List[Dict[str, Any]], bool]:
                 gb = min(usable) if usable else 0.0
 
             for idx, name in enumerate(gpu_names):
-                gpu = {"id": idx, "name": name, "vram_total_gb": gb, "vram_free_gb": gb, "load_percent": 0.0}
+                own = _adapter_bytes(name, windows_adapters)
+                size_gb = round(own / (1024**3), 1) if own else gb
+                gpu = {"id": idx, "name": name, "vram_total_gb": size_gb, "vram_free_gb": size_gb, "load_percent": 0.0}
                 if idx < len(integrated):
                     gpu["integrated"] = integrated[idx]
                 gpus.append(gpu)
@@ -608,9 +693,13 @@ def _probe_all_gpus() -> Tuple[List[Dict[str, Any]], bool]:
                 data = json.loads(res.stdout)
                 if isinstance(data, dict):
                     data = [data]
+                adapters = _windows_registry_adapters()
                 for idx, item in enumerate(data):
                     name = item.get("Name", "Unknown GPU")
-                    ram_bytes = item.get("AdapterRAM") or 0
+                    # AdapterRAM is a 32-bit field: every card above 4 GB reads as 4 GB (a 16 GB Radeon
+                    # would then fall under the coding member's 8 GB floor). The driver's own 64-bit
+                    # figure in the registry comes first; AdapterRAM is the last resort.
+                    ram_bytes = _adapter_bytes(name, adapters) or item.get("AdapterRAM") or 0
                     gb = round(ram_bytes / (1024**3), 1)
                     gpus.append({"id": idx, "name": name, "vram_total_gb": gb, "vram_free_gb": gb, "load_percent": 0.0})
         except Exception: pass
@@ -767,6 +856,72 @@ def _collect_llama_processes() -> List[psutil.Process]:
     return list(current.values())
 
 
+# SHQueryUserNotificationState's answers that mean the owner is busy with something full-screen:
+# QUNS_BUSY (a full-screen application, or Presentation Settings are on) and
+# QUNS_RUNNING_D3D_FULL_SCREEN (a Direct3D game). The others (not present, accepts notifications,
+# quiet time, a Store app) are not.
+_QUNS_BUSY = 2
+_QUNS_RUNNING_D3D_FULL_SCREEN = 3
+
+
+def _windows_fullscreen_app_running() -> bool:
+    """
+    Windows only: whether the shell reports a full-screen game or application
+    (``SHQueryUserNotificationState``). The same question Windows asks before it shows a toast,
+    answered for every GPU vendor. False elsewhere, and False when the call fails. Never raises.
+    """
+    if platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+        state = ctypes.c_int(0)
+        query = ctypes.windll.shell32.SHQueryUserNotificationState
+        query.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        query.restype = ctypes.c_long
+        if query(ctypes.byref(state)) != 0:          # an HRESULT: 0 is S_OK
+            return False
+        return state.value in (_QUNS_BUSY, _QUNS_RUNNING_D3D_FULL_SCREEN)
+    except Exception:  # noqa: BLE001 - no signal is not a reason to yield
+        return False
+
+
+def _external_nvidia_load(own_pids: List[int]) -> Optional[float]:
+    """
+    The highest GPU utilisation (percent of the card's compute) used by processes that are not ``own_pids``,
+    per NVIDIA card, from ``nvidia-smi pmon`` (one sample, about a second). None when it cannot be told:
+    no nvidia-smi, the command fails, or the driver gives no per-process figures (Windows' WDDM mode
+    prints dashes). 0.0 when nothing else is using a card.
+    """
+    try:
+        if not get_gpu_type().startswith("nvidia"):
+            return None
+        result = subprocess.run(["nvidia-smi", "pmon", "-c", "1", "-s", "u"], capture_output=True, text=True,
+                                timeout=10, **_hidden_process_kwargs())
+    except Exception:  # noqa: BLE001
+        return None
+    if result.returncode != 0:
+        return None
+    mine = set(own_pids)
+    per_card: Dict[int, float] = {}
+    rows = 0
+    known = 0
+    for line in (result.stdout or "").splitlines():
+        fields = line.split()
+        if not fields or fields[0].startswith("#") or len(fields) < 4 or not fields[0].isdigit() or not fields[1].isdigit():
+            continue
+        rows += 1
+        if not fields[3].isdigit():
+            continue                                 # "-": the driver does not say for this process
+        known += 1
+        card = int(fields[0])
+        per_card.setdefault(card, 0.0)
+        if int(fields[1]) not in mine:
+            per_card[card] += float(fields[3])
+    if rows and not known:
+        return None
+    return max(per_card.values(), default=0.0)
+
+
 def is_gaming_or_heavy_load(gpu_info: Optional[Dict[str, Any]] = None) -> bool:
     """
     Reports whether the machine is busy with work that is not DLNE's own inference.
@@ -784,12 +939,27 @@ def is_gaming_or_heavy_load(gpu_info: Optional[Dict[str, Any]] = None) -> bool:
     """
     llama_processes = _collect_llama_processes()
 
-    if not llama_processes:
-        # With no inference running, a hot GPU can only be someone else's workload.
-        if gpu_info is None:
-            gpu_info = get_gpu_info()
-        if gpu_info["has_gpu"] and gpu_info["load_percent"] > 60.0:
-            return True
+    # Windows: a full-screen game (or a presentation) is running. Vendor-neutral, and the one signal
+    # that works while our own llama-server is using the GPU, which hides the GPU's total load.
+    if _windows_fullscreen_app_running():
+        return True
+
+    if gpu_info is None:
+        gpu_info = get_gpu_info()
+    if gpu_info["has_gpu"]:
+        if not llama_processes:
+            # With no inference running, a hot GPU can only be someone else's workload.
+            if gpu_info["load_percent"] > 60.0:
+                return True
+        else:
+            # Our own llama-server is on the GPU, so the total says nothing about the owner's load. On
+            # NVIDIA each process's share is known (when the driver tells it): what the other processes
+            # use is the owner's. Where it cannot be told (AMD, Intel, Apple; NVIDIA on Windows) this is
+            # None and only the signals above and below apply. Known gap on Linux and macOS: a GPU-bound
+            # game that leaves the CPU under 60% is not seen there while we are serving.
+            outside = _external_nvidia_load([p.pid for p in llama_processes])
+            if outside is not None and outside > 60.0:
+                return True
 
     # Non-blocking: covers the window since the previous heartbeat instead of sleeping.
     total_cpu_percent = psutil.cpu_percent(interval=None)

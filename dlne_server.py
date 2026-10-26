@@ -174,6 +174,12 @@ def cmd_worker(args):
         updates["MAX_VRAM_GB"] = str(args.max_vram)
     if args.max_ram:
         updates["MAX_RAM_GB"] = str(args.max_ram)
+    if args.coding_max_ram is not None:
+        # -1 is a value here (no cap on the coding job), so this tests for None, unlike --max-ram above.
+        updates["CODING_MAX_RAM_GB"] = str(args.coding_max_ram)
+    if args.also_cpu_ram is not None:
+        # "Both": the CPU also serves the phone pool with this much RAM; 0 turns it off again.
+        updates["ALSO_CPU_RAM_GB"] = str(args.also_cpu_ram)
     if updates:
         set_config_values(updates)
 
@@ -263,6 +269,10 @@ def main():
     p_worker.add_argument("--allowed-gpus", default=None, help="Comma-separated GPU indices to contribute")
     p_worker.add_argument("--max-vram", type=float, default=None, help="Max VRAM in GB to contribute")
     p_worker.add_argument("--max-ram", type=float, default=None, help="Max System RAM overhead in GB")
+    p_worker.add_argument("--coding-max-ram", type=float, default=None,
+                          help="Max System RAM in GB the coding job may use (-1: no cap; default: follow --max-ram)")
+    p_worker.add_argument("--also-cpu-ram", type=float, default=None,
+                          help="GB of RAM the CPU also lends to the phone pool while the GPU does its own job (0: not)")
     p_worker.add_argument("--rpc-ip", default=None, help="Local RPC IP to bind")
     p_worker.add_argument("--rpc-port", type=int, default=None, help="Local RPC port to bind")
 

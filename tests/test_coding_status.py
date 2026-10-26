@@ -439,9 +439,10 @@ async def test_status_lists_the_ladder_in_the_agreed_shape(cluster):
         assert set(row) == {"id", "name", "min_vram_gb", "enabled", "unlocked", "active"}
         assert isinstance(row["min_vram_gb"], int)
         assert all(isinstance(row[k], bool) for k in ("enabled", "unlocked", "active"))
-    assert [t["unlocked"] for t in tiers] == [True] + [False] * 7      # 16 GB holds only the first
-    assert [t["active"] for t in tiers] == [True] + [False] * 7
-    assert [t["enabled"] for t in tiers] == [True] * 4 + [False] * 4
+    rest = len(tiers) - 1
+    assert [t["unlocked"] for t in tiers] == [True] + [False] * rest      # 16 GB holds only the first
+    assert [t["active"] for t in tiers] == [True] + [False] * rest
+    assert [t["enabled"] for t in tiers] == [True] * 4 + [False] * (len(tiers) - 4)   # the four approved tiers, then pinned-but-off ones
     assert set(data["coding_model"]) == {"file", "name", "context", "tokens_per_second", "speed_measured_at"}
 
 
@@ -529,7 +530,7 @@ async def test_cluster_tiers_lists_the_ladder_with_the_old_field_names(cluster, 
     assert [r["id"] for r in rows] == [t["id"] for t in LADDER]
     for row in rows:
         assert {"min_vram_gb", "tier", "model", "alt_model", "unlocked", "cached_on_disk"} <= set(row)
-    first, split = rows[0], rows[4]
+    first, split = rows[0], {r["id"]: r for r in rows}["qwen38-flash-next-q2"]
     assert (first["model"], first["tier"], first["cached_on_disk"], first["parts"]) == \
         (LIVE_FILE, "Qwen3.6 35B-A3B (15 GB+ VRAM)", True, 1)
     assert split["parts"] == 3 and split["enabled"] is False and split["blocked"].startswith("placeholder")

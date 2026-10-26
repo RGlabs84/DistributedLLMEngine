@@ -1,139 +1,77 @@
-# Change Log
+# DLNE server changelog
 
-All notable changes to the **DLNE Frontier Coding Assistant** extension will be documented in this file.
+Changes to the DLNE coordinator and worker engine (`engine/`, `dlne_server.py`), released as one signed
+version that every node runs. The VS Code extension keeps its own log in
+[vscode-extension/CHANGELOG.md](vscode-extension/CHANGELOG.md); the older entries that used to be here were
+the extension's and are there.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [1.0.22] - 2026-10-24
+## [2.4.0] - 2026-10-26
 
-### Fixed
-- **Graceful Fallback on Model Swap OOM / Startup Crashes**: If an oversized model (e.g. 32B) fails to allocate in the current cluster VRAM pool and returns 500/503 during startup, the client automatically synchronizes with the active cluster model (e.g. 14B) and retries seamlessly instead of failing the user prompt.
-- **Auto-Track Active Cluster Model**: Set `dlne.chatModel` default to `""` so extensions automatically track the active cluster model without requesting an incompatible model swap.
-
----
-
-## [1.0.21] - 2026-10-24
-
-### Fixed
-- **Prioritize Active Worker Token Over Stale Settings API Key**: The extension now prioritizes the live local worker token whenever the user is actively contributing compute, and automatically retries with the worker token if a configured static `dlne.apiKey` is rejected with HTTP 403.
-
----
-
-## [1.0.20] - 2026-10-24
-
-### Fixed
-- **Persistent Worker Across Window Reloads**: Removed `stopWorker()` from extension `dispose()`. Reloading the window, switching workspaces, or updating the extension no longer terminates background worker compute processes or systemd user services.
-- **Auto-Start & Auto-Resume Worker (`dlne.worker.autoStart: true`)**: Automatically resumes local worker compute contribution on VS Code activation so users never have to manually click `/contribute` or "re-establish worker" after restarts.
-- **Self-Healing Non-Contrib 403 Flow**: When an inference request encounters a 403, the client now checks worker state, automatically starts the local worker in the background, reports progress in the chat stream, and seamlessly retries instead of immediately failing with a "DLNE Compute Required" error.
-- **Worker Token Preservation Across Restarts**: Removed `atexit` token wiping in `engine/worker.py` so brief worker restarts or reload cycles retain the last valid token on disk during the coordinator's 90-second grace window.
-
----
-
-## [1.0.19] - 2026-10-24
-
-### Fixed
-- **"Error connecting to DLNE cluster: read ECONNRESET"**: Chat requests now open a fresh socket instead of reusing a pooled keep-alive connection the coordinator had already closed, and transient network errors (`ECONNRESET`, `EPIPE`, `ECONNREFUSED`, `ETIMEDOUT`) are retried up to 4 times with backoff.
-
----
-
-## [1.0.18] - 2026-10-24
-
-### Fixed
-- **False "DLNE Compute Required" 403 While Contributing**: Fixed a race where the worker wrote its rotated ephemeral token to disk before the Coordinator had registered it, causing chat requests to be rejected for a few seconds after each rotation or worker restart.
-  - Worker now writes the new token to disk only after the Coordinator accepts the heartbeat carrying it.
-  - Coordinator keeps the previous token valid for a 90 s grace window after rotation.
-  - Extension transparently re-reads the token and retries (up to 5x / 15 s) on a 403 while a local worker token exists.
-
----
-
-## [1.0.17] - 2026-10-24
+Coding members are off until the operator sets `CODING_MEMBERS_ENABLED=true`. With it off, every endpoint
+answers as in 2.3.7, apart from the additions named below. Details: [docs/coding-members.md](docs/coding-members.md)
+and [docs/privacy.md](docs/privacy.md).
 
 ### Added
-- **Built-in Open VSX Self-Updater & Reload Prompt**: On startup and every 30 minutes, the extension directly checks `https://open-vsx.org/api/dlne/dlne-code-assistant` for newer releases, automatically downloads and installs the latest `.vsix` when `dlne.autoUpdate` is enabled (`true` by default), and displays a 1-click **"Reload Window"** prompt (even if originally installed via a local `.vsix`).
+- **Coding members.** A volunteer's GPU with 8 GB or more that is not on the coordinator's fast network can run a
+  whole coding model behind a small member proxy, reached through the existing reverse tunnel, and answer coding
+  requests on its own: two agent slots each. It runs the smartest Qwen3.6-35B-A3B tier it can hold whole and run
+  fast enough, and a join test checks the speed floors (`CODING_MEMBER_MIN_DECODE_TPS` 15,
+  `CODING_MEMBER_MIN_PREFILL_TPS` 80). A machine with no GPU is never given the job.
+- **The volunteer stays in control.** `CODING_MEMBER_ALLOWED=false` refuses the job, `MAX_VRAM_GB` and
+  `MAX_CPU_THREADS` cap it, and the member steps aside while the owner's own load (a game) needs the machine.
+  The coding job's RAM has its own cap, `CODING_MAX_RAM_GB` (-1: none, the job counts only the RAM that is free;
+  extension 1.3.0 sets it only from a `dlne.worker.maxRamGb` the volunteer chose). Without the key it follows
+  `MAX_RAM_GB` as before.
+- **Routing.** `GET /v1/coding/route` hands the extension a route id (10 minutes) and the member's public key.
+  Privacy filter first, then the member that served the same session in the last 30 minutes, else the least busy.
+  Only sealed requests ever reach a member; a plain request is answered by the coordinator's own engine. A
+  sealed request that cannot be served answers `503 dlne_reroute` and the extension asks again. Member-served
+  answers carry `X-DLNE-Served: member`.
+- **End-to-end encryption** between the extension and a member (X25519, HKDF-SHA256, ChaCha20-Poly1305): padded
+  to 256 bytes, complete only after a sealed end marker, each request usable once, member keys rotated every
+  6 hours. The coordinator relays bytes it cannot open.
+- **Privacy modes** `open`, `trusted` and `any`, sent by the extension; the coordinator never widens one, and a
+  request without one counts as `trusted`. Trusted machines are listed by trust id in `TRUSTED_MEMBERS`, derived
+  from each member's own Ed25519 identity key, which also signs its coding heartbeat.
+- **No-trace members and canaries.** Members run their model server with logging off and never log bodies.
+  Decoy requests carrying a made-up `/c/<token>` link flag a member that opens it (`CODING_CANARY_PER_DAY`, 4 per
+  untrusted member); the operator sees flags at `GET /v1/admin/canaries`.
+- **Place in line.** A streamed request from the DLNE extension (`X-DLNE-Session`) that has to wait gets
+  `dlne_queue` frames with its place every 3 s. Every other caller waits silently, as before.
+- **"Both": a GPU machine's CPU can serve the phone pool at the same time.** With `ALSO_CPU_RAM_GB` set
+  (`dlne_server.py worker --also-cpu-ram <gb>`, written by extension 1.3.0's "Lend both"), the worker runs a
+  companion node, `<worker id>-cpu`, on a thread of the same process: an ordinary phone-pool member with its own
+  heartbeat and tunnel and `companion_of` in its signed profile. The GPU node keeps its own job; every node still
+  has one. The two split the CPU threads (`MAX_CPU_THREADS` is the total), and a coding model loads after the
+  phone-pool model has. The coordinator counts the machine once; the phone pool counts the companion.
+- `/v1/cluster/status` gains `coding_members: {enabled, members, ready, slots, busy}` (counts only).
+- Verified, resumable downloads (`engine/downloader.py`): every part's size and SHA-256 checked.
+- The signed coding ladder gains one row, disabled until measured: Qwen3-Coder-Next UD-IQ4_XS on a 49 GB rung.
 
----
+### Changed (not behind the members flag)
+- **Faster ghost text.** Before each fill-in-the-middle completion the coordinator sends its engine the text
+  before the cursor as a request of its own (no tokens generated), so the real request re-reads only what follows
+  the cursor. Median 1.57 s to 1.0 s per completion on TheWall, same quality. `--cache-ram` is now allowed in
+  `ENGINE_EXTRA_ARGS`.
+- **More coding slots from the same GPUs.** The engine now chooses its own slot count and per-slot context from the model's real KV cost and the free VRAM: slots first (as many as hold 32,768 tokens each, at most 8), then more context per slot. New `ENGINE_SLOTS` (0 = automatic) sits next to `ENGINE_CONTEXT`; with `ENGINE_CONTEXT` set and `ENGINE_SLOTS` at 0 the slots are the context divided into 32,768 per slot, so TheWall's 65,536 is still 2 x 32,768.
+- **Correct KV sizing for hybrid models.** `engine/gguf.py` counts only the attention blocks (Qwen3.6-35B-A3B: 10 of 40, 20 KiB a token at f16, not 80), prices the recurrent state each slot carries (62.8 MiB), and prices q8_0/q4_0 caches exactly (34/32 and 18/32 bytes per element). Checked against llama.cpp's own memory breakdown (805 MiB at `-c 65536 -np 2`).
+- **Admission from real bytes.** A model whose header can be read is admitted from the bytes that sit on the GPUs (file minus the token embedding and any `--n-cpu-moe` expert blocks) plus 0.75 GiB of runtime buffers, instead of 1.2 x the file. Qwen3.6 IQ3_S on TheWall: 11.8 GiB, not 15.3. Its RAM part must fit the host's RAM.
+- **q4_0 cache is chosen per slot** (from 131,072 tokens a slot), not on the total context.
+- **Shard planner** (`registry.plan_endpoints`) asks for `required / POOL_SAFETY_FRACTION` of raw VRAM, so it no longer plans a pool that admission would then refuse.
+- **Windows and gaming-mode fixes in the worker.** A 16 GB Radeon on Windows reports 16 GB, not 4, and the
+  "owner is gaming" signals keep working while the machine serves (full-screen detection on Windows, per-process
+  GPU use on NVIDIA).
 
-## [1.0.16] - 2026-10-24
-
-### Fixed
-- **Automatic Windows `ggml-rpc-server.exe` Binary Provisioning**: Added automatic download and extraction of the pre-compiled Vulkan & CPU `ggml-rpc-server.exe` binaries (`/v1/download/rpc-bin`, ~15 MB) into `%LOCALAPPDATA%\DLNE\runtime\bin\` whenever missing, resolving `FATAL: Could not locate a compatible bundled binary for 'ggml-rpc-server'` on fresh Windows installations.
-- **Discrete GPU Detection & Isolation on Hybrid Systems (e.g., Ryzen iGPU + NVIDIA RTX 5070)**:
-  - Prioritized `nvidia-smi` discrete GPU detection and `PHYSICAL_DEVICE_TYPE_DISCRETE_GPU` in `vulkaninfo` so hybrid laptops/desktops accurately display and contribute their discrete GPU (e.g., RTX 5070 12 GB) instead of the integrated GPU (e.g., Radeon 880M 0.5 GB).
-  - Automatically sets `GGML_VK_VISIBLE_DEVICES` to the discrete Vulkan device index when both integrated and discrete GPUs are present so `ggml-rpc-server` never binds the 0.5 GB iGPU.
-- **Auto-Update Enabled by Default (`dlne.autoUpdate: true`)**: Automatically keeps both the VS Code extension (`extensions.autoUpdate`) and the local DLNE compute runtime synced with the latest coordinator release on startup.
-- **Redacted Network Key in Output Logs**: Masked `--network-key` in the extension output channel logs.
-
----
-
-## [1.0.15] - 2026-10-24
-
-### Fixed
-- **Resolved 404 Error on Engine Download**: Replaced private GitHub repository clone/download URLs with direct coordinator-served distribution endpoints (`/v1/download/source` and `/v1/download/windows`).
-- **HTTP / HTTPS Protocol Compatibility**: Fixed protocol dispatch in extension file downloader so `http://` coordinator endpoints stream reliably without throwing HTTPS-only protocol errors.
-- **Standalone `DLNE-Node.exe` Support**: Added native execution of standalone pre-compiled Windows executable bundles without requiring Python, Git, or pip environments.
-- **Automatic Multi-CDN Fallback**: If coordinator is busy, engine downloads smoothly fall back to Google Drive distribution mirrors.
-
----
-
-## [1.0.14] - 2026-10-24
-
-### Added
-- **Zero-Friction In-Extension Auto-Bootstrap**:
-  - Automatically installs and configures the DLNE compute engine runtime upon 1-click user permission.
-  - Automatic fallback download over HTTPS when `git` is not installed on the system.
-  - Auto-detection of system Python (Windows `py -3`, `python`, `winget` integration, Linux `python3`).
-  - Isolated virtual environment creation (`.venv`) with automated lightweight dependency installation.
-  - Default runtime installed cleanly into `%LOCALAPPDATA%\DLNE\runtime` (Windows) or `~/.dlne/runtime` (Linux/macOS).
-- **Public Swarm Discovery**:
-  - Cluster status (`/v1/cluster/status`), tier recommendations (`/v1/cluster/tiers`), and model catalogues (`/v1/models`, `/v1/models.json`) are now fully public with no authentication required.
-  - All users installing the extension immediately see live swarm health, available pooled VRAM, and active models in the status bar without encountering HTTP 403 blocks.
-- **Ultra-Long Context Support**:
-  - Full support for `Qwen2.5-14B-Instruct-1M` with up to 256,000+ token context windows deployed on the public swarm.
-- **Pre-Configured Public Swarm Network Key**:
-  - Extension now defaults `dlne.worker.networkKey` out of the box to the public cluster secret, allowing seamless instant connection.
-
-### Changed
-- **Suite Setup Flow**: Replaced the terminal command script execution with a native in-extension setup modal and notification progress bar.
-- **Documentation**: Completely overhauled `README.md` with detailed walkthroughs for both Public Zero-Config Swarm usage and Private Self-Hosted clusters, hardware requirements, and FAQ.
-- **Repository Metadata**: Corrected repository URLs in extension manifest to `https://github.com/RGlabs84/DistributedLLMEngine`.
-
-### Fixed
-- Fixed HTTP 403 "NON-CONTRIB BAN" middleware interception that prevented new users from reading cluster status.
-- Fixed Windows terminal failure when executing non-existent `python3` command.
-- Fixed 404 clone failure caused by outdated git repository reference.
-- Fixed Activity Bar icon rasterization by adopting clean vector SVG (`media/brain.svg`).
-
----
-
-## [1.0.13] - 2026-10-24
-
-### Added
-- Native vector SVG brain icon (`media/brain.svg`) for crisp rendering in the VS Code Activity Bar across all DPI scalings.
-- Cluster model loading telemetry in the status bar displaying live transfer speeds (MB/s), RPC sync progress, and estimated arrival times (ETA).
-
-### Changed
-- Polished status bar tooltips to display detailed node breakdown and active lease status.
-
----
-
-## [1.0.12] - 2026-10-23
-
-### Added
-- Initial public release on Open VSX Marketplace.
-- Fill-In-The-Middle (FIM) inline ghost-text completion provider with sub-150ms latency.
-- Dedicated Frontier Reasoning Agent sidebar webview with deep `<think>` chain-of-thought support.
-- Native VS Code Chat Participant (`@dlne`) integration in the primary chat panel (`Ctrl+Alt+I`).
-- Quick-pick cluster model selector and hot-swap controls.
-
----
-
-## [1.0.10] - 2026-10-23
-
-### Added
-- Initial pre-release of the DLNE extension client.
-- Integration with Distributed LLM Engine Coordinator API.
-- Support for autonomous file editing (`write_file`, `edit_file_diff`) and compiler diagnostic self-healing (`dlne.fixDiagnostics`).
-
+### Security
+- Free-trial callers' route lookups hold no member slot and are limited to 6 per 30 s per client (429 with
+  `Retry-After`).
+- A member's whole non-streamed answer is capped at 8 MiB and a whole exchange at 30 minutes, a stalled stream
+  included.
+- The member proxy answers 421 to any request with an `Origin` header or a non-loopback `Host`, so a web page in
+  the owner's browser cannot use it.
+- A worker that already serves as a coding member keeps its role across a coordinator restart.

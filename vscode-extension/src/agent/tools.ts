@@ -5,6 +5,7 @@ import * as child_process from 'child_process';
 import * as os from 'os';
 import { DiffManager, FileDiffData } from './diffManager';
 import { ToolDefinition } from '../client/dlneClient';
+import { REDACTION_MARK, excludedNotice, excludedReason, isExcludedFile, redactSecrets, redactionNote } from '../privacy';
 
 export interface ToolCallResult {
   tool_call_id?: string;
@@ -28,6 +29,17 @@ export function resolvePath(rootPath: string | undefined, targetPath: string): s
     return path.normalize(path.resolve(rootPath, expanded));
   }
   return path.normalize(path.resolve(os.homedir(), expanded));
+}
+
+/** `text` with this machine's workspace and home folders replaced by `<workspace>` and `~`. */
+function withoutLocalPaths(text: string, workspace: string | undefined): string {
+  let out = String(text);
+  for (const [folder, label] of [[workspace, '<workspace>'], [os.homedir(), '~']] as Array<[string | undefined, string]>) {
+    if (folder && folder.length > 1) {
+      out = out.split(folder).join(label);
+    }
+  }
+  return out;
 }
 
 /** What the user is asked to allow before a tool runs. */
@@ -58,10 +70,33 @@ async function promptForApproval(req: ApprovalRequest): Promise<ApprovalAnswer> 
   return 'deny';
 }
 
-/** True when `target` is the workspace root or inside it (never true with no folder open). */
+/**
+ * `p` with every symbolic link in it resolved. A path that does not exist yet (a file about to be created) is
+ * resolved through its nearest folder that does, so a link in the middle of it still counts.
+ */
+function realPathOf(p: string): string {
+  const missing: string[] = [];
+  let current = path.resolve(p);
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync(current), ...missing.reverse());
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return path.resolve(p);
+      missing.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
+ * True when `target` is the workspace root or inside it (never true with no folder open). Judged on where the
+ * path really leads: a link in the workspace that points at ~/Documents is not "inside" it, or the approval
+ * for anything outside the workspace could be walked round with one `ln -s`.
+ */
 function insideWorkspace(root: string | undefined, target: string): boolean {
   if (!root) return false;
-  const rel = path.relative(path.resolve(root), path.resolve(target));
+  const rel = path.relative(realPathOf(root), realPathOf(target));
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
@@ -258,13 +293,55 @@ export class ToolRegistry {
     return result;
   }
 
+  /**
+   * Secrets never leave the editor: a file excluded for privacy is not read (the model is told so, and
+   * the user is not asked to approve a read that cannot happen), and a rewrite that would put the
+   * `[REDACTED]` marker into a real file is refused. null when the call may go on.
+   */
+  private static privacyRefusal(name: string, args: Record<string, any>, root: string | undefined): string | null {
+    if (typeof args?.path !== 'string' || !args.path) return null;
+    const target = resolvePath(root, args.path);
+    if (name === 'read_file' || name === 'edit_file_diff') {
+      let reason: string | null;
+      try {
+        reason = excludedReason(target);
+      } catch {
+        reason = 'the privacy check could not be completed'; // fail closed
+      }
+      if (reason) return excludedNotice(args.path, reason);
+    }
+    if (name === 'write_file' || name === 'edit_file_diff') {
+      const writes = [args.content, args.search_block, args.replace_block].map((s) => String(s ?? '')).join('\n');
+      if (writes.includes(REDACTION_MARK)) {
+        let existing = '';
+        try { existing = fs.readFileSync(target, 'utf-8'); } catch { /* a new file: nothing to lose */ }
+        if (!existing.includes(REDACTION_MARK) && redactSecrets(existing, target).count > 0) {
+          return `Refused: the text contains ${REDACTION_MARK}, which stands for a secret DLNE hid from you, and this file holds such secrets. ` +
+            'Writing it would replace the real values. Edit only the lines you need to change and leave the lines with secrets out.';
+        }
+      }
+    }
+    return null;
+  }
+
+  /** What a tool returns goes to the model, so secrets are removed (read_file already did, before numbering lines). */
+  private static scrub(result: ToolCallResult): ToolCallResult {
+    if (result.name === 'read_file' || !result.output) return result;
+    const { text, count } = redactSecrets(result.output);
+    if (count > 0) result.output = text + redactionNote(count);
+    return result;
+  }
+
   static async executeTool(name: string, args: Record<string, any>): Promise<ToolCallResult> {
     const folders = vscode.workspace.workspaceFolders;
     const root = folders && folders.length > 0 ? folders[0].uri.fsPath : undefined;
+    // An excluded file is refused before the user is even asked: its contents are not the user's to give away.
+    const hidden = this.privacyRefusal(name, args || {}, root);
+    if (hidden) return { name, output: hidden, is_error: true };
     const refusal = await this.checkApproval(name, args || {}, root);
     if (refusal) return { name, output: refusal, is_error: true };
     const result = await this.executeToolInternal(name, args);
-    return this.capOutput(result);
+    return this.capOutput(this.scrub(result));
   }
 
   private static async executeToolInternal(name: string, args: Record<string, any>): Promise<ToolCallResult> {
@@ -276,16 +353,17 @@ export class ToolRegistry {
         case 'read_file': {
           const filePath = resolvePath(rootPath, args.path);
           if (!fs.existsSync(filePath)) {
-            return { name, output: `File not found: ${args.path} (resolved: ${filePath})`, is_error: true };
+            return { name, output: `File not found: ${args.path}`, is_error: true };
           }
-          const text = fs.readFileSync(filePath, 'utf-8');
+          // Redact the whole file before numbering: a private key spans lines, and redaction keeps line counts.
+          const { text, count: hidden } = redactSecrets(fs.readFileSync(filePath, 'utf-8'), filePath);
           const lines = text.split(/\r?\n/);
 
           const start = Math.max(1, args.start_line || 1) - 1;
           const end = args.end_line ? Math.min(lines.length, args.end_line) : lines.length;
 
           const numbered = lines.slice(start, end).map((line, idx) => `${start + idx + 1}: ${line}`);
-          return { name, output: numbered.join('\n') };
+          return { name, output: numbered.join('\n') + redactionNote(hidden) };
         }
 
         case 'write_file': {
@@ -330,7 +408,7 @@ export class ToolRegistry {
           const filePath = resolvePath(rootPath, args.path);
           const relPath = rootPath ? path.relative(rootPath, filePath) : filePath;
           if (!fs.existsSync(filePath)) {
-            return { name, output: `File not found: ${args.path} (resolved: ${filePath})`, is_error: true };
+            return { name, output: `File not found: ${args.path}`, is_error: true };
           }
           const originalText = fs.readFileSync(filePath, 'utf-8');
 
@@ -350,7 +428,7 @@ export class ToolRegistry {
         case 'list_directory': {
           const dirPath = resolvePath(rootPath, args.path || '.');
           if (!fs.existsSync(dirPath)) {
-            return { name, output: `Directory not found: ${args.path || '.'} (resolved: ${dirPath})`, is_error: true };
+            return { name, output: `Directory not found: ${args.path || '.'}`, is_error: true };
           }
           const entries = fs.readdirSync(dirPath, { withFileTypes: true });
           const listing = entries.map(ent => {
@@ -365,9 +443,12 @@ export class ToolRegistry {
           const matches: string[] = [];
 
           for (const uri of uris) {
+            if (isExcludedFile(uri)) continue; // a match in a private file would tell the model what it holds
             try {
               const data = await vscode.workspace.fs.readFile(uri);
-              const text = new TextDecoder().decode(data);
+              // Searched as the model would see the file (read_file hides secrets): matching the raw text would
+              // let it recover a hidden value one prefix at a time, by asking whether "pass...x" occurs.
+              const text = redactSecrets(new TextDecoder().decode(data), uri.fsPath).text;
               if (text.includes(query)) {
                 matches.push(path.relative(rootPath, uri.fsPath));
               }
@@ -433,6 +514,7 @@ export class ToolRegistry {
             if (args.file_path && !uri.fsPath.endsWith(args.file_path)) {
               continue;
             }
+            if (isExcludedFile(uri)) continue;
             for (const d of diags) {
               if (d.severity === vscode.DiagnosticSeverity.Error || d.severity === vscode.DiagnosticSeverity.Warning) {
                 const relPath = path.relative(rootPath, uri.fsPath);
@@ -450,7 +532,9 @@ export class ToolRegistry {
           return { name, output: `Unknown tool: ${name}`, is_error: true };
       }
     } catch (err: any) {
-      return { name, output: `Tool execution failed: ${err.message || String(err)}`, is_error: true };
+      // Node's messages quote absolute paths ("ENOENT: ... open '/home/alice/work/x'"), and this text goes to
+      // the model, which may be on a stranger's machine: the machine's user name stays here.
+      return { name, output: `Tool execution failed: ${withoutLocalPaths(err.message || String(err), rootPath)}`, is_error: true };
     }
   }
 }

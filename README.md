@@ -23,6 +23,7 @@ type `@dlne` in the chat panel.
 | `vscode-extension/` | The product: chat/code agent, ghost-text autocomplete, one-click compute sharing |
 | `engine/` | The coordinator and worker: model scheduling, worker registry, free-trial quota, admin API |
 | `dlne_server.py` | Command line: `start` (coordinator), `worker`, `apikey`, `adminkey`, `status` |
+| `docs/` | [`privacy.md`](docs/privacy.md) (what is sent where, and who can see it) and [`coding-members.md`](docs/coding-members.md) (the technical contract for coding members) |
 | `tests/` | Python test suite (`pytest`) |
 | `scripts/` | Release tooling (`release.py`, `release_apply.py`, `package_llama.py`), `publish_public.py` (the scanned snapshot that updates this public repository) and the Discord status tile |
 
@@ -31,6 +32,60 @@ swarm status. The OpenAI-compatible API lives under `/v1/*`.
 
 The public swarm's coding model is Qwen3.6-35B-A3B (a UD-IQ3_S quant) on two 8 GB AMD GPUs,
 with a 65,536-token context; bigger models unlock automatically as more GPUs join.
+
+## Coding members: lend a GPU, add agents
+
+A **coding member** is a volunteer's GPU that runs a whole coding model on its own and answers coding
+requests by itself, the way the phone pool's machines already do for chat. One request touches one
+machine, so ordinary home internet is enough, and **each member adds about two more agents** working at
+the same time.
+
+- **Who qualifies:** a GPU with 8 GB of memory or more that is not on the coordinator's own fast network
+  (a GPU that is still joins the shared big model, as before), and about 22 GB of GPU memory plus free
+  system memory together for the first version (for example an 8 GB GPU with 14 GB of RAM free). The model
+  is held whole: GPU memory first, the rest in system RAM. When a machine joins, it is timed on reading a
+  prompt and writing an answer; one under the speed floors is not sent work.
+- **Which model:** the smartest version of Qwen3.6-35B-A3B that the machine can hold whole and run fast
+  enough. About 22 GB of GPU plus free system memory runs the first version (IQ3_S, live today). Higher-quality
+  versions of the same model need more, roughly 26 GB (IQ4_XS), 30 GB (Q4_K_M) and 37 GB (Q6_K), and the
+  larger ones also need a stronger GPU to be fast enough. Open, MIT-licensed heavyweight models are planned
+  from 192 GB; they are not available yet.
+- **Your machine stays yours.** A volunteer can refuse the job (turn off `dlne.worker.allowCodingMember` in
+  the extension, which writes `CODING_MEMBER_ALLOWED=false` into the engine's `config.txt`, or choose "Lend my
+  CPU only"), the lending limits
+  (`dlne.worker.maxVramGb`, `dlne.worker.maxRamGb`) are honoured, and a member steps aside while the
+  owner's own load (a game, a render) needs the machine.
+- **Off by default.** A coordinator uses members only when its operator sets `CODING_MEMBERS_ENABLED=true`;
+  until then every coding request is answered by the coordinator's own engine, as before.
+- **The coordinator's status** (`/v1/cluster/status`) reports `coding_members` with counts only: how many
+  members have joined and are ready, how many agent slots they offer, and how many are in use.
+
+### Privacy, in short
+
+**A coding member has to read a request to run the model, so it sees the code it is sent.** What protects
+you from members:
+
+- **Public repositories** may be answered by any member, including changes you have not pushed yet (for
+  unpublished work in a clone of a public repository, set `dlne.privacy` to `trustedOnly`). **Everything
+  else** is answered only by the coordinator's own engine or by machines the operator has listed as
+  trusted, unless you opt in (`dlne.privacy`). While coding members are off, the extension makes no
+  repository lookup.
+- **Secrets are removed in the editor** before a request leaves it, and files such as `.env`, `*.pem`,
+  `.gitignore`d files and anything in `.dlneignore` are never sent.
+- A member is **not told who asked**: no IP address, no API key, no account.
+- Members run with **no-trace** settings (prompts kept out of logs and off disk), and the coordinator
+  sends **canary** decoys to catch a member that snoops.
+- Requests and answers are **encrypted on the way** to and from a member (X25519, HKDF-SHA256,
+  ChaCha20-Poly1305): the coordinator relays bytes it cannot open, and the tunnel and the internet between
+  it and the member carry nothing readable. That protects the trip, not the machine that answers.
+  Requests answered by the coordinator's own engine go over HTTPS instead.
+- **The coordinator is the operator's own machine and is trusted**: it hands out each member's public key.
+- A volunteer who changes DLNE's software could still read or keep what a member receives. None of this
+  can promise otherwise.
+
+The details, what members can and cannot see, and what none of this can promise are in
+[`docs/privacy.md`](docs/privacy.md). The formats and routes are in
+[`docs/coding-members.md`](docs/coding-members.md).
 
 ## Run the tests
 
@@ -56,7 +111,17 @@ Everything under `/v1/admin/*` needs that operator key as `Authorization: Bearer
 default only accepts it from the coordinator's own machine (`ADMIN_ALLOW_REMOTE=true` to change
 that). BarrkBOT's `/dlne` command uses it.
 
-Settings live in `config/config.txt` (`KEY=VALUE`). Six groups matter for most operators:
+Settings live in `config/config.txt` (`KEY=VALUE`). Seven groups matter for most operators:
+
+- **Coding members (off by default)**: volunteers' GPUs that each run a whole coding model and answer
+  coding requests on their own (see [Coding members](#coding-members-lend-a-gpu-add-agents) and
+  [`docs/coding-members.md`](docs/coding-members.md)). `CODING_MEMBERS_ENABLED=false` keeps today's
+  behaviour; set it to `true` to route to members. `TRUSTED_MEMBERS` is a comma-separated list of trust
+  ids, each derived from a member's own identity key (a member shows its trust id in its log and UI): only
+  those machines (and the coordinator's own engine) answer private workspaces. A worker id carries no
+  trust, and a member can never claim it. `CODING_MEMBER_MIN_DECODE_TPS` (15) and
+  `CODING_MEMBER_MIN_PREFILL_TPS` (80) are the speed floors from the join test, and
+  `CODING_CANARY_PER_DAY` (4 per member) sets how many decoy requests each member gets.
 
 - **The CPU pool (the phone app)**: workers with no usable GPU serve the phone app instead of
   the coding pipeline, each running a whole model on its CPU (`engine/app_pool.py`,
@@ -127,7 +192,12 @@ their llama.cpp RPC protocol, and the coordinator only routes to workers that sp
 ## Security and privacy
 
 - Prompts, and the code the agent reads, go to the coordinator you point the extension at. The
-  public coordinator is run by the maintainer; treat it like any hosted AI service.
+  public coordinator is run by the maintainer; treat it like any hosted AI service. When coding
+  members are on, a request may be answered by a volunteer's machine instead: which requests may go
+  where, what is redacted and encrypted, and what a member can and cannot see are in
+  [`docs/privacy.md`](docs/privacy.md). A member has to read a request to answer it; nothing there
+  changes that.
+- The phone chat is separate: the volunteer machine that answers a chat sees its text.
 - The public coordinator is reached over HTTPS (`https://dlne.duckdns.org`, Caddy in front
   of the coordinator). Run your own for anything sensitive.
 - The agent asks before it edits files, runs a command, or reads outside your workspace.

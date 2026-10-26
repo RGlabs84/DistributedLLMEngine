@@ -220,17 +220,25 @@ SPEC_DEFAULTS = {
 
 # The coding engine's per-host tuning for models the automatic sizing cannot place (a
 # mixture-of-experts model whose experts partly live in RAM, 2.3.3). ENGINE_CONTEXT fixes the
-# total -c (0 = automatic). ENGINE_EXTRA_ARGS adds llama-server flags, only from this list and
-# only while the engine runs on this host's own GPUs: a split like -ts names local cards.
+# total -c (0 = automatic). ENGINE_SLOTS fixes the number of parallel request slots, -np (0 =
+# automatic: as many as the free VRAM holds at 32,768 tokens each, then more context per
+# slot). With both left at 0 the engine sizes itself from the model's real KV cost; with
+# ENGINE_CONTEXT set and ENGINE_SLOTS at 0 the slots are ENGINE_CONTEXT divided into 32,768
+# per slot, so the 65,536 TheWall runs today is still 2 x 32,768. ENGINE_EXTRA_ARGS adds
+# llama-server flags, only from this list and only while the engine runs on this host's own
+# GPUs: a split like -ts names local cards.
 ENGINE_DEFAULTS = {
     "engine_context": 0,
+    "engine_slots": 0,
     "engine_extra_args": (),
 }
+ENGINE_SLOTS_MAX = 32
 ENGINE_ARG_FLAGS_WITH_VALUE = frozenset({
     "--n-cpu-moe", "-ncmoe", "-ts", "--tensor-split", "-ot", "--override-tensor", "-sm", "--split-mode",
     "-mg", "--main-gpu", "-t", "--threads", "-tb", "--threads-batch", "-C", "--cpu-mask", "--cpu-strict",
     "-Cb", "--cpu-mask-batch", "--cpu-strict-batch", "--chat-template-kwargs", "--reasoning-budget",
     "--reasoning-format", "--ctx-checkpoints", "--checkpoint-min-step",
+    "--cache-ram",          # host-memory prompt cache, MiB (llama-server defaults to 8192); a slot's saved conversation
 })
 ENGINE_ARG_FLAGS = frozenset({"--swa-full", "--no-mmap"})
 # Where the model's weights go on this host's own cards. Written for those cards, they are wrong
@@ -283,10 +291,38 @@ def parse_engine_args(raw: str) -> List[str]:
     return out
 
 
+def parse_trusted_members(raw: str) -> List[str]:
+    """
+    TRUSTED_MEMBERS as a list of trust ids (docs/coding-members.md sections 1 and 2): comma-
+    separated, each exactly 32 hexadecimal characters in either case, kept lower-case, each once.
+    Anything else is skipped, a worker id included: worker ids can be claimed by anyone, so
+    listing one must never make a machine trusted.
+    """
+    seen: List[str] = []
+    for item in str(raw).split(","):
+        item = item.strip().lower()
+        if len(item) == 32 and all(c in "0123456789abcdef" for c in item) and item not in seen:
+            seen.append(item)
+    return seen
+
+
 CPU_NODE_DEFAULTS = {
     "cpu_min_ram_gb": 8.0,
     "cpu_min_cores": 4,             # physical: hyperthreads add little to a bandwidth-bound job
     "cpu_min_bandwidth_gbs": 30.0,  # good dual-channel DDR4 measures ~30-35, DDR5 ~45-70
+}
+
+
+# A coding member (a volunteer's machine running a whole coding model, engine/coding_member_select.py)
+# must clear both speed floors in the join test, measured on its own llama-server: generating for one
+# user, and reading a prompt (the agent resends its history every turn). The RAM reserve is what the
+# model choice leaves to the operating system; the margin is how far above the floors the speed
+# ESTIMATE must be before a tier is downloaded (the join test, not the estimate, admits a member).
+CODING_MEMBER_DEFAULTS = {
+    "coding_member_min_decode_tps": 15.0,
+    "coding_member_min_prefill_tps": 80.0,
+    "coding_member_ram_reserve_gb": 6.0,
+    "coding_member_estimate_margin": 1.2,
 }
 
 
@@ -304,6 +340,15 @@ def get_worker_limits() -> dict:
         # Comma-separated when splitting tensors across multiple GPUs, hence a string.
         "max_vram_gb": "-1",
         "max_ram_gb": -1.0,
+        # The system RAM the CODING job may use, apart from max_ram_gb (which the extension sets to a small
+        # default meant for the GPU's other job, an RPC node for the shared model): CODING_MAX_RAM_GB, where
+        # -1 means no cap at all. None means the key is not in config.txt (an older extension), and then the
+        # coding job falls back to max_ram_gb as it always did. engine.worker reads it.
+        "coding_max_ram_gb": None,
+        # "Both": the RAM, in GB, that the CPU of a GPU machine lends to the phone pool at the same time as its GPU
+        # does its own job (engine/companion.py). Presence of a positive value turns the second job on; None, zero or
+        # a negative number is off. dlne_server.py worker --also-cpu-ram writes it; MAX_RAM_GB is not involved.
+        "also_cpu_ram_gb": None,
         "max_cpu_threads": -1,
         "allowed_gpu_indices": "-1",
         "enforce_model_whitelist": False,
@@ -357,6 +402,24 @@ def get_worker_limits() -> dict:
         # Whether new worker connections trigger auto-rebalance/restart of running models.
         # False by default (zero-rework policy): existing running inference continues undisturbed.
         "rebalance_on_join": False,
+        # Automatic model switching for the GPU coding pool (engine/auto_swap.py): move up the
+        # coding ladder when the pooled GPU memory has held a bigger enabled tier for
+        # AUTO_SWAP_UP_STABLE_SECONDS, and down when it has been too small for the served
+        # model for AUTO_SWAP_DOWN_STABLE_SECONDS; up-switches are at least
+        # AUTO_SWAP_COOLDOWN_SECONDS apart, and so is any switch after a manual one. On by
+        # default, but it only ever moves between enabled tiers. AUTO_SWAP=false turns it off
+        # within one tick (30 s), no restart needed.
+        "auto_swap": True,
+        "auto_swap_up_stable_seconds": 600,
+        "auto_swap_down_stable_seconds": 120,
+        "auto_swap_cooldown_seconds": 1800,
+        # Only GPUs this close (measured round trip, milliseconds) count toward the coding
+        # pool; the default is a LAN. A volunteer across the internet would make the bigger
+        # model slower than the local one, and loading it would take minutes or hours.
+        "auto_swap_max_rtt_ms": 15.0,
+        # A switched-to model that is not answering within this long is replaced by the one
+        # it replaced, so users are never held for longer than this.
+        "auto_swap_load_timeout_seconds": 180,
         # "auto"   - shard only when the model does not fit the cheapest devices alone.
         # "always" - hand every registered endpoint to llama-server, the pre-1.1.0
         #            behaviour, kept for demos and for exercising the sharding path.
@@ -383,6 +446,8 @@ def get_worker_limits() -> dict:
         # operator can raise them, and a node below any one of them is refused with the
         # reason (see coordinator.cpu_node_shortfalls).
         **CPU_NODE_DEFAULTS,
+        # What a volunteer's coding member must measure in the join test, and how its model is chosen.
+        **CODING_MEMBER_DEFAULTS,
         # A CPU contributor's use of the GPU coding agent: this many chats in any window of
         # this many hours (engine/priority.UsageWindow). GPU contributors are not limited.
         "cpu_coding_limit": 300,
@@ -401,6 +466,16 @@ def get_worker_limits() -> dict:
         # A volunteer's pool member: llama-server threads, 0 = half the physical cores, 2 to 8
         # (engine/app_member.default_threads), so the owner keeps the rest of their machine.
         "app_member_threads": 0,
+        # Coding members (docs/coding-members.md, engine/coding_router.py): volunteers' machines
+        # that each run a whole coding model and answer coding requests on their own. Off until
+        # the owner turns it on; with it off nothing here is read and the coordinator behaves
+        # exactly as before. TRUSTED_MEMBERS is a comma-separated list of trust ids (32 hex
+        # characters, from a member's own identity key) that may be sent private work; trust is
+        # the coordinator's to give, never a member's to claim.
+        "coding_members_enabled": False,
+        "trusted_members": [],
+        # (The speed floors a member must meet, CODING_MEMBER_MIN_DECODE_TPS and _PREFILL_TPS, are
+        # CODING_MEMBER_DEFAULTS above, with engine/coding_member_select.py.)
         # The phone chat's lookup tools (engine/search.py: weather, wikipedia, news, web_search),
         # always run by the coordinator, never by a pool member. Every tool works with no key:
         # web_search asks the local SearXNG first, then Brave (only with a key, and only
@@ -418,6 +493,14 @@ def get_worker_limits() -> dict:
         "search_context_tokens": 1000,
         # Lookups per network address in any hour, across all four tools (cache hits are free).
         "search_per_network_per_hour": 30,
+        # Canaries for coding members (engine/canary.py): about this many decoy coding requests a
+        # day to each untrusted member, each holding a decoy key and link that flag the member if
+        # they are ever used. 0 turns the sending off (detection of already-sent decoys stays on).
+        "coding_canary_per_day": 4,
+        # The volunteer's switch for being a coding member (a whole coding model on their GPU, answering other
+        # people's requests). On by default; CODING_MEMBER_ALLOWED=false in config.txt refuses the job. The
+        # worker says so in its heartbeat ("coding_ok"), so the coordinator does not offer it.
+        "coding_member_allowed": True,
     }
 
     config = get_config()
@@ -432,6 +515,23 @@ def get_worker_limits() -> dict:
             limits["max_ram_gb"] = float(config["MAX_RAM_GB"])
         except ValueError:
             pass
+
+    if "CODING_MAX_RAM_GB" in config:
+        try:
+            coding_ram = float(config["CODING_MAX_RAM_GB"])
+        except ValueError:
+            coding_ram = None
+        # A number that is not finite is no answer; the key then counts as absent (the coding job follows MAX_RAM_GB).
+        if coding_ram is not None and coding_ram == coding_ram and abs(coding_ram) != float("inf"):
+            limits["coding_max_ram_gb"] = coding_ram
+
+    if "ALSO_CPU_RAM_GB" in config:
+        try:
+            also_ram = float(config["ALSO_CPU_RAM_GB"])
+        except ValueError:
+            also_ram = None
+        if also_ram is not None and also_ram == also_ram and abs(also_ram) != float("inf"):
+            limits["also_cpu_ram_gb"] = also_ram
 
     if "MAX_CPU_THREADS" in config:
         try:
@@ -553,6 +653,12 @@ def get_worker_limits() -> dict:
         if mask == "" or (mask.startswith("0x") and len(mask) > 2 and all(c in "0123456789abcdef" for c in mask[2:])):
             limits["app_local_cpu_mask"] = mask
 
+    if "CODING_MEMBERS_ENABLED" in config:
+        limits["coding_members_enabled"] = _as_bool(config["CODING_MEMBERS_ENABLED"])
+
+    if "TRUSTED_MEMBERS" in config:
+        limits["trusted_members"] = parse_trusted_members(config["TRUSTED_MEMBERS"])
+
     if "SEARCH_ENABLED" in config:
         limits["search_enabled"] = _as_bool(config["SEARCH_ENABLED"])
 
@@ -576,6 +682,20 @@ def get_worker_limits() -> dict:
             if low <= value <= high:
                 limits[key.lower()] = value
 
+    # Like the other switches: only the literal "true" (any casing) is true, so a typo turns the job off, which
+    # is the safe direction for a volunteer's off switch.
+    if "CODING_MEMBER_ALLOWED" in config:
+        limits["coding_member_allowed"] = _as_bool(config["CODING_MEMBER_ALLOWED"])
+
+    if "CODING_CANARY_PER_DAY" in config:
+        try:
+            per_day = int(config["CODING_CANARY_PER_DAY"])
+        except ValueError:
+            per_day = -1
+        # A cap, so a typo cannot turn a member's day into decoys; a bad value keeps the default.
+        if 0 <= per_day <= 48:
+            limits["coding_canary_per_day"] = per_day
+
     if "CPU_CODING_LIMIT" in config:
         try:
             value = int(config["CPU_CODING_LIMIT"])
@@ -591,6 +711,17 @@ def get_worker_limits() -> dict:
             hours = 0.0
         if 0.25 <= hours <= 168:
             limits["cpu_coding_window_hours"] = hours
+
+    # A value outside its range (or a typo) keeps the default; NaN fails both comparisons.
+    for key, low, high in (("CODING_MEMBER_MIN_DECODE_TPS", 1.0, 1000.0), ("CODING_MEMBER_MIN_PREFILL_TPS", 1.0, 100000.0),
+                           ("CODING_MEMBER_RAM_RESERVE_GB", 1.0, 64.0), ("CODING_MEMBER_ESTIMATE_MARGIN", 1.0, 3.0)):
+        if key in config:
+            try:
+                value = float(config[key])
+            except ValueError:
+                continue
+            if low <= value <= high:
+                limits[key.lower()] = value
 
     if "SPEC_TYPE" in config:
         types = [t.strip().lower() for t in config["SPEC_TYPE"].split(",") if t.strip()]
@@ -631,11 +762,49 @@ def get_worker_limits() -> dict:
         if context == 0 or 2048 <= context <= 1048576:
             limits["engine_context"] = context
 
+    if "ENGINE_SLOTS" in config:
+        try:
+            slots = int(config["ENGINE_SLOTS"])
+        except ValueError:
+            slots = -1
+        # A typo or an absurd value keeps the default (automatic) rather than starting the
+        # engine with a slot count nobody asked for.
+        if 0 <= slots <= ENGINE_SLOTS_MAX:
+            limits["engine_slots"] = slots
+
     if "ENGINE_EXTRA_ARGS" in config:
         limits["engine_extra_args"] = parse_engine_args(config["ENGINE_EXTRA_ARGS"])
 
     if "REBALANCE_ON_JOIN" in config:
         limits["rebalance_on_join"] = _as_bool(config["REBALANCE_ON_JOIN"])
+
+    # Only the literal "true" keeps automatic switching on once the key is present: a typo
+    # turns it off, which is the safe direction for an off switch.
+    if "AUTO_SWAP" in config:
+        limits["auto_swap"] = _as_bool(config["AUTO_SWAP"])
+
+    # The floors keep a typo from making the coordinator switch models every few seconds; a
+    # value outside the range keeps the default.
+    for key, low, high in (("AUTO_SWAP_UP_STABLE_SECONDS", 60, 7 * 86400),
+                           ("AUTO_SWAP_DOWN_STABLE_SECONDS", 30, 7 * 86400),
+                           ("AUTO_SWAP_COOLDOWN_SECONDS", 300, 7 * 86400),
+                           ("AUTO_SWAP_LOAD_TIMEOUT_SECONDS", 30, 3600)):
+        if key in config:
+            try:
+                value = int(config[key])
+            except ValueError:
+                continue
+            if low <= value <= high:
+                limits[key.lower()] = value
+
+    if "AUTO_SWAP_MAX_RTT_MS" in config:
+        try:
+            rtt = float(config["AUTO_SWAP_MAX_RTT_MS"])
+        except ValueError:
+            rtt = -1.0
+        # NaN fails both comparisons and keeps the default.
+        if 0.1 <= rtt <= 1000.0:
+            limits["auto_swap_max_rtt_ms"] = rtt
 
     if "TRUST_PROXY_HEADERS" in config:
         limits["trust_proxy_headers"] = _as_bool(config["TRUST_PROXY_HEADERS"])

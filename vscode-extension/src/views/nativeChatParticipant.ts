@@ -3,9 +3,11 @@ import * as path from 'path';
 import { DlneClient, formatLoadingTelemetry } from '../client/dlneClient';
 import { SWARM_AUTO_LABEL } from '../client/modelChoice';
 import { WorkerManager } from '../worker/workerManager';
-import { CPU_POOL_HEADLINE, CPU_POOL_PERK } from '../worker/contribution';
+import { newSessionId } from '../client/session';
+import { ALSO_CPU_LINE, CPU_POOL_HEADLINE, CPU_POOL_PERK, MEMBER_PRIVACY_SUMMARY, ROLE_LABEL, TRUST_ID_HINT, roleMeaning } from '../worker/contribution';
 import { AgentLoop } from '../agent/agentLoop';
 import { ToolCallResult } from '../agent/tools';
+import { isExcludedFile, redactSecrets } from '../privacy';
 
 /**
  * The one entry the swarm adds to VS Code's Chat model picker. It names no model: the coordinator
@@ -24,6 +26,8 @@ export function registerNativeChatParticipant(
   }
 
   const agentLoop = new AgentLoop(client);
+  // The language-model entry below has no conversation of its own to name: its requests share one session.
+  const modelSessionId = newSessionId();
 
   const handler = async (
     request: any,
@@ -91,6 +95,12 @@ export function registerNativeChatParticipant(
           `| **Active RPC Nodes** | ${status.active_workers_count} node(s) |`,
           `| **Local Contribution** | ${contribBadge} |`,
           `| **Active Leases** | ${status.active_leases_count} |`,
+          ...(status.coding_queue
+            ? [`| **Coding Slots** | ${status.coding_queue.in_use} of ${status.coding_queue.slots} busy, ${status.coding_queue.waiting} waiting |`]
+            : []),
+          ...(status.coding_members?.enabled
+            ? [`| **Coding Members** | ${status.coding_members.ready ?? 0} ready of ${status.coding_members.members ?? 0}, ${status.coding_members.busy ?? 0} of ${status.coding_members.slots ?? 0} slots busy |`]
+            : []),
           `| **Extension Version** | \`v${extVersion}\` |`,
           `| **Server Version** | \`v${status.server_version}\` |`,
           ``,
@@ -110,8 +120,16 @@ export function registerNativeChatParticipant(
           `### 📱 Compute Contribution Active!\n${CPU_POOL_HEADLINE}: **${updated.vramContributedGb} GB** of RAM lent, at low priority on half your cores. You get ${CPU_POOL_PERK}.`
         );
       } else if (updated.state === 'contributing') {
+        // The job the swarm gave this GPU, once the worker has said (an older engine never does).
+        const role = updated.role ?? 'rpc';
+        const job = `\n\n**Your GPU's job: ${ROLE_LABEL[role]}.** ${roleMeaning(role, updated.roleDetail)}` +
+          (role === 'coding'
+            ? ` ${MEMBER_PRIVACY_SUMMARY}` +
+              (updated.roleDetail?.trustId ? `\n\nTrust id: \`${updated.roleDetail.trustId}\`. ${TRUST_ID_HINT}` : '')
+            : '') +
+          (updated.alsoCpu ? `\n\n**Also: ${ROLE_LABEL.app}.** ${ALSO_CPU_LINE}` : '');
         stream.markdown(
-          `### ⚡ Compute Contribution Active!\nContributing **${updated.vramContributedGb} GB VRAM** (${updated.gpu.name}) via **${updated.gpu.api.toUpperCase()}** to the DLNE cluster. Your GPU powers the coding agent, and you are first in line.`
+          `### ⚡ Compute Contribution Active!\nContributing **${updated.vramContributedGb} GB VRAM** (${updated.gpu.name}) via **${updated.gpu.api.toUpperCase()}** to the DLNE cluster. Your GPU powers the coding agent, and you are first in line.${job}`
         );
       } else {
         stream.markdown(`### ⏹️ Compute Contribution Stopped\nYour local worker is now idle.`);
@@ -159,6 +177,10 @@ export function registerNativeChatParticipant(
     let fullPrompt = userPrompt;
     if (cmd === 'fix') {
       const editor = vscode.window.activeTextEditor;
+      if (editor && isExcludedFile(editor.document.uri)) {
+        stream.markdown(`\`${vscode.workspace.asRelativePath(editor.document.uri)}\` is excluded for privacy (a credentials file, or ignored by .gitignore or .dlneignore), so DLNE does not read it or send it anywhere.`);
+        return { metadata: { command: 'fix' } };
+      }
       if (editor) {
         const relPath = vscode.workspace.asRelativePath(editor.document.uri);
         const diags = vscode.languages
@@ -311,7 +333,8 @@ export function registerNativeChatParticipant(
             ) {
               const mapped = messages.map((m: any) => ({
                 role: (m.role === 1 || m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
-                content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+                // VS Code builds these messages (attached files, selections): secrets are removed before they leave.
+                content: redactSecrets(typeof m.content === 'string' ? m.content : JSON.stringify(m.content)).text
               }));
               await client.streamChat(
                 mapped,
@@ -322,7 +345,9 @@ export function registerNativeChatParticipant(
                   }
                 },
                 undefined,
-                undefined
+                undefined,
+                undefined,
+                { sessionId: modelSessionId }
               );
             },
             async provideTokenCount(_text: string) {

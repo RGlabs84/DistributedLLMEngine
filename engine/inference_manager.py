@@ -102,6 +102,152 @@ MIN_CONTEXT_TOKENS = 2048
 # an underestimate would let the coordinator promise capacity the cluster does not have.
 UNKNOWN_MODEL_ESTIMATE_GB = 8.0
 
+# --------------------------------------------------------------------------------------
+# Real memory, slots and context (2.4)
+#
+# Until 2.4 a model was admitted as 1.2x its file and its KV cache was priced by counting
+# every layer, which is four times too much for a hybrid like Qwen3.6 and sized the coding
+# engine at the same two slots whatever the cards could hold. A model that is read (see
+# engine/gguf.py) is now admitted from the bytes that really sit on the GPUs plus the
+# runtime's own buffers, and its slots and context come from what is left.
+# --------------------------------------------------------------------------------------
+
+# What llama.cpp allocates on the cards besides weights and cache: compute buffers (about
+# 220-300 MiB per card at -b 2048 -ub 512 with flash attention, measured on an RTX 4070
+# Laptop and on TheWall's two BC-160s) and the driver's context. 0.75 GiB covers two cards
+# with room to spare; the file-times-1.2 fallback below already carries its own slack.
+RUNTIME_OVERHEAD_GB = 0.75
+
+# The least context a slot gets when the engine picks its own numbers (ENGINE_CONTEXT and
+# ENGINE_SLOTS at 0). Slots are added first, as long as each can still have this much.
+SLOT_CONTEXT_FLOOR = 32768
+
+# Most slots the engine adds on its own. Decode batches across slots, but every extra user
+# also splits the same memory bandwidth and prompt processing, so the automatic choice
+# stops here; ENGINE_SLOTS goes higher.
+AUTO_SLOTS_MAX = 8
+
+# Context is given in steps of this many tokens.
+CONTEXT_STEP = 1024
+
+# Past this per-slot context the cache switches from q8_0 to q4_0 (as it always has, but
+# per slot now, not on the total: 4 users at 32K each are not a 128K context). The engine
+# never grows a slot into q4_0 on its own: automatic context stops one step short. An
+# operator who sets a bigger ENGINE_CONTEXT per slot gets q4_0 as before.
+Q4_KV_SLOT_CONTEXT = 131072
+AUTO_SLOT_CONTEXT_CAP = Q4_KV_SLOT_CONTEXT - CONTEXT_STEP
+
+# Of the memory left after weights, the automatic choice claims this much for slots and
+# context. It is the fraction the context sizing has always claimed; the rest is the margin
+# for a card that is shared with a desktop, since workers report totals, not free memory.
+# An operator who knows the machine sets ENGINE_SLOTS and spends the margin deliberately.
+AUTO_KV_CLAIM_FRACTION = 0.70
+
+_GIB = 1024 ** 3
+
+
+@dataclass(frozen=True)
+class SlotPlan:
+    """How many request slots an engine gets and how much context each has."""
+
+    slots: int
+    context_per_slot: int
+    total_context: int          # the engine's -c: slots x context_per_slot
+    cache_type: str             # -ctk / -ctv
+    kv_gb: float                # KV cache plus recurrent state at this size, in GiB
+    mode: str                   # "fixed", "context-fixed", "slots-fixed" or "auto"
+
+
+def plan_slots_and_context(
+    *,
+    kv_f16_bytes_per_token: int,
+    state_bytes_per_slot: int,
+    budget_gb: float,
+    native_context: int,
+    requested_slots: int,
+    fixed_slots: int = 0,
+    fixed_context: int = 0,
+) -> SlotPlan:
+    """
+    Chooses -np and -c. Pure arithmetic: no files, no locks, so the same call answers the
+    admission query and the start, and the tests can feed it real models' numbers.
+
+    The rule is the owner's: MORE SLOTS FIRST, then more context per slot, and no slot
+    below SLOT_CONTEXT_FLOOR tokens when the engine chooses.
+
+    * ``fixed_context`` (ENGINE_CONTEXT, the total ``-c``) and ``fixed_slots`` (ENGINE_SLOTS,
+      ``-np``) are the operator's and win outright. With only the context fixed the slots
+      are that context divided into floors (65,536 gives the 2 x 32,768 TheWall has always
+      run); with only the slots fixed the context is what the budget holds.
+    * Otherwise slots = how many floor-sized slots the budget holds (at most
+      AUTO_SLOTS_MAX), then every slot's context grows into what is left, up to the model's
+      own limit.
+    * ``requested_slots`` (the caller's queue_channels) is a floor on the slot count,
+      never a cap: the coordinator asks for 2 normally and for 6 after a traffic spike. If
+      the budget cannot give that many slots the floor of context gives way, not the
+      slots, as it always did.
+
+    Args:
+        kv_f16_bytes_per_token: the model's KV cost per token at f16 (see gguf).
+        state_bytes_per_slot: recurrent state each slot carries (0 for plain attention).
+        budget_gb: memory the cache may take, in GiB.
+        native_context: the context one slot may use at most (the model's own limit).
+        requested_slots: the caller's wish for slots, at least 1.
+        fixed_slots / fixed_context: the operator's ENGINE_SLOTS / ENGINE_CONTEXT, 0 = auto.
+    """
+    native = max(MIN_CONTEXT_TOKENS, int(native_context))
+    floor = min(SLOT_CONTEXT_FLOOR, native)
+    ceiling = max(floor, min(native, AUTO_SLOT_CONTEXT_CAP))
+    requested = max(1, int(requested_slots))
+    budget_bytes = max(0.0, float(budget_gb)) * _GIB
+
+    def token_bytes(cache_type: str) -> int:
+        return max(1, gguf.scale_kv_bytes(int(kv_f16_bytes_per_token), cache_type))
+
+    def fit_per_slot(slots: int) -> int:
+        tokens = (budget_bytes / slots - state_bytes_per_slot) / token_bytes("q8_0")
+        return max(0, int(tokens) // CONTEXT_STEP * CONTEXT_STEP)
+
+    if fixed_context:
+        total = max(MIN_CONTEXT_TOKENS, int(fixed_context))
+        if fixed_slots:
+            slots, mode = int(fixed_slots), "fixed"
+        else:
+            slots = max(1, min(AUTO_SLOTS_MAX, total // floor), requested)
+            mode = "context-fixed"
+        per_slot = total // slots
+    else:
+        if fixed_slots:
+            slots, mode = int(fixed_slots), "slots-fixed"
+        else:
+            floor_slot_bytes = state_bytes_per_slot + floor * token_bytes("q8_0")
+            fits = int(budget_bytes // floor_slot_bytes) if floor_slot_bytes > 0 else AUTO_SLOTS_MAX
+            slots, mode = max(1, min(fits, AUTO_SLOTS_MAX), requested), "auto"
+        per_slot = min(ceiling, max(MIN_CONTEXT_TOKENS, fit_per_slot(slots)))
+        total = per_slot * slots
+
+    cache_type = "q4_0" if per_slot >= Q4_KV_SLOT_CONTEXT else "q8_0"
+    kv_gb = (slots * state_bytes_per_slot + total * token_bytes(cache_type)) / _GIB
+    return SlotPlan(slots, per_slot, total, cache_type, kv_gb, mode)
+
+
+def cpu_moe_layers(extra_args) -> int:
+    """
+    The N of ``--n-cpu-moe N`` (or ``-ncmoe N``) in ENGINE_EXTRA_ARGS, or 0.
+
+    Those blocks' routed experts live in system RAM instead of on the cards, which is
+    1.4 GB of Qwen3.6 on TheWall. ``-ot`` patterns are not interpreted: a model placed with
+    them is priced as if all of it were on the cards, the safe direction.
+    """
+    tokens = [str(token) for token in (extra_args or ())]
+    for index, token in enumerate(tokens[:-1]):
+        if token in ("--n-cpu-moe", "-ncmoe"):
+            try:
+                return max(0, int(tokens[index + 1]))
+            except ValueError:
+                return 0
+    return 0
+
 
 # --------------------------------------------------------------------------------------
 # Port allocation
@@ -302,6 +448,18 @@ class _StartPlan:
     resolved_path: str = ""
     safe_context: int = 0
     reserved_gb: float = 0.0
+
+    # PLAN_START only: -np, the per-slot context, the -ctk/-ctv type and how the numbers were
+    # chosen ("auto", "fixed", ...; see plan_slots_and_context).
+    slots: int = 0
+    slot_context: int = 0
+    cache_type: str = "q8_0"
+    sizing_mode: str = ""
+
+    # PLAN_START only: set when the operator's fixed slots/context need more than the pool
+    # has left by our count. Logged by start_model (not here: the dry run repeats every two
+    # seconds); the operator's number still wins.
+    sizing_warning: str = ""
 
     # PLAN_START only, purely for the log line: the pool state the decision was made against.
     committed_gb: float = 0.0
@@ -760,7 +918,18 @@ class InferenceManager:
 
     def estimate_model_vram_gb(self, model_path: str) -> float:
         """
-        Estimates a model's resident footprint in GB from its file size.
+        Estimates what a model needs on the GPUs before any context, in GiB: the bytes that
+        really sit there plus the runtime's buffers.
+
+        When the model's header and tensor table can be read (engine/gguf.py) that is the
+        file minus what llama.cpp keeps in system RAM (the token embedding, and the routed
+        experts of the first N blocks when the operator passes ``--n-cpu-moe N``) plus
+        RUNTIME_OVERHEAD_GB. Qwen3.6-35B-A3B at IQ3_S with 5 expert blocks in RAM is 11.0
+        GiB of weights, 11.8 with the overhead, where the old 1.2 x file said 15.3.
+        Otherwise it is the old 1.2 x the file's size, which already carries its own slack.
+
+        The KV cache is NOT in this number: it is sized from what is left (see
+        :meth:`_plan_start_locked`).
 
         Everything goes through ``resolve_model_path`` so an unresolvable or out-of-bounds
         tag can never be stat'ed. When the file is not present yet (a model that is still
@@ -771,9 +940,34 @@ class InferenceManager:
         if not resolved:
             return UNKNOWN_MODEL_ESTIMATE_GB
         try:
-            return (os.path.getsize(resolved) / (1024 ** 3)) * VRAM_OVERHEAD_FACTOR
+            shape = gguf.model_shape(resolved)
+            if shape is not None and shape.has_tensor_table:
+                layers = cpu_moe_layers(get_worker_limits().get("engine_extra_args"))
+                return shape.gpu_bytes(layers) / _GIB + RUNTIME_OVERHEAD_GB
+            file_bytes = sum(os.path.getsize(shard) for shard in gguf.shard_paths(resolved))
+            return (file_bytes / _GIB) * VRAM_OVERHEAD_FACTOR
         except OSError:
             return UNKNOWN_MODEL_ESTIMATE_GB
+
+    def _host_memory_gb(self, model_path: str, remote: bool) -> Tuple[float, float]:
+        """
+        ``(host_gb, returned_gb)`` for a model whose tensor table can be read, else (0, 0).
+
+        ``host_gb`` is what lives in system RAM on this machine: the token embedding plus
+        the experts ``--n-cpu-moe`` keeps there. ``returned_gb`` is how much of that
+        placement is NOT applied when volunteers' GPUs join (engine_args_without_placement
+        drops it): those experts go back to the cards, so :meth:`estimate_model_vram_gb`
+        has under-counted the GPU side by that much.
+        """
+        resolved = self.resolve_model_path(model_path)
+        shape = gguf.model_shape(resolved) if resolved else None
+        if shape is None or not shape.has_tensor_table:
+            return 0.0, 0.0
+        layers = cpu_moe_layers(get_worker_limits().get("engine_extra_args"))
+        moved = shape.experts_on_cpu_bytes(layers) / _GIB
+        if remote:
+            return (shape.cpu_bytes(0)) / _GIB, moved
+        return shape.cpu_bytes(layers) / _GIB, 0.0
 
     def _lookup_json_max_context(self, model_path: str) -> int:
         """
@@ -1278,6 +1472,7 @@ class InferenceManager:
         total_vram_gb: float,
         total_sysram_gb: float,
         excluded_gb: float = 0.0,
+        remote: bool = False,
     ) -> Tuple[bool, str, float, float, float, float]:
         """
         The single budget calculation.
@@ -1294,23 +1489,39 @@ class InferenceManager:
                 changed. Without this term a restart would be tested against a pool that
                 still contains the model it is replacing, and would refuse every model large
                 enough to matter.
+            remote: True when the engine will run across volunteers' GPUs, where the
+                operator's card placement (``--n-cpu-moe``) is dropped and those experts go
+                back onto the cards.
 
-        Returns ``(admitted, reason, weights_gb, free_gb, committed_gb, budget_gb)``. The
-        extra numbers are what ``start_model`` needs to size the KV cache, so admission and
-        sizing are literally computed from the same locals.
+        Returns ``(admitted, reason, weights_gb, free_gb, committed_gb, budget_gb)``.
+        ``weights_gb`` is what the model charges the budget it is admitted against: the
+        bytes on the GPUs plus the runtime's buffers, and, only when it has to spill into
+        system RAM, the part of it that lives there too. The extra numbers are what
+        ``start_model`` needs to size the cache, so admission and sizing are literally
+        computed from the same locals.
         """
         # VRAM is the primary compute pool; SysRAM is strictly an emergency overflow spillover
         vram_budget = total_vram_gb * POOL_SAFETY_FRACTION
         total_budget = (total_vram_gb + total_sysram_gb) * POOL_SAFETY_FRACTION
         committed = max(0.0, self._committed_gb_locked() - excluded_gb)
         weights = self.estimate_model_vram_gb(model_path)
+        host_gb, returned_gb = self._host_memory_gb(model_path, remote)
+        weights += returned_gb
+
+        # The part that lives in this machine's RAM has to fit there whatever the cards
+        # hold. Skipped when the pool reports no RAM at all, as admission always has.
+        if host_gb > 0 and total_sysram_gb > 0 and host_gb > total_sysram_gb * POOL_SAFETY_FRACTION:
+            return (False, NETWORK_MAXED_OUT_MESSAGE, weights,
+                    vram_budget - committed - weights, committed, vram_budget)
 
         # If it fits in VRAM, budget is VRAM only so SysRAM is never touched
         if (committed + weights + MIN_KV_GB) <= vram_budget:
             budget = vram_budget
             free = budget - committed - weights
         else:
-            # Emergency spillover into SysRAM only when model strictly exceeds VRAM
+            # Emergency spillover into SysRAM only when model strictly exceeds VRAM; the
+            # whole model is then charged, host part included.
+            weights += host_gb
             budget = total_budget
             free = budget - committed - weights
 
@@ -1419,43 +1630,50 @@ class InferenceManager:
             )
 
         # --- 4. Admission ----------------------------------------------------------------
+        remote = any(_endpoint_is_remote(endpoint) for endpoint in (requested_endpoints or []))
         admitted, reason, weights, free, committed, budget = self._evaluate_admission_locked(
-            model_path, total_vram_gb, total_sysram_gb, excluded_gb=incumbent_gb
+            model_path, total_vram_gb, total_sysram_gb, excluded_gb=incumbent_gb, remote=remote
         )
         if not admitted:
             return _StartPlan(outcome=PLAN_REJECT, message=reason)
 
-        # --- 5. Context sizing, from the same locals admission was decided from -----------
-        # Size KV cache prioritizing free VRAM; never steal SysRAM unless in emergency
+        # --- 5. Slots and context, from the same locals admission was decided from --------
+        # What the cache may take: prioritise free VRAM and claim only part of it (the rest
+        # is the margin for a card shared with a desktop); never steal SysRAM unless in
+        # emergency.
         free_vram = max(0.0, (total_vram_gb * POOL_SAFETY_FRACTION) - committed - weights)
         if free_vram >= MIN_KV_GB:
-            kv_gb = free_vram * 0.70  # Stays strictly inside VRAM
+            kv_budget_gb = free_vram * AUTO_KV_CLAIM_FRACTION  # Stays strictly inside VRAM
         else:
-            kv_gb = max(MIN_KV_GB, free * 0.30)  # Emergency minimum spillover only
+            kv_budget_gb = max(MIN_KV_GB, free * 0.30)  # Emergency minimum spillover only
 
-        # What a token of cache costs is a property of THIS model, not of the release.
-        # DLNE enables quantized KV caching (q8_0 for standard, q4_0 for >=128K/1M ultra-long context)
-        # to halve or quarter memory footprint without accuracy degradation.
-        json_max_context = self._lookup_json_max_context(model_path)
-        kv_compression = 4.0 if json_max_context >= 131072 else 2.0
-        kv_gb_per_token = (gguf.kv_bytes_per_token_for_model(resolved_path) / kv_compression) / (1024 ** 3)
-        hardware_max_context = int(kv_gb / kv_gb_per_token)
+        # What a token of cache costs, and what each slot costs besides, are properties of
+        # THIS model, read from its file: only the attention blocks of a hybrid hold a cache
+        # (Qwen3.6: 10 of 40 blocks, 20 KiB a token at f16, not 80), and the others keep a
+        # fixed recurrent state per slot. The type is q8_0 below 131,072 tokens per slot,
+        # q4_0 from there.
+        shape = gguf.model_shape(resolved_path)
+        limits = get_worker_limits()
+        sized = plan_slots_and_context(
+            kv_f16_bytes_per_token=gguf.kv_bytes_per_token_for_model(resolved_path),
+            state_bytes_per_slot=shape.state_bytes_per_sequence if shape else 0,
+            budget_gb=kv_budget_gb,
+            native_context=self._lookup_json_max_context(model_path),
+            requested_slots=queue_channels,
+            # The operator's ENGINE_SLOTS and ENGINE_CONTEXT win outright; 0 is automatic.
+            fixed_slots=int(limits.get("engine_slots") or 0),
+            fixed_context=int(limits.get("engine_context") or 0),
+        )
+        safe_context = sized.total_context
+        reserved_gb = weights + sized.kv_gb
 
-        # In llama-server, -c (total context) is split evenly across -np (parallel slots).
-        # To give each slot its full native context capacity (json_max_context),
-        # scale the total context target by dynamic_slots when hardware VRAM allows.
-        target_slots = max(1, queue_channels)
-        desired_total_context = json_max_context * target_slots
-        safe_context = max(MIN_CONTEXT_TOKENS, min(desired_total_context, hardware_max_context))
-        # The operator's fixed size wins (ENGINE_CONTEXT): the estimate above counts a KV cache
-        # in every layer, four times too much for hybrid models like Qwen3.6, and cannot see
-        # experts kept in RAM.
-        fixed_context = int(get_worker_limits().get("engine_context") or 0)
-        if fixed_context:
-            safe_context = max(MIN_CONTEXT_TOKENS, fixed_context)
-
-        # Recompute from the context we actually settled on
-        reserved_gb = weights + (safe_context * kv_gb_per_token)
+        sizing_warning = ""
+        if sized.mode != "auto" and sized.kv_gb > free_vram:
+            sizing_warning = (
+                f"ENGINE_SLOTS/ENGINE_CONTEXT ask for {sized.slots} slots x {sized.context_per_slot} "
+                f"tokens, about {sized.kv_gb:.1f}GB of cache, and the pool has {free_vram:.1f}GB left "
+                f"after the weights by our count. The setting is used as written."
+            )
 
         # --- 6. Port ----------------------------------------------------------------------
         # Deliberately BEFORE the incumbent is detached, in both modes: a detached engine
@@ -1471,6 +1689,11 @@ class InferenceManager:
             resolved_path=resolved_path,
             safe_context=safe_context,
             reserved_gb=reserved_gb,
+            slots=sized.slots,
+            slot_context=sized.context_per_slot,
+            cache_type=sized.cache_type,
+            sizing_mode=sized.mode,
+            sizing_warning=sizing_warning,
             committed_gb=committed,
             budget_gb=budget,
         )
@@ -1674,8 +1897,11 @@ class InferenceManager:
             if not binary_path:
                 return False, 0, "Binary Missing"
 
-            # Directly use the requested queue channels (defaults to 2, scales up during viral spikes)
-            dynamic_slots = queue_channels
+            # The slot count the plan settled on: the operator's ENGINE_SLOTS, or as many as
+            # the free memory holds at 32,768 tokens each, never fewer than the caller's
+            # queue_channels (2 normally, 6 after a traffic spike).
+            dynamic_slots = plan.slots
+            cache_type = plan.cache_type
 
             # Apply the explicit user-defined CPU limits
             cpu_limit = get_worker_limits().get('max_cpu_threads', -1)
@@ -1684,11 +1910,14 @@ class InferenceManager:
                 cpu_limit = get_cpu_cores()
 
             log_coordinator(
-                f"Dynamic Context Scaling: Reserved {safe_context} tokens Global KV Pool across "
-                f"{dynamic_slots} parallel request slots for {model_path} "
+                f"Dynamic Context Scaling ({plan.sizing_mode}): Reserved {safe_context} tokens Global KV Pool across "
+                f"{dynamic_slots} parallel request slots ({plan.slot_context} tokens each, "
+                f"{cache_type} cache) for {model_path} "
                 f"({reserved_gb:.1f}GB of a {plan.budget_gb:.1f}GB pool, "
                 f"{plan.committed_gb:.1f}GB already committed)."
             )
+            if plan.sizing_warning:
+                log_warning(plan.sizing_warning)
 
             remote_rpc_endpoints = []
             for e in (requested_endpoints or []):
@@ -1718,8 +1947,8 @@ class InferenceManager:
                 "-b", batch_size, # Optimized batch size
                 "-ub", ubatch_size, # Micro-batching for pipelined GPU execution
                 "-fa", "on", # Flash Attention
-                "-ctk", "q4_0" if safe_context >= 131072 else "q8_0", # Quantized Key cache
-                "-ctv", "q4_0" if safe_context >= 131072 else "q8_0", # Quantized Value cache
+                "-ctk", cache_type, # Quantized Key cache (q8_0; q4_0 from 131,072 tokens a slot)
+                "-ctv", cache_type, # Quantized Value cache
                 "--cache-reuse", "256", # Reuse KV prompt prefixes across multi-turn agent loops
                 # Render prompts with the model's OWN chat template out of the GGUF, rather
                 # than llama.cpp's legacy matcher, which recognises a fixed set of templates

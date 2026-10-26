@@ -44,10 +44,21 @@ EXCLUDED_DIRS = ("builder", "ABOUT-DLNE", "discord")
 
 # Single files left out, as paths from the repository root with "/" separators:
 #   download_dlne_models.sh   a legacy model downloader whose file names do not match what they download;
-#   the wallpaper with logos  it shows another app's icon beside DLNE's, and DLNE has one icon only.
+#   the wallpaper with logos  it shows another app's icon beside DLNE's, and DLNE has one icon only;
+#   the fakes                 test files made of invented credentials (the owner: "dont push the fakers"):
+#                             the end-to-end encryption vectors, the secret-redaction tests and their fake-secret
+#                             helper, the tests that read them, and the extension's security-review tests (an
+#                             invented password in a curl line). They stay in the repository and its CI.
 EXCLUDED_FILES = (
     "download_dlne_models.sh",
     "wallpapers/dlne_background_1440p_16_9_with_logos.png",
+    "tests/fixtures/e2e_vectors.json",
+    "tests/test_e2e.py",
+    "vscode-extension/test/privacy-e2e.test.js",
+    "vscode-extension/test/redact.test.js",
+    "vscode-extension/test/helpers/fake-secrets.js",
+    "vscode-extension/test/privacy-hooks.test.js",
+    "vscode-extension/test/security-review.test.js",
 )
 
 # Never public, wherever they turn up in the tree.

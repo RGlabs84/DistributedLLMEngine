@@ -2,7 +2,7 @@
   "name": "dlne-code-assistant",
   "displayName": "DLNE Coding Assistant: Free AI Agent",
   "description": "A free AI coding agent and autocomplete, running on GPUs its users share. 100 free chats, no account or API key.",
-  "version": "1.2.5",
+  "version": "1.3.0",
   "publisher": "dlne",
   "license": "MIT",
   "repository": {
@@ -32,6 +32,12 @@
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "DLNE's agent reads files and runs tools in your workspace, and a folder's own settings can change where your code may run, so DLNE waits until you trust the workspace."
+    }
+  },
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -128,54 +134,88 @@
       "properties": {
         "dlne.serverUrl": {
           "type": "string",
+          "scope": "application",
           "default": "https://dlne.duckdns.org",
           "description": "DLNE coordinator URL. The default is the public swarm over HTTPS. Change it only to use your own coordinator. The public swarm's earlier addresses are read as this one automatically."
         },
         "dlne.apiKey": {
           "type": "string",
+          "scope": "application",
           "default": "",
           "description": "DLNE Bearer API Key (leave empty to authenticate automatically via your local worker compute contribution)"
         },
+        "dlne.privacy": {
+          "type": "string",
+          "enum": ["auto", "trustedOnly", "anyMember"],
+          "enumDescriptions": [
+            "Code from a public repository (a public github.com, gitlab.com or codeberg.org project) may run on any member's computer that lends its GPU to the swarm. All other code runs only on DLNE's own machines and the members DLNE trusts. When DLNE cannot tell, it counts as not public.",
+            "Your code runs only on DLNE's own machines and the members DLNE trusts, whether or not the repository is public.",
+            "Your code may run on any member's computer that lends its GPU to the swarm, even when the repository is private. The person who owns that computer could see it. Choose this only for code you are happy to share."
+          ],
+          "default": "auto",
+          "scope": "resource",
+          "markdownDescription": "Where your code may run when the swarm has members who lend a whole GPU to coding. **auto** (the default): public repositories can use any member, everything else stays on trusted machines. To tell, DLNE asks the repository's host (GitHub, GitLab or Codeberg) whether the project is public, with a plain request that carries no account, token or code, and remembers the answer for a day. No remote, several remotes, another host, no network or any other doubt counts as not public. **trustedOnly**: always trusted machines only. **anyMember**: any member, public or private."
+        },
         "dlne.worker.networkKey": {
           "type": "string",
+          "scope": "application",
           "default": "bd1d9bbf50b93e10a963fa2d0b6ee44e1138ca20f4036b765dbc51dd7bc7f083",
           "description": "Cluster Network Key. Pre-configured out of the box for the official Public Swarm. Only modify this if connecting to a private custom cluster."
         },
         "dlne.worker.pythonPath": {
           "type": "string",
+          "scope": "machine",
           "default": "python3",
           "description": "Python executable for running worker node ('python' on Windows, 'python3' on Linux)"
         },
         "dlne.worker.autoStart": {
           "type": "boolean",
+          "scope": "application",
           "default": false,
           "description": "Automatically resume compute worker contribution when VS Code is open (only when explicitly enabled via contribute/toggle)"
         },
         "dlne.worker.device": {
           "type": "string",
-          "enum": ["auto", "gpu", "cpu"],
+          "scope": "application",
+          "enum": ["auto", "gpu", "cpu", "both"],
           "enumDescriptions": [
             "Use the GPU when there is one, otherwise the CPU.",
             "Only contribute a GPU; do not start without one.",
-            "Power the DLNE phone app with the CPU and RAM only, even when there is a GPU (it stays free for you)."
+            "Power the DLNE phone app with the CPU and RAM only, even when there is a GPU (it stays free for you).",
+            "Both at once: the GPU does the job the swarm gives it, and the CPU also powers the DLNE phone app with the RAM in dlne.worker.alsoCpuRamGb. Without a usable GPU this is the same as \"cpu\"."
           ],
           "default": "auto",
           "description": "What to contribute. A GPU powers the coding agent; a CPU powers the DLNE phone app. Without a GPU the swarm needs at least 8 GB of RAM (dlne.worker.maxRamGb), 4 CPU cores, AVX2 on Intel/AMD, and 30 GB/s of memory bandwidth."
         },
+        "dlne.worker.alsoCpuRamGb": {
+          "type": "number",
+          "scope": "application",
+          "default": 0,
+          "description": "With dlne.worker.device set to \"both\": the system RAM, in GB, that the CPU lends to the DLNE phone app next to the GPU's own job (at least 8; you are offered an amount when you start, never more than half your RAM). It is separate from dlne.worker.maxRamGb, which stays the limit of the GPU's jobs."
+        },
+        "dlne.worker.allowCodingMember": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Let the swarm give this GPU the coding-member job (it answers other people's coding requests with a whole model). Off: the GPU only joins the shared pool."
+        },
         "dlne.worker.allowedGpus": {
           "type": "string",
+          "scope": "application",
           "default": "",
           "description": "Comma-separated GPU indices to contribute (leave blank to contribute all detected Vulkan/CUDA GPUs)"
         },
         "dlne.worker.maxVramGb": {
           "type": "number",
+          "scope": "application",
           "default": -1,
           "description": "Maximum VRAM in GB to contribute (-1 for auto-detect)"
         },
         "dlne.worker.maxRamGb": {
           "type": "number",
+          "scope": "application",
           "default": 4.0,
-          "description": "Most system RAM the worker may use, in GB. With a GPU it only needs a little. Contributing a CPU needs at least 8, and the more you lend the bigger the phone-app model your computer runs: 16 GB runs the main model, Qwen3.6. When you start, you are offered an amount to suit your machine (never more than half your RAM)."
+          "description": "Most system RAM the worker may use, in GB. For a GPU it is the limit of the shared-model job, which only needs a little; the coding-member job is not held to the default 4, it uses the memory that is free when it starts, unless you set this yourself, and then it is limited to what you set. Contributing a CPU needs at least 8, and the more you lend the bigger the phone-app model your computer runs: 16 GB runs the main model, Qwen3.6. When you start, you are offered an amount to suit your machine (never more than half your RAM)."
         },
         "dlne.chatModel": {
           "type": "string",
@@ -199,16 +239,19 @@
         },
         "dlne.autoApproveReads": {
           "type": "boolean",
+          "scope": "application",
           "default": true,
           "description": "Automatically approve read-only tools (reading files, directory listing)"
         },
         "dlne.autoUpdate": {
           "type": "boolean",
+          "scope": "application",
           "default": true,
           "description": "Automatically keep the DLNE extension and local compute engine runtime updated to the latest release"
         },
         "dlne.worker.allowUnsignedEngine": {
           "type": "boolean",
+          "scope": "application",
           "default": false,
           "markdownDescription": "Install the compute engine from a coordinator that does not publish a signed release. **Leave this off for the public swarm**: the engine runs on your machine, so DLNE only installs releases signed with the maintainer's key. Turn it on only for a private coordinator you run yourself. A signed release that fails verification is never installed, whatever this is set to."
         }
@@ -218,7 +261,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "test": "tsc -p ./ && node --test --test-force-exit test/*.test.js",
+    "test": "tsc -p ./ && node --test test/*.test.js",
     "test:e2e": "tsc -p ./ && node --test --test-force-exit test/e2e/*.e2e.js",
     "watch": "tsc -watch -p ./",
     "publish:ovsx": "bash -c 'set -a && source .env && set +a && npx -y ovsx publish'",

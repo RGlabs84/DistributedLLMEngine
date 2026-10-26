@@ -375,6 +375,70 @@ def test_a_model_that_does_not_fit_reaches_for_the_network():
     assert planned == ["127.0.0.1:50052", "10.8.0.4:50052"]
 
 
+def test_the_planner_covers_the_model_with_the_part_of_the_pool_admission_will_spend():
+    """
+    Admission only lets a model claim POOL_SAFETY_FRACTION of the pool's reported VRAM, so
+    the planner must not stop adding GPUs at raw VRAM >= the model. A 14.5 GiB model on
+    16 GiB of local cards "fits" raw, but 14.5 > 0.9 x 16 = 14.4: admission would refuse
+    it, and the planner had not asked the LAN node for help.
+    """
+    from engine.inference_manager import POOL_SAFETY_FRACTION
+
+    registry = _registry_with(("127.0.0.1", 16.0), ("192.168.1.50", 8.0))
+    assert 14.3 < 16.0 * POOL_SAFETY_FRACTION < 14.5
+    # 14.3 / 0.9 = 15.9 <= 16: the local cards cover it, nothing is borrowed
+    assert registry.plan_endpoints(required_gb=14.3) == ["127.0.0.1:50052"]
+    # 14.5 / 0.9 = 16.1 > 16: raw VRAM "fits" (the old test stopped here) but admission
+    # would refuse it, so the LAN node is brought in
+    assert registry.plan_endpoints(required_gb=14.5) == ["127.0.0.1:50052", "192.168.1.50:50052"]
+
+
+@pytest.mark.parametrize("policy", ["auto", "always"])
+def test_no_endpoints_at_all_plans_nothing_instead_of_raising(policy):
+    """
+    The router agent reported an IndexError (`candidates[0]`) when there is nothing to plan
+    over. Every shape of "nothing" must give an empty plan: an empty registry, a pool of
+    members that run their own models (CPU pool and coding members have no rpc-server), and
+    a GPU handed back to its owner.
+    """
+    assert WorkerRegistry().plan_endpoints(required_gb=10.0, policy=policy) == []
+
+    members = WorkerRegistry()
+    members.update_worker(worker_id="app", ip="10.8.0.2", port=50052, token="t1",
+                          hardware_profile={"pool": "app", "gpu": {"has_gpu": False}})
+    members.update_worker(worker_id="coder", ip="10.8.0.3", port=50052, token="t2",
+                          hardware_profile={"pool": "coding", "gpu": {"has_gpu": True, "vram_total_gb": 24.0}})
+    assert members.plan_endpoints(required_gb=10.0, policy=policy) == []
+    assert members.plan_endpoints(required_gb=0.0, policy=policy) == []
+
+    yielding = WorkerRegistry()
+    yielding.update_worker(worker_id="w", ip="192.168.1.50", port=50052, token="t3",
+                           hardware_profile={"gpu": {"has_gpu": True, "vram_total_gb": 8.0}, "is_yielding": True})
+    assert yielding.plan_endpoints(required_gb=4.0, policy=policy) == []
+
+
+def test_a_coding_member_is_left_out_of_the_plan_but_the_pool_still_plans():
+    """Members run whole models of their own; the GPUs that do shard are planned as before."""
+    registry = WorkerRegistry()
+    registry.update_worker(worker_id="coder", ip="127.0.0.1", port=50099, token="t0",
+                           hardware_profile={"pool": "coding", "gpu": {"has_gpu": True, "vram_total_gb": 24.0}})
+    registry.update_worker(worker_id="gpu", ip="192.168.1.50", port=50052, token="t1",
+                           hardware_profile={"gpu": {"has_gpu": True, "vram_total_gb": 8.0}})
+
+    assert registry.plan_endpoints(required_gb=4.0) == ["192.168.1.50:50052"]
+
+
+def test_the_planner_stops_adding_gpus_exactly_at_the_safety_adjusted_need():
+    """required_gb / POOL_SAFETY_FRACTION: 9 GiB needs 10 GiB of raw VRAM, no more, no less."""
+    # 0.5 local + 9.0 LAN = 9.5 raw: enough for 9.0 by the old comparison, short of 10.0 by the new
+    short = _registry_with(("127.0.0.1", 0.5), ("192.168.1.50", 9.0), ("10.8.0.4", 8.0))
+    assert short.plan_endpoints(required_gb=9.0) == ["127.0.0.1:50052", "192.168.1.50:50052", "10.8.0.4:50052"]
+
+    # 0.5 + 9.5 = 10.0 covers it exactly: the WAN node is not needed
+    exact = _registry_with(("127.0.0.1", 0.5), ("192.168.1.50", 9.5), ("10.8.0.4", 8.0))
+    assert exact.plan_endpoints(required_gb=9.0) == ["127.0.0.1:50052", "192.168.1.50:50052"]
+
+
 def test_capacity_is_bought_cheapest_first():
     """LAN before WAN, whatever order the workers happened to register in."""
     registry = _registry_with(("10.8.0.4", 8.0), ("192.168.1.50", 8.0), ("127.0.0.1", 2.0))

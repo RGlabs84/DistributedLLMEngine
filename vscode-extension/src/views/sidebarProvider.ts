@@ -1,10 +1,12 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { AgentLoop } from '../agent/agentLoop';
 import { DlneClient } from '../client/dlneClient';
 import { swarmModelLine } from '../client/modelChoice';
+import { QueueUpdate, queueDetail, queueHeadline } from '../client/queue';
 import { WorkerManager, WorkerStatus } from '../worker/workerManager';
-import { contributionCopy } from '../worker/contribution';
+import { contributionCopy, roleCopy } from '../worker/contribution';
 import { phoneChatUrl } from '../serverUrl';
 import { ToolCallResult } from '../agent/tools';
 
@@ -42,8 +44,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
 
     this.workerManager.onStatusChange((status) => {
-      this._view?.webview.postMessage({ type: 'workerStatus', status, copy: contributionCopy(status) });
+      this._view?.webview.postMessage({ type: 'workerStatus', status, copy: contributionCopy(status), role: roleCopy(status) });
     });
+  }
+
+  /** What the queue banner shows for a place in line (null hides it). */
+  private _queueView(queue: QueueUpdate | null | undefined) {
+    return queue ? { headline: queueHeadline(queue), detail: queueDetail(queue) } : null;
   }
 
   private saveHistory() {
@@ -75,7 +82,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       history: this.conversationHistory,
       workerStatus,
       workerCopy: contributionCopy(workerStatus),
-      modelLine: this._modelLine()
+      workerRole: roleCopy(workerStatus),
+      modelLine: this._modelLine(),
+      queue: this._queueView(this.client.currentQueue?.())
     });
 
     // The model line follows the status the status bar already polls; nothing here asks for it.
@@ -86,6 +95,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
       switch (data.type) {
+        case 'copyTrustId': {
+          // Only a trust id (32 hex characters, from the worker's own output) is ever copied.
+          if (typeof data.id === 'string' && /^[0-9a-f]{32}$/.test(data.id)) {
+            await vscode.env?.clipboard?.writeText(data.id);
+            vscode.window.showInformationMessage('DLNE: trust id copied.');
+          }
+          break;
+        }
         case 'sendMessage': {
           await this.handleUserMessage(data.text);
           break;
@@ -158,6 +175,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       onLoadingProgress: (statusText) => {
         this._view?.webview.postMessage({ type: 'loadingProgress', statusText });
       },
+      // While every coding slot is taken: where this request stands, in a banner that stays in view.
+      onQueue: (queue) => {
+        this._view?.webview.postMessage({ type: 'queue', queue: this._queueView(queue) });
+      },
       onThinkingDelta: (delta) => {
         assistantMsg.thinking = (assistantMsg.thinking || '') + delta;
         this._view?.webview.postMessage({ type: 'thinkingDelta', delta });
@@ -214,14 +235,23 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const badgeText = st.state.toUpperCase();
     const btnClass = isContrib ? 'contrib-btn stop-btn' : 'contrib-btn';
     const { deviceHtml: gpuText, ruleHtml: ruleText, buttonText: btnText } = contributionCopy(st);
+    const role = roleCopy(st);
     // Shown as the link's tooltip; it comes from a setting, so it is escaped for the attribute.
     const phoneUrl = phoneChatUrl(vscode.workspace.getConfiguration('dlne'))
       .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+
+    // Script runs only with this nonce and the page may load nothing but its own files: if text a coding
+    // member wrote ever did become markup, it could not become a handler that reads the chat, reaches the
+    // network or posts a message to the extension. (The page has no inline handlers, one script block, and
+    // loads only the logo from the extension; its styles are inline.)
+    const nonce = crypto.randomBytes(16).toString('base64');
+    const cspSource = this._view ? this._view.webview.cspSource : '';
 
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource} data:; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DLNE Code Assistant</title>
   <style>
@@ -307,6 +337,44 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       display: flex;
       gap: 6px;
       margin-top: 4px;
+    }
+    .contrib-card a {
+      color: var(--vscode-textLink-foreground);
+      cursor: pointer;
+    }
+    .contrib-card code {
+      font-family: var(--vscode-editor-font-family, monospace);
+      word-break: break-all;
+    }
+    .role-details summary {
+      cursor: pointer;
+      font-size: 0.82em;
+      color: var(--vscode-textLink-foreground);
+    }
+    .role-details ul {
+      margin: 4px 0 0;
+      padding-left: 18px;
+      font-size: 0.82em;
+      color: var(--vscode-descriptionForeground);
+      line-height: 1.35;
+    }
+
+    /* Busy: every coding slot is taken and this request is waiting its turn */
+    .queue-banner {
+      flex-shrink: 0;
+      border: 1px solid var(--vscode-inputValidation-warningBorder, #b89500);
+      background-color: var(--vscode-inputValidation-warningBackground, rgba(184, 149, 0, 0.12));
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 0.86em;
+      line-height: 1.4;
+    }
+    .queue-headline {
+      font-weight: 600;
+    }
+    .queue-detail {
+      color: var(--vscode-descriptionForeground);
+      margin-top: 2px;
     }
 
     /* Chat Container */
@@ -593,6 +661,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     </div>
     <div class="contrib-info" id="gpu-display">${gpuText}</div>
     <div class="contrib-info" id="contrib-rule">${ruleText}</div>
+    <div class="contrib-info" id="role-display">${role.roleHtml}</div>
+    <div class="contrib-info" id="trust-display"${role.trustHtml ? '' : ' style="display:none"'}>${role.trustHtml}</div>
+    <div id="role-facts">${role.factsHtml}</div>
     <div class="contrib-actions">
       <button class="${btnClass}" id="toggle-worker-btn">${btnText}</button>
       <button class="secondary" id="suite-btn" title="Install the signed DLNE compute engine">Set Up Engine</button>
@@ -604,6 +675,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       <strong><img class="logo" src="${logoSrc}" alt="" width="24" height="24">DLNE Code Assistant</strong>
       <div class="assistant-body">Connected to cluster. Ready for autonomous coding, refactoring, and test verification.</div>
     </div>
+  </div>
+
+  <div class="queue-banner" id="queue-banner" role="status" aria-live="polite" style="display:none">
+    <div class="queue-headline" id="queue-headline"></div>
+    <div class="queue-detail" id="queue-detail"></div>
   </div>
 
   <div id="input-container">
@@ -622,7 +698,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     <a href="#" id="phone-link" title="${phoneUrl}">📱 Use DLNE on your phone</a>
   </div>
 
-  <script>
+  <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const chatContainer = document.getElementById('chat-container');
     const promptInput = document.getElementById('prompt-input');
@@ -635,6 +711,23 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const workerBadge = document.getElementById('worker-badge');
     const gpuDisplay = document.getElementById('gpu-display');
     const contribRule = document.getElementById('contrib-rule');
+    const roleDisplay = document.getElementById('role-display');
+    const trustDisplay = document.getElementById('trust-display');
+    const roleFacts = document.getElementById('role-facts');
+    const queueBanner = document.getElementById('queue-banner');
+    const queueHeadline = document.getElementById('queue-headline');
+    const queueDetail = document.getElementById('queue-detail');
+
+    // Where this request stands while every coding slot is taken; null takes the banner down.
+    function showQueue(queue) {
+      if (!queue) {
+        queueBanner.style.display = 'none';
+        return;
+      }
+      queueHeadline.textContent = queue.headline;
+      queueDetail.textContent = queue.detail;
+      queueBanner.style.display = 'block';
+    }
 
     let currentAssistantMsg = null;
     let currentThinkingElem = null;
@@ -663,6 +756,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     document.getElementById('phone-link').addEventListener('click', (e) => {
       e.preventDefault();
       vscode.postMessage({ type: 'openPhoneApp' });
+    });
+
+    trustDisplay.addEventListener('click', (e) => {
+      const target = e.target;
+      if (target && target.classList && target.classList.contains('copy-trust')) {
+        e.preventDefault();
+        vscode.postMessage({ type: 'copyTrustId', id: target.getAttribute('data-id') });
+      }
     });
 
     sendBtn.addEventListener('click', () => {
@@ -711,7 +812,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
       const pathElem = document.createElement('div');
       pathElem.className = 'file-path';
-      pathElem.innerHTML = '📄 ' + diff.path;
+      pathElem.textContent = '📄 ' + diff.path;
 
       const counts = document.createElement('div');
       counts.className = 'diff-counts';
@@ -753,13 +854,20 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     function renderTerminalCard(parentElem, cmd, output) {
       const card = document.createElement('div');
       card.className = 'terminal-card';
-      card.innerHTML = '<div class="terminal-cmd">⚡ Terminal: ' + cmd + '</div><div class="terminal-out">' + (output || '') + '</div>';
+      const cmdLine = document.createElement('div');
+      cmdLine.className = 'terminal-cmd';
+      cmdLine.textContent = '⚡ Terminal: ' + cmd;          // the command is the model's, the output may be a repository's
+      const out = document.createElement('div');
+      out.className = 'terminal-out';
+      out.textContent = output || '';
+      card.appendChild(cmdLine);
+      card.appendChild(out);
       parentElem.appendChild(card);
     }
 
     // The wording comes from the extension (contributionCopy), so the first render and these
     // updates say the same thing, for a GPU contributor and for the CPU pool alike.
-    function applyWorkerStatus(st, copy) {
+    function applyWorkerStatus(st, copy, role) {
       if (!st || !copy) return;
       workerBadge.className = 'badge ' + st.state;
       workerBadge.textContent = st.state.toUpperCase();
@@ -767,13 +875,27 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       contribRule.innerHTML = copy.ruleHtml;
       toggleWorkerBtn.textContent = copy.buttonText;
       toggleWorkerBtn.className = st.state === 'contributing' ? 'contrib-btn stop-btn' : 'contrib-btn';
+      if (role) {
+        roleDisplay.innerHTML = role.roleHtml;
+        trustDisplay.innerHTML = role.trustHtml;
+        trustDisplay.style.display = role.trustHtml ? '' : 'none';
+        // The details stay open or shut as the user left them while the card updates around them.
+        const wasOpen = roleFacts.querySelector('details') && roleFacts.querySelector('details').open;
+        roleFacts.innerHTML = role.factsHtml;
+        if (wasOpen && roleFacts.querySelector('details')) roleFacts.querySelector('details').open = true;
+      }
     }
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
       switch (msg.type) {
         case 'workerStatus': {
-          applyWorkerStatus(msg.status, msg.copy);
+          applyWorkerStatus(msg.status, msg.copy, msg.role);
+          break;
+        }
+
+        case 'queue': {
+          showQueue(msg.queue);
           break;
         }
 
@@ -787,8 +909,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             modelLine.textContent = msg.modelLine;
           }
           if (msg.workerStatus) {
-            applyWorkerStatus(msg.workerStatus, msg.workerCopy);
+            applyWorkerStatus(msg.workerStatus, msg.workerCopy, msg.workerRole);
           }
+          showQueue(msg.queue);
           if (msg.history && msg.history.length > 0) {
             chatContainer.innerHTML = '';
             msg.history.forEach((item) => {
@@ -804,7 +927,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 if (item.thinking) {
                   const details = document.createElement('details');
                   details.className = 'thinking-drawer';
-                  details.innerHTML = '<summary><span>Thought Process</span> <span class="thinking-badge">Complete</span></summary><div class="thinking-content">' + item.thinking + '</div>';
+                  const summary = document.createElement('summary');
+                  summary.innerHTML = '<span>Thought Process</span> <span class="thinking-badge">Complete</span>';
+                  const thinking = document.createElement('div');
+                  thinking.className = 'thinking-content';
+                  thinking.textContent = item.thinking;      // what the model wrote is text, never markup
+                  details.appendChild(summary);
+                  details.appendChild(thinking);
                   asstDiv.appendChild(details);
                 }
 
@@ -962,6 +1091,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
         case 'turnComplete':
         case 'taskAborted': {
+          showQueue(null);
           if (currentThinkingBadge) {
             currentThinkingBadge.textContent = 'Complete';
           }
@@ -976,6 +1106,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         }
 
         case 'error': {
+          showQueue(null);
           const div = document.createElement('div');
           div.className = 'message assistant';
           div.style.color = 'var(--vscode-errorForeground)';

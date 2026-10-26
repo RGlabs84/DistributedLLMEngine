@@ -7,9 +7,12 @@
 
 No account, no API key, no subscription. Install it, open the DLNE sidebar, and ask it to write or fix code. It reads the files in your workspace, and asks before it changes a file, runs a command, or looks outside your workspace.
 
+> **Upgrading to 1.3.0?** `dlne.serverUrl`, `dlne.apiKey`, `dlne.autoApproveReads`, `dlne.autoUpdate` and the `dlne.worker.*` settings are now read only from your user settings. If you set one of them in a workspace's `.vscode/settings.json`, move it to your user settings (`Preferences: Open User Settings`), or DLNE uses the default. This stops a cloned repository from sending your code to another server. [More below](#settings).
+
 - **Agent chat**: in the DLNE sidebar, or as `@dlne` in VS Code's Chat view.
 - **Ghost-text autocomplete**: suggestions inline as you type.
 - **Fix problems**: `DLNE: Fix Current File Problems` sends the file's errors and warnings to the agent.
+- **Secrets stay in your editor**: API keys, tokens, private keys and passwords in common formats are replaced with `[REDACTED]` before a request leaves VS Code, and files like `.env` and `*.pem` are never sent. Private repositories are answered only by trusted machines unless you opt in. [Details below](#privacy-what-to-know).
 - **On your phone**: [DLNE Chat](https://dlne.duckdns.org/chat) is the same swarm in a phone browser (on an iPhone: Safari, Share, Add to Home Screen), and there is an Android app (the APK is on the [DLNE website](https://live.ravenirongames.com/#dlne); it is not on Google Play yet). In VS Code, use the **Use DLNE on your phone** link in the sidebar, or the command `DLNE: Use DLNE on Your Phone`.
 
 ---
@@ -32,6 +35,23 @@ A CPU contributor's chats show how many are left, and at the limit the agent say
 You choose how much to lend (`dlne.worker.maxVramGb`, `dlne.worker.maxRamGb`, `dlne.worker.allowedGpus`), and you can stop at any time.
 
 > **Contributing works on Windows and Linux (x64 and ARM64) and on macOS (Apple Silicon and Intel).** GPUs are used through Vulkan on Windows and Linux and Metal on Apple Silicon. Intel Macs contribute their CPU (llama.cpp has no GPU support for them). The ARM64 and Intel Mac builds are the newest and the least tested.
+
+### 8 GB of GPU memory or more? Be a coding member
+
+A **coding member** runs a whole coding model on your GPU and answers coding requests on its own, so one request touches one machine and ordinary home internet is enough. **Each member adds about two more agents** working at the same time, so the swarm can run more agents as members join.
+
+There is no separate switch to find. Click **Start Contributing** and choose **Lend my GPU**: when the coordinator has coding members turned on and your GPU is not on its own fast network, it gives your GPU this job instead of a share of the big model. The sidebar card, the status bar ("Coding member") and a one-time notice tell you which job you got. If you would rather not answer other people's requests, choose **Lend my CPU only**, or turn off **`dlne.worker.allowCodingMember`** (the extension writes `CODING_MEMBER_ALLOWED=false` into the engine's `config/config.txt` for you). The coding job uses the memory that is free when it starts (it steps aside when you game); set **`dlne.worker.maxRamGb`** to limit it. (That setting is also the limit of the shared-model job, which needs little, and its default of 4 GB does not apply to the coding job; the extension passes the coding limit as `--coding-max-ram`, `-1` meaning none.)
+
+**Lend both.** The third button, **Lend both** (`dlne.worker.device` = `"both"`), lends the GPU and the CPU at the same time: the GPU does the job the swarm gives it, and the CPU also powers the DLNE phone app with the RAM you choose (you are asked on the first start; `dlne.worker.alsoCpuRamGb` holds the amount, at least 8 GB and never more than half your RAM; `dlne.worker.maxRamGb` stays the limit of the GPU's jobs). Your processor's threads are shared between the two jobs (`MAX_CPU_THREADS` is the total), the phone-app model loads before the coding model does, and when you game both step aside. The sidebar card, the status bar (`[Coding member 8GB + Phone app]`) and `@dlne /contribute` show both jobs while both run. On a machine without a usable GPU "both" is the same as "cpu".
+
+- **You need** a GPU with **8 GB of memory or more**, and enough free system memory for the rest of the model: about **22 GB of GPU memory plus free system memory together** for the first version (for example an 8 GB GPU with 14 GB of RAM free). DLNE runs the best version of the model your machine can hold whole, using the GPU first and system memory for the rest.
+- **Your machine is timed** when it joins, on reading a prompt and writing an answer. A machine under the speed floor is not sent coding work.
+- **The more memory you have, the better the version you run.** About 22 GB runs the first version of Qwen3.6-35B-A3B (IQ3_S); higher-quality versions of the same model need roughly 26 GB (IQ4_XS), 30 GB (Q4_K_M) and 37 GB (Q6_K), and the larger ones also need a stronger GPU to be fast enough. Open, MIT-licensed heavyweight models are planned from 192 GB and are not available yet.
+- **Your limits count.** The amounts you set with `dlne.worker.maxVramGb` and `dlne.worker.maxRamGb` are the most the member may use.
+- **The model server runs at low priority**, so your computer stays usable, and the member steps aside while your own load (a game, a render) needs the machine.
+- **Off until the coordinator turns it on.** Coding members are switched on by the coordinator's operator. Until then, coding requests are answered as before.
+
+What a member can and cannot see of the requests it answers is under [Privacy](#privacy-what-to-know), and in full in [docs/privacy.md](https://github.com/RGlabs84/DistributedLLMEngine/blob/main/docs/privacy.md).
 
 ### No GPU? Your computer powers the DLNE phone app
 
@@ -85,17 +105,47 @@ The agent's slash commands: `/code`, `/fix`, `/status`, `/model`, `/contribute`,
 
 ## Privacy: what to know
 
-- **Your prompts, and the code the agent reads, go to the coordinator.** The public coordinator is run by the DLNE maintainer, so treat it like any hosted AI service. Do not send secrets.
+This section is about the coding agent in VS Code. The full version, with what each party can and cannot see, is [docs/privacy.md](https://github.com/RGlabs84/DistributedLLMEngine/blob/main/docs/privacy.md).
+
+- **Your prompts, and the code the agent reads, go to the coordinator.** The public coordinator is run by the DLNE maintainer, so treat it like any hosted AI service. When coding members are on, a request may instead be answered by a volunteer's machine (below).
 - **The connection to the public swarm is encrypted (HTTPS)**, so nobody between you and the coordinator can read it. For anything sensitive, run your own coordinator (below).
 - When the model is split across several contributors' GPUs, those machines process the model's intermediate numbers for your request, not your text.
+
+**Who can answer your requests: `dlne.privacy`**
+
+**A coding member has to read your request to run the model, so it sees the code it is sent.** This setting decides which requests can go to which members.
+
+DLNE looks at your workspace's git remote. If it is a **public repository** (GitHub, GitLab or Codeberg), any coding member can answer. **Anything else**, and anything DLNE cannot check, is answered only by the coordinator's own engine or by machines the coordinator's operator has listed as trusted. The operator lists a machine by its identity key, not by a name it claims, so a member cannot claim to be trusted.
+
+**A public repository counts as public even for changes you have not pushed.** If you are working on something unpublished in a clone of a public repository, set `dlne.privacy` to `trustedOnly`. A repository's own settings can only narrow `dlne.privacy`, never widen it (only your own user settings can), and DLNE does not run in a workspace you have not trusted. While coding members are off (the default), the extension makes no repository lookup, and nothing about your repository leaves your machine beyond the request itself.
+
+| `dlne.privacy` | Who may answer |
+|---|---|
+| `auto` (default) | Public repositories: any member. Everything else: trusted machines only. |
+| `trustedOnly` | Trusted machines only, even for a public repository. |
+| `anyMember` | Any member, for every workspace. Choose this only if you are happy for any volunteer's machine to see that work. |
+
+**Secrets are removed in your editor.** Before a request leaves VS Code, API keys, tokens, private keys and passwords in common formats are replaced with `[REDACTED]`. These files are never sent: files your `.gitignore` ignores, anything in a `.dlneignore` file in your workspace, `.env*`, `*.pem`, `*.key`, `id_rsa*`, `.npmrc`, `.pypirc` and cloud credential files. This applies to every request, including those to the coordinator. It catches common formats, not every secret, so keep real secrets out of prompts.
+
+**Requests and answers are encrypted on the way to and from a coding member.** Your editor encrypts the request and decrypts the reply. The coordinator relays bytes it cannot open, and the tunnel and the internet between it and the member carry nothing readable. That protects the trip, not the machine that answers: the member itself has to read the request. The coordinator is the operator's own machine and is trusted: it hands out the member's public key. A request answered by the coordinator's own engine goes over HTTPS instead and is not sealed.
+
+**Members are not told who you are.** The coordinator passes on only the request: no IP address, no API key, no account. What the request itself contains (file paths, names in code or comments) can still say who you are.
+
+**No-trace members and canaries.** Members run their model server with settings that keep prompts out of logs and off disk. Now and then the coordinator sends a member a normal-looking request holding a made-up link, built to look like any real request (where a file would hold a key it shows `[REDACTED]`, as yours do). If the link is ever opened, that member is flagged and gets no more work.
+
+> **The honest limit: a coding member sees the code it is sent.** What protects you from members is the privacy mode (private repositories go only to trusted machines unless you opt in), the secrets removed in your editor, the no-trace settings and anonymity, and the canaries that are there to catch a member that snoops. A volunteer who changes DLNE's software could still read or keep what it receives, and none of this can promise otherwise. For code you cannot afford to expose, keep `dlne.privacy` on `auto` or `trustedOnly` (`trustedOnly` for unpublished work in a clone of a public repository), or run your own coordinator.
+
+**If you contribute:**
+
 - As a GPU contributor, your machine runs DLNE's worker and `ggml-rpc-server`, and accepts connections from the coordinator on port 50052.
-- As a CPU contributor, your machine answers phone-app requests, so it sees the text of those questions and answers (the phone app tells its users this) and any search results for them. Its model server listens on your machine only, and the coordinator reaches it through a tunnel your worker opens.
+- As a coding member, your machine decrypts and answers coding requests, so it sees their text (after redaction), but not who sent them. It never logs request or reply text. Its model server listens on your machine only, and the coordinator reaches it through a tunnel your worker opens.
+- As a CPU contributor, your machine answers phone-app requests, so it sees the text of those questions and answers (the phone app tells its users this) and any search results for them. Its model server listens on your machine only, and the coordinator reaches it through a tunnel your worker opens. The phone chat is a separate path: none of the above (redaction, encryption, trusted routing) is promised for it.
 
 ---
 
 ## Which model?
 
-The coding agent runs on GPU contributors' machines: one model at a time, chosen by the coordinator from the GPU memory available. Today that is **Qwen3.6-35B-A3B** (a UD-IQ3_S quant) on two 8 GB AMD GPUs, with a 65,536-token context: 38.5 tokens/s for one user and about 27 each for two, measured on the public swarm. Bigger models unlock automatically as more GPUs join. `/status` shows what is running now, and the sidebar shows it under the chat box. There is nothing to pick: VS Code's Chat model picker lists a single entry, **DLNE Swarm (auto)**. The phone app runs a different, smaller model on CPU contributors' machines (see above).
+The coding agent runs on GPU contributors' machines: one model at a time, chosen by the coordinator from the GPU memory available. Today that is **Qwen3.6-35B-A3B** (a UD-IQ3_S quant) on two 8 GB AMD GPUs, with a 65,536-token context: 38.5 tokens/s for one user and about 27 each for two, measured on the public swarm. Bigger models unlock automatically as more GPUs join. `/status` shows what is running now, and the sidebar shows it under the chat box. There is nothing to pick: VS Code's Chat model picker lists a single entry, **DLNE Swarm (auto)**. When coding members are on, each member runs its own copy of the best version of the model its machine can hold whole (see [Be a coding member](#8-gb-of-gpu-memory-or-more-be-a-coding-member)). The phone app runs a different, smaller model on CPU contributors' machines (see above).
 
 ---
 
@@ -129,12 +179,16 @@ Then in VS Code settings:
 
 ## Settings
 
+The settings that decide where your code or keys go (`dlne.serverUrl`, `dlne.apiKey`, `dlne.autoApproveReads`, `dlne.autoUpdate`, and every `dlne.worker.*` setting) are read only from your own user settings: a workspace's or folder's `.vscode/settings.json` cannot change them, so a cloned repository cannot point DLNE at another server or turn on auto-approval. A folder can only narrow `dlne.privacy`, never widen it.
+
 | Setting | Default | What it does |
 |---|---|---|
 | `dlne.serverUrl` | `https://dlne.duckdns.org` | The coordinator: the public swarm (over HTTPS), or your own. |
 | `dlne.apiKey` | `""` | Optional API key. Leave blank to use the free trial or your contribution. |
+| `dlne.privacy` | `auto` | Who may answer your coding requests: `auto` (any coding member for a public repository, trusted machines only for everything else), `trustedOnly` (use this for unpublished work in a clone of a public repository), or `anyMember` (any member, for every workspace). A repository's own settings can only narrow it, never widen it. See [Privacy](#privacy-what-to-know). |
 | `dlne.worker.networkKey` | public swarm key | The swarm's shared worker key. Change it only for a private coordinator. |
 | `dlne.worker.device` | `auto` | What to contribute: `auto` (a GPU if there is one that counts, else the CPU), `gpu`, or `cpu` (power the phone app and keep the GPU for yourself). |
+| `dlne.worker.allowCodingMember` | `true` | Let the swarm give your GPU the coding-member job (answering other people's coding requests). Turn it off and your GPU only joins the shared pool. |
 | `dlne.worker.allowedGpus` | `""` | GPU indices to lend (e.g. `0,1`). Blank lends all detected GPUs. |
 | `dlne.worker.maxVramGb` | `-1` | Most VRAM to lend, in GB (`-1`: detect). |
 | `dlne.worker.maxRamGb` | `4.0` | Most system RAM the worker may use, in GB. A CPU-only machine needs at least 8; the more it lends, the bigger the phone-app model it runs (16 GB: Qwen3.6). You're offered an amount when you start. |

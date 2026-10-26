@@ -1,0 +1,135 @@
+--- a/engine/coding_router.py	2026-10-26 01:36:35.664284343 -0400
++++ b/engine/coding_router.py	2026-10-26 01:53:44.557782098 -0400
+@@ -92,6 +92,8 @@
+ MAX_SESSIONS = 20000
+ MAX_ROUTES = 20000
+ MAX_FIRST_SEEN = 4096
++MAX_VERIFIED = 4096                # signed blocks whose signature check is remembered (see CodingRouter._trust_of)
++BAD_BLOCK_REMEMBERED_SECONDS = 5.0
+ MAX_ATTEMPTS = 3                   # members tried for one request before the local engine takes it
+ SESSION_ID_MAX_CHARS = 128
+ IDENTITY_MAX_SKEW_SECONDS = 300    # a coding block signed longer ago (or further ahead) than this is dropped
+@@ -342,9 +344,40 @@
+         self._waiters: List[_Waiter] = []
+         self._seq = itertools.count()
+         self._first_seen: "OrderedDict[str, float]" = OrderedDict()
++        # canonical JSON of a signed block -> (its trust id or None, wall-clock time until the answer holds)
++        self._verified: "OrderedDict[str, Tuple[Optional[str], float]]" = OrderedDict()
+         self._contested_logged: set = set()
+ 
+     # ------------------------------------------------------------------ members
++    def _trust_of(self, block: Dict[str, Any]) -> Optional[str]:
++        """
++        ``member_identity.verify_block``, remembered. A heartbeat's block is signed once and read many times: every
++        request, every route lookup, every waiting request's one-second look and every status call builds the member
++        list, and an Ed25519 check is about 120 microseconds a member (measured: 100 waiters on 10 members made one
++        freed slot block the event loop for 123 ms). The same bytes verify the same way until their ``signed_at``
++        leaves the skew window, so a good answer is kept until then; a bad one for a few seconds (it may be a clock
++        that is about to be right). The key is the whole block, signature included: a changed field is a new key.
++        """
++        try:
++            key = json.dumps(block, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
++        except (TypeError, ValueError):
++            return None
++        now = time.time()
++        hit = self._verified.get(key)
++        if hit is not None and now <= hit[1]:
++            return hit[0]
++        trust_id = member_identity.verify_block(block, max_skew=IDENTITY_MAX_SKEW_SECONDS)
++        signed_at = block.get("signed_at")
++        if trust_id and isinstance(signed_at, (int, float)) and not isinstance(signed_at, bool):
++            until = signed_at + IDENTITY_MAX_SKEW_SECONDS
++        else:
++            until = now + BAD_BLOCK_REMEMBERED_SECONDS
++        self._verified[key] = (trust_id, until)
++        self._verified.move_to_end(key)
++        while len(self._verified) > MAX_VERIFIED:
++            self._verified.popitem(last=False)
++        return trust_id
++
+     def all_members(self, registry, relay_lookup: Callable[[str, int], Optional[int]],
+                     limits: Optional[Dict[str, Any]] = None) -> List[CodingMember]:
+         """
+@@ -365,7 +398,7 @@
+             trust_id = None
+             if block:
+                 try:
+-                    trust_id = member_identity.verify_block(block, max_skew=IDENTITY_MAX_SKEW_SECONDS)
++                    trust_id = self._trust_of(block)
+                 except Exception:  # noqa: BLE001 - a bad block is a dropped block, never an error
+                     trust_id = None
+             if isinstance(trust_id, str):
+@@ -476,7 +509,7 @@
+             self._last_served[member.trust_id] = self._wall()
+             while len(self._last_served) > MAX_FIRST_SEEN:
+                 self._last_served.pop(next(iter(self._last_served)))
+-        self._wake()
++        self._wake(member)
+ 
+     def in_flight(self) -> int:
+         return sum(self._inflight.values())
+@@ -617,11 +650,26 @@
+             return None
+         return self._reserve(member)
+ 
+-    def _wake(self) -> None:
+-        """A slot was freed: hand it to the best-placed waiter that can use it."""
+-        for waiter in sorted(self._waiters, key=lambda w: (w.priority, w.seq)):
++    def _wake(self, freed: Optional[CodingMember] = None) -> None:
++        """A slot was freed: hand it to the best-placed waiter that can use it. Within a tier, a waiter whose session
++        this member served last goes first: its prompt is still cached here, and reading it again on another member
++        costs minutes at a laptop's prompt speed (measured: 21% sticky hits with all slots busy, because a waiter
++        took whichever member freed up first)."""
++        def order(w: "_Waiter"):
++            here = freed is not None and w.want.session_id is not None and self._sticky(w.want.session_id) == freed.key
++            return (w.priority, 0 if here else 1, w.seq)
++
++        waiters = sorted((w for w in self._waiters if not w.future.done()), key=order)
++        if not waiters:
++            return
++        # One look at the members, not one per waiter: with nothing free no waiter can be served, and finding that
++        # out used to cost every waiter its own member-list build (100 waiters on 10 members: 123 ms of event loop).
++        members = waiters[0].want.members_fn()
++        for waiter in waiters:
+             if waiter.future.done():
+                 continue
++            if not any(self.free_slots(m) > 0 for m in members):
++                return
+             lease = self._try(waiter.want)
+             if lease is not None:
+                 waiter.future.set_result(lease)
+--- a/engine/coordinator.py	2026-10-26 01:36:35.663660412 -0400
++++ b/engine/coordinator.py	2026-10-26 01:52:49.653542913 -0400
+@@ -2027,6 +2027,9 @@
+         return False
+ 
+ 
++HIGH_THROUGHPUT_LANES = 6      # request slots the engine is rebooted with after a traffic spike
++
++
+ async def recalculate_engine_queue(model_path: str):
+     """Reboots the engine with more parallel slots after a sustained traffic spike."""
+     global is_recalculating_queue
+@@ -2063,7 +2066,7 @@
+             active_endpoints,
+             registry.get_total_vram_gb(),
+             registry.get_total_sysram_gb(),
+-            queue_channels=6
++            queue_channels=HIGH_THROUGHPUT_LANES
+         )
+ 
+         cluster_status = "Online"
+@@ -2672,7 +2675,12 @@
+                 yield b"data: [DONE]\n\n"
+             finally:
+                 await release_slot()
+-                if active_inference_requests > 12 and not is_recalculating_queue:
++                # Once the engine runs its high-throughput lanes another restart changes nothing, and every restart
++                # stops the engine and parks every request for tens of seconds (measured: 4 restarts in 100 s with 20
++                # agents, the engine down or booting for 60 of them). Waiting requests count here, so 13 people in
++                # line are enough to trigger it.
++                if (active_inference_requests > 12 and not is_recalculating_queue
++                        and coding_gate.stats()["slots"] < HIGH_THROUGHPUT_LANES):
+                     spawn_background_task(recalculate_engine_queue(model_path), "queue-recalc")
+ 
+         slot_handed_off = True

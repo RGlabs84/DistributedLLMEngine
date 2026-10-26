@@ -222,8 +222,13 @@ def engine_env(isolated_config, dlne_root, make_worker_limits, monkeypatch):
     bound_ports = set()
     spawned = []
 
+    # A test sets ``engine_env.limits["engine_slots"] = 2`` (or any other worker limit) to
+    # play the operator; the default is what production ships, ENGINE_SLOTS and
+    # ENGINE_CONTEXT automatic.
+    limits_overrides = {}
     monkeypatch.setattr(inference_manager, "get_base_dir", lambda: str(dlne_root))
-    monkeypatch.setattr(inference_manager, "get_worker_limits", make_worker_limits)
+    monkeypatch.setattr(inference_manager, "get_worker_limits",
+                        lambda: make_worker_limits(**limits_overrides))
 
     # Pin what a token of KV cache costs. Real sizing reads it out of the model's GGUF
     # header, and the models here are empty stub files, so every test would otherwise be
@@ -235,6 +240,7 @@ def engine_env(isolated_config, dlne_root, make_worker_limits, monkeypatch):
                         lambda path: TEST_KV_BYTES_PER_TOKEN)
 
     env = EngineEnv(None, models_dir, bound_ports, spawned)
+    env.limits = limits_overrides
 
     # No llama.cpp release is unpacked on a test machine, and downloading one would need the
     # network. Point at a file that exists so the "Binary Missing" branch is not taken.
@@ -743,10 +749,11 @@ def test_admission_and_context_sizing_share_one_budget(engine_env, monkeypatch):
     assert ok_a is True, msg_a
 
     entry = manager.running_models["big-a.gguf"]
-    # The cache is stored q8_0 below 131,072 tokens of context, which halves its cost
-    # (quartered with q4_0 above that); this model's context is far below that line.
-    assert entry["safe_context"] < 131072
-    expected_reserved = weights_gb + entry["safe_context"] * (TEST_KV_GB_PER_TOKEN / 2.0)
+    # The cache is stored q8_0 below 131,072 tokens of context a slot, which costs 34/64 of
+    # f16 (q4_0, 18/64, from there); this model's context a slot is far below that line.
+    assert entry["safe_context"] // entry["dynamic_slots"] < 131072
+    q8_gb_per_token = inference_manager.gguf.scale_kv_bytes(TEST_KV_BYTES_PER_TOKEN, "q8_0") / (1024 ** 3)
+    expected_reserved = weights_gb + entry["safe_context"] * q8_gb_per_token
     assert entry["reserved_gb"] == pytest.approx(expected_reserved)
     # The KV cache is genuinely charged to the pool, not silently free.
     assert entry["reserved_gb"] > weights_gb
@@ -792,11 +799,11 @@ def test_reserved_memory_never_exceeds_the_safety_capped_pool(engine_env, monkey
 
 def test_context_respects_both_the_hardware_ceiling_and_the_model_declaration(engine_env, monkeypatch, dlne_root):
     """
-    ``safe_context`` is ``max(MIN_CONTEXT_TOKENS, min(json_max_context, hardware_max))``.
+    A slot's context is never more than the model declares, and the total never drops below
+    the absolute floor, under which an instruct model cannot fit a system prompt plus a reply.
 
     A generous pool must not push the context past what the model actually supports (that
-    reserves memory nobody can use and locks other models out), and it must never drop below
-    the absolute floor, under which an instruct model cannot fit a system prompt plus a reply.
+    reserves memory nobody can use and locks other models out).
     """
     manager = engine_env.manager
     engine_env.add_model("model-a")
@@ -805,7 +812,10 @@ def test_context_respects_both_the_hardware_ceiling_and_the_model_declaration(en
     (dlne_root / "models" / "models.json").write_text(
         '[{"id": "model-a", "max_context": 8192}]', encoding="utf-8"
     )
-    slots = 2   # start_model's default queue_channels: llama-server splits -c across them
+    # The operator pins two slots here (llama-server splits -c across them); the automatic
+    # slot count has its own tests below.
+    engine_env.limits["engine_slots"] = 2
+    slots = 2
     declared_total = 8192 * slots
 
     # Huge pool: the model's own declaration (per slot, times slots) is the binding
@@ -1135,6 +1145,9 @@ def test_concurrent_admissions_cannot_over_commit_the_pool(engine_env, monkeypat
     """
     manager = engine_env.manager
     monkeypatch.setattr(manager, "estimate_model_vram_gb", lambda path: 4.0)
+    # Two slots pinned: the automatic count would give the first model four and leave room
+    # for no second one, which is a different (and tested elsewhere) property.
+    engine_env.limits["engine_slots"] = 2
     engine_env.download_gate.arm()
 
     total_vram, total_sysram = 12.0, 0.0
@@ -1576,9 +1589,30 @@ def test_astart_model_forwards_keyword_arguments(engine_env):
     ok, _port, _message = asyncio.run(scenario())
 
     assert ok is True
-    assert manager.running_models["model-a.gguf"]["dynamic_slots"] == 6
+    # queue_channels is a floor on the slot count, not a cap: this pool holds more than 6.
+    slots = manager.running_models["model-a.gguf"]["dynamic_slots"]
+    assert slots >= 6
     assert "-np" in engine_env.spawned[0].cmd
-    assert engine_env.spawned[0].cmd[engine_env.spawned[0].cmd.index("-np") + 1] == "6"
+    assert engine_env.spawned[0].cmd[engine_env.spawned[0].cmd.index("-np") + 1] == str(slots)
+
+
+def test_queue_channels_is_honoured_when_the_pool_holds_fewer_slots(engine_env, monkeypatch):
+    """
+    After a traffic spike the coordinator restarts the engine with 6 lanes. A pool that
+    holds only one slot at the floor context still gets 6: the slots are kept and the
+    context gives way, as before the engine chose its own slot count.
+    """
+    manager = engine_env.manager
+    engine_env.add_model("model-a")
+    monkeypatch.setattr(manager, "estimate_model_vram_gb", lambda path: 8.0)
+
+    ok, _port, message = manager.start_model("model-a", [], 12.0, 0.0, queue_channels=6)
+
+    assert ok is True, message
+    entry = manager.running_models["model-a.gguf"]
+    assert entry["dynamic_slots"] == 6
+    assert entry["safe_context"] // 6 < inference_manager.SLOT_CONTEXT_FLOOR
+    assert entry["safe_context"] // 6 >= inference_manager.MIN_CONTEXT_TOKENS
 
 
 def test_every_locking_method_has_an_async_wrapper(engine_env):
@@ -1874,6 +1908,7 @@ def test_a_published_model_is_never_counted_twice(engine_env, monkeypatch):
     """
     manager = engine_env.manager
     monkeypatch.setattr(manager, "estimate_model_vram_gb", lambda path: 4.0)
+    engine_env.limits["engine_slots"] = 2   # the automatic count would fill the pool
     for tag in ("first", "second"):
         engine_env.add_model(tag)
 
@@ -2194,6 +2229,7 @@ def test_snapshot_model_hands_back_a_coherent_private_copy(engine_env):
     """
     manager = engine_env.manager
     engine_env.add_model("model-a")
+    engine_env.limits["engine_slots"] = 3
     manager.start_model("model-a", ["10.0.0.2:50052"], BIG_VRAM, BIG_SYSRAM, queue_channels=3)
 
     snapshot = manager.snapshot_model("model-a")
@@ -2215,3 +2251,345 @@ def test_snapshot_model_hands_back_a_coherent_private_copy(engine_env):
     assert manager.snapshot_model("model-b") is None
     manager.stop_model("model-a")
     assert manager.snapshot_model("model-a") is None
+
+
+# ======================================================================================
+# Slots and context from the model's real cost (2.4)
+#
+# The numbers are Qwen3.6-35B-A3B UD-IQ3_S, read from the pinned file: 10 attention blocks
+# of 40, 20 KiB of KV a token at f16 (10,880 B at q8_0), 62.8 MiB of recurrent state a slot,
+# 13,676,723,168 bytes of which 417 MB is the token embedding and 11.57 GB routed experts.
+# ======================================================================================
+
+from engine import gguf as gguf_module
+from engine.config import parse_engine_args
+
+GIB = 1024 ** 3
+QWEN_KV_F16 = 20_480
+QWEN_STATE = 65_863_680
+
+
+def _plan(**overrides):
+    values = dict(kv_f16_bytes_per_token=QWEN_KV_F16, state_bytes_per_slot=QWEN_STATE, budget_gb=1.0,
+                  native_context=262_144, requested_slots=2)
+    values.update(overrides)
+    return inference_manager.plan_slots_and_context(**values)
+
+
+def test_the_floor_slot_costs_what_the_hand_arithmetic_says():
+    """32,768 tokens at q8_0 plus one slot's recurrent state: 0.393 GiB, not the 1.7 GB of 2.3.7."""
+    cost = (QWEN_STATE + 32768 * gguf_module.scale_kv_bytes(QWEN_KV_F16, "q8_0")) / GIB
+
+    assert cost == pytest.approx(0.3934, abs=1e-3)
+
+
+def test_slots_come_first_then_context():
+    """Owner's rule: more slots first, then more context per slot, never a slot under 32,768."""
+    previous_slots = 0
+    for budget in (1.5, 1.86, 2.0, 2.4, 3.0, 4.0):
+        plan = _plan(budget_gb=budget)
+        assert plan.mode == "auto"
+        assert plan.slots >= previous_slots, "more memory must never mean fewer slots"
+        assert plan.context_per_slot >= inference_manager.SLOT_CONTEXT_FLOOR
+        assert plan.kv_gb <= budget + 1e-9
+        previous_slots = plan.slots
+
+    assert _plan(budget_gb=1.5).slots == 3
+    assert _plan(budget_gb=1.86).slots == 4
+    assert _plan(budget_gb=2.4).slots == 6
+    # Slots stop at AUTO_SLOTS_MAX; only then does the surplus become context.
+    assert _plan(budget_gb=4.0).slots == 8
+    assert _plan(budget_gb=8.0).context_per_slot > _plan(budget_gb=4.0).context_per_slot
+    # With room to spare in the slots that exist, they grow before another slot is added.
+    assert _plan(budget_gb=1.0).slots == 2 and _plan(budget_gb=1.0).context_per_slot > 32768
+
+
+def test_the_automatic_choice_stops_at_eight_slots_and_never_goes_q4_0():
+    plan = _plan(budget_gb=100.0)
+
+    assert plan.slots == inference_manager.AUTO_SLOTS_MAX == 8
+    assert plan.context_per_slot == inference_manager.AUTO_SLOT_CONTEXT_CAP
+    assert plan.cache_type == "q8_0"
+
+
+def test_the_model_native_context_limits_a_slot():
+    plan = _plan(budget_gb=100.0, native_context=8192)
+
+    assert plan.context_per_slot == 8192
+    assert plan.slots == 8
+
+
+def test_the_callers_slots_are_a_floor_not_a_cap():
+    """2 normally, 6 after a traffic spike: the context gives way, not the slots."""
+    tight = _plan(budget_gb=0.3, requested_slots=6)
+    assert tight.slots == 6
+    assert tight.context_per_slot >= inference_manager.MIN_CONTEXT_TOKENS
+    assert tight.context_per_slot < inference_manager.SLOT_CONTEXT_FLOOR
+    # and where the budget holds more, the budget wins
+    assert _plan(budget_gb=2.4, requested_slots=2).slots == 6
+
+
+def test_a_dense_model_with_no_recurrent_state_is_planned_the_same_way():
+    """Qwen2.5-Coder-14B: 192 KiB a token at f16, no state. One slot at the floor costs 3.2 GiB."""
+    plan = _plan(kv_f16_bytes_per_token=196_608, state_bytes_per_slot=0, budget_gb=5.0)
+
+    assert plan.slots == 2                      # the floor of 1 fits once; the caller's 2 stands
+    assert plan.context_per_slot == 25_600      # (5 GiB / 2) / 102 KiB, in steps of 1,024
+    assert plan.kv_gb <= 5.0
+
+
+def test_the_operators_context_alone_gives_floor_sized_slots():
+    """TheWall's 65,536 is 2 x 32,768 today; that is what it still is."""
+    for budget in (0.1, 1.86, 100.0):    # the budget does not matter: the operator fixed it
+        plan = _plan(fixed_context=65_536, budget_gb=budget)
+        assert (plan.slots, plan.context_per_slot, plan.total_context) == (2, 32_768, 65_536)
+        assert plan.cache_type == "q8_0" and plan.mode == "context-fixed"
+
+    # After a spike the coordinator asks for 6 lanes on the same 65,536
+    spike = _plan(fixed_context=65_536, requested_slots=6)
+    assert (spike.slots, spike.total_context) == (6, 65_536)
+
+
+def test_the_operators_slots_alone_get_the_context_the_budget_holds():
+    plan = _plan(fixed_slots=6, budget_gb=2.4)
+
+    assert plan.slots == 6 and plan.mode == "slots-fixed"
+    assert plan.context_per_slot == 32_768
+    assert _plan(fixed_slots=6, budget_gb=1.0).context_per_slot < 32_768   # the operator chose 6; the context shrinks
+
+
+def test_both_fixed_is_used_as_written():
+    plan = _plan(fixed_slots=6, fixed_context=196_608)
+
+    assert (plan.slots, plan.total_context, plan.context_per_slot, plan.mode) == (6, 196_608, 32_768, "fixed")
+
+
+def test_q4_0_starts_at_131072_tokens_a_slot_not_on_the_total():
+    """Eight users at 32K are not a 256K context: the cache stays q8_0."""
+    assert _plan(fixed_context=262_144).cache_type == "q8_0"                 # 8 x 32,768
+    assert _plan(fixed_context=262_144).slots == 8
+    assert _plan(fixed_context=262_144, fixed_slots=2).cache_type == "q4_0"   # 2 x 131,072
+    assert _plan(fixed_context=262_144, fixed_slots=2).context_per_slot == 131_072
+    assert _plan(fixed_context=131_072, fixed_slots=2).cache_type == "q8_0"   # 2 x 65,536
+
+
+# --- TheWall, with its real configuration -----------------------------------------------
+
+THEWALL_EXTRA_ARGS = ("--n-cpu-moe 5 -ts 23,17 --threads 4 --threads-batch 4 --cpu-mask 0xc3 --cpu-strict 1 "
+                      "--chat-template-kwargs '{\"enable_thinking\":false}'")
+# /v1/cluster/status on 2026-10-26: total_vram_gb 16.0 (two 8 GB BC-160), total_sysram_gb 12.0
+THEWALL_VRAM_GB, THEWALL_SYSRAM_GB = 16.0, 12.0
+# /sys/class/drm mem_info_vram_* with the engine running 2 x 32,768: both cards 8,573,157,376
+# bytes, used 7,048,101,888 and 6,058,741,760. The engine's own cache is 805 MiB of that.
+THEWALL_FREE_BYTES = 2 * 8_573_157_376 - 7_048_101_888 - 6_058_741_760
+THEWALL_ENGINE_CACHE_BYTES = 805 * 1024 * 1024
+
+QWEN36_IQ3S = gguf_module.ModelShape(
+    arch="qwen35moe",
+    file_bytes=13_676_723_168,
+    kv_layers=10,
+    kv_f16_bytes_per_token=QWEN_KV_F16,
+    state_bytes_per_sequence=QWEN_STATE,
+    embedding_bytes=417_177_600,
+    embedding_tied=False,
+    expert_bytes_by_layer=tuple(
+        (block, 314_572_800 if block in (34, 38, 39) else 287_309_824) for block in range(40)),
+    has_tensor_table=True,
+)
+# What 2.3.7 computed for it on TheWall, by the formulas of that release: 1.2 x the file, and
+# a cache priced on all 40 blocks at half of f16 for 65,536 tokens.
+OLD_THEWALL_WEIGHTS_GB = 13_676_723_168 / GIB * 1.2
+OLD_THEWALL_RESERVED_GB = OLD_THEWALL_WEIGHTS_GB + 65_536 * (4 * QWEN_KV_F16 / 2) / GIB
+
+
+@pytest.fixture
+def thewall(engine_env, monkeypatch):
+    """The coordinator as TheWall runs it: Qwen3.6 IQ3_S, ENGINE_CONTEXT 65536, the real extra args."""
+    monkeypatch.setattr(inference_manager.gguf, "model_shape", lambda path: QWEN36_IQ3S)
+    monkeypatch.setattr(inference_manager.gguf, "kv_bytes_per_token_for_model",
+                        lambda path: QWEN36_IQ3S.kv_f16_bytes_per_token)
+    engine_env.limits.update(engine_context=65_536, shard_policy="auto",
+                             engine_extra_args=parse_engine_args(THEWALL_EXTRA_ARGS))
+    engine_env.add_model("Qwen3.6-35B-A3B-UD-IQ3_S")
+    engine_env.tag = "Qwen3.6-35B-A3B-UD-IQ3_S"
+    return engine_env
+
+
+def _flag(cmd, name):
+    return cmd[cmd.index(name) + 1]
+
+
+def _thewall_start(env, **kwargs):
+    ok, _port, message = env.manager.start_model(
+        env.tag, ["127.0.0.1:50052"], THEWALL_VRAM_GB, THEWALL_SYSRAM_GB, **kwargs)
+    assert ok is True, message
+    return env.spawned[-1].cmd, next(iter(env.manager.running_models.values()))
+
+
+def test_thewall_still_gets_two_slots_of_32768(thewall):
+    """The proof that today's behaviour does not get worse: the same -c, -np and cache."""
+    cmd, entry = _thewall_start(thewall)
+
+    assert (_flag(cmd, "-c"), _flag(cmd, "-np")) == ("65536", "2")
+    assert (_flag(cmd, "-ctk"), _flag(cmd, "-ctv")) == ("q8_0", "q8_0")
+    assert (entry["safe_context"], entry["dynamic_slots"]) == (65_536, 2)
+    # and everything the operator wrote in ENGINE_EXTRA_ARGS reaches the engine untouched
+    assert cmd[cmd.index("--n-cpu-moe"):cmd.index("--n-cpu-moe") + 4] == ["--n-cpu-moe", "5", "-ts", "23,17"]
+    assert _flag(cmd, "--chat-template-kwargs") == '{"enable_thinking":false}'
+    assert _flag(cmd, "--cpu-mask") == "0xc3"
+
+
+def test_thewall_is_admitted_from_real_bytes_and_reserves_less_than_before(thewall):
+    manager = thewall.manager
+    estimate = manager.estimate_model_vram_gb(thewall.tag)
+
+    # 11.01 GiB of weights on the cards (file - token embedding - 5 expert blocks in RAM)
+    # plus the runtime's buffers; 2.3.7 said 15.28 and sent it through the RAM spillover.
+    assert estimate == pytest.approx(11_822_996_448 / GIB + inference_manager.RUNTIME_OVERHEAD_GB)
+    assert estimate < OLD_THEWALL_WEIGHTS_GB
+    assert estimate + inference_manager.MIN_KV_GB <= THEWALL_VRAM_GB * inference_manager.POOL_SAFETY_FRACTION
+
+    assert manager.can_admit(thewall.tag, THEWALL_VRAM_GB, THEWALL_SYSRAM_GB) == (True, "ok")
+    _cmd, entry = _thewall_start(thewall)
+    # 0.79 GiB of cache for 2 x 32,768 plus two recurrent states, not 2.5 GiB
+    assert entry["reserved_gb"] == pytest.approx(estimate + (65_536 * 10_880 + 2 * QWEN_STATE) / GIB)
+    assert entry["reserved_gb"] < OLD_THEWALL_RESERVED_GB
+
+
+def test_thewall_with_a_lan_volunteer_still_runs_on_its_own_cards(thewall):
+    """
+    The two halves of this change belong together. The shard planner now asks for
+    required / 0.9 of raw VRAM; fed the old 15.28 GiB estimate that is 17.0 GiB against
+    TheWall's 16, and a LAN volunteer would be pulled in (a restart across the network, for
+    a model that fits). Fed the real 11.76 GiB it is 13.1 and TheWall stays on its own cards.
+    """
+    from engine.registry import WorkerRegistry
+
+    registry = WorkerRegistry()
+    for index, (ip, vram) in enumerate((("127.0.0.1", 16.0), ("192.168.1.50", 8.0))):
+        registry.update_worker(worker_id=f"w{index}", ip=ip, port=50052, token=f"t{index}",
+                               hardware_profile={"gpu": {"has_gpu": True, "vram_total_gb": vram}})
+
+    estimate = thewall.manager.estimate_model_vram_gb(thewall.tag)
+
+    assert registry.plan_endpoints(estimate) == ["127.0.0.1:50052"]
+    assert registry.plan_endpoints(OLD_THEWALL_WEIGHTS_GB) == ["127.0.0.1:50052", "192.168.1.50:50052"]
+
+
+def test_thewall_after_a_traffic_spike_keeps_its_six_lanes(thewall):
+    cmd, entry = _thewall_start(thewall, queue_channels=6)
+
+    assert (_flag(cmd, "-c"), _flag(cmd, "-np")) == ("65536", "6")
+    assert entry["dynamic_slots"] == 6
+
+
+def test_thewall_with_the_context_left_automatic_gets_more_slots(thewall):
+    """ENGINE_CONTEXT removed: four slots of at least 32,768, inside what the cards really have."""
+    thewall.limits["engine_context"] = 0
+
+    cmd, entry = _thewall_start(thewall)
+
+    slots = int(_flag(cmd, "-np"))
+    assert slots == 4
+    assert int(_flag(cmd, "-c")) // slots >= inference_manager.SLOT_CONTEXT_FLOOR
+    assert (_flag(cmd, "-ctk"), _flag(cmd, "-ctv")) == ("q8_0", "q8_0")
+    # The measured headroom: the cards had 4.04 GB free while the engine held 805 MiB of cache.
+    cache_bytes = (entry["reserved_gb"] - thewall.manager.estimate_model_vram_gb(thewall.tag)) * GIB
+    assert cache_bytes < THEWALL_FREE_BYTES + THEWALL_ENGINE_CACHE_BYTES
+
+
+def test_thewall_with_six_operator_slots_is_used_as_written_and_fits_the_measured_headroom(thewall, monkeypatch):
+    """The proposal for TheWall: ENGINE_SLOTS=6 with ENGINE_CONTEXT=196608 (6 x 32,768)."""
+    warnings = []
+    monkeypatch.setattr(inference_manager, "log_warning", warnings.append)
+    thewall.limits.update(engine_slots=6, engine_context=196_608)
+
+    cmd, entry = _thewall_start(thewall)
+
+    assert (_flag(cmd, "-c"), _flag(cmd, "-np")) == ("196608", "6")
+    assert warnings == [], "the proposal must not need the pool's margin"
+    cache_bytes = (entry["reserved_gb"] - thewall.manager.estimate_model_vram_gb(thewall.tag)) * GIB
+    assert cache_bytes < THEWALL_FREE_BYTES + THEWALL_ENGINE_CACHE_BYTES
+
+
+def test_an_operator_setting_beyond_the_pool_is_used_but_warned_about(thewall, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(inference_manager, "log_warning", warnings.append)
+    thewall.limits.update(engine_slots=8, engine_context=1_048_576)
+
+    cmd, _entry = _thewall_start(thewall)
+
+    assert _flag(cmd, "-c") == "1048576" and _flag(cmd, "-np") == "8"
+    assert len(warnings) == 1 and "ENGINE_SLOTS" in warnings[0]
+
+
+def test_a_cache_slot_of_131072_tokens_is_the_only_way_to_q4_0(thewall):
+    thewall.limits.update(engine_slots=2, engine_context=262_144)
+    cmd, _entry = _thewall_start(thewall)
+    assert (_flag(cmd, "-ctk"), _flag(cmd, "-ctv")) == ("q4_0", "q4_0")
+
+    thewall.manager.stop_all_models()
+    # 262,144 shared by eight slots used to flip the cache to q4_0 on the total alone
+    thewall.limits.update(engine_slots=0, engine_context=262_144)
+    cmd, _entry = _thewall_start(thewall)
+    assert _flag(cmd, "-np") == "8" and _flag(cmd, "-ctk") == "q8_0"
+
+
+def test_volunteers_gpus_give_the_experts_back_to_the_cards(thewall):
+    """
+    --n-cpu-moe is dropped when the engine runs across volunteers' GPUs
+    (engine_args_without_placement), so those experts are on the cards again and the model
+    is admitted as the heavier thing it then is.
+    """
+    manager = thewall.manager
+    with manager._state_lock:
+        local = manager._evaluate_admission_locked(thewall.tag, 16.0, 12.0, remote=False)
+        remote = manager._evaluate_admission_locked(thewall.tag, 16.0, 12.0, remote=True)
+
+    returned = 5 * 287_309_824 / GIB
+    assert remote[2] - local[2] == pytest.approx(returned)
+
+
+def test_the_host_part_of_a_model_must_fit_the_machines_ram(thewall):
+    """1.7 GiB of embedding and expert blocks live in RAM whatever the cards hold."""
+    manager = thewall.manager
+
+    assert manager.can_admit(thewall.tag, 16.0, 1.0) == (False, "Network Maxed Out")
+    # a pool that reports no RAM at all is not read as "no RAM", as admission has always done
+    assert manager.can_admit(thewall.tag, 16.0, 0.0) == (True, "ok")
+
+
+def test_a_model_spilling_out_of_the_cards_is_charged_its_host_part_too(thewall):
+    """11 GB of cards cannot hold 11.8 GiB of weights: the spillover branch charges everything."""
+    thewall.limits["engine_context"] = 0
+    _cmd, entry = _thewall_start_pool(thewall, vram=11.0, sysram=12.0)
+
+    host_gb = 1_853_726_720 / GIB
+    assert entry["reserved_gb"] > 11_822_996_448 / GIB + inference_manager.RUNTIME_OVERHEAD_GB + host_gb
+
+
+def _thewall_start_pool(env, vram, sysram):
+    ok, _port, message = env.manager.start_model(env.tag, [], vram, sysram)
+    assert ok is True, message
+    return env.spawned[-1].cmd, next(iter(env.manager.running_models.values()))
+
+
+def test_a_model_whose_header_cannot_be_read_is_sized_the_old_way(engine_env, monkeypatch):
+    """Nothing to read means 1.2 x the file, as it always was; the slots still follow the budget."""
+    monkeypatch.setattr(inference_manager.gguf, "model_shape", lambda path: None)
+    engine_env.add_model("unreadable", size_bytes=4 * 1024 * 1024)
+
+    expected = (4 * 1024 * 1024 / GIB) * inference_manager.VRAM_OVERHEAD_FACTOR
+    assert engine_env.manager.estimate_model_vram_gb("unreadable") == pytest.approx(expected)
+    ok, _port, message = engine_env.manager.start_model("unreadable", [], 16.0, 8.0)
+    assert ok is True, message
+    assert 2 <= engine_env.manager.running_models["unreadable.gguf"]["dynamic_slots"] <= 8
+
+
+def test_cpu_moe_layers_reads_the_operators_flag():
+    assert inference_manager.cpu_moe_layers(parse_engine_args(THEWALL_EXTRA_ARGS)) == 5
+    assert inference_manager.cpu_moe_layers(["-ncmoe", "12"]) == 12
+    assert inference_manager.cpu_moe_layers(["--n-cpu-moe", "lots"]) == 0
+    assert inference_manager.cpu_moe_layers(["--n-cpu-moe"]) == 0
+    assert inference_manager.cpu_moe_layers(None) == 0
+    assert inference_manager.cpu_moe_layers(["-ot", "exps=CPU"]) == 0     # patterns are not interpreted

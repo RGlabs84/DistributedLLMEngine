@@ -95,11 +95,42 @@ def test_the_shipped_ladder_is_the_approved_one():
     assert [tiers[i]["min_vram_gb"] for i in approved] == [15, 24, 29, 39]
     assert all(tiers[i]["enabled"] and tiers[i]["blocked"] is None for i in approved)
     assert all(tiers[i]["context"] == 65536 for i in approved)
-    # Everything bigger is a placeholder: off, and saying so.
-    rest = [t for i, t in tiers.items() if i not in approved]
+    # Qwen3-Coder-Next sits above them, pinned but off (see the test below). Everything else bigger is a placeholder:
+    # off, and saying so.
+    rest = [t for i, t in tiers.items() if i not in approved and i != CODER_NEXT["id"]]
     assert len(rest) == 4
     assert all(not t["enabled"] and t["blocked"].startswith("placeholder") for t in rest)
     assert all(len(t["files"]) > 1 for t in rest), "the Flash-Next tiers are split models"
+
+
+# Qwen3-Coder-Next UD-IQ4_XS as pinned by the 2026-10-25 research (unsloth/Qwen3-Coder-Next-GGUF at commit ce09c67b...;
+# size and SHA-256 are the Hugging Face LFS values at that commit). Off until the DLNE coding suite has measured it.
+CODER_NEXT = {
+    "id": "qwen3-coder-next-iq4xs",
+    "min_vram_gb": 49,
+    "context": 65536,
+    "file": "Qwen3-Coder-Next-UD-IQ4_XS.gguf",
+    "url": "https://huggingface.co/unsloth/Qwen3-Coder-Next-GGUF/resolve/ce09c67b53bc8739eef83fe67b2f5d293c270632/Qwen3-Coder-Next-UD-IQ4_XS.gguf",
+    "sha256": "abf56d7fe8a0a99c15d220c13de4aa57b69cfba6ef4c2a007b56e34d7b40cd11",
+    "size": 38429272064,
+}
+
+
+def test_qwen3_coder_next_is_pinned_but_disabled():
+    tiers = release.check_coding_tiers(SHIPPED)
+    ids = [t["id"] for t in tiers]
+    tier = tiers[ids.index(CODER_NEXT["id"])]
+    assert {k: tier[k] for k in CODER_NEXT} == CODER_NEXT
+    assert tier["files"] == [{k: CODER_NEXT[k] for k in ("file", "url", "sha256", "size")}]
+    # on the 48 GB rung: after the Q6_K tier, before the Flash-Next placeholders
+    assert ids.index("qwen36-a3b-q6") + 1 == ids.index(CODER_NEXT["id"]) == ids.index("qwen38-flash-next-q2") - 1
+    assert not tier["enabled"]
+    assert tier["blocked"] and "not measured" in tier["blocked"]
+    # a 49 GB pool is not sent to it while it is off, and still is once someone enables it
+    assert coding_ladder.tier_for_vram(tiers, 60)["id"] == "qwen36-a3b-q6"
+    on = [dict(t, enabled=True, blocked=None) if t["id"] == CODER_NEXT["id"] else t for t in tiers]
+    assert coding_ladder.tier_for_vram(on, 48.9)["id"] == "qwen36-a3b-q6"
+    assert coding_ladder.tier_for_vram(on, 49)["id"] == CODER_NEXT["id"]
 
 
 def test_the_live_tier_is_the_same_file_as_the_phone_pools():
@@ -391,6 +422,9 @@ LADDER = release.check_coding_tiers(SHIPPED)
     (30, True, "qwen36-a3b-q4"),
     (48, True, "qwen36-a3b-q6"),
     (500, True, "qwen36-a3b-q6"),        # the placeholders above are off
+    (49, True, "qwen36-a3b-q6"),         # Qwen3-Coder-Next is pinned at 49 but disabled
+    (49, False, "qwen3-coder-next-iq4xs"),
+    (64.9, False, "qwen3-coder-next-iq4xs"),
     (500, False, "qwen38-flash-next-q5"),
     (70, False, "qwen38-flash-next-q2"),
     (None, True, None),

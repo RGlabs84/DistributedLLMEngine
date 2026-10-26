@@ -80,7 +80,8 @@ async def test_completions_never_stack(engine_reached):
 
 @pytest.mark.anyio
 async def test_no_completion_when_every_engine_slot_is_taken(engine_reached):
-    leases = [lease_manager.acquire(task_type="chat", timeout=60.0) for _ in range(coordinator.FIM_ENGINE_SLOTS)]
+    # As many chats as the engine has slots (the gate follows the engine's real count, never fewer than 2).
+    leases = [lease_manager.acquire(task_type="chat", timeout=60.0) for _ in range(coordinator._fim_engine_slots())]
     try:
         resp = await _complete()
     finally:
@@ -88,6 +89,21 @@ async def test_no_completion_when_every_engine_slot_is_taken(engine_reached):
             lease.release()
     assert _busy(resp)
     assert engine_reached == []
+
+
+@pytest.mark.anyio
+async def test_autocomplete_follows_the_engines_real_slot_count(engine_reached, monkeypatch):
+    """With 6 slots (ENGINE_SLOTS=6 on TheWall), two busy chats leave room for ghost text."""
+    from engine.priority import CodingGate
+    monkeypatch.setattr(coordinator, "coding_gate", CodingGate(slots=6))
+    leases = [lease_manager.acquire(task_type="chat", timeout=60.0) for _ in range(2)]
+    try:
+        assert coordinator._fim_engine_slots() == 6
+        resp = await _complete()
+    finally:
+        for lease in leases:
+            lease.release()
+    assert not _busy(resp)
 
 
 def test_lease_counts_can_be_filtered_by_type():

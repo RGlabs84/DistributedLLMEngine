@@ -48,6 +48,7 @@ class AppMember:
         self._log = None
         self._lock = threading.Lock()
         self._busy = False
+        self._assigned = False          # assign() has been called at least once
         self._stopped = threading.Event()
         # tier id -> (failures in a row, monotonic time before which it is not tried again)
         self._backoff: Dict[str, Tuple[int, float]] = {}
@@ -56,6 +57,22 @@ class AppMember:
     def status(self) -> Dict[str, Any]:
         alive = self.process is not None and self.process.poll() is None
         return {"model": self.serving, "ready": bool(self.ready and alive), "slots": APP_SLOTS}
+
+    def settled(self) -> bool:
+        """
+        True once the member has nothing left to load: it serves, or the coordinator told it to serve nothing, or its
+        model failed and is backing off. False before the first assignment and while it downloads or loads. A machine
+        that also runs a coding model (docs/coding-members.md, "both") waits for this before it loads that one, so
+        the two never read the machine's RAM at the same instant.
+        """
+        with self._lock:
+            if self._busy:
+                return False
+            if self.process is not None and self.process.poll() is None and self.ready:
+                return True
+            if not self._assigned:
+                return False
+            return self.target is None or self._held_back(self.target)
 
     # --------------------------------------------------------------------- control
     def assign(self, tier_id: Optional[str]) -> None:
@@ -66,6 +83,7 @@ class AppMember:
             if self._stopped.is_set():
                 return
             self.target = tier_id
+            self._assigned = True
             if self._busy:
                 return
             alive = self.process is not None and self.process.poll() is None

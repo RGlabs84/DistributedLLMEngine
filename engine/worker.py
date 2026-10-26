@@ -28,6 +28,7 @@ its port, which previously allowed free cluster membership, forged hardware repo
 outright RPC hijacking.
 """
 
+import json
 import re
 import time
 import httpx
@@ -35,14 +36,17 @@ import subprocess
 import threading
 import sys
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 from engine.logger import log_worker, log_error, log_system, log_warning
-from engine.hardware import get_hardware_profile
+from engine.hardware import get_hardware_profile, _hidden_process_kwargs
 from engine.downloader import download_and_extract_engine
 from engine.version import VERSION
 from engine.config import get_base_dir, get_worker_limits
 from engine.authn import sign_heartbeat
 from engine.release import is_older
+from engine.companion import (
+    ALSO_MARKER, COMPANION_SUFFIX, GATE_TIMEOUT_SECONDS, also_cpu_ram_gib, split_cpu_threads,
+)
 
 import secrets
 import atexit
@@ -113,9 +117,48 @@ VERSION_MISMATCH_EXIT_CODE = 75
 CPU_BELOW_MINIMUM_EXIT_CODE = 78
 REFUSAL_MARKER = "DLNE_REFUSAL: "
 
+# The job this machine has, printed for the VS Code extension the way REFUSAL_MARKER is
+# (docs/coding-members.md section 10): "DLNE_ROLE: rpc", "DLNE_ROLE: app" or
+# 'DLNE_ROLE: coding {"model": ..., "tier": ..., "slots": 2, "trust_id": "<32 hex>"}'. One line of compact
+# JSON with names and counts only; the last line printed wins, and a new one follows every change.
+ROLE_MARKER = "DLNE_ROLE: "
+
 # How long a node that is AHEAD of its coordinator waits between heartbeats. The coordinator
 # is probably mid-restart onto the same version; hammering it helps nobody.
 AHEAD_OF_COORDINATOR_RETRY_SECONDS = 30.0
+
+# The roles the coordinator can give a node in a heartbeat answer ("role"): an RPC node (a share
+# of the big pipeline), a CPU pool member (phone app) or a coding member (a whole coding model).
+POOL_ROLES = ("rpc", "coding", "app")
+
+# After a role that could not start, the coordinator asking for it again is ignored for this long.
+ROLE_RETRY_SECONDS = 300.0
+
+
+def _vram_cap_gib(limits: Dict[str, Any]) -> Optional[float]:
+    """The owner's MAX_VRAM_GB as one number of GiB ("24,8" lends 32 in all), or None for no cap."""
+    raw = str(limits.get("max_vram_gb", "-1")).strip()
+    if raw in ("", "-1"):
+        return None
+    try:
+        return sum(float(part.strip()) for part in raw.split(","))
+    except ValueError:
+        return None
+
+
+def _coding_ram_cap_gib(limits: Dict[str, Any]) -> Optional[float]:
+    """
+    The GiB of system RAM the CODING job may use, or None for no cap. CODING_MAX_RAM_GB when config.txt
+    has it (-1 means no cap: the job then counts only the RAM that is free), otherwise MAX_RAM_GB, which an
+    older extension wrote alone. MAX_RAM_GB stays what the GPU's other job (an RPC node) and the phone pool
+    are held to; the extension's default for it is small and was never meant for a whole coding model.
+    """
+    def number(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    coding = limits.get("coding_max_ram_gb")
+    cap = coding if number(coding) else limits.get("max_ram_gb", -1.0)
+    return float(cap) if number(cap) and cap >= 0 else None
 
 
 def _response_detail(response: httpx.Response) -> str:
@@ -166,7 +209,7 @@ def _rpc_server_supports_cache(binary_path: str) -> bool:
     supported = False
     try:
         result = subprocess.run(
-            [binary_path, "--help"], capture_output=True, text=True, timeout=30
+            [binary_path, "--help"], capture_output=True, text=True, timeout=30, **_hidden_process_kwargs()
         )
         # Exit status is not consistent across these tools and both streams are used for
         # usage text depending on the build, so the output is what is trusted.
@@ -207,15 +250,42 @@ def read_rpc_banner(log_path: str, offset: int, process=None, timeout: float = 1
 
 class WorkerNode:
     def __init__(self, coordinator_url: str, rpc_ip: str = "0.0.0.0", rpc_port: int = 50052,
-                 verbose_heartbeats: bool = True, role: str = "worker"):
+                 verbose_heartbeats: bool = True, role: str = "worker", companion_of: str = "",
+                 companion_ram_gb: float = 0.0, companion_threads: int = 0,
+                 companion_gate: Optional[threading.Event] = None):
         self.coordinator_url = coordinator_url
-        self.hardware_profile = get_hardware_profile()
+        # "Both" (engine/companion.py): a companion node is the CPU half of a GPU machine, a second worker
+        # identity in the same process that serves the phone pool with ``companion_ram_gb`` of RAM and
+        # ``companion_threads`` threads. ``companion_gate`` is opened when its model has settled, so the GPU
+        # node's coding model loads after it, not at the same moment. All empty/zero on every ordinary node.
+        self.companion_of = companion_of
+        self.companion_ram_gb = companion_ram_gb
+        self.companion_threads = companion_threads
+        self.companion_gate = companion_gate
+        self._companion_started = time.monotonic()
+        self.hardware_profile = self._probe_hardware()
         self.rpc_process = None
         # The RPC protocol the running ggml-rpc-server announced, e.g. "8.0.1" ("" = unknown).
         self.rpc_proto = ""
         # Set when this node serves the CPU pool (no usable GPU) instead of running an RPC
         # engine: engine/app_member.py.
         self.app_member = None
+        # Set when this node serves the coding pool: a whole coding model on its own GPU,
+        # engine/coding_member.py. At most one of rpc_process, app_member and coding_member runs.
+        self.coding_member = None
+        # The CPU half of a "both" machine (a companion WorkerNode), the gate its model opens, the thread split
+        # between the two jobs and the RAM lent to the phone pool. None / 0 on a node that is not running both.
+        self._companion: Optional["WorkerNode"] = None
+        self._companion_gate: Optional[threading.Event] = None
+        self._thread_split: Optional[Tuple[int, int]] = None
+        self._companion_lent = 0.0
+        self._role_lock = threading.Lock()
+        self._role_busy = False
+        self._role_target: Optional[str] = None
+        self._role_hold: Dict[str, float] = {}
+        self._latest_answer: Dict[str, Any] = {}
+        self._announced = ""        # the last DLNE_ROLE line printed
+        self._coding_refused_logged = False
         self.is_running = False
         self.rpc_ip = rpc_ip
         self.rpc_port = rpc_port
@@ -259,6 +329,31 @@ class WorkerNode:
         from engine.setup_core import get_or_create_worker_id
 
         self.worker_id = get_or_create_worker_id()
+        if self.companion_of:
+            self.worker_id = f"{self.companion_of}{COMPANION_SUFFIX}"
+
+    # ----------------------------------------------------------------------------------
+    # The hardware this node reports
+    # ----------------------------------------------------------------------------------
+
+    def _probe_hardware(self) -> Dict[str, Any]:
+        """The hardware profile of this node. A companion reports the CPU half of the machine only: no GPU, the RAM
+        it lends, its memory bandwidth (a CPU-only node is admitted on it), and ``companion_of``, which is how the
+        coordinator counts the machine once. Every other node reports exactly what the probe found."""
+        profile = get_hardware_profile()
+        if not self.companion_of or not isinstance(profile, dict):
+            return profile
+        from engine.hardware import get_memory_bandwidth_gbs
+
+        profile = dict(profile)
+        profile["gpu"] = {"has_gpu": False, "vram_total_gb": 0, "vram_free_gb": 0, "name": None, "load_percent": 0.0}
+        profile["gpu_type"] = "cpu"
+        profile["ram_gb"] = round(self.companion_ram_gb, 1)
+        profile["companion_of"] = self.companion_of
+        bandwidth = get_memory_bandwidth_gbs()
+        if bandwidth is not None:
+            profile["mem_bandwidth_gbs"] = bandwidth
+        return profile
 
     # ----------------------------------------------------------------------------------
     # Shutdown coordination
@@ -370,7 +465,20 @@ class WorkerNode:
             # flight; the Coordinator routes only to nodes that speak its own major.
             hardware = {**hardware, "rpc_proto": self.rpc_proto}
         app_member = getattr(self, "app_member", None)
-        if isinstance(hardware, dict) and app_member is not None:
+        coding_member = getattr(self, "coding_member", None)
+        if isinstance(hardware, dict):
+            # Whether this machine may be a coding member (the owner allows it, CODING_MEMBER_ALLOWED, and it
+            # has a GPU): the coordinator assigns the job only to nodes that say yes.
+            hardware = {**hardware, "coding_ok": not self._coding_refusal()}
+        if coding_member is not None:
+            # The owner's own load (a game, a render) makes the member stop at once; see CodingMember.set_yielding.
+            set_yielding = getattr(coding_member, "set_yielding", None)
+            if callable(set_yielding):
+                set_yielding(isinstance(hardware, dict) and hardware.get("is_yielding") is True)
+        if isinstance(hardware, dict) and coding_member is not None:
+            # A coding member says so, and what it serves, inside the signed profile.
+            hardware = {**hardware, "pool": "coding", "coding": coding_member.status()}
+        elif isinstance(hardware, dict) and app_member is not None:
             # A CPU pool member says so, and what it serves, inside the signed profile.
             hardware = {**hardware, "pool": "app", "app": app_member.status()}
         # Captured once for the same both-signed-and-sent reason as the profile: the
@@ -422,7 +530,7 @@ class WorkerNode:
         gpu = self.hardware_profile.get("gpu") if isinstance(self.hardware_profile, dict) else None
         return not (isinstance(gpu, dict) and gpu.get("has_gpu"))
 
-    def start_app_member(self) -> bool:
+    def start_app_member(self, keep_port: bool = False) -> bool:
         from engine import release
         from engine.app_member import APP_PORT, AppMember, default_threads
         from engine.downloader import fetch_verified_manifest
@@ -443,12 +551,474 @@ class WorkerNode:
             return cache["tiers"]
 
         threads = int(get_worker_limits().get("app_member_threads", 0)) or default_threads(get_cpu_cores())
-        self.app_member = AppMember(get_base_dir(), tiers, threads=threads)
-        # The heartbeat names this port, and the tunnel carries the coordinator to it.
-        self.rpc_port = APP_PORT
-        log_worker("No usable GPU: this node serves the phone app's CPU pool. "
-                   "The coordinator assigns its model with the first heartbeat.")
+        if self.companion_of and self.companion_threads > 0:
+            threads = self.companion_threads      # its share of the machine's threads, next to the coding model's
+        # The heartbeat names this port, and the tunnel carries the coordinator to it. A node that
+        # joined as something else keeps the port its tunnel already dials.
+        port = self.rpc_port if keep_port else APP_PORT
+        self.app_member = AppMember(get_base_dir(), tiers, threads=threads, port=port)
+        self.rpc_port = port
+        if self.companion_of:
+            log_worker(f"This machine's CPU also serves the phone app's pool, with {self.companion_ram_gb:g} GB of RAM and "
+                       f"{threads} threads, next to its GPU's own job. The coordinator assigns the model with the first heartbeat.")
+        else:
+            log_worker("No usable GPU: this node serves the phone app's CPU pool. "
+                       "The coordinator assigns its model with the first heartbeat.")
         return True
+
+    # ----------------------------------------------------------------------------------
+    # Coding member (a whole coding model on this machine's GPU), engine/coding_member.py
+    # ----------------------------------------------------------------------------------
+
+    def start_coding_member(self) -> bool:
+        """
+        Opens the member proxy on this node's RPC port. The coordinator names the model with a
+        heartbeat answer; nothing is downloaded or started before that. False when the proxy
+        cannot listen (the node then carries on in its previous role).
+        """
+        from engine import release
+        from engine.coding_member import CodingMember
+        from engine.downloader import fetch_verified_manifest
+
+        # llama-server ships in the signed engine zip beside ggml-rpc-server, as for the CPU pool.
+        download_and_extract_engine(
+            "worker", coordinator_url=None if self.role == "hybrid" else self.coordinator_url)
+
+        cache: Dict[str, Any] = {"at": 0.0, "tiers": []}
+
+        def tiers() -> list:
+            # The ladder comes from the coordinator's signed release, re-read at most every ten
+            # minutes; it is what a tier named in a heartbeat answer is checked against.
+            if time.time() - cache["at"] > 600:
+                cache["tiers"] = release.coding_tiers(fetch_verified_manifest(self.coordinator_url.rstrip("/")))
+                cache["at"] = time.time()
+            return cache["tiers"]
+
+        threads = get_worker_limits().get("max_cpu_threads", -1)
+        member = CodingMember(
+            get_base_dir(), tiers, port=self.rpc_port,
+            threads=threads if isinstance(threads, int) and threads > 0 else 0,
+            env_provider=lambda: self._gpu_environment()[0],
+            machine_provider=self._machine_info,
+            limits_provider=get_worker_limits,
+            resources_provider=self._coding_resources,
+            start_gate=self._companion_gate,
+        )
+        if not member.start():
+            return False
+        with self._role_lock:
+            if self._stopped or self._shutdown_event.is_set():
+                member.stop()
+                return False
+            self.coding_member = member
+        log_worker("This node serves the coding pool: a whole coding model on its own GPU. "
+                   "The coordinator assigns the model with a heartbeat answer.")
+        return True
+
+    # Hardware whose GPU shares the CPU's memory: Apple Silicon and AMD Strix Halo (the names engine/hardware.py allows).
+    _UNIFIED_MEMORY = re.compile(r"\bapple\b|radeon(?:\W|tm)*80[456]0s\b|gfx1151|strix[ _]halo|ryzen\W*ai\W*max")
+
+    def _machine_info(self) -> Dict[str, Any]:
+        """
+        What this machine can spare for a coding model, as engine/coding_member_select.py wants it:
+        the GPU's memory, the RAM that is really free right now (not the total), and ``unified`` for
+        a GPU that shares the CPU's memory (then ``ram_gb`` is that one pool). The owner's limits
+        cap both figures, and ``limited`` says that one of them did: MAX_VRAM_GB for the GPU memory, and for
+        the RAM CODING_MAX_RAM_GB (-1: none, the figure is just what is free right now) or, when config.txt
+        lacks it, MAX_RAM_GB. MAX_RAM_GB itself, and what the RPC node and the phone pool report, are not
+        touched by the coding job's cap.
+        """
+        hardware = self.hardware_profile if isinstance(self.hardware_profile, dict) else {}
+        gpu = hardware.get("gpu") if isinstance(hardware.get("gpu"), dict) else {}
+        vram = gpu.get("vram_total_gb", 0)
+        ram = hardware.get("ram_gb", 0)
+        try:
+            import psutil
+            ram = psutil.virtual_memory().available / 2 ** 30
+        except Exception:
+            pass
+        if self._companion_gate is not None and not self._companion_gate.is_set() and isinstance(ram, (int, float)):
+            # "Both": the phone-pool model has not been loaded yet and is about to take its RAM; the coding model
+            # is chosen for what will be left, and measures the real figure again once the pool model has loaded.
+            ram = max(0.0, ram - self._companion_lent)
+        limits = get_worker_limits()
+        limited = False
+        vram_cap = _vram_cap_gib(limits)
+        if vram_cap is not None and isinstance(vram, (int, float)) and vram > vram_cap:
+            vram, limited = vram_cap, True
+        ram_cap = _coding_ram_cap_gib(limits)
+        if ram_cap is not None and isinstance(ram, (int, float)) and ram > ram_cap:
+            ram, limited = ram_cap, True
+        info = {"vram_gb": vram, "ram_gb": ram,
+                "unified": bool(self._UNIFIED_MEMORY.search(str(gpu.get("name") or "").lower()))}
+        if limited:
+            info["limited"] = True
+        return info
+
+    def _coding_resources(self) -> Dict[str, Any]:
+        """
+        The owner's limits as llama-server launch settings, read at every start of the coding model so an
+        edit of config.txt takes effect: MAX_CPU_THREADS caps its threads (0 means one, never "all"),
+        MAX_VRAM_GB becomes ``--fit-target`` margins so ``--fit`` leaves the rest of each card alone, and a
+        coding RAM cap that binds (CODING_MAX_RAM_GB, else MAX_RAM_GB; none by default) shrinks the prompt
+        cache that lives in system memory. The model itself is chosen to fit the capped figures
+        (``_machine_info``).
+        """
+        from engine.coding_member import LIMITED_PROMPT_CACHE_MIB, fit_targets_mib
+
+        limits = get_worker_limits()
+        resources: Dict[str, Any] = {"threads": 0, "extra_args": []}
+        threads = limits.get("max_cpu_threads", -1)
+        if isinstance(threads, int) and not isinstance(threads, bool) and threads >= 0:
+            resources["threads"] = max(1, threads)
+        if self._thread_split is not None:
+            resources["threads"] = self._thread_split[1]      # "both": the threads left after the phone pool's share
+        cap = _vram_cap_gib(limits)
+        if cap is not None:
+            margins = fit_targets_mib(self._gpu_totals_gib(limits), cap)
+            if margins:
+                resources["extra_args"] = ["--fit-target", ",".join(str(m) for m in margins)]
+        ram_cap = _coding_ram_cap_gib(limits)
+        if ram_cap is not None:
+            try:
+                import psutil
+                if ram_cap < psutil.virtual_memory().total / 2 ** 30:
+                    resources["cache_ram_mib"] = LIMITED_PROMPT_CACHE_MIB
+            except Exception:
+                resources["cache_ram_mib"] = LIMITED_PROMPT_CACHE_MIB
+        return resources
+
+    @staticmethod
+    def _gpu_totals_gib(limits: Dict[str, Any]) -> list:
+        """GPU memory per card the coding model may see, in the order llama-server numbers the cards
+        (the owner's ALLOWED_GPU_INDICES, integrated GPUs that engine/hardware.py does not count left out)."""
+        from engine import hardware
+
+        allowed = str(limits.get("allowed_gpu_indices", "-1")).strip()
+        if allowed.lower() == "none":
+            return []
+        cards = list(hardware.get_all_gpus() or [])
+        if allowed != "-1":
+            by_id = {card.get("id"): card for card in cards}
+            cards = [by_id[int(x)] for x in allowed.split(",") if x.strip().isdigit() and int(x) in by_id]
+        cards = [c for c in cards if hardware.counts_as_gpu(c.get("name") or "", c.get("integrated"))]
+        return [c.get("vram_total_gb", 0) for c in cards]
+
+    def _coding_allowed(self) -> bool:
+        """The volunteer's switch (CODING_MEMBER_ALLOWED in config.txt, on by default)."""
+        try:
+            return bool(get_worker_limits().get("coding_member_allowed", True))
+        except Exception:
+            return True
+
+    def _coding_refusal(self) -> str:
+        """Why this node may not be a coding member, or "" when it may: the owner said no, or there is no
+        usable GPU (a CPU-only machine is a phone-pool member; a whole coding model needs a GPU)."""
+        if not self._coding_allowed():
+            return "CODING_MEMBER_ALLOWED is false here"
+        if self._serves_cpu_pool():
+            return "this machine has no usable GPU"
+        return ""
+
+    # ----------------------------------------------------------------------------------
+    # Roles: RPC node, CPU pool member or coding member - never two at once
+    # ----------------------------------------------------------------------------------
+
+    # ----------------------------------------------------------------------------------
+    # "Both": the CPU of a GPU machine also serves the phone pool (engine/companion.py)
+    # ----------------------------------------------------------------------------------
+
+    def _plan_companion(self) -> None:
+        """
+        Whether this GPU node's CPU also serves the phone pool, decided from ALSO_CPU_RAM_GB (the RAM it lends) and
+        MAX_CPU_THREADS. Sets the thread split between the two jobs, the RAM the pool model is about to take and the
+        gate the coding model waits on. Nothing for a node without a GPU (it already is the phone pool's CPU
+        member, "both" acts as "cpu" there), for the coordinator's own hybrid worker, or for a companion.
+        """
+        if self.companion_of or self.role == "hybrid" or self._serves_cpu_pool():
+            return
+        limits = get_worker_limits()
+        lent = also_cpu_ram_gib(limits)
+        if lent is None:
+            return
+        from engine.hardware import get_cpu_cores
+
+        split = split_cpu_threads(limits.get("max_cpu_threads", -1), get_cpu_cores())
+        if split is None:
+            log_worker("MAX_CPU_THREADS leaves fewer than 2 threads, too few for the CPU to serve the phone pool "
+                       "next to the GPU's own job; the GPU does its job alone.")
+            return
+        self._thread_split, self._companion_lent, self._companion_gate = split, lent, threading.Event()
+
+    def _launch_companion(self) -> None:
+        if self._companion_gate is None or self._thread_split is None:
+            return
+        threading.Thread(target=self._run_companion, name="dlne-companion", daemon=True).start()
+
+    def _run_companion(self) -> None:
+        """The companion node, on a thread of its own: the same process, a second worker identity, one job."""
+        gate = self._companion_gate
+        try:
+            companion = WorkerNode(
+                self.coordinator_url, rpc_ip=self.rpc_ip, verbose_heartbeats=False, role="worker",
+                companion_of=self.worker_id, companion_ram_gb=self._companion_lent,
+                companion_threads=self._thread_split[0] if self._thread_split else 0, companion_gate=gate,
+            )
+            with self._role_lock:
+                if self._stopped:
+                    return
+                self._companion = companion
+            companion.start()
+        except Exception as exc:  # noqa: BLE001 - the GPU's own job goes on without it
+            log_error(f"The phone-pool half of this machine stopped: {type(exc).__name__}: {exc}")
+        finally:
+            if gate is not None:
+                gate.set()          # a pool model that will not come must not hold the coding model back
+            if not self._stopped:
+                print(ALSO_MARKER + "none", flush=True)
+
+    def _default_pool(self) -> str:
+        """The role a node starts in: the CPU pool without a usable GPU, otherwise an RPC node."""
+        return "app" if self._serves_cpu_pool() else "rpc"
+
+    def _current_pool(self) -> str:
+        if self.coding_member is not None:
+            return "coding"
+        if self.app_member is not None:
+            return "app"
+        return "rpc"
+
+    def _announce_role(self) -> None:
+        """Print the DLNE_ROLE line for the job this node has now, if it differs from the last one printed.
+        Cheap, so it is called at start, after every role switch and with every heartbeat answer (the
+        model a coding member serves is only known after the coordinator has named a tier)."""
+        if self.companion_of:
+            # A companion is the CPU half of a "both" machine: it says so with its own marker and never touches
+            # DLNE_ROLE, which is the GPU's job.
+            with self._role_lock:
+                if self._announced:
+                    return
+                self._announced = ALSO_MARKER + "app"
+            print(self._announced, flush=True)
+            return
+        pool = self._current_pool()
+        detail: Dict[str, Any] = {}
+        if pool == "coding":
+            reporter = getattr(self.coding_member, "role_detail", None)
+            detail = reporter() if callable(reporter) else {}
+        line = ROLE_MARKER + pool
+        if detail:
+            line += " " + json.dumps(detail, separators=(",", ":"))      # ASCII only, one line
+        with self._role_lock:
+            if line == self._announced:
+                return
+            self._announced = line
+        print(line, flush=True)
+
+    def _follow_assignment(self, answer: Any) -> None:
+        """
+        What a heartbeat answer asks of this node. ``role`` ("rpc", "coding", "app" or null for
+        "stay as you are") switches the node over in the background; ``coding_tier`` and
+        ``app_model`` tell the running member which model to serve.
+        """
+        if not isinstance(answer, dict):
+            return
+        self._latest_answer = answer
+        if self.companion_of:
+            # The CPU half of a "both" machine has one job, the phone pool's: it takes its model and nothing else
+            # (the GPU node's role is the GPU node's business), and tells the GPU node's coding model when it is up.
+            if self.app_member is not None:
+                self.app_member.assign(answer.get("app_model"))
+                if self.companion_gate is not None and not self.companion_gate.is_set() and (
+                        self.app_member.settled() or time.monotonic() - self._companion_started > GATE_TIMEOUT_SECONDS):
+                    self.companion_gate.set()
+            return
+        role = answer.get("role")
+        refusal = self._coding_refusal()
+        if refusal:
+            # The owner has switched coding off, or this machine has no GPU to lend: the job is refused quietly
+            # (no hold-off, nothing to retry) and a node that already has it goes back to the role it would
+            # start in.
+            if role == "coding":
+                role = None
+                if not self._coding_refused_logged:
+                    self._coding_refused_logged = True
+                    log_worker(f"The coordinator offered the coding job, but {refusal}; ignored.")
+            if self.coding_member is not None and self.role != "hybrid":
+                self._switch_role(self._default_pool())
+        else:
+            self._coding_refused_logged = False
+        if (role in POOL_ROLES and self.role != "hybrid" and role != self._current_pool()
+                and time.monotonic() >= self._role_hold.get(role, 0.0)):
+            self._switch_role(role)
+        # A coding tier moves the member; an answer without one ("no assignment", which a coordinator that
+        # has just restarted sends for a while) leaves it serving what it serves. Stopping a coding member is
+        # a role change.
+        tier = answer.get("coding_tier")
+        if self.coding_member is not None and tier is not None:
+            self.coding_member.assign(tier)
+        if self.app_member is not None:
+            self.app_member.assign(answer.get("app_model"))
+
+    def _switch_role(self, target: str) -> None:
+        with self._role_lock:
+            self._role_target = target
+            if self._role_busy or self._stopped:
+                return
+            self._role_busy = True
+        threading.Thread(target=self._role_worker, name="dlne-role-switch", daemon=True).start()
+
+    def _role_worker(self) -> None:
+        try:
+            while not self._shutdown_event.is_set():
+                with self._role_lock:
+                    target = self._role_target
+                if target is None or target == self._current_pool() or time.monotonic() < self._role_hold.get(target, 0.0):
+                    return
+                self._become(target)
+        except Exception as exc:  # noqa: BLE001 - a role switch must never take the heartbeat down with it
+            log_error(f"Switching roles failed: {type(exc).__name__}: {exc}")
+        finally:
+            with self._role_lock:
+                self._role_busy = False
+
+    def _become(self, target: str) -> None:
+        """
+        Stop the role this node has and start ``target``, as the coordinator asked. The old role
+        is stopped before the new one starts (they share this node's RPC port and its GPU), so the
+        two never overlap. A target that cannot start is not tried again for ROLE_RETRY_SECONDS,
+        and the node falls back to the role it would have started in.
+        """
+        previous = self._current_pool()
+        log_worker(f"The coordinator asked this node to serve as '{target}' instead of '{previous}'.")
+        old_coding, old_app = self.coding_member, self.app_member
+        try:
+            if old_coding is not None:
+                old_coding.stop()
+            elif old_app is not None:
+                old_app.stop()
+            else:
+                self._stop_rpc_server()
+        except Exception as exc:  # noqa: BLE001 - the new role is started regardless
+            log_error(f"Error stopping the '{previous}' role: {type(exc).__name__}: {exc}")
+        started = False
+        try:
+            if target == "coding":
+                started = self.start_coding_member()
+            elif target == "app":
+                started = self.start_app_member(keep_port=True)
+            else:
+                started = self.start_rpc_server()
+        except Exception as exc:  # noqa: BLE001 - treated like any other failed start
+            log_error(f"Could not start the '{target}' role: {type(exc).__name__}: {exc}")
+        if started:
+            # The old member stayed referenced (stopped, reporting "not ready") until now, so the
+            # heartbeats in between kept naming the old role instead of showing a gap.
+            with self._role_lock:
+                if target != "coding":
+                    self.coding_member = None
+                if target != "app":
+                    self.app_member = None
+                gone = self._stopped
+            if gone:
+                # stop() ran while this switch was starting the new role: nothing may outlive it.
+                for member in (self.coding_member, self.app_member):
+                    if member is not None:
+                        member.stop()
+                self._stop_rpc_server()
+                return
+            self._announce_role()
+            if self._latest_answer:
+                self._follow_assignment(self._latest_answer)
+            return
+        self._role_hold[target] = time.monotonic() + ROLE_RETRY_SECONDS
+        log_error(f"The '{target}' role could not start; this node goes back to '{self._default_pool()}'.")
+        with self._role_lock:
+            self.coding_member = self.app_member = None
+        fallback = self._default_pool()
+        ok = False
+        if fallback != target:
+            try:
+                ok = self.start_app_member(keep_port=True) if fallback == "app" else self.start_rpc_server()
+            except Exception as exc:  # noqa: BLE001
+                log_error(f"Could not start the '{fallback}' role: {type(exc).__name__}: {exc}")
+        if ok:
+            self._announce_role()
+        elif not self._shutdown_event.is_set():
+            self.request_shutdown(FATAL_EXIT_CODE, f"no engine could be started after leaving the '{previous}' role")
+
+    def _stop_rpc_server(self) -> None:
+        """Stops ggml-rpc-server for a role change (the node keeps heartbeating)."""
+        # The reference is cleared first: the heartbeat loop treats an exited rpc_process it still
+        # holds as a crash, and a deliberate stop must not look like one.
+        process, self.rpc_process = self.rpc_process, None
+        self.rpc_proto = ""
+        if process is not None:
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            except Exception as e:
+                log_error(f"Error terminating RPC process: {e}")
+        log_file, self.rpc_log_file = getattr(self, "rpc_log_file", None), None
+        if log_file:
+            try:
+                log_file.close()
+            except Exception:
+                pass
+
+    def _gpu_environment(self) -> Tuple[Dict[str, str], str]:
+        """
+        The environment for a process that uses this node's GPU, and the ``allowed_gpu_indices``
+        limit it was built from ("-1" for no limit, "none" for CPU only). Applies the owner's GPU
+        limit, and keeps Vulkan off an integrated GPU when a discrete one is present.
+        """
+        # Inject GPU isolation environment variables
+        env = os.environ.copy()
+        allowed_gpu = get_worker_limits().get('allowed_gpu_indices', '-1').lower()
+        if allowed_gpu != '-1' and allowed_gpu != 'none':
+            env['CUDA_VISIBLE_DEVICES'] = str(allowed_gpu)
+            env['GGML_VK_VISIBLE_DEVICES'] = str(allowed_gpu)
+            log_worker(f"Hardware Isolated to GPU ID(s): {allowed_gpu}")
+        elif allowed_gpu == 'none':
+            env['CUDA_VISIBLE_DEVICES'] = ""
+            env['GGML_VK_VISIBLE_DEVICES'] = ""
+            log_worker("Hardware Isolated to CPU Only.")
+        elif 'GGML_VK_VISIBLE_DEVICES' not in env:
+            # On hybrid iGPU + dGPU systems (e.g. AMD Radeon 880M iGPU + NVIDIA RTX 5070 dGPU),
+            # automatically isolate Vulkan to discrete GPU(s) so the 0.5 GB iGPU is not bound.
+            try:
+                vk_res = subprocess.run(
+                    ["vulkaninfo", "--summary"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    **_hidden_process_kwargs()
+                )
+                if vk_res.returncode == 0:
+                    discrete_indices = []
+                    integrated_indices = []
+                    current_idx = None
+                    for line in vk_res.stdout.splitlines():
+                        s = line.strip()
+                        if s.startswith("GPU") and s.endswith(":"):
+                            num = s[3:-1]
+                            if num.isdigit():
+                                current_idx = int(num)
+                        elif s.startswith("deviceType") and "=" in s and current_idx is not None:
+                            dtype = s.split("=", 1)[1].strip()
+                            if "DISCRETE_GPU" in dtype:
+                                discrete_indices.append(str(current_idx))
+                            elif "INTEGRATED_GPU" in dtype:
+                                integrated_indices.append(str(current_idx))
+                    if discrete_indices and integrated_indices:
+                        vk_devs = ",".join(discrete_indices)
+                        env['GGML_VK_VISIBLE_DEVICES'] = vk_devs
+                        log_worker(f"Auto-isolated discrete Vulkan GPU index(es): {vk_devs} (ignoring integrated GPU {','.join(integrated_indices)})")
+            except Exception:
+                pass
+        return env, allowed_gpu
 
     def start_rpc_server(self) -> bool:
         """
@@ -473,49 +1043,7 @@ class WorkerNode:
 
         log_worker(f"Starting RPC Server on {self.rpc_ip}:{self.rpc_port}...")
 
-        # Inject GPU isolation environment variables
-        env = os.environ.copy()
-        allowed_gpu = get_worker_limits().get('allowed_gpu_indices', '-1').lower()
-        if allowed_gpu != '-1' and allowed_gpu != 'none':
-            env['CUDA_VISIBLE_DEVICES'] = str(allowed_gpu)
-            env['GGML_VK_VISIBLE_DEVICES'] = str(allowed_gpu)
-            log_worker(f"Hardware Isolated to GPU ID(s): {allowed_gpu}")
-        elif allowed_gpu == 'none':
-            env['CUDA_VISIBLE_DEVICES'] = ""
-            env['GGML_VK_VISIBLE_DEVICES'] = ""
-            log_worker("Hardware Isolated to CPU Only.")
-        elif 'GGML_VK_VISIBLE_DEVICES' not in env:
-            # On hybrid iGPU + dGPU systems (e.g. AMD Radeon 880M iGPU + NVIDIA RTX 5070 dGPU),
-            # automatically isolate Vulkan to discrete GPU(s) so the 0.5 GB iGPU is not bound.
-            try:
-                vk_res = subprocess.run(
-                    ["vulkaninfo", "--summary"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if vk_res.returncode == 0:
-                    discrete_indices = []
-                    integrated_indices = []
-                    current_idx = None
-                    for line in vk_res.stdout.splitlines():
-                        s = line.strip()
-                        if s.startswith("GPU") and s.endswith(":"):
-                            num = s[3:-1]
-                            if num.isdigit():
-                                current_idx = int(num)
-                        elif s.startswith("deviceType") and "=" in s and current_idx is not None:
-                            dtype = s.split("=", 1)[1].strip()
-                            if "DISCRETE_GPU" in dtype:
-                                discrete_indices.append(str(current_idx))
-                            elif "INTEGRATED_GPU" in dtype:
-                                integrated_indices.append(str(current_idx))
-                    if discrete_indices and integrated_indices:
-                        vk_devs = ",".join(discrete_indices)
-                        env['GGML_VK_VISIBLE_DEVICES'] = vk_devs
-                        log_worker(f"Auto-isolated discrete Vulkan GPU index(es): {vk_devs} (ignoring integrated GPU {','.join(integrated_indices)})")
-            except Exception:
-                pass
+        env, allowed_gpu = self._gpu_environment()
 
         # THE TENSOR CACHE IS WHAT MAKES A REMOTE NODE PRACTICAL.
         #
@@ -561,7 +1089,8 @@ class WorkerNode:
                 [binary_path, "--host", self.rpc_ip, "--port", str(self.rpc_port)] + cache_args + device_args,
                 stdout=self.rpc_log_file,
                 stderr=subprocess.STDOUT,
-                env=env
+                env=env,
+                **_hidden_process_kwargs()
             )
             log_worker("RPC Server started successfully.")
             self.rpc_proto = read_rpc_banner(log_path, banner_offset, self.rpc_process)
@@ -605,12 +1134,15 @@ class WorkerNode:
                         token_rotated = True
 
                     # Refresh hardware profile to check for yielding (Gaming Mode)
-                    self.hardware_profile = get_hardware_profile()
+                    self.hardware_profile = self._probe_hardware()
 
                     # Check if RPC server crashed! Done before building the payload so a
                     # dead engine is never announced to the cluster as available capacity.
-                    if self.rpc_process and self.rpc_process.poll() is not None:
-                        err_code = self.rpc_process.returncode
+                    # A role change clears self.rpc_process before it stops the process, so an
+                    # engine stopped on purpose is never mistaken for a crash.
+                    rpc_process = self.rpc_process
+                    if rpc_process and rpc_process.poll() is not None and self.rpc_process is rpc_process:
+                        err_code = rpc_process.returncode
                         log_error(f"CRITICAL: Engine subprocess crashed unexpectedly with error code {err_code}!")
                         log_error("CRITICAL: This node cannot continue processing. Stopping worker...")
                         # A crashed engine must never report success to a supervisor, so a
@@ -632,16 +1164,18 @@ class WorkerNode:
                         # 5-second socket connection timeout and 10-second read timeout to handle network drops
                         response = httpx.post(f"{safe_url}/worker/heartbeat", json=payload, timeout=httpx.Timeout(10.0, connect=5.0))
                         response.raise_for_status()
-                        if token_rotated:
+                        if token_rotated and not self.companion_of:
+                            # (A companion has tokens of its own for its own tunnel; the file the editor reads to
+                            # prove "I contribute" is the GPU node's.)
                             _write_token_to_disk(self.access_token)
-                        if self.app_member is not None:
-                            # The coordinator says which model tier this member serves.
-                            try:
-                                answer = response.json()
-                            except ValueError:
-                                answer = {}
-                            if isinstance(answer, dict):
-                                self.app_member.assign(answer.get("app_model"))
+                        # The coordinator says which role this node plays and, for a pool member,
+                        # which model it serves.
+                        try:
+                            answer = response.json()
+                        except ValueError:
+                            answer = {}
+                        self._follow_assignment(answer)
+                        self._announce_role()
                         if self.verbose_heartbeats:
                             log_worker(f"Heartbeat OK | Status: {status_msg}")
 
@@ -690,8 +1224,11 @@ class WorkerNode:
                             # Below the swarm's floor for CPU-only nodes. The hardware will not
                             # change between heartbeats, so stop and say exactly what is missing.
                             reason = _response_detail(e.response) or "this machine is below the swarm's minimum for CPU-only nodes"
-                            log_error(f"The coordinator will not admit this machine: {reason}")
-                            print(f"{REFUSAL_MARKER}{reason}", flush=True)
+                            log_error(f"The coordinator will not admit this machine{' as a phone-pool member' if self.companion_of else ''}: {reason}")
+                            if not self.companion_of:
+                                # (The editor shows this to the owner and stops; a companion's refusal ends the
+                                # companion only, and the GPU keeps working.)
+                                print(f"{REFUSAL_MARKER}{reason}", flush=True)
                             self.request_shutdown(CPU_BELOW_MINIMUM_EXIT_CODE, "below the minimum for CPU-only nodes")
                             return
                         else:
@@ -715,6 +1252,29 @@ class WorkerNode:
     # Lifecycle
     # ----------------------------------------------------------------------------------
 
+    def _stop_on_termination_signal(self) -> None:
+        """
+        Turn SIGTERM (what the editor and ``kill`` send on macOS and Linux) and SIGBREAK (Ctrl+Break on
+        Windows) into the ordinary shutdown. Python's default for SIGTERM is to die on the spot, running
+        no atexit hook and no ``finally``, which left a coding member's llama-server running with the
+        owner's memory after "Stop contributing". Only the main thread may install a handler; a node
+        that runs on a background thread (hybrid, redundancy) leaves the signals to its host.
+        """
+        if threading.current_thread() is not threading.main_thread():
+            return
+        import signal
+
+        def handler(signum, frame) -> None:
+            self.request_shutdown(0, "terminated")
+
+        for name in ("SIGTERM", "SIGBREAK"):
+            number = getattr(signal, name, None)
+            if number is not None:
+                try:
+                    signal.signal(number, handler)
+                except (ValueError, OSError):
+                    pass
+
     def start(self):
         """
         Boots the node and blocks until it shuts down.
@@ -726,6 +1286,7 @@ class WorkerNode:
         worker component.
         """
         self.is_running = True
+        self._stop_on_termination_signal()
 
         started = self.start_app_member() if self._serves_cpu_pool() else self.start_rpc_server()
         if not started:
@@ -737,6 +1298,13 @@ class WorkerNode:
             # printed once during startup, next to the rest of the boot output, rather than
             # five seconds later in the middle of the heartbeat stream.
             self._get_network_key()
+
+            # Tell the extension what this machine's job is (the coordinator may change it later).
+            self._announce_role()
+
+            # "Both": decided before the first heartbeat, so the coding model's thread share, its RAM figure and
+            # its gate are in place whenever the coordinator assigns the job.
+            self._plan_companion()
 
             # Start heartbeat in a background thread
             heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True, name="dlne-worker-heartbeat")
@@ -757,6 +1325,8 @@ class WorkerNode:
                     pass
 
             log_worker("Worker Node initialized and broadcasting to network.")
+
+            self._launch_companion()
 
         try:
             # Wait on the shutdown Event rather than sleeping forever. The heartbeat thread
@@ -793,6 +1363,23 @@ class WorkerNode:
             self._stopped = True
 
         log_worker("Shutting down Worker Node...")
+        # Under the role lock so a role switch in flight either shows up here or sees _stopped
+        # (set above) and stops the member it just made.
+        with self._role_lock:
+            self._role_target = None
+            coding_member = self.coding_member
+            companion = self._companion
+        if companion is not None:
+            try:
+                companion.request_shutdown(0, "the GPU node of this machine stopped")
+                companion.stop()
+            except Exception as e:
+                log_error(f"Error stopping the phone-pool half of this machine: {e}")
+        if coding_member is not None:
+            try:
+                coding_member.stop()
+            except Exception as e:
+                log_error(f"Error stopping the coding member: {e}")
         if self.app_member is not None:
             try:
                 self.app_member.stop()

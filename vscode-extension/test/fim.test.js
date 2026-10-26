@@ -41,12 +41,34 @@ const token = () => {
 
 // --- the prompt -----------------------------------------------------------------------------
 
-test('the prefix is the last 50 lines and the suffix the next 10', () => {
+test('the prefix is 50 to 57 lines (its first line moves in blocks of 8) and the suffix the next 10', () => {
   const text = Array.from({ length: 200 }, (_, i) => `line ${i}`).join('\n');
   const { prefix, suffix } = buildFimContext(doc(text), pos(100, 0));
-  assert.equal(prefix.split('\n')[0], 'line 50');
-  assert.equal(prefix.split('\n').length, 51);
+  assert.equal(prefix.split('\n')[0], 'line 48');
+  assert.equal(prefix.split('\n').length, 53);
   assert.equal(suffix.split('\n').pop(), 'line 110');
+});
+
+test('the front of the prompt holds still while lines are typed, so the model can reuse what it read', () => {
+  const text = Array.from({ length: 300 }, (_, i) => `line ${i}`).join('\n');
+  const firstLine = (line) => buildFimContext(doc(text), pos(line, 0)).prefix.split('\n')[0];
+  const firsts = new Set();
+  for (let line = 202; line < 210; line++) firsts.add(firstLine(line));
+  assert.equal(firsts.size, 1);                                    // eight lines typed, one front (50..57 lines above the cursor)
+  assert.notEqual(firstLine(202), firstLine(218));                 // it does move, in steps of 8
+  for (let line = 120; line < 220; line++) {
+    const n = buildFimContext(doc(text), pos(line, 0)).prefix.split('\n').length - 1;
+    assert.ok(n >= 50 && n < 58, `line ${line} sends ${n} lines above the cursor`);
+  }
+});
+
+test('over the character budget whole blocks are dropped from the top, so the front still moves in steps', () => {
+  const fat = Array.from({ length: 300 }, (_, i) => `${'x'.repeat(150)} ${String(i).padStart(3, '0')}`).join('\n');
+  const first = (line) => buildFimContext(doc(fat), pos(line, 154)).prefix.split('\n')[0].slice(-3);
+  const fronts = new Set();
+  for (let line = 200; line < 208; line++) fronts.add(first(line));
+  assert.ok(fronts.size <= 2, `${[...fronts]}`);
+  assert.ok(buildFimContext(doc(fat), pos(207, 154)).prefix.length <= 4000);
 });
 
 test('very long lines are capped by characters too', () => {

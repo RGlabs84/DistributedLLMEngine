@@ -30,7 +30,8 @@ import socket
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from collections import deque
+from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Set, Tuple
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -64,13 +65,26 @@ from engine.inference_manager import (
 from engine.logger import log_coordinator, log_error, log_warning
 from engine.registry import WorkerRegistry, is_app_member, safe_log_text
 from engine.app_pool import LocalAppServer, app_pool
-from engine.downloader import download_and_extract_engine
+from engine import coding_router as coding_members_lib
+from engine.coding_router import coding_router
+from engine.downloader import download_and_extract_engine, download_verified
 from engine.version import VERSION
 from engine import release as release_lib
 from engine import coding_ladder, coding_speed
 from engine.lease import lease_manager, InferenceLease
 from engine.priority import UsageWindow, coding_gate, cpu_coding_window, tier_priority
 from engine.api_keys import api_key_manager, hash_admin_key
+from engine import canary
+from engine.auto_swap import (
+    AutoSwapController,
+    LinkProbe,
+    SwapResult,
+    downloadable,
+    file_is_pinned,
+    rtt_is_near,
+    split_pool_by_distance,
+    tier_files,
+)
 
 # The rich-backed helpers in engine.logger deliberately expose no debug level, because
 # everything they emit is meant for an operator watching the console. The update checker
@@ -405,6 +419,9 @@ CPU_REFUSAL_VALUE = "cpu-minimum"
 
 def get_request_token(request: Request | WebSocket) -> str:
     """Extracts the node token from an Authorization header or the ``token`` query param."""
+    if isinstance(request, WebSocket):
+        # HTTP requests are checked for a decoy key once, in NonContribBlockerMiddleware.
+        canary.check_request(request.headers, request.query_params, lambda: get_client_ip(request))
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         return auth.replace("Bearer ", "").strip()
@@ -563,7 +580,7 @@ def use_starter_quota(request: Request, client_id: str, limit: int) -> Tuple[boo
     would burn the whole trial in minutes. It is let through while the trial still has chat
     requests left but is never charged; only chat requests spend the quota.
     """
-    if request.url.path.startswith("/v1/completions"):
+    if request.url.path.startswith(("/v1/completions", "/v1/coding/")):
         allowed, _used, remaining = starter_quota_mgr.peek(client_id, limit=limit)
     else:
         allowed, _used, remaining = starter_quota_mgr.check_and_consume(client_id, limit=limit)
@@ -577,8 +594,14 @@ class NonContribBlockerMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
+        # Canary tripwire: a decoy key flags the member it was given to, and the request is
+        # then handled like any other invalid key (engine/canary.py).
+        canary.check_request(request.headers, request.query_params, lambda: get_client_ip(request))
         is_cluster_control = path.startswith("/v1/cluster/swap")
-        if path.startswith("/v1/chat") or path.startswith("/v1/completions") or is_cluster_control:
+        # /v1/coding/ (route lookups for coding members) is gated like the requests it precedes,
+        # but never charged: use_starter_quota only looks.
+        if (path.startswith("/v1/chat") or path.startswith("/v1/completions") or path.startswith("/v1/coding/")
+                or is_cluster_control):
             client_ip = get_client_ip(request)
             client_token = get_request_token(request)
             # Every request that reaches the coding engine carries its tier, which decides
@@ -677,6 +700,19 @@ async def root():
 
 # The phone chat at /chat (engine/chat_page.py): an installable page over the CPU pool.
 app.include_router(chat_router)
+
+
+@app.api_route("/c/{token}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+               include_in_schema=False)
+async def canary_link(token: str, request: Request):
+    """
+    A canary link (engine/canary.py): the address inside a decoy coding request. Opening it flags
+    the coding member that was sent it. It answers exactly as an address that does not exist does
+    (same status and body, for every method and every token), so the visit tells the visitor
+    nothing, and it is never linked from anywhere a real user would go.
+    """
+    canary.fetched(token, lambda: get_client_ip(request))
+    raise HTTPException(status_code=404, detail="Not Found")
 
 
 # ======================================================================================
@@ -1253,11 +1289,17 @@ async def worker_heartbeat(request: Request, payload: HeartbeatPayload):
     )
 
     # A CPU pool member is told which model tier to serve (engine/app_pool.py).
+    answer: Dict[str, Any] = {"status": "ok"}
     if is_app_member(payload.hardware):
         tier = app_pool.assignment(_as_number(payload.hardware.get("ram_gb", 0)), _app_members(),
                                    int(get_worker_limits().get("app_tier_min_members", 2)))
-        return {"status": "ok", "app_model": tier}
-    return {"status": "ok"}
+        answer = {"status": "ok", "app_model": tier}
+
+    # With coding members on, every worker is also told what to be (engine/coding_router.assign_role).
+    # Off, the answer is exactly what it always was.
+    if get_worker_limits().get("coding_members_enabled", False):
+        answer.update(_coding_role_answer(payload.worker_id, client_ip, payload.port, payload.hardware))
+    return answer
 
 
 def check_contrib_clause(request: Request):
@@ -1684,6 +1726,24 @@ async def admin_quota_reset(request: Request):
     return {"status": "reset", "clients_reset": removed}
 
 
+@app.get("/v1/admin/canaries")
+async def admin_canaries(request: Request):
+    """Coding members flagged by a canary (a decoy key or link was used), the latest detections,
+    and how many decoys have been sent. See engine/canary.py."""
+    _require_admin(request)
+    return canary.admin_view()
+
+
+@app.delete("/v1/admin/canaries/{trust_id}")
+async def admin_canary_clear(trust_id: str, request: Request):
+    """Clear a flagged member (by its trust id, as listed above) after the operator has looked into
+    it; it may receive traffic again."""
+    _require_admin(request)
+    if not canary.book().unflag(trust_id):
+        raise HTTPException(status_code=404, detail="That member is not flagged.")
+    return {"status": "cleared", "trust_id": trust_id}
+
+
 @app.post("/v1/admin/benchmark")
 async def admin_benchmark(request: Request):
     """
@@ -1870,9 +1930,20 @@ async def engine_client():
         _engine_http = (loop, httpx.AsyncClient(limits=httpx.Limits(keepalive_expiry=2.0)))
     yield _engine_http[1]
 
-# Request slots llama-server is started with for ordinary traffic (the queue_channels=2 every
-# chat and completion path passes to astart_model). Autocomplete only runs while one is free.
+# Request slots llama-server is started with for ordinary traffic, used before the engine has reported
+# its own count. Autocomplete only runs while one is free; once a chat has sized the gate to the engine's
+# real slots (ENGINE_SLOTS, or as many as fit), it follows that instead (_fim_engine_slots).
 FIM_ENGINE_SLOTS = 2
+
+
+def _fim_engine_slots() -> int:
+    """The engine's request slots as the coding gate knows them, never fewer than FIM_ENGINE_SLOTS."""
+    return max(FIM_ENGINE_SLOTS, int(coding_gate.stats().get("slots") or 0))
+
+# Ghost text on the hybrid coding model: a prefix-only warm-up goes ahead of each fill-in-the-middle
+# completion (engine/fim_warm.py; coding members do the same on their own engine).
+from engine.fim_warm import fim_warm_body  # noqa: E402 - kept beside the autocomplete settings it serves
+
 
 # Bound at import, deliberately: the test-suite replaces ``coordinator.httpx`` wholesale with
 # a stub namespace, and an ``except httpx.ReadTimeout`` resolved at raise-time against that
@@ -1967,58 +2038,12 @@ async def _probe_engine_port(port: int) -> bool:
         return False
 
 
-async def recalculate_engine_queue(model_path: str):
-    """Reboots the engine with more parallel slots after a sustained traffic spike."""
-    global is_recalculating_queue
-    global cluster_status
-
-    if is_recalculating_queue:
-        return
-
-    is_recalculating_queue = True
-    try:
-        cluster_status = "Recalculating Queue..."
-        await broadcast({
-            "type": "cluster_stats",
-            "status": cluster_status,
-            "vram": registry.get_total_vram_gb(),
-            "sysram": registry.get_total_sysram_gb(),
-            "nodes": registry.count()
-        })
-
-        log_coordinator("Viral traffic spike detected (>12 requests). Pausing to recalculate engine queue...")
-
-        # Wait for active streams to finish (down to the currently processing 2 or less, or a strict timeout)
-        timeout = 30
-        while active_inference_requests > 2 and timeout > 0:
-            await asyncio.sleep(1)
-            timeout -= 1
-
-        await manager.astop_all_models()
-
-        # Reboot with 6 lanes for high-throughput mode
-        active_endpoints = registry.get_active_rpc_endpoints()
-        await manager.astart_model(
-            model_path,
-            active_endpoints,
-            registry.get_total_vram_gb(),
-            registry.get_total_sysram_gb(),
-            queue_channels=6
-        )
-
-        cluster_status = "Online"
-    finally:
-        # Always clear the flag: chat_completions parks every incoming request in a wait
-        # loop while this is set, so leaking it on an exception would freeze the cluster.
-        is_recalculating_queue = False
-
-    await broadcast({
-        "type": "cluster_stats",
-        "status": cluster_status,
-        "vram": registry.get_total_vram_gb(),
-        "sysram": registry.get_total_sysram_gb(),
-        "nodes": registry.count()
-    })
+# The "viral traffic" reboot (more than 12 requests in flight -> stop the engine, start it again with 6 slots)
+# was removed in 2.4. The engine sizes its slots from the model's real KV cost when it starts (ENGINE_SLOTS, or
+# as many 32,768-token slots as fit); a reboot could only repeat that count or, with ENGINE_CONTEXT fixed, split
+# the same context over more slots (6 over 65,536 is 10.9K each), and it parked every request while it ran
+# (load test: 4 reboots in 100 s with 20 agents, the engine down or booting for 60 of them). Waiting requests
+# queue in coding_gate instead. is_recalculating_queue stays, always False, for the code that waits on it.
 
 
 # Recognises a model's function-call output, in the two shapes the catalog's model families
@@ -2079,9 +2104,57 @@ async def chat_completions(request: Request):
     """
     OpenAI API proxy endpoint.
     Starts the model with active RPC workers and proxies the stream.
+
+    A coding member answers a SEALED request (``X-DLNE-Route`` and a ``dlne_e2e`` body) when members
+    are on (engine/coding_router.py): a member-served request holds none of the local engine's
+    resources, waits for none of its swaps and does not count towards its load. Every plain request is
+    this coordinator's own engine's to answer: a member is never sent a body in the clear.
+
+    A STREAMED request from the DLNE extension (it sends ``X-DLNE-Session``) takes its engine slot
+    here, so that one that has to wait can say so: it is answered at once with
+    ``data: {"dlne_queue": {...}}`` frames showing its place in line, then the model's chunks
+    (docs/coding-members.md section 10; :class:`_QueuedChat`). Every other caller waits silently, as
+    it always has: a generic OpenAI client would read a chunk without ``choices`` as a broken
+    answer, and a 200 sent before the engine is ready would turn its errors into model text.
+    """
+    members_on = bool(get_worker_limits().get("coding_members_enabled", False))
+    streamed = False
+    try:
+        body = await request.json()
+        streamed = isinstance(body, dict) and body.get("stream") is True
+    except Exception:  # noqa: BLE001 - the handler reports a body that is not JSON
+        body = None
+
+    if members_on:
+        routed = await _route_to_member(request, "/v1/chat/completions")
+        if routed is not None:
+            return routed
+    if not streamed or not request.headers.get("x-dlne-session"):
+        return await _chat_completions_impl(request)
+    if coding_gate.try_acquire():
+        return await _chat_completions_impl(request, slot_held=True)
+    queued = _QueuedChat(request, body, get_worker_limits())
+    return StreamingResponse(queued.stream(), media_type="text/event-stream", background=BackgroundTask(queued.cleanup),
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+async def _chat_completions_impl(request: Request, slot_held: bool = False):
+    """
+    The local engine's answer to a chat request. ``slot_held`` means the caller already waited for
+    one of the engine's request slots and passes it on: this request releases it, with everything
+    else it holds, however it ends.
     """
     global is_swapping_models
     global is_recalculating_queue
+
+    if slot_held:
+        # Cancelled while a swap is under way, before release_slot exists to give the slot back.
+        try:
+            while is_swapping_models or is_recalculating_queue:
+                await asyncio.sleep(1)
+        except BaseException:
+            coding_gate.release()
+            raise
 
     while is_swapping_models or is_recalculating_queue:
         await asyncio.sleep(1)
@@ -2097,7 +2170,8 @@ async def chat_completions(request: Request):
 
     slot_released = False   # release_slot() is idempotent: at most one decrement per request
     slot_handed_off = False  # True once a StreamingResponse owns the release
-    gate_held = False        # True while this request holds an engine slot (coding_gate)
+    gate_held = slot_held    # True while this request holds an engine slot (coding_gate)
+    gate_since = time.monotonic()    # when it took it (for the wait estimate, _coding_eta)
 
     async def release_slot() -> None:
         """
@@ -2116,6 +2190,7 @@ async def chat_completions(request: Request):
         nonlocal slot_released, gate_held
         if gate_held:
             gate_held = False
+            _note_coding_hold(time.monotonic() - gate_since)
             coding_gate.release()
         if slot_released:
             return
@@ -2177,6 +2252,12 @@ async def chat_completions(request: Request):
 
         requested = body.get("model") if _may_choose_model(request) else None
         model_path = canonical_model_tag(requested or global_active_model or _default_coding_model())
+        if requested:
+            # A caller who may choose, naming another rung of the coding ladder (a status read
+            # just before an automatic switch), is served by the rung in use: starting the old
+            # one would swap the cluster straight back (engine/auto_swap.py). Public callers'
+            # model names are already ignored above.
+            model_path = auto_swapper.serve_as(model_path, global_active_model)
         body["model"] = model_path
 
         # 1. Grab planned workers based on sharding policy and calculate resources
@@ -2338,8 +2419,12 @@ async def chat_completions(request: Request):
         # and this host) first, CPU contributors second, free-trial users third. Held until
         # release_slot() gives it back with the rest of this request's resources.
         tier = getattr(getattr(request, "state", None), "dlne_tier", None)
-        await coding_gate.acquire(tier_priority(tier), slots=dynamic_slots)
+        if slot_held:
+            coding_gate.resize(dynamic_slots)        # already ours: only follow the engine's slot count
+        else:
+            await coding_gate.acquire(tier_priority(tier), slots=dynamic_slots)
         gate_held = True
+        gate_since = time.monotonic()
 
         # Estimate tokens in the messages and truncate if they exceed (slot_context - 100)
         messages = body.get("messages", [])
@@ -2553,8 +2638,6 @@ async def chat_completions(request: Request):
                 yield b"data: [DONE]\n\n"
             finally:
                 await release_slot()
-                if active_inference_requests > 12 and not is_recalculating_queue:
-                    spawn_background_task(recalculate_engine_queue(model_path), "queue-recalc")
 
         slot_handed_off = True
         return StreamingResponse(
@@ -2593,6 +2676,12 @@ async def completions(request: Request):
     global is_swapping_models
     global is_recalculating_queue
 
+    # Autocomplete goes to a member only while it has a slot to spare (engine/coding_router.py).
+    if get_worker_limits().get("coding_members_enabled", False):
+        routed = await _route_to_member(request, "/v1/completions")
+        if routed is not None:
+            return routed
+
     while is_swapping_models or is_recalculating_queue:
         await asyncio.sleep(1)
 
@@ -2611,7 +2700,7 @@ async def completions(request: Request):
     # Autocomplete never queues: it runs only on a slot nobody is waiting for, so it can
     # never delay a chat at any tier (engine/priority.CodingGate).
     if (lease_manager.active_count(task_type="completion") > 0
-            or lease_manager.active_count() >= FIM_ENGINE_SLOTS
+            or lease_manager.active_count() >= _fim_engine_slots()
             or coding_gate.stats()["waiting"] > 0):
         return {"choices": [{"text": "", "index": 0, "finish_reason": "busy"}]}
 
@@ -2635,7 +2724,11 @@ async def completions(request: Request):
             raise
 
     try:
-        model_path = (body.get("model") if _may_choose_model(request) else None) or global_active_model
+        requested = body.get("model") if _may_choose_model(request) else None
+        model_path = requested or global_active_model
+        if requested:
+            # Same ladder rule as the chat path: another rung of the coding ladder means the rung in use.
+            model_path = auto_swapper.serve_as(model_path, global_active_model)
         if not model_path:
             raise HTTPException(status_code=400, detail="No model specified and no global active model.")
 
@@ -2676,6 +2769,15 @@ async def completions(request: Request):
             raise HTTPException(status_code=504, detail="Inference engine timed out while loading the model.")
 
         forwarded_headers = {"Content-Type": "application/json"}
+
+        warm = fim_warm_body(body)
+        if warm is not None:
+            try:
+                async with engine_client() as client:
+                    await client.post(llama_url, json=warm, headers=forwarded_headers,
+                                      timeout=httpx.Timeout(20.0, connect=ENGINE_CONNECT_TIMEOUT_SECONDS))
+            except Exception:  # noqa: BLE001 - best effort; the real request below is complete without it
+                pass
 
         if is_stream:
             async def stream_generator():
@@ -2839,6 +2941,8 @@ async def get_cluster_status(request: Request):
         # The phone app's CPU pool: members, the unlocked model tier and the ladder. Counts
         # and model names only.
         "app_pool": app_pool.status(_app_members(), int(get_worker_limits().get("app_tier_min_members", 2))),
+        # Coding members (engine/coding_router.py), counts only: {enabled, members, ready, slots, busy}.
+        "coding_members": _coding_members_status(),
         # The phone model's lookups: which tools are on and today's counts. No key, no URL,
         # nothing about any network (engine/search.search_status).
         "app_search": _app_search_status(),
@@ -2847,6 +2951,10 @@ async def get_cluster_status(request: Request):
         "is_swapping_models": is_swapping_models,
         "model_loading": loading_telemetry,
         "server_version": VERSION,
+        # Automatic model switching (engine/auto_swap.py): {enabled, state, target, detail},
+        # state one of off|steady|waiting|downloading|swapping|cooldown, detail a sentence
+        # such as "Switching to X in 6 min if the pool keeps 24 GB."
+        "auto_swap": auto_swapper.status(),
     }
 
 
@@ -2901,9 +3009,9 @@ async def swap_cluster_model(payload: SwapModelPayload, request: Request):
     active leases) and boots the requested model. Operator only (this machine, an API key, or
     the admin key): it changes the model for everyone, and until 2.3.6 a free-trial caller
     could do it.
-    """
-    global global_active_model, is_swapping_models, cluster_status
 
+    The switch itself is :func:`_swap_model_core`, which automatic switching uses too.
+    """
     if not _may_choose_model(request):
         _require_admin(request)
 
@@ -2927,15 +3035,115 @@ async def swap_cluster_model(payload: SwapModelPayload, request: Request):
             ),
         )
 
-    if lease_manager.is_locked():
-        await lease_manager.wait_for_idle(timeout=15.0)
+    swap = await _swap_model_core(target_model, req_gb, total_vram, total_sysram)
+    # Automatic switching holds off for its cooldown after a manual switch, so it never
+    # undoes what somebody just chose (engine/auto_swap.py).
+    auto_swapper.note_manual_swap(target_model)
+    return {
+        "status": "swapped" if swap["success"] else "queued",
+        "active_model": global_active_model,
+        "detail": swap["detail"],
+        "required_gb": round(req_gb, 2),
+        "total_vram_gb": round(total_vram, 2),
+    }
 
-    is_swapping_models = True
+
+# ======================================================================================
+# Model switching, manual and automatic
+# ======================================================================================
+
+# Bumped by every switch. A switch that finds it changed under it knows another switch took
+# over, and then leaves the cluster to that one: it neither rolls back nor clears
+# ``is_swapping_models`` (which the newer switch owns).
+_model_swap_generation = 0
+
+ENGINE_READY_POLL_SECONDS = 1.0
+
+
+def _auto_swap_load_timeout() -> float:
+    """
+    How long an automatic switch holds requests while the new engine loads, before it gives up
+    and restores the previous model (AUTO_SWAP_LOAD_TIMEOUT_SECONDS, 3 min by default). Only
+    near GPUs unlock a tier, so a load that takes longer than this is a load gone wrong.
+    """
+    return float(get_worker_limits().get("auto_swap_load_timeout_seconds", 180))
+
+
+async def _swap_model_core(
+    target_model: str,
+    req_gb: float,
+    total_vram: float,
+    total_sysram: float,
+    *,
+    drain_timeout: float = 15.0,
+    hold_first: bool = False,
+    abort_if_busy: bool = False,
+    ready_timeout: float = 0.0,
+    rollback_model: Optional[str] = None,
+    endpoints: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Stop every engine and start ``target_model``: the one code path every model switch takes.
+
+    With the defaults this is exactly what ``POST /v1/cluster/swap`` has always done: wait up
+    to 15 s for in-flight leases, then raise ``is_swapping_models`` (which parks new chat and
+    completion requests), stop, start, lower the flag, and tell the WebUIs.
+
+    Automatic switching (engine/auto_swap.py) passes the options, which make it safer for a
+    switch nobody asked for:
+
+    * ``hold_first``: claim the cluster first (refusing if any other switch or engine restart
+      is running), so no new request starts while in-flight ones drain. With
+      ``abort_if_busy`` a queue that does not drain within ``drain_timeout`` calls the switch
+      off before anything is touched.
+    * ``ready_timeout``: keep the flag raised until the new engine answers ``/health``, so
+      requests wait for a model that works rather than queueing on one that is still loading.
+    * ``rollback_model``: if the new engine does not start, dies while loading, or is not
+      ready in time, start this one again.
+    * ``endpoints``: the RPC endpoints to start it on, already checked by the caller
+      (default: the shard planner's choice, as always).
+
+    Returns ``{"outcome", "success", "detail"}``, outcome being ``swapped``, ``failed``,
+    ``busy`` (nothing touched) or ``superseded`` (another switch took over).
+    """
+    global global_active_model, is_swapping_models, cluster_status, _model_swap_generation
+
+    if hold_first:
+        if is_swapping_models or is_recalculating_queue or reconfiguration_in_flight():
+            return {"outcome": "busy", "success": False,
+                    "detail": "another model switch or engine restart is in progress"}
+        is_swapping_models = True
+        _model_swap_generation += 1
+        generation = _model_swap_generation
+        drained = True
+        try:
+            if lease_manager.is_locked():
+                drained = await lease_manager.wait_for_idle(timeout=drain_timeout)
+        except BaseException:
+            if generation == _model_swap_generation:
+                is_swapping_models = False
+            raise
+        if generation != _model_swap_generation:
+            return {"outcome": "superseded", "success": False, "detail": "another model switch took over"}
+        if not drained and abort_if_busy:
+            is_swapping_models = False
+            return {"outcome": "busy", "success": False,
+                    "detail": f"coding requests were still running after {drain_timeout:.0f} s"}
+    else:
+        if lease_manager.is_locked():
+            await lease_manager.wait_for_idle(timeout=drain_timeout)
+        is_swapping_models = True
+        _model_swap_generation += 1
+        generation = _model_swap_generation
+
+    success = False
+    status_msg = ""
+    outcome = "failed"
     try:
         global_active_model = target_model
         cluster_status = f"Swapping to {target_model}..."
         await manager.astop_all_models()
-        active_endpoints = _planned_endpoints(req_gb)
+        active_endpoints = endpoints if endpoints is not None else _planned_endpoints(req_gb)
         success, assigned_port, status_msg = await manager.astart_model(
             target_model, active_endpoints, total_vram, total_sysram, queue_channels=2
         )
@@ -2944,17 +3152,389 @@ async def swap_cluster_model(payload: SwapModelPayload, request: Request):
             spawn_vram_progress_task(assigned_port, target_model)
         else:
             cluster_status = f"Paused ({status_msg})"
-    finally:
-        is_swapping_models = False
 
-    await broadcast({"type": "swap_complete", "model": global_active_model})
-    return {
-        "status": "swapped" if success else "queued",
-        "active_model": global_active_model,
-        "detail": status_msg,
-        "required_gb": round(req_gb, 2),
-        "total_vram_gb": round(total_vram, 2),
-    }
+        if success and ready_timeout > 0:
+            success, why = await _wait_for_engine_ready(target_model, ready_timeout, generation)
+            if not success:
+                status_msg = why
+
+        if generation != _model_swap_generation:
+            outcome = "superseded"
+        elif success:
+            outcome = "swapped"
+        elif rollback_model and canonical_model_tag(rollback_model) != target_model:
+            await _restore_model(canonical_model_tag(rollback_model), target_model, status_msg,
+                                 ready_timeout or _auto_swap_load_timeout(), generation)
+    finally:
+        # Only the newest switch lowers the flag: an older one finishing late must not let
+        # requests through while the newer one is still stopping and starting engines.
+        if generation == _model_swap_generation:
+            is_swapping_models = False
+
+    if not (hold_first and outcome == "superseded"):
+        await broadcast({"type": "swap_complete", "model": global_active_model})
+    return {"outcome": outcome, "success": success, "detail": status_msg}
+
+
+async def _engine_health_ok(port: int) -> bool:
+    """True when the llama-server on ``port`` answers ``/health`` with 200 (weights loaded)."""
+    if port <= 0:
+        return False
+    try:
+        async with engine_client() as client:
+            response = await client.get(f"http://127.0.0.1:{port}/health", timeout=2.0)
+        return response.status_code == 200
+    except Exception:  # noqa: BLE001 - not listening yet, or still loading
+        return False
+
+
+async def _wait_for_engine_ready(model_path: str, timeout: float, generation: int) -> Tuple[bool, str]:
+    """
+    Wait until ``model_path``'s engine has loaded and answers, it dies, or ``timeout`` passes.
+
+    Returns ``(ready, why_not)``. Gives up early when another switch takes over.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if generation != _model_swap_generation:
+            return False, "another model switch took over"
+        snapshot = await manager.asnapshot_model(model_path)
+        if snapshot is None:
+            return False, "the engine stopped while loading"
+        process = snapshot.get("process")
+        if process is not None and process.poll() is not None:
+            return False, f"the engine exited while loading (exit code {process.returncode})"
+        if await _engine_health_ok(int(snapshot.get("port") or 0)):
+            return True, ""
+        if time.monotonic() >= deadline:
+            return False, f"the engine was not ready after {timeout:.0f} s"
+        await asyncio.sleep(ENGINE_READY_POLL_SECONDS)
+
+
+async def _restore_model(model_path: str, failed_model: str, why: str,
+                         ready_timeout: float, generation: int) -> None:
+    """
+    Put the model that was being served before a failed automatic switch back.
+
+    Called with ``is_swapping_models`` still raised. If even this fails, the cluster is left
+    paused and the monitor loop takes over once the flag drops, exactly as it would after
+    any engine crash.
+    """
+    global global_active_model, cluster_status
+
+    log_warning(
+        f"Auto-swap: {safe_log_text(failed_model)} did not come up ({safe_log_text(why)}); "
+        f"going back to {safe_log_text(model_path)}."
+    )
+    global_active_model = model_path
+    cluster_status = f"Restoring {model_path}..."
+    await manager.astop_all_models()
+    req_gb = await manager.aestimate_model_vram_gb(model_path)
+    ok, port, msg = await manager.astart_model(
+        model_path, _planned_endpoints(req_gb), registry.get_total_vram_gb(),
+        registry.get_total_sysram_gb(), queue_channels=2
+    )
+    if ok:
+        spawn_vram_progress_task(port, model_path)
+        ok, msg = await _wait_for_engine_ready(model_path, ready_timeout, generation)
+    if generation != _model_swap_generation:
+        return  # a manual switch took over; the cluster's state is its to report
+    if ok:
+        cluster_status = "Active"
+        log_coordinator(f"Auto-swap: {safe_log_text(model_path)} is being served again.")
+    else:
+        cluster_status = f"Paused ({safe_log_text(msg, max_chars=48)})"
+        log_error(f"Auto-swap: could not restore {safe_log_text(model_path)} either ({safe_log_text(msg)}).")
+
+
+def _coding_tiers_for_swap() -> List[Dict[str, Any]]:
+    """
+    The coding model ladder automatic switching works from: the same tiers /v1/cluster/status
+    shows (engine/coding_ladder.load_coding_tiers, read once per process), smallest first.
+    """
+    return _coding_ladder()
+
+
+def _coding_gpu_workers() -> List[Dict[str, Any]]:
+    """
+    The GPU workers the coding pool can use, the same ones registry.get_total_vram_gb() adds
+    up, each as ``{"worker_id", "endpoint", "vram_gb", "class"}``. ``class`` is
+    engine/benchmark.classify_endpoint's: "local" is this machine.
+    """
+    registry.prune_dead_workers()
+    workers = []
+    for worker_id, data in registry.snapshot().items():
+        hardware = data.get("hardware")
+        if not isinstance(hardware, dict) or hardware.get("is_yielding", False):
+            continue
+        if not registry.rpc_compatible(hardware):
+            continue
+        gpu = gpu_section(hardware)
+        if not gpu.get("has_gpu", False):
+            continue
+        endpoint = f"{data.get('ip', '')}:{data.get('port', '')}"
+        workers.append({
+            "worker_id": worker_id,
+            "endpoint": endpoint,
+            "vram_gb": _as_number(gpu.get("vram_total_gb", 0.0)),
+            "class": benchmark.classify_endpoint(endpoint),
+        })
+    return workers
+
+
+def _coding_worker_is_near(worker: Dict[str, Any], max_rtt_ms: float) -> bool:
+    """
+    This machine's own GPUs, or a volunteer whose last measured round trip (its own link
+    report, or the coordinator's probe below) is fresh and at most ``max_rtt_ms``. A
+    volunteer nobody has measured is far.
+    """
+    if worker.get("class") == "local":
+        return True
+    measurement = registry.get_link_measurement(worker.get("worker_id", ""))
+    reported_at = measurement.get("reported_at")
+    age = time.time() - reported_at if isinstance(reported_at, (int, float)) else None
+    return rtt_is_near(measurement.get("rtt_min_ms"), age, max_rtt_ms)
+
+
+def _coding_pool() -> Dict[str, float]:
+    """
+    The pool automatic switching sizes the coding model for: ``vram_gb`` counts only near
+    GPUs (AUTO_SWAP_MAX_RTT_MS), ``far_vram_gb`` the rest, which is reported but never used.
+    """
+    max_rtt = float(get_worker_limits().get("auto_swap_max_rtt_ms", 15.0))
+    pool = split_pool_by_distance(_coding_gpu_workers(), lambda w: _coding_worker_is_near(w, max_rtt))
+    pool["sysram_gb"] = registry.get_total_sysram_gb()
+    return pool
+
+
+def _probe_rpc_rtt(endpoint: str) -> Optional[float]:
+    """
+    Round trip to a volunteer's RPC port, timed as TCP connects (engine/benchmark.measure_rtt_ms),
+    or None when it cannot be reached directly. A volunteer behind NAT, reached only through its
+    reverse tunnel, is never reached directly and so stays far: its weights and tokens would
+    cross the internet. Blocking; run on a thread.
+    """
+    host, _, port = endpoint.rpartition(":")
+    try:
+        result = benchmark.measure_rtt_ms(host, int(port), samples=3, timeout=1.0)
+    except (ValueError, OSError):
+        return None
+    return result.get("rtt_min_ms") if result.get("ok") else None
+
+
+def _record_probed_rtt(endpoint: str, rtt_ms: float) -> None:
+    """
+    File a probe result as the worker's link measurement, next to anything it reported about
+    itself. The shard planner already orders volunteers by this figure, so the engine is put
+    on the near GPUs first, the same ones that unlocked the tier.
+    """
+    for worker in _coding_gpu_workers():
+        if worker["endpoint"] == endpoint:
+            measurement = registry.get_link_measurement(worker["worker_id"])
+            measurement["rtt_min_ms"] = rtt_ms
+            registry.record_link_measurement(worker["worker_id"], measurement)
+
+
+def _probe_targets() -> List[str]:
+    """Every volunteer GPU endpoint (this machine's own needs no measuring)."""
+    return [w["endpoint"] for w in _coding_gpu_workers() if w["class"] != "local"]
+
+
+link_probe = LinkProbe(measure=_probe_rpc_rtt, record=_record_probed_rtt)
+
+
+def _coding_reconfiguration_running() -> bool:
+    """Any switch or engine restart under way: auto-swap waits for it to finish."""
+    return is_swapping_models or is_recalculating_queue or reconfiguration_in_flight()
+
+
+def _coding_queue_busy() -> bool:
+    """Any coding request in flight (every chat and completion holds a lease while it runs)."""
+    return lease_manager.is_locked() or active_inference_requests > 0
+
+
+# (path, size, mtime) of files that failed their checksum, so a multi-GB file is not hashed
+# again every tick until it changes.
+_coding_files_refused: Set[Tuple[str, int, int]] = set()
+
+
+def _coding_tier_on_disk(tier: Dict[str, Any]) -> bool:
+    """
+    Every file of ``tier`` is where the engine will look for it, with the pinned size and
+    SHA-256. Blocking (the first check of a file hashes it; a marker beside it remembers the
+    result, the same one the CPU pool uses).
+    """
+    from engine.app_pool import sha256_ok
+
+    files = tier_files(tier)
+    if not files or not all(file_is_pinned(entry) for entry in files):
+        return False
+    for entry in files:
+        path = manager.resolve_model_path(entry["file"])
+        if not path:
+            return False
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return False
+        stamp = (path, stat.st_size, int(stat.st_mtime))
+        if stamp in _coding_files_refused:
+            return False
+        if not sha256_ok(path, entry["sha256"], int(entry["size"])):
+            _coding_files_refused.add(stamp)
+            log_warning(f"Auto-swap: {safe_log_text(path)} does not match the coding ladder's size and "
+                        "SHA-256, so it will not be switched to.")
+            return False
+    return True
+
+
+async def _coding_tier_ready(tier: Dict[str, Any]) -> bool:
+    return await asyncio.to_thread(_coding_tier_on_disk, tier)
+
+
+# Free space a download must leave on the models drive, as the model request path requires.
+CODING_DOWNLOAD_FREE_BUFFER_GB = 20.0
+
+
+async def _download_split_coding_tier(tier: Dict[str, Any], files: List[Dict[str, Any]]) -> bool:
+    """
+    Fetch every part of a split model (engine/downloader.py ``download_verified``): resumable,
+    each part's size and SHA-256 checked while it streams in, renamed into place only when it
+    is whole and right, and one caller per part. The same free-space rule as a single file.
+    """
+    models_dir = manager._model_search_roots()[0]
+    total = sum(int(entry["size"]) for entry in files)
+    margin = int(total * 0.1 + CODING_DOWNLOAD_FREE_BUFFER_GB * (1024 ** 3))
+    cancel = threading.Event()
+
+    def progress(update: Dict[str, Any]) -> None:
+        auto_swapper.note_download_progress(str(tier.get("id") or ""), update["done"], update["total"])
+
+    try:
+        # The download is blocking and runs on a thread; a cancelled task (auto-swap switched
+        # off, coordinator shutdown) stops it at its next block and keeps the partial part.
+        return await asyncio.to_thread(download_verified, files, models_dir, progress,
+                                       cancel=cancel, free_margin=margin)
+    except asyncio.CancelledError:
+        cancel.set()
+        raise
+
+
+async def _download_coding_tier(tier: Dict[str, Any]) -> bool:
+    """
+    Fetch a tier's model file(s) into the models folder and verify them.
+
+    A single file is downloaded under a temporary name and only renamed into place once its
+    size and SHA-256 match; a split model goes through :func:`_download_split_coding_tier`
+    (every part the same way). Either way the engine can never be pointed at a partial or
+    wrong file.
+    """
+    from engine.app_pool import sha256_ok
+
+    if not downloadable(tier):
+        return False
+    files = tier_files(tier)
+    if len(files) > 1:
+        return await _download_split_coding_tier(tier, files)
+    entry = files[0]
+    name, size, label = entry["file"], int(entry["size"]), str(tier.get("name") or entry["file"])
+    models_dir = manager._model_search_roots()[0]
+    dest = os.path.join(models_dir, name)
+    staging = dest + ".dlne-download"
+    try:
+        os.makedirs(models_dir, exist_ok=True)
+        free = shutil.disk_usage(models_dir).free
+    except OSError as exc:
+        log_error(f"Auto-swap: cannot use {safe_log_text(models_dir)} for {safe_log_text(label)}: {exc}")
+        return False
+    need = size * 1.1 + CODING_DOWNLOAD_FREE_BUFFER_GB * (1024 ** 3)
+    if free < need:
+        log_error(f"Auto-swap: not downloading {safe_log_text(label)}: it needs {size / 1e9:.1f} GB plus a "
+                  f"{CODING_DOWNLOAD_FREE_BUFFER_GB:.0f} GB buffer, and {free / 1e9:.1f} GB is free.")
+        return False
+
+    if not await download_file_multistream_async(entry["url"], staging, label):
+        return False
+    try:
+        if not await asyncio.to_thread(sha256_ok, staging, entry["sha256"], size):
+            log_error(f"Auto-swap: the download of {safe_log_text(label)} does not match its pinned size "
+                      "and SHA-256; deleted.")
+            for leftover in (staging, staging + ".dlne-sha256"):
+                if os.path.exists(leftover):
+                    os.remove(leftover)
+            return False
+        os.replace(staging, dest)
+        # The verification marker names size and mtime, not the path, and a rename keeps both.
+        if os.path.exists(staging + ".dlne-sha256"):
+            os.replace(staging + ".dlne-sha256", dest + ".dlne-sha256")
+    except OSError as exc:
+        log_error(f"Auto-swap: could not put {safe_log_text(label)} in place: {exc}")
+        return False
+    return True
+
+
+async def _auto_swap_to(tier: Dict[str, Any], *, drain_seconds: float, abort_if_busy: bool) -> SwapResult:
+    """
+    Switch the coding pool to ``tier`` for engine/auto_swap.py, through the same
+    :func:`_swap_model_core` the manual endpoint uses, with the safety options on.
+    """
+    from engine.inference_manager import MIN_KV_GB, POOL_SAFETY_FRACTION
+
+    target = canonical_model_tag(tier.get("file") or "")
+    if not target:
+        return SwapResult("refused", "the tier names no model file")
+    if not await manager.aresolve_model_path(target):
+        return SwapResult("refused", f"{target} is not on disk")
+
+    # The engine's own admission rule, applied before anything is stopped: a model the
+    # inference manager would refuse must not cost users the model they have now.
+    req_gb = await manager.aestimate_model_vram_gb(target)
+    total_vram = registry.get_total_vram_gb()
+    total_sysram = registry.get_total_sysram_gb()
+    room = (total_vram + total_sysram) * POOL_SAFETY_FRACTION
+    if req_gb + MIN_KV_GB > room:
+        return SwapResult("refused", f"{target} needs about {req_gb:.1f} GB and the pool can give {room:.1f} GB")
+
+    # The same near-only rule that unlocked the tier, applied to where the engine will really
+    # run: if the shard planner would spread it onto a GPU that is too far away, do not switch.
+    planned = _planned_endpoints(req_gb)
+    max_rtt = float(get_worker_limits().get("auto_swap_max_rtt_ms", 15.0))
+    near = {w["endpoint"] for w in _coding_gpu_workers() if _coding_worker_is_near(w, max_rtt)}
+    far = [endpoint for endpoint in planned
+           if endpoint not in near and benchmark.classify_endpoint(endpoint) != "local"]
+    if far:
+        return SwapResult("refused", f"{target} would be spread onto {len(far)} GPU(s) too far away "
+                                     f"(over {max_rtt:g} ms or never measured)")
+
+    swap = await _swap_model_core(
+        target, req_gb, total_vram, total_sysram,
+        drain_timeout=drain_seconds,
+        hold_first=True,
+        abort_if_busy=abort_if_busy,
+        ready_timeout=_auto_swap_load_timeout(),
+        rollback_model=global_active_model,
+        endpoints=planned,
+    )
+    return SwapResult(swap["outcome"], swap["detail"])
+
+
+auto_swapper = AutoSwapController(
+    tiers_provider=_coding_tiers_for_swap,
+    pool_provider=_coding_pool,
+    current_model=lambda: global_active_model,
+    swap=_auto_swap_to,
+    tier_ready=_coding_tier_ready,
+    download=_download_coding_tier,
+    settings=get_worker_limits,
+    swap_in_progress=_coding_reconfiguration_running,
+    queue_busy=_coding_queue_busy,
+    log=lambda message: log_coordinator(safe_log_text(message, max_chars=500)),
+    warn=lambda message: log_warning(safe_log_text(message, max_chars=500)),
+)
+
+# The controller's loop, started with the other monitors and cancelled on shutdown.
+_auto_swap_task: Optional[asyncio.Task] = None
+_auto_swap_tasks: List[asyncio.Task] = []
 
 
 class CreateApiKeyPayload(BaseModel):
@@ -3963,6 +4543,321 @@ async def monitor_workers_async():
 
 
 # ======================================================================================
+# Coding members (docs/coding-members.md, engine/coding_router.py)
+# ======================================================================================
+
+def _coding_members(limits: Optional[Dict[str, Any]] = None):
+    """The members that can be sent work now, with TRUSTED_MEMBERS applied to the router."""
+    from engine.reverse_tunnel import reverse_bridge
+    limits = limits if limits is not None else get_worker_limits()
+    coding_router.trusted_ids = set(limits.get("trusted_members") or ())
+    return coding_router.members(registry, reverse_bridge.get_relay_port, limits)
+
+
+def _coding_members_status() -> Dict[str, Any]:
+    from engine.reverse_tunnel import reverse_bridge
+    limits = get_worker_limits()
+    try:
+        return coding_router.status(registry, reverse_bridge.get_relay_port, limits,
+                                    bool(limits.get("coding_members_enabled", False)))
+    except Exception as exc:  # noqa: BLE001 - the status must answer even if this part cannot
+        log_warning(f"Coding member status unavailable ({type(exc).__name__}: {exc}).")
+        return {"enabled": bool(limits.get("coding_members_enabled", False)),
+                "members": 0, "ready": 0, "slots": 0, "busy": 0}
+
+
+# Canaries (engine/canary.py): the scheduler is given the routable members (CodingMember: trust id,
+# key, last_served_at in epoch seconds) and decides for itself who is due, never a trusted or idle one.
+
+def _canary_members() -> List[Any]:
+    """The members canaries may be sent to: none while coding members are off."""
+    if not get_worker_limits().get("coding_members_enabled", False):
+        return []
+    return _coding_members()
+
+
+def _canary_trusted() -> Set[str]:
+    """Trust ids the operator listed in TRUSTED_MEMBERS: those members are never sent canaries."""
+    return set(coding_members_lib.normalize_trust_ids(get_worker_limits().get("trusted_members") or ()))
+
+
+async def _canary_forward(member: Any, wire: bytes, headers: Dict[str, str]) -> Any:
+    """A canary request handed to a member along the path routed traffic takes (engine/canary.py)."""
+    async with engine_client() as client:
+        return await coding_router.forward_to(client, _coding_members, member, wire, headers)
+
+
+# How long recent answers held a local engine slot, for the wait estimate in the queue frames.
+_coding_hold_seconds: Deque[float] = deque(maxlen=40)
+
+# A streamed request that has to wait tells its client where it stands this often (the first time at
+# once), and gives up after this long (the extension gives up on its side after 15 minutes).
+QUEUE_FRAME_SECONDS = 3.0
+QUEUE_POLL_SECONDS = 1.0
+QUEUE_MAX_WAIT_SECONDS = 15 * 60.0
+
+
+def _note_coding_hold(seconds: float) -> None:
+    if 0 < seconds < 3600:
+        _coding_hold_seconds.append(seconds)
+
+
+def _coding_eta(position: int, slots: int) -> Optional[int]:
+    """A best guess, in seconds, at how long until the request at ``position`` gets a slot: the typical
+    time recent answers held one, times the position, over the slots working in turn. None until a few
+    answers have been seen."""
+    holds = sorted(_coding_hold_seconds)
+    if len(holds) < 3:
+        return None
+    return max(1, min(3600, int(round(holds[len(holds) // 2] * position / max(1, slots)))))
+
+
+def _sse_notice_bytes(text: str) -> bytes:
+    chunk = {"choices": [{"delta": {"content": text}}]}
+    return f"data: {json.dumps(chunk)}\n\n".encode() + b"data: [DONE]\n\n"
+
+
+class _QueuedChat:
+    """
+    A streamed chat request that has to wait for a coding slot (docs/coding-members.md section 10).
+
+    It is answered at once (HTTP 200, text/event-stream) and, while it waits, sent
+    ``data: {"dlne_queue": {"position", "waiting", "slots", "in_use", "eta_seconds"}}`` frames, the first
+    immediately and then every few seconds, before any chunk of the model's. They come from this
+    coordinator, so they are never sealed, and carry only counts: nothing of the request, the client or a
+    member. ``position`` is the exact place in the queue slots are handed out in (best tier first, then
+    the earliest arrival; 1 = next) at the local engine's gate. Only the local engine serves a plain
+    request, so that is the only queue there is.
+
+    The request then goes to the usual handler, which takes over the slot. Failing before a slot is
+    won (the client leaves) frees everything it held.
+    """
+
+    def __init__(self, request: Request, parsed: Any, limits: Dict[str, Any]) -> None:
+        self.request, self.parsed, self.limits = request, parsed, limits
+        self.priority = tier_priority(getattr(getattr(request, "state", None), "dlne_tier", None))
+        self.gate_ticket: Dict[str, Any] = {}
+        self.gate_task: Optional["asyncio.Task"] = None
+        self.counted = False
+        self.winner: Optional[str] = None
+
+    # ---------------------------------------------------------------- what the frames say
+    def state(self) -> Dict[str, int]:
+        stats = coding_gate.stats()
+        slots, in_use = stats["slots"], stats["in_use"]
+        place = coding_gate.position(self.gate_ticket) or 1
+        state = {"position": place, "waiting": max(stats["waiting"], place), "slots": slots,
+                 "in_use": min(in_use, slots)}
+        eta = _coding_eta(place, slots)
+        if eta is not None:
+            state["eta_seconds"] = eta
+        return state
+
+    @staticmethod
+    def frame(state: Dict[str, int]) -> bytes:
+        return f"data: {json.dumps({'dlne_queue': state})}\n\n".encode()
+
+    # ---------------------------------------------------------------- the waiting
+    def _start_waiting(self) -> None:
+        """Join the queue for the local engine's slots."""
+        self.gate_ticket.clear()
+        self.gate_task = asyncio.create_task(coding_gate.acquire(self.priority, ticket=self.gate_ticket))
+
+    @staticmethod
+    def _gate_granted(task: Optional["asyncio.Task"]) -> bool:
+        return task is not None and task.done() and not task.cancelled() and task.exception() is None
+
+    # Leaving the queue is synchronous on purpose: a client that disconnects cancels this coroutine, and
+    # nothing that gives a slot back may wait for anything. A wait that is still pending is cancelled
+    # and gives back what it was granted in that same instant itself (CodingGate.acquire).
+
+    def _drop_gate(self) -> None:
+        """Leave the engine's queue; a slot already granted and not passed on is given back."""
+        task, self.gate_task = self.gate_task, None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        elif self._gate_granted(task):
+            coding_gate.release()
+
+    async def cleanup(self) -> None:
+        """Give back everything still held (the queue place, a slot just granted, the in-flight count).
+        Safe to call again: it runs when the stream ends and again as the response's background task."""
+        self._drop_gate()
+        if self.counted:
+            self.counted = False
+            await _change_inference_count(-1)
+
+    async def stream(self) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in self._run():
+                yield chunk
+        finally:
+            await self.cleanup()
+
+    async def _wait(self, deadline: float) -> AsyncIterator[bytes]:
+        """Frames until the engine's slot is ours; then ``self.winner`` is "engine" (None: gave up)."""
+        loop = asyncio.get_running_loop()
+        self.winner = None
+        self._start_waiting()
+        last_frame: Optional[float] = None
+        await asyncio.wait([self.gate_task], timeout=0.05)
+        while True:
+            if self._gate_granted(self.gate_task):
+                self.winner = "engine"
+                return
+            if self.gate_task.done() or loop.time() >= deadline:
+                return
+            now = loop.time()
+            if last_frame is None or now - last_frame >= QUEUE_FRAME_SECONDS:
+                yield self.frame(self.state())
+                last_frame = now
+            await asyncio.wait([self.gate_task], timeout=QUEUE_POLL_SECONDS)
+
+    async def _run(self) -> AsyncIterator[bytes]:
+        loop = asyncio.get_running_loop()
+        await _change_inference_count(1)       # waiting counts as in flight: the traffic detector and auto-swap see it
+        self.counted = True
+        async for frame in self._wait(loop.time() + QUEUE_MAX_WAIT_SECONDS):
+            yield frame
+        if self.winner != "engine":
+            yield _sse_notice_bytes("\n\n[System] Still no free coding slot after 15 minutes. Please try again later.")
+            return
+
+        # The local engine's slot is ours: the usual handler takes it over from here.
+        self.gate_task = None
+        self.counted = False
+        await _change_inference_count(-1)      # the handler counts the request itself
+        try:
+            response = await _chat_completions_impl(self.request, slot_held=True)
+        except HTTPException as exc:
+            yield _sse_notice_bytes(f"\n\n[System Alert] {exc.detail}")
+            return
+        except Exception as exc:  # noqa: BLE001 - the 200 has gone out: say so in the stream
+            log_error(f"Queued chat request failed: {type(exc).__name__}: {exc}")
+            yield _sse_notice_bytes("\n\n[System Alert] The inference engine failed to answer. Please send your message again.")
+            return
+        try:
+            async for chunk in response.body_iterator:
+                yield chunk
+        finally:
+            if getattr(response, "background", None) is not None:
+                await response.background()
+
+
+def _coding_role_near(worker_id: str, ip: str, port: Any, settled: bool = False) -> Optional[bool]:
+    """
+    Whether a GPU worker is near enough to join the sharded engine (auto-swap's rule, the
+    LinkProbe round trip against AUTO_SWAP_MAX_RTT_MS), False when it is far, and None when
+    nobody has measured it yet and it only just arrived: the probe runs within a minute of a
+    worker joining, and a LAN machine must not be sent away as "far" in that gap.
+
+    A ``settled`` worker, one whose heartbeat already says it is a coding member, gets no such
+    grace: this coordinator may just have restarted (its memory of when it first heard of every
+    worker, and of every measurement, is gone), and a member that has been serving must not be told
+    "no assignment" and unload its model for the minute and a half that would take.
+    """
+    max_rtt = float(get_worker_limits().get("auto_swap_max_rtt_ms", 15.0))
+    endpoint = f"{ip}:{port}"
+    worker = {"worker_id": worker_id, "endpoint": endpoint, "class": benchmark.classify_endpoint(endpoint)}
+    if _coding_worker_is_near(worker, max_rtt):
+        return True
+    if (not settled and registry.get_link_measurement(worker_id).get("rtt_min_ms") is None
+            and time.time() - coding_router.first_seen(worker_id) < coding_members_lib.ROLE_GRACE_SECONDS):
+        return None
+    return False
+
+
+def _coding_role_answer(worker_id: str, ip: str, port: Any, hardware: Dict[str, Any]) -> Dict[str, Any]:
+    """``role`` and ``coding_tier`` for a worker's heartbeat answer (engine/coding_router.assign_role)."""
+    is_gpu = _as_number(gpu_section(hardware).get("vram_total_gb", 0)) > 0 and not is_app_member(hardware)
+    near = _coding_role_near(worker_id, ip, port, settled=hardware.get("pool") == "coding") if is_gpu else True
+    role, tier = coding_members_lib.assign_role(hardware, near, _coding_ladder())
+    return {"role": role, "coding_tier": tier}
+
+
+def _member_response(served) -> Response:
+    """A member's answer (engine/coding_router.Served) as the response to send."""
+    response_headers = {"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
+    if served.status == 200:
+        response_headers["X-DLNE-Served"] = "member"
+    if served.retry_after:
+        response_headers["Retry-After"] = str(served.retry_after)
+    if served.stream is not None:
+        return StreamingResponse(served.stream, status_code=served.status, media_type=served.media_type,
+                                 headers=response_headers, background=BackgroundTask(served.release))
+    return Response(content=served.body, status_code=served.status, media_type=served.media_type,
+                    headers=response_headers)
+
+
+async def _route_to_member(request: Request, path: str) -> Optional[Response]:
+    """
+    The request's answer from a coding member, or None for the local engine to answer.
+
+    Only a SEALED request (``{"dlne_e2e": ...}``, selected by ``X-DLNE-Route``) is ever sent to a
+    member, passed on untouched; if its member cannot take it the answer is the re-route code, never
+    another member or this engine (engine/coding_router.py). Every plain request, whatever it
+    carries, is this coordinator's own engine's to answer: what a volunteer's machine is sent has
+    always been encrypted on the way.
+    """
+    limits = get_worker_limits()
+    try:
+        raw = await request.body()
+        # Cheap for the usual plain request: no need to parse a long conversation to find it is not sealed.
+        parsed = json.loads(raw) if raw and b'"dlne_e2e"' in raw else None
+    except Exception:  # noqa: BLE001 - not JSON: the local path gives its usual 400
+        return None
+    if parsed is None:
+        return None
+    reserve = 0 if path.endswith("/chat/completions") else coding_members_lib.COMPLETION_RESERVE_SLOTS
+    async with engine_client() as client:
+        served = await coding_router.serve(
+            client=client, members_fn=lambda: _coding_members(limits), path=path, raw_body=raw, parsed=parsed,
+            privacy=request.headers.get("X-DLNE-Privacy"), route_id=request.headers.get("X-DLNE-Route"),
+            reserve=reserve, trusted_ids=limits.get("trusted_members"))
+    return None if served is None else _member_response(served)
+
+
+# Route lookups by free-trial callers: this many per window per client (SR-09).
+TRIAL_ROUTE_LOOKUPS = 6
+TRIAL_ROUTE_WINDOW_SECONDS = 30.0
+coding_route_window = UsageWindow()
+
+
+@app.get("/v1/coding/route")
+async def coding_route(request: Request):
+    """
+    ``GET /v1/coding/route?session=<id>&privacy=<mode>``: a coding member for the client to seal
+    its next request to (docs/coding-members.md, sections 5 and 6), or ``{"route": null}`` when the
+    local engine should answer. The route id is opaque and good for 10 minutes; the client sends it
+    back as ``X-DLNE-Route`` with the sealed body. Counts as a little load on the member until used.
+    """
+    no_store = {"Cache-Control": "no-store"}
+    limits = get_worker_limits()
+    if not limits.get("coding_members_enabled", False):
+        return JSONResponse({"route": None}, headers=no_store)
+    # A free-trial caller is any stranger: its lookups are limited per client (a few per 30 seconds) and
+    # hold no member's slots (SR-09), so a flood of them can neither fill the route table nor keep agents out.
+    trial = getattr(getattr(request, "state", None), "dlne_tier", None) == "trial"
+    if trial:
+        allowed, _remaining, reset_at = coding_route_window.check_and_record(
+            trial_identity(get_client_ip(request)), TRIAL_ROUTE_LOOKUPS, TRIAL_ROUTE_WINDOW_SECONDS)
+        if not allowed:
+            wait = max(1, int(reset_at - time.time()))
+            return JSONResponse({"detail": "Too many route lookups. Try again shortly."}, status_code=429,
+                                headers={**no_store, "Retry-After": str(wait)})
+    session = request.query_params.get("session")
+    privacy = request.query_params.get("privacy")
+    member = coding_router.pick(_coding_members(limits), session, privacy, need_pubkey=True)
+    if member is None:
+        return JSONResponse({"route": None}, headers=no_store)
+    route = coding_router.issue_route(member, session, privacy, hold=not trial)
+    return JSONResponse({"route": route, "pubkey": member.pubkey, "alg": coding_members_lib.E2E_ALG},
+                        headers=no_store)
+
+
+# ======================================================================================
 # The CPU pool (phone app)
 # ======================================================================================
 
@@ -4138,6 +5033,7 @@ async def admin_app_reports(request: Request, limit: int = 100):
 @app.on_event("startup")
 async def startup_event():
     """Starts the long-lived monitors once uvicorn's event loop is running."""
+    global _auto_swap_task
     log_coordinator("Proactive Worker Tracking & Event Broadcaster is active.")
     _apply_rpc_requirement()
     spawn_background_task(monitor_workers_async(), "monitor-workers")
@@ -4149,6 +5045,27 @@ async def startup_event():
     _load_app_tiers()
     if get_worker_limits().get("app_local_enabled", False) and app_pool.tiers:
         spawn_background_task(monitor_app_pool_async(), "app-pool")
+    # Automatic model switching for the coding pool (engine/auto_swap.py). It always runs and
+    # reads AUTO_SWAP on every tick, so config.txt can turn it off or on without a restart.
+    # The link probe measures how far each volunteer's GPU is, which decides whether it counts.
+    _auto_swap_task = spawn_background_task(auto_swapper.run(), "auto-swap")
+    _auto_swap_tasks.append(spawn_background_task(
+        link_probe.run(_probe_targets, warn=lambda m: log_warning(safe_log_text(m, max_chars=300))),
+        "auto-swap-link-probe"))
+    # Canary requests to untrusted coding members (engine/canary.py). The members list is empty
+    # while CODING_MEMBERS_ENABLED is off, so this does nothing until the owner turns members on.
+    _auto_swap_tasks.append(spawn_background_task(
+        canary.CanaryScheduler(_canary_members, _canary_forward, trusted=_canary_trusted).run(),
+        "coding-canaries"))
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stops automatic model switching (and any model download it started)."""
+    auto_swapper.shutdown()
+    for task in [_auto_swap_task, *_auto_swap_tasks]:
+        if task is not None and not task.done():
+            task.cancel()
 
 
 # ======================================================================================

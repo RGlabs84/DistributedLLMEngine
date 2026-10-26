@@ -69,7 +69,12 @@ class CodingGate:
         while self._in_use < self._slots and self._wake_next():
             self._in_use += 1
 
-    async def acquire(self, priority: int, slots: Optional[int] = None) -> None:
+    async def acquire(self, priority: int, slots: Optional[int] = None, ticket: Optional[dict] = None) -> None:
+        """
+        Take a slot, waiting for one in priority order if none is free. A ``ticket`` (an empty dict
+        the caller keeps) gets this request's place in the queue once it has to wait, so
+        :meth:`position` can say where it stands while another coroutine awaits this one.
+        """
         loop = self._sync_loop()
         if slots is not None and int(slots) != self._slots:
             self.resize(slots)
@@ -77,7 +82,10 @@ class CodingGate:
             self._in_use += 1
             return
         future = loop.create_future()
-        heapq.heappush(self._waiters, [int(priority), next(self._seq), future])
+        entry = [int(priority), next(self._seq), future]
+        if ticket is not None:
+            ticket["entry"] = entry
+        heapq.heappush(self._waiters, entry)
         try:
             await future
         except asyncio.CancelledError:
@@ -87,6 +95,15 @@ class CodingGate:
             else:
                 future.cancel()
             raise
+
+    def try_acquire(self) -> bool:
+        """Take a slot right now if one is free and nobody is waiting; never waits (False: none is free).
+        Must be called from a running event loop, like :meth:`acquire`. The caller releases it."""
+        self._sync_loop()
+        if self._in_use < self._slots and not self._live_waiters():
+            self._in_use += 1
+            return True
+        return False
 
     def release(self) -> None:
         if self._loop is not None and self._loop.is_closed():
@@ -107,6 +124,17 @@ class CodingGate:
 
     def _live_waiters(self) -> int:
         return sum(1 for _p, _s, f in self._waiters if not f.done())
+
+    def position(self, ticket: Optional[dict]) -> Optional[int]:
+        """
+        Where the request waiting under ``ticket`` stands: 1 is next to get a slot, 2 has one request
+        ahead of it, and so on, in the order slots are handed out (better priority first, then the
+        earliest arrival). None when it is not waiting: it never had to, or was granted or cancelled.
+        """
+        entry = (ticket or {}).get("entry")
+        if entry is None or entry[2].done():
+            return None
+        return 1 + sum(1 for p, s, f in self._waiters if not f.done() and (p, s) < (entry[0], entry[1]))
 
     def stats(self) -> Dict[str, int]:
         waiting = [p for p, _s, f in self._waiters if not f.done()]

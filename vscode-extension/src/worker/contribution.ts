@@ -1,7 +1,7 @@
 // What this machine contributes (dlne.worker.device), decided before the worker starts,
 // and what a CPU contributor is told about it.
 
-export type DeviceChoice = 'auto' | 'gpu' | 'cpu';
+export type DeviceChoice = 'auto' | 'gpu' | 'cpu' | 'both';
 
 /** The coordinator's floor for RAM lent by a CPU-only node (CPU_MIN_RAM_GB, engine/config.py). */
 export const CPU_MIN_RAM_GB = 8;
@@ -35,8 +35,14 @@ export interface ContributionPlan {
   cpuOnly: boolean;
   /** What to pass as --allowed-gpus ('' for "all detected"). */
   allowedGpus: string;
-  /** dlne.worker.maxRamGb is below the CPU floor; ask before starting. */
+  /** dlne.worker.maxRamGb is below the CPU floor (for "both": dlne.worker.alsoCpuRamGb is); ask before starting. */
   needsMoreRam: boolean;
+  /**
+   * "Both" on a machine with a usable GPU: the GPU does whatever job the swarm gives it, and the CPU serves the
+   * phone app's pool at the same time with the RAM in dlne.worker.alsoCpuRamGb. Never set with cpuOnly: on a
+   * machine without a usable GPU "both" is "cpu".
+   */
+  alsoCpu?: boolean;
   /** Set when the worker must not start at all; written to be shown as-is. */
   error?: string;
 }
@@ -101,9 +107,10 @@ export function planContribution(
   hasGpu: boolean,
   allowedGpus: string,
   maxRamGb: number,
-  integratedGpu?: string
+  integratedGpu?: string,
+  alsoCpuRamGb: number = 0
 ): ContributionPlan {
-  const choice: DeviceChoice = device === 'gpu' || device === 'cpu' ? device : 'auto';
+  const choice: DeviceChoice = device === 'gpu' || device === 'cpu' || device === 'both' ? device : 'auto';
   if (choice === 'gpu' && !hasGpu) {
     return {
       cpuOnly: false,
@@ -116,6 +123,18 @@ export function planContribution(
     };
   }
   const cpuOnly = choice === 'cpu' || !hasGpu;
+  if (choice === 'both' && !hasGpu) {
+    // "Both" without a usable GPU is "cpu", exactly.
+    return planContribution('cpu', hasGpu, allowedGpus, maxRamGb, integratedGpu);
+  }
+  if (choice === 'both' && hasGpu) {
+    return {
+      cpuOnly: false,
+      allowedGpus,
+      needsMoreRam: !(alsoCpuRamGb >= CPU_MIN_RAM_GB),
+      alsoCpu: true,
+    };
+  }
   return {
     cpuOnly,
     allowedGpus: choice === 'cpu' || (!hasGpu && integratedGpu) ? 'none' : allowedGpus,
@@ -134,6 +153,104 @@ export function parseRefusal(output: string): string | null {
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Windows details: quoting, executable names, lines that arrive in pieces
+// ---------------------------------------------------------------------------------------------
+
+/** A PowerShell single-quoted string literal: an apostrophe inside it (a user called O'Brien) is doubled. */
+export function powershellQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/** The command that unpacks a zip with Windows PowerShell. `-LiteralPath` so `[` and `]` in a folder name are not wildcards. */
+export function powershellExpandCommand(zipPath: string, destDir: string): string {
+  return `powershell -NoProfile -Command "Expand-Archive -LiteralPath ${powershellQuote(zipPath)} -DestinationPath ${powershellQuote(destDir)} -Force"`;
+}
+
+/** `value` in double quotes when it contains whitespace (a command line splits an unquoted path at the first space). */
+export function quoteIfSpaced(value: string): string {
+  return /\s/.test(value) && !value.startsWith('"') ? `"${value}"` : value;
+}
+
+/** Whether this RPC platform's zip holds `ggml-rpc-server.exe` (every Windows build: win-x64 and win-arm64). */
+export function isRpcExecutablePlatform(platform: string): boolean {
+  return platform.startsWith('win');
+}
+
+/**
+ * Split worker output into the lines that are complete and the unfinished rest: `pending` is what was left
+ * over from the chunk before. A pipe may cut a line anywhere, and a line printed by the Windows worker ends
+ * in CRLF, which stays attached to its line (the parsers trim it). The rest is capped so a worker that
+ * never prints a newline cannot grow it without bound.
+ */
+export function takeCompleteLines(pending: string, chunk: string): { complete: string; rest: string } {
+  const text = pending + chunk;
+  const end = text.lastIndexOf('\n');
+  if (end === -1) {
+    return { complete: '', rest: text.slice(-65536) };
+  }
+  return { complete: text.slice(0, end + 1), rest: text.slice(end + 1).slice(-65536) };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The volunteer's coding-member switch, kept in the engine's config.txt
+// ---------------------------------------------------------------------------------------------
+
+/** The config.txt key engine/config.py reads (only the literal `true`, any casing, is true). */
+export const CODING_MEMBER_ALLOWED_KEY = 'CODING_MEMBER_ALLOWED';
+/** The engine's config.txt key for the RAM a "both" machine's CPU lends to the phone pool (0: off). */
+export const ALSO_CPU_RAM_KEY = 'ALSO_CPU_RAM_GB';
+
+/**
+ * The new text of config.txt for ALSO_CPU_RAM_GB, or null when it needs no change: a machine that lends both
+ * writes the amount; every other machine only clears a leftover positive value (so a systemd-started worker does
+ * not keep lending the CPU after the owner went back to the GPU alone). A config without the key is left alone,
+ * so a single-job machine's config.txt is never touched.
+ */
+export function alsoCpuConfigUpdate(text: string, lendBoth: boolean, ramGb: number): string | null {
+  const wanted = lendBoth ? String(ramGb) : '0';
+  const existing = /^\s*ALSO_CPU_RAM_GB\s*=\s*(.*?)\s*$/im.exec(text);
+  if (!lendBoth && (!existing || !(parseFloat(existing[1]) > 0))) {
+    return null;
+  }
+  const next = setConfigValue(text, ALSO_CPU_RAM_KEY, wanted);
+  return next === text ? null : next;
+}
+
+/**
+ * `text` (a config.txt) with `key` set to `value`, the way engine.config.set_config_values does it:
+ * keys match in any casing, comments, blank lines and other keys are copied through untouched,
+ * the first match is edited in place, a duplicate further down is dropped (the engine's parser is
+ * last-write-wins, so a stale duplicate would override the new value), and a missing key is
+ * appended. The file's line endings (a Windows editor may have saved it with CRLF) and a leading
+ * byte-order mark are handled: the mark is removed (the engine would read it as part of the first
+ * key's name) and the result ends with exactly one line ending.
+ */
+export function setConfigValue(text: string, key: string, value: string): string {
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const lines = text.replace(/^﻿/, '').split(/\r?\n/);
+  if (lines[lines.length - 1] === '') lines.pop();
+  const wanted = key.trim().toUpperCase();
+  const out: string[] = [];
+  let written = false;
+  for (const raw of lines) {
+    const stripped = raw.trim();
+    if (!stripped || stripped.startsWith('#') || !stripped.includes('=')) {
+      out.push(raw);
+      continue;
+    }
+    const name = stripped.slice(0, stripped.indexOf('=')).trim();
+    if (name.toUpperCase() !== wanted) {
+      out.push(raw);
+    } else if (!written) {
+      out.push(`${name}=${value}`);
+      written = true;
+    }
+  }
+  if (!written) out.push(`${wanted}=${value}`);
+  return out.join(eol) + eol;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -159,6 +276,17 @@ export function defaultRamOffer(totalGb: number): number | null {
   const step = OFFER_BY_TOTAL_RAM.find((s) => totalGb >= s.totalGb);
   const offer = Math.min(step ? step.offerGb : CPU_MIN_RAM_GB, Math.floor(totalGb * MAX_LEND_SHARE));
   return offer >= CPU_MIN_RAM_GB ? offer : null;
+}
+
+/**
+ * What `--coding-max-ram` carries: the RAM, in GB, the coding job may use. dlne.worker.maxRamGb has a small
+ * default (4) that is right for the GPU's other job, an RPC node for the shared model, and wrong for a whole
+ * coding model (an 8 GB GPU needs about 14 GB of RAM counted), so the coding job is uncapped (-1: it counts only
+ * the RAM that is free when it starts) unless the user set the setting themselves. `explicit` is that value
+ * (`inspect().globalValue`), undefined when they did not; zero or less counts as not set, as it does for `--max-ram`.
+ */
+export function codingMaxRamGb(explicit: number | null | undefined): number {
+  return typeof explicit === 'number' && Number.isFinite(explicit) && explicit > 0 ? explicit : -1;
 }
 
 export interface RamChoice {
@@ -213,7 +341,7 @@ export function cpuReason(hasGpu: boolean, integratedGpu?: string): string {
 }
 
 /** The modal that asks a CPU-only machine how much RAM to lend. The choices come from ramChoices. */
-export function ramOfferText(why: string, choices: RamChoice[]): { message: string; detail: string } {
+export function ramOfferText(why: string, choices: RamChoice[], setting: string = 'dlne.worker.maxRamGb'): { message: string; detail: string } {
   return {
     message: `DLNE: ${why} ${CPU_POOL_HEADLINE} (the CPU pool). How much RAM do you want to lend?`,
     detail: [
@@ -222,7 +350,7 @@ export function ramOfferText(why: string, choices: RamChoice[]): { message: stri
       '',
       `In return you get ${CPU_POOL_PERK}.`,
       `${CPU_POOL_PERFORMANCE}.`,
-      'DLNE offers at most half of this machine\'s RAM; set dlne.worker.maxRamGb for another amount.',
+      `DLNE offers at most half of this machine's RAM; set ${setting} for another amount.`,
     ].join('\n'),
   };
 }
@@ -250,6 +378,11 @@ export interface ContributionView {
   vramContributedGb: number;
   /** integratedGpu: the integrated GPU that was left out because it does not count (isAllowedIntegratedGpu). */
   gpu: { name: string; api: string; vramTotalGb: number; integratedGpu?: string };
+  /** The job the coordinator gave this machine, once the worker has said (see parseRole). */
+  role?: WorkerRole;
+  roleDetail?: RoleDetail;
+  /** "Both": the worker says the CPU also serves the phone pool next to the GPU's job (see parseAlso). */
+  alsoCpu?: boolean;
 }
 
 /** The sidebar's contribution card: two HTML lines and the button. */
@@ -284,7 +417,8 @@ export function contributionCopy(st: ContributionView): ContributionCopy {
   return {
     deviceHtml: `<strong>${apiTag} GPU:</strong> ${st.gpu.name || 'Local GPU'} (${st.gpu.vramTotalGb || 8} GB)`,
     ruleHtml: active
-      ? `✅ <strong>Active:</strong> Contributing ${st.vramContributedGb} GB to cluster. Inference unlocked!`
+      ? `✅ <strong>Active:</strong> Contributing ${st.vramContributedGb} GB to cluster. Inference unlocked!` +
+        (st.alsoCpu ? `<br>📱 <strong>Also:</strong> ${ALSO_CPU_LINE}` : '')
       : starting
       ? '⏳ Connecting local worker to cluster coordinator...'
       : '<strong>Core Rule:</strong> You must give compute to receive compute.',
@@ -304,5 +438,238 @@ export function contributionTooltip(st: ContributionView): string[] {
     ];
   }
   const api = st.gpu.api.toUpperCase();
-  return [active ? `Local Contribution: CONTRIBUTING (${st.vramContributedGb}GB via ${api} - ${st.gpu.name})` : `Local Contribution: IDLE (${st.gpu.name} - ${api})`];
+  const lines = [active ? `Local Contribution: CONTRIBUTING (${st.vramContributedGb}GB via ${api} - ${st.gpu.name})` : `Local Contribution: IDLE (${st.gpu.name} - ${api})`];
+  // The job the swarm gave this GPU, once the worker has said what it is.
+  if (active && st.role) {
+    lines.push(`Role: ${ROLE_LABEL[st.role]}. ${roleMeaning(st.role, st.roleDetail)}`);
+    if (st.role === 'coding') {
+      lines.push(MEMBER_PRIVACY_SUMMARY);
+      if (st.roleDetail?.trustId) {
+        lines.push(`Trust id: ${st.roleDetail.trustId}. ${TRUST_ID_HINT}`);
+      }
+    }
+  }
+  if (active && st.alsoCpu) {
+    lines.push(`Also: ${ROLE_LABEL.app}. ${ALSO_CPU_LINE}`);
+  }
+  return lines;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The job the swarm gives a GPU: GPU pool, coding member, or (for a CPU) phone app member
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * What the coordinator made of this machine (docs/coding-members.md section 10): `rpc` is a share of one
+ * big model run together with other volunteers' GPUs, `coding` a whole coding model on this GPU alone that
+ * answers other people's coding requests, `app` the phone app's CPU pool.
+ */
+export type WorkerRole = 'rpc' | 'coding' | 'app';
+
+export interface RoleDetail {
+  model?: string;
+  tier?: string;
+  /** Coding requests the member runs at once. */
+  slots?: number;
+  /**
+   * The member's trust id (contract section 1: 32 hex characters derived from its own identity key). The
+   * operator lists the trust ids of machines they trust to receive private code; a volunteer who owns the
+   * machine gives theirs to the operator.
+   */
+  trustId?: string;
+}
+
+/** The hint shown beside a trust id. */
+export const TRUST_ID_HINT = 'Give this to the operator if this is your own machine and you want private repos routed to it.';
+
+export interface RoleAssignment extends RoleDetail {
+  role: WorkerRole;
+}
+
+/**
+ * The line the worker prints when the coordinator has given it a job, which the extension reads from its
+ * output the way it reads DLNE_REFUSAL:
+ * `DLNE_ROLE: coding {"model": "...", "tier": "...", "slots": 2, "trust_id": "<32 hex>"}`.
+ * The JSON part is optional; `DLNE_ROLE: rpc` alone is a whole line. A worker that never prints one (an
+ * engine from before coding members) is a GPU pool member, which is what it was.
+ */
+export const ROLE_MARKER = 'DLNE_ROLE: ';
+
+/** The last job the worker announced in `output`, or null. Anything malformed is ignored. */
+export function parseRole(output: string): RoleAssignment | null {
+  let found: RoleAssignment | null = null;
+  for (const line of output.split(/\r?\n/)) {
+    const at = line.indexOf(ROLE_MARKER);
+    if (at === -1) continue;
+    const match = /^(rpc|coding|app)\b\s*(\{.*\})?\s*$/.exec(line.slice(at + ROLE_MARKER.length).trim());
+    if (!match) continue;
+    const assignment: RoleAssignment = { role: match[1] as WorkerRole };
+    if (match[2]) {
+      try {
+        const detail = JSON.parse(match[2]);
+        if (typeof detail.model === 'string' && detail.model.length <= 128) assignment.model = detail.model;
+        if (typeof detail.tier === 'string' && detail.tier.length <= 128) assignment.tier = detail.tier;
+        if (Number.isInteger(detail.slots) && detail.slots >= 1 && detail.slots <= 64) assignment.slots = detail.slots;
+        if (typeof detail.trust_id === 'string' && /^[0-9a-f]{32}$/.test(detail.trust_id)) assignment.trustId = detail.trust_id;
+      } catch {
+        // the role alone stands
+      }
+    }
+    found = assignment;
+  }
+  return found;
+}
+
+/**
+ * The line the worker prints beside DLNE_ROLE on a machine that also lends its CPU to the phone app ("both"):
+ * `DLNE_ALSO: app` while the CPU serves the pool, `DLNE_ALSO: none` when it stops. DLNE_ROLE stays the GPU's job.
+ */
+export const ALSO_MARKER = 'DLNE_ALSO: ';
+
+/** Whether the CPU is serving the phone pool next to the GPU's own job, from the last DLNE_ALSO line; null if none. */
+export function parseAlso(output: string): boolean | null {
+  let found: boolean | null = null;
+  for (const line of output.split(/\r?\n/)) {
+    const at = line.indexOf(ALSO_MARKER);
+    if (at === -1) continue;
+    const word = line.slice(at + ALSO_MARKER.length).trim();
+    if (word === 'app') found = true;
+    else if (word === 'none') found = false;
+  }
+  return found;
+}
+
+export const ROLE_LABEL: Record<WorkerRole, string> = {
+  rpc: 'GPU pool',
+  coding: 'Coding member',
+  app: 'Phone app member',
+};
+
+const modelTitle = (file: string) => file.replace(/\.gguf$/i, '');
+
+/** What a role means for the machine that has it, in one sentence. */
+export function roleMeaning(role: WorkerRole, detail?: RoleDetail): string {
+  switch (role) {
+    case 'rpc':
+      return 'Your GPU holds a share of one big model that the swarm runs together on many volunteers\' GPUs.';
+    case 'coding': {
+      const model = detail?.model ? ` (${modelTitle(detail.model)})` : '';
+      const at = detail?.slots ? `, about ${detail.slots} at a time` : '';
+      return `Your GPU runs a whole coding model${model} by itself and answers other people's coding requests${at}.`;
+    }
+    case 'app':
+      return 'Your computer runs a small model that answers questions in the DLNE phone app.';
+  }
+}
+
+/** The privacy facts a coding member is shown, plainly (contract sections 6 to 8). */
+export const MEMBER_PRIVACY_FACTS: readonly string[] = [
+  'You run other people\'s coding requests. Your GPU has to read their prompts and code to answer, so the machine itself sees them while it works.',
+  'The requests are anonymous. No name, account or IP address of the person asking reaches your machine.',
+  'They are end-to-end encrypted in transit: each request is sealed for your machine and opened only by the DLNE worker on it, so the network and DLNE\'s server cannot read it.',
+  'Your machine keeps no trace: the worker writes no prompts or answers to disk or to its logs.',
+  'Code from a private repository goes only to machines the operator trusts, unless its owner allows any member. Public repositories can reach any member.',
+  'The swarm sometimes sends test requests holding decoy credentials; a member that ever uses one is removed.',
+];
+
+/** The short form of the same facts, for the card and the tooltip. */
+export const MEMBER_PRIVACY_SUMMARY = 'Requests are anonymous and end-to-end encrypted in transit, and your machine keeps no trace.';
+
+export const LEND_GPU = 'Lend my GPU';
+export const LEND_CPU_ONLY = 'Lend my CPU only';
+export const LEND_BOTH = 'Lend both';
+
+/** One plain sentence for the third button of the lend dialog. */
+export const LEND_BOTH_SENTENCE =
+  `"${LEND_BOTH}" does both at once: your GPU does the job above, and your CPU also powers the DLNE phone app with the RAM you choose ` +
+  '(it sets dlne.worker.device to "both"; you are asked how much RAM next).';
+
+/** Why this machine also lends its CPU, as the first sentence of the RAM offer. */
+export const ALSO_CPU_REASON = 'You chose to lend your CPU as well as your GPU.';
+
+/** The sidebar and chat line for a GPU machine whose CPU also serves the pool. */
+export const ALSO_CPU_LINE = 'Your CPU also powers the DLNE phone app (the CPU pool), at low priority, next to your GPU\'s job.';
+
+/** Shown when "both" is chosen on a machine that cannot lend the minimum RAM: the GPU is lent alone. */
+export function bothRamTooSmallText(totalGb: number): string {
+  return `DLNE: this machine has about ${totalGb} GB of RAM. Powering the DLNE phone app needs ${CPU_MIN_RAM_GB} GB lent, ` +
+    `and DLNE never offers more than half of your RAM, so your CPU is not lent this time; your GPU is lent as usual.`;
+}
+
+/** The one sentence the lend dialog gives about the RAM a coding member may use (see codingMaxRamGb). */
+export const CODING_RAM_SENTENCE =
+  'The coding job uses the memory that is free when it starts (it steps aside when you game); set dlne.worker.maxRamGb to limit it.';
+
+/**
+ * The modal a GPU owner sees the first time they click to contribute: what happens, the two jobs the swarm
+ * may give the GPU, the privacy facts for the second, and a way to keep the GPU out of it. ("About 2 at a
+ * time" is the usual figure for a coding member, given as an example; the sidebar shows the real one.)
+ */
+export function lendGpuPrompt(gpuName: string): { message: string; detail: string; buttons: [string, string, string] } {
+  return {
+    message: `DLNE: lend ${gpuName || 'your GPU'} to the swarm?`,
+    detail: [
+      'The swarm decides what your GPU does, and the sidebar shows you which:',
+      `- ${ROLE_LABEL.rpc}: ${roleMeaning('rpc')}`,
+      `- ${ROLE_LABEL.coding}: ${roleMeaning('coding', { slots: 2 })}`,
+      '',
+      'If it becomes a coding member, you should know:',
+      ...MEMBER_PRIVACY_FACTS.map((fact) => `- ${fact}`),
+      '',
+      CODING_RAM_SENTENCE,
+      'In return the coding agent is yours first in line, with no limit. You can stop at any time from the sidebar.',
+      `"${LEND_CPU_ONLY}" keeps your GPU yours: your computer then powers the DLNE phone app instead (it sets dlne.worker.device to "cpu").`,
+      LEND_BOTH_SENTENCE,
+    ].join('\n'),
+    buttons: [LEND_GPU, LEND_CPU_ONLY, LEND_BOTH],
+  };
+}
+
+/** The toast when the swarm makes a GPU a coding member (once per install). */
+export const CODING_MEMBER_NOTICE =
+  'DLNE: the swarm made your GPU a coding member. It answers other people\'s coding requests. ' + MEMBER_PRIVACY_SUMMARY;
+
+/** The sidebar's role lines: one line on the card, and the details behind it. */
+export interface RoleCopy {
+  roleHtml: string;
+  /** Empty for a CPU contributor, who is not shown GPU-only facts. */
+  factsHtml: string;
+  /** A coding member's trust id with its one-line hint and a Copy link; empty otherwise. */
+  trustHtml: string;
+}
+
+export function roleCopy(st: ContributionView): RoleCopy {
+  const active = st.state === 'contributing';
+  const starting = st.state === 'starting';
+  if (st.cpuPool) {
+    return { roleHtml: `<strong>Role:</strong> ${ROLE_LABEL.app}. ${escapeHtml(roleMeaning('app'))}`, factsHtml: '', trustHtml: '' };
+  }
+  const facts =
+    '<details class="role-details"><summary>What does lending my GPU mean?</summary><ul>' +
+    `<li><strong>${ROLE_LABEL.rpc}:</strong> ${escapeHtml(roleMeaning('rpc'))}</li>` +
+    `<li><strong>${ROLE_LABEL.coding}:</strong> ${escapeHtml(roleMeaning('coding', { slots: 2 }))} If you become one:<ul>` +
+    MEMBER_PRIVACY_FACTS.map((fact) => `<li>${escapeHtml(fact)}</li>`).join('') +
+    '</ul></li></ul></details>';
+  if (active) {
+    // An engine from before coding members never says; it is a GPU pool member, as it always was.
+    const role = st.role ?? 'rpc';
+    const privacy = role === 'coding' ? ` ${escapeHtml(MEMBER_PRIVACY_SUMMARY)}` : '';
+    const trustId = role === 'coding' ? st.roleDetail?.trustId : undefined;
+    const also = st.alsoCpu ? `<br><strong>Also:</strong> ${ROLE_LABEL.app}. ${escapeHtml(ALSO_CPU_LINE)}` : '';
+    return {
+      roleHtml: `<strong>Role:</strong> ${ROLE_LABEL[role]}. ${escapeHtml(roleMeaning(role, st.roleDetail))}${privacy}${also}`,
+      factsHtml: facts,
+      trustHtml: trustId
+        ? `<strong>Trust id:</strong> <code>${escapeHtml(trustId)}</code> <a href="#" class="copy-trust" data-id="${escapeHtml(trustId)}">Copy</a><br>${escapeHtml(TRUST_ID_HINT)}`
+        : '',
+    };
+  }
+  if (starting) {
+    return { roleHtml: '⏳ The swarm is choosing a job for your GPU...', factsHtml: facts, trustHtml: '' };
+  }
+  return {
+    roleHtml: `<strong>Your GPU's job:</strong> the swarm chooses, a share of one big model (${ROLE_LABEL.rpc}) or a whole coding model for other people's requests (${ROLE_LABEL.coding}).`,
+    factsHtml: facts,
+    trustHtml: '',
+  };
 }

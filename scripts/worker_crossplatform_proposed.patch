@@ -1,0 +1,78 @@
+--- a/engine/worker.py
++++ b/engine/worker.py
+@@ -38,7 +38,7 @@
+ import os
+ from typing import Any, Dict, Optional, Tuple
+ from engine.logger import log_worker, log_error, log_system, log_warning
+-from engine.hardware import get_hardware_profile
++from engine.hardware import get_hardware_profile, _hidden_process_kwargs
+ from engine.downloader import download_and_extract_engine
+ from engine.version import VERSION
+ from engine.config import get_base_dir, get_worker_limits
+@@ -191,7 +191,7 @@
+     supported = False
+     try:
+         result = subprocess.run(
+-            [binary_path, "--help"], capture_output=True, text=True, timeout=30
++            [binary_path, "--help"], capture_output=True, text=True, timeout=30, **_hidden_process_kwargs()
+         )
+         # Exit status is not consistent across these tools and both streams are used for
+         # usage text depending on the build, so the output is what is trusted.
+@@ -831,7 +831,8 @@
+                     ["vulkaninfo", "--summary"],
+                     capture_output=True,
+                     text=True,
+-                    timeout=5
++                    timeout=5,
++                    **_hidden_process_kwargs()
+                 )
+                 if vk_res.returncode == 0:
+                     discrete_indices = []
+@@ -926,7 +927,8 @@
+                 [binary_path, "--host", self.rpc_ip, "--port", str(self.rpc_port)] + cache_args + device_args,
+                 stdout=self.rpc_log_file,
+                 stderr=subprocess.STDOUT,
+-                env=env
++                env=env,
++                **_hidden_process_kwargs()
+             )
+             log_worker("RPC Server started successfully.")
+             self.rpc_proto = read_rpc_banner(log_path, banner_offset, self.rpc_process)
+@@ -1083,6 +1085,29 @@
+     # Lifecycle
+     # ----------------------------------------------------------------------------------
+ 
++    def _stop_on_termination_signal(self) -> None:
++        """
++        Turn SIGTERM (what the editor and ``kill`` send on macOS and Linux) and SIGBREAK (Ctrl+Break on
++        Windows) into the ordinary shutdown. Python's default for SIGTERM is to die on the spot, running
++        no atexit hook and no ``finally``, which left a coding member's llama-server running with the
++        owner's memory after "Stop contributing". Only the main thread may install a handler; a node
++        that runs on a background thread (hybrid, redundancy) leaves the signals to its host.
++        """
++        if threading.current_thread() is not threading.main_thread():
++            return
++        import signal
++
++        def handler(signum, frame) -> None:
++            self.request_shutdown(0, "terminated")
++
++        for name in ("SIGTERM", "SIGBREAK"):
++            number = getattr(signal, name, None)
++            if number is not None:
++                try:
++                    signal.signal(number, handler)
++                except (ValueError, OSError):
++                    pass
++
+     def start(self):
+         """
+         Boots the node and blocks until it shuts down.
+@@ -1094,6 +1119,7 @@
+         worker component.
+         """
+         self.is_running = True
++        self._stop_on_termination_signal()
+ 
+         started = self.start_app_member() if self._serves_cpu_pool() else self.start_rpc_server()
+         if not started:
