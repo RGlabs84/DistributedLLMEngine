@@ -11,10 +11,12 @@ before anything leaves VS Code, and private repositories stay on machines the op
 [What that does and doesn't protect](docs/privacy.md).
 
 **Use it:**
-- **VSCodium, Cursor, Theia** and other Open VSX editors: search the Extensions view for
-  **DLNE Code Assistant** ([Open VSX](https://open-vsx.org/extension/dlne/dlne-code-assistant)).
-- **VS Code:** download the `.vsix` from the [latest release](https://github.com/RGlabs84/DistributedLLMEngine/releases/latest),
-  then Extensions view, the `...` menu, **Install from VSIX...**. (It is not on the VS Code Marketplace yet.)
+- **VS Code:** search the Extensions view for **DLNE Code Assistant**
+  ([VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=dlne.dlne-code-assistant)).
+- **VSCodium, Cursor, Theia** and other Open VSX editors: the same search finds it on
+  [Open VSX](https://open-vsx.org/extension/dlne/dlne-code-assistant).
+- Offline or locked down: the `.vsix` is on the [latest release](https://github.com/RGlabs84/DistributedLLMEngine/releases/latest)
+  (Extensions view, the `...` menu, **Install from VSIX...**).
 - Then open the DLNE sidebar, or type `@dlne` in the chat panel. No account needed.
 - **No editor?** [DLNE Chat](https://dlne.duckdns.org/chat) runs in a phone browser.
 
