@@ -50,6 +50,8 @@ data class PendingReply(
     val lookup: Lookup? = null,
     val sources: List<Source> = emptyList(),
     val searchNotes: List<String> = emptyList(),
+    /** The id the answer is saved under, so what the reader unfolded stays unfolded once saved. */
+    val messageId: String = newId(),
 ) {
     /**
      * The server took back what it had streamed (`retract`): the text is emptied and the
@@ -276,7 +278,7 @@ class ChatViewModel(application: Application, private val savedState: SavedState
         val conversation = store.get(conversationId) ?: return
         val now = System.currentTimeMillis()
         val answer = ChatMessage(
-            id = newId(),
+            id = reply.messageId,
             role = Role.ASSISTANT,
             content = reply.text,
             notice = notice,

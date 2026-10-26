@@ -181,7 +181,7 @@ Then in VS Code settings:
 
 ## Settings
 
-The settings that decide where your code or keys go (`dlne.serverUrl`, `dlne.apiKey`, `dlne.autoApproveReads`, `dlne.autoUpdate`, and every `dlne.worker.*` setting) are read only from your own user settings: a workspace's or folder's `.vscode/settings.json` cannot change them, so a cloned repository cannot point DLNE at another server or turn on auto-approval. A folder can only narrow `dlne.privacy`, never widen it.
+The settings that decide where your code or keys go (`dlne.serverUrl`, `dlne.apiKey`, `dlne.autoApproveReads`, `dlne.autoApproveAll`, `dlne.autoUpdate`, and every `dlne.worker.*` setting) are read only from your own user settings: a workspace's or folder's `.vscode/settings.json` cannot change them, so a cloned repository cannot point DLNE at another server or turn on auto-approval. A folder can only narrow `dlne.privacy`, never widen it.
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -199,7 +199,8 @@ The settings that decide where your code or keys go (`dlne.serverUrl`, `dlne.api
 | `dlne.enableInlineCompletion` | `true` | Ghost-text autocomplete. |
 | `dlne.inlineCompletionDelay` | `150` | Delay after typing before asking for a completion, in ms. |
 | `dlne.chatModel` / `dlne.fimModel` | `""` | Leave blank: the swarm serves the model it has active. Name a model file only for a private coordinator you run. |
-| `dlne.autoApproveReads` | `true` | Let the agent read, list and search inside your workspace without asking. Edits (which you can allow for a whole session), shell commands (always one at a time), and anything outside the workspace always ask. |
+| `dlne.autoApproveReads` | `true` | Let the agent read, list and search inside your workspace without asking. Edits and shell commands ask, and the approval dialog can remember the answer for the project: **Always allow edits in this project**, or **Always allow "npm test"** for one command (with any arguments; never for a command with `;`, `&&`, `\|` or `$(...)` in it, and never for programs that delete, use `sudo`, fetch from the network or open a shell). Anything outside the workspace always asks. **DLNE: Forget Agent Approvals for This Project** lists what is remembered and clears it. |
+| `dlne.autoApproveAll` | `false` | Run every agent action without asking: edits anywhere and every shell command. The agent's next step can come from a volunteer's machine (a coding member), so a command it sends would run on your computer unseen. Only your user settings can turn it on. |
 | `dlne.autoUpdate` | `true` | Keep this extension and the engine on the latest signed release, and restart the worker when the coordinator upgrades. |
 | `dlne.worker.allowUnsignedEngine` | `false` | Install the engine from a coordinator that publishes no signed release. Only for a private coordinator you run. A signed release that fails verification is never installed, whatever this says. |
 

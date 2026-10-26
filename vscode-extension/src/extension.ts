@@ -12,6 +12,7 @@ import { ClusterStatusBar } from './statusbar/clusterStatusBar';
 import { WorkerManager } from './worker/workerManager';
 import { CPU_POOL_HEADLINE, CPU_POOL_PERK, EXTERNAL_WORKER_LINE, ROLE_LABEL, workerStartedNotice } from './worker/contribution';
 import { phoneChatUrl } from './serverUrl';
+import { ToolRegistry } from './agent/tools';
 
 function isNewerVersion(current: string, remote: string): boolean {
   const cParts = current.split('.').map((n) => parseInt(n, 10) || 0);
@@ -128,6 +129,11 @@ export function activate(context: vscode.ExtensionContext) {
   setTimeout(() => checkAndAutoUpdateExtension(context), 3000);
   const updateTimer = setInterval(() => checkAndAutoUpdateExtension(context), 30 * 60 * 1000);
   context.subscriptions.push({ dispose: () => clearInterval(updateTimer) });
+
+  // The agent's "Always allow" answers are remembered per project, across restarts.
+  if (context.workspaceState) {
+    ToolRegistry.store = context.workspaceState;
+  }
 
   const client = new DlneClient();
   const workerManager = new WorkerManager(context);
@@ -283,6 +289,30 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.executeCommand('dlne.openPhoneApp');
       } else if (chosen.label.includes('Refresh')) {
         await statusBar.updateStatus();
+      }
+    })
+  );
+
+  // Shows what "Always allow" holds for this project and offers to forget it.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('dlne.forgetApprovals', async () => {
+      const { edits, commands } = ToolRegistry.alwaysApprovals();
+      if (!edits && commands.length === 0) {
+        vscode.window.showInformationMessage('DLNE: The agent has no "Always allow" answers for this project.');
+        return;
+      }
+      const held = [
+        ...(edits ? ['edits inside this project'] : []),
+        ...commands.map((command) => `the command "${command}"`),
+      ];
+      const choice = await vscode.window.showWarningMessage(
+        'DLNE: Forget the agent\'s "Always allow" answers for this project?',
+        { modal: true, detail: `The agent may now, without asking:\n- ${held.join('\n- ')}` },
+        'Forget them'
+      );
+      if (choice === 'Forget them') {
+        await ToolRegistry.forgetAlwaysApprovals();
+        vscode.window.showInformationMessage('DLNE: The agent will ask again before edits and commands in this project.');
       }
     })
   );

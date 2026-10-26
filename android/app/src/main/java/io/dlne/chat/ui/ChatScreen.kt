@@ -49,7 +49,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -217,6 +219,12 @@ private fun MessageList(
     val unanswered = canRetry && pending == null && last?.role == Role.USER
     val direction = LocalLayoutDirection.current
 
+    // Answers whose sources the reader unfolded, by message id. Held here rather than in each
+    // answer so the streaming reply (known by the id it will be saved under) stays unfolded
+    // when it is saved; rememberSaveable keeps it through scrolling and rotation.
+    var openSources by rememberSaveable { mutableStateOf(listOf<String>()) }
+    val toggleSources = { id: String -> openSources = if (id in openSources) openSources - id else openSources + id }
+
     LazyColumn(
         state = listState,
         reverseLayout = true,
@@ -234,7 +242,13 @@ private fun MessageList(
             item(key = "unanswered") { NoticeRow(stringResource(R.string.not_answered), onRetry) }
         }
         if (pending != null) {
-            item(key = "pending") { PendingMessage(pending) }
+            item(key = "pending") {
+                PendingMessage(
+                    pending,
+                    sourcesOpen = pending.messageId in openSources,
+                    onToggleSources = { toggleSources(pending.messageId) },
+                )
+            }
         }
         items(count = messages.size, key = { index -> messages[messages.size - 1 - index].id }) { index ->
             val message = messages[messages.size - 1 - index]
@@ -245,6 +259,8 @@ private fun MessageList(
                     message,
                     onRetry = if (isLast && canRetry && pending == null && message.notice != null) onRetry else null,
                     onReport = { onReport(message.id) },
+                    sourcesOpen = message.id in openSources,
+                    onToggleSources = { toggleSources(message.id) },
                 )
             }
         }
@@ -282,12 +298,18 @@ private fun UserMessage(message: ChatMessage) {
 }
 
 /**
- * A saved answer: the text (with `[n]` citations), its sources, the service's lookup notes,
- * any notice, then Copy and Report. Long-press anywhere also copies.
+ * A saved answer: the text (with `[n]` citations), its sources (folded unless [sourcesOpen]),
+ * the service's lookup notes, any notice, then Copy and Report. Long-press anywhere also copies.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun AssistantMessage(message: ChatMessage, onRetry: (() -> Unit)?, onReport: () -> Unit) {
+private fun AssistantMessage(
+    message: ChatMessage,
+    onRetry: (() -> Unit)?,
+    onReport: () -> Unit,
+    sourcesOpen: Boolean,
+    onToggleSources: () -> Unit,
+) {
     val context = LocalContext.current
     val copyLabel = stringResource(R.string.copy_message)
     Column(
@@ -303,7 +325,7 @@ private fun AssistantMessage(message: ChatMessage, onRetry: (() -> Unit)?, onRep
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         if (message.content.isNotBlank()) MarkdownText(message.content, sources = message.sources)
-        if (message.sources.isNotEmpty()) SourceList(message.sources)
+        if (message.sources.isNotEmpty()) SourceList(message.sources, sourcesOpen, onToggleSources)
         if (message.searchNotes.isNotEmpty()) SearchNotes(message.searchNotes)
         message.notice?.let { NoticeRow(it, onRetry) }
         if (message.content.isNotBlank()) {
@@ -314,7 +336,7 @@ private fun AssistantMessage(message: ChatMessage, onRetry: (() -> Unit)?, onRep
 
 /** The answer while it streams: lookup status until text arrives, then text, sources and notes. */
 @Composable
-private fun PendingMessage(pending: PendingReply) {
+private fun PendingMessage(pending: PendingReply, sourcesOpen: Boolean, onToggleSources: () -> Unit) {
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (pending.text.isEmpty() && pending.notice == null) {
             if (pending.lookup != null) {
@@ -331,7 +353,7 @@ private fun PendingMessage(pending: PendingReply) {
             }
         }
         if (pending.text.isNotEmpty()) MarkdownText(pending.text, sources = pending.sources)
-        if (pending.sources.isNotEmpty()) SourceList(pending.sources)
+        if (pending.sources.isNotEmpty()) SourceList(pending.sources, sourcesOpen, onToggleSources)
         if (pending.searchNotes.isNotEmpty()) SearchNotes(pending.searchNotes)
         pending.notice?.let { NoticeRow(it, onRetry = null) }
     }

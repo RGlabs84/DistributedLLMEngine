@@ -45,8 +45,8 @@ android {
         targetSdk = 36
         // Bump versionCode by one for every upload to Google Play (it must always increase);
         // versionName is what people see. See android/README.md.
-        versionCode = 3
-        versionName = "1.0.2"
+        versionCode = 4
+        versionName = "1.0.3"
     }
 
     signingConfigs {

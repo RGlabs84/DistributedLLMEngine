@@ -2,7 +2,7 @@
   "name": "dlne-code-assistant",
   "displayName": "DLNE Coding Assistant: Free AI Agent",
   "description": "A free AI coding agent and autocomplete, running on GPUs its users share. 100 free chats, no account or API key.",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "publisher": "dlne",
   "license": "MIT",
   "repository": {
@@ -127,6 +127,11 @@
         "command": "dlne.openPhoneApp",
         "title": "DLNE: Use DLNE on Your Phone",
         "category": "DLNE"
+      },
+      {
+        "command": "dlne.forgetApprovals",
+        "title": "DLNE: Forget Agent Approvals for This Project",
+        "category": "DLNE"
       }
     ],
     "configuration": {
@@ -242,6 +247,12 @@
           "scope": "application",
           "default": true,
           "description": "Automatically approve read-only tools (reading files, directory listing)"
+        },
+        "dlne.autoApproveAll": {
+          "type": "boolean",
+          "scope": "application",
+          "default": false,
+          "markdownDescription": "**Run every agent action without asking**: edits anywhere and every shell command. The agent's next step can come from a volunteer's machine (a coding member), so with this on, a command it sends runs on your computer unseen. Off, the approval dialog's **Always allow** buttons remember edits in a project and one command at a time. Only your user settings can turn this on; a project's settings cannot."
         },
         "dlne.autoUpdate": {
           "type": "boolean",

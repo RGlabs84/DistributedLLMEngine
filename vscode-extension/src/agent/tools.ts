@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as child_process from 'child_process';
 import * as os from 'os';
 import { DiffManager, FileDiffData } from './diffManager';
+import { allowedAlways, alwaysPrefix } from './commandRules';
 import { ToolDefinition } from '../client/dlneClient';
 import { REDACTION_MARK, excludedNotice, excludedReason, isExcludedFile, redactSecrets, redactionNote } from '../privacy';
 
@@ -51,23 +52,51 @@ export interface ApprovalRequest {
   detail: string;
   /** Whether "allow for the rest of this session" may be offered (edits inside the workspace only). */
   sessionAllowed: boolean;
+  /**
+   * The "Always allow …" button, when one is offered: edits inside the project, or one command (see
+   * commandRules.ts). Its answer is remembered for this project, across restarts.
+   */
+  always?: string;
 }
 
-export type ApprovalAnswer = 'once' | 'session' | 'deny';
+export type ApprovalAnswer = 'once' | 'session' | 'always' | 'deny';
 
 const ALLOW = 'Allow';
 const ALLOW_SESSION = 'Allow edits for this session';
+const ALWAYS_EDITS = 'Always allow edits in this project';
 
 async function promptForApproval(req: ApprovalRequest): Promise<ApprovalAnswer> {
-  const buttons = req.sessionAllowed ? [ALLOW, ALLOW_SESSION] : [ALLOW];
+  const buttons = [ALLOW];
+  if (req.sessionAllowed) buttons.push(ALLOW_SESSION);
+  if (req.always) buttons.push(req.always);
   const choice = await vscode.window.showWarningMessage(
     `DLNE agent wants to ${req.summary}`,
     { modal: true, detail: req.detail },
     ...buttons
   );
+  if (req.always && choice === req.always) return 'always';
   if (choice === ALLOW_SESSION) return 'session';
   if (choice === ALLOW) return 'once';
   return 'deny';
+}
+
+/** Where "Always allow" answers live: the extension's storage for this project (VS Code's workspaceState). */
+export interface ApprovalStore {
+  get<T>(key: string): T | undefined;
+  update(key: string, value: unknown): Thenable<void>;
+}
+
+const ALWAYS_EDITS_KEY = 'dlne.agent.alwaysAllowEdits';
+const ALWAYS_COMMANDS_KEY = 'dlne.agent.alwaysAllowCommands';
+const MAX_ALWAYS_COMMANDS = 100;
+
+/** Until the extension hands over its project storage (and in tests): kept for this window only. */
+function memoryStore(): ApprovalStore {
+  const values = new Map<string, unknown>();
+  return {
+    get: <T>(key: string) => values.get(key) as T | undefined,
+    update: async (key: string, value: unknown) => { values.set(key, value); },
+  };
 }
 
 /**
@@ -110,16 +139,44 @@ export class ToolRegistry {
    */
   static approver: (req: ApprovalRequest) => Promise<ApprovalAnswer> = promptForApproval;
   private static editsAllowedForSession = false;
+  /** "Always allow" answers for this project (extension.ts hands over workspaceState at activation). */
+  static store: ApprovalStore = memoryStore();
 
-  /** Forget "allow for this session" (called when the conversation is cleared). */
+  /** Forget "allow for this session" (called when the conversation is cleared). "Always allow" answers stay. */
   static resetApprovals(): void {
     this.editsAllowedForSession = false;
   }
 
+  /** Forget every "Always allow" answer for this project (the command "DLNE: Forget Agent Approvals"). */
+  static async forgetAlwaysApprovals(): Promise<void> {
+    await this.store.update(ALWAYS_EDITS_KEY, undefined);
+    await this.store.update(ALWAYS_COMMANDS_KEY, undefined);
+  }
+
+  /** What "Always allow" holds for this project, for showing it to the user. */
+  static alwaysApprovals(): { edits: boolean; commands: string[] } {
+    const commands = this.store.get<unknown>(ALWAYS_COMMANDS_KEY);
+    return {
+      edits: this.store.get<unknown>(ALWAYS_EDITS_KEY) === true,
+      commands: Array.isArray(commands) ? commands.filter((c): c is string => typeof c === 'string') : [],
+    };
+  }
+
+  private static async rememberCommand(prefix: string): Promise<void> {
+    const commands = this.alwaysApprovals().commands.filter((c) => c !== prefix);
+    commands.push(prefix);
+    await this.store.update(ALWAYS_COMMANDS_KEY, commands.slice(-MAX_ALWAYS_COMMANDS));
+  }
+
   /** null when the call may run; otherwise the refusal to hand back to the model. */
   private static async checkApproval(name: string, args: Record<string, any>, root: string | undefined): Promise<string | null> {
-    const autoReads = vscode.workspace.getConfiguration('dlne').get<boolean>('autoApproveReads', true);
+    const config = vscode.workspace.getConfiguration('dlne');
+    // The full auto switch (off by default, user settings only): every tool runs without asking.
+    if (config.get<boolean>('autoApproveAll', false) === true) return null;
+    const autoReads = config.get<boolean>('autoApproveReads', true);
+    const always = this.alwaysApprovals();
     let req: ApprovalRequest | null = null;
+    let commandPrefix: string | null = null;
 
     switch (name) {
       case 'read_file':
@@ -144,24 +201,33 @@ export class ToolRegistry {
       case 'edit_file_diff': {
         const target = resolvePath(root, args.path);
         const inside = insideWorkspace(root, target);
-        if (inside && this.editsAllowedForSession) return null;
+        if (inside && (this.editsAllowedForSession || always.edits)) return null;
         const excerpt = String(name === 'write_file' ? args.content ?? '' : args.replace_block ?? '').slice(0, 600);
         req = {
           tool: name,
           summary: `${name === 'write_file' ? (fs.existsSync(target) ? 'overwrite' : 'create') : 'edit'} ${inside ? path.relative(root!, target) : target}${inside ? '' : ' (OUTSIDE your workspace)'}`,
           detail: `${target}\n\n${excerpt}`,
           sessionAllowed: inside,
+          // Only inside a project: edits elsewhere on the machine are asked about every time.
+          always: inside ? ALWAYS_EDITS : undefined,
         };
         break;
       }
-      case 'run_terminal_command':
+      case 'run_terminal_command': {
+        const command = String(args.command ?? '');
+        // Remembered per project: with no folder open, a command is asked about every time.
+        if (root && allowedAlways(command, always.commands)) return null;
+        commandPrefix = root ? alwaysPrefix(command) : null;
         req = {
           tool: name,
           summary: 'run a command in your shell',
-          detail: `${String(args.command ?? '')}\n\nIn: ${root || os.homedir()}`,
+          detail: `${command}\n\nIn: ${root || os.homedir()}` +
+            (commandPrefix ? `\n\n"Always allow" lets "${commandPrefix}" run again in this project, with any arguments, without asking.` : ''),
           sessionAllowed: false,
+          always: commandPrefix ? `Always allow "${commandPrefix}"` : undefined,
         };
         break;
+      }
       default:
         return null; // unknown tools fail on their own in executeToolInternal
     }
@@ -171,6 +237,13 @@ export class ToolRegistry {
       return `The user declined: ${req.summary}. Do not retry it; ask the user or choose another approach.`;
     }
     if (answer === 'session' && req.sessionAllowed) this.editsAllowedForSession = true;
+    if (answer === 'always' && req.always) {
+      if (name === 'run_terminal_command' && commandPrefix) {
+        await this.rememberCommand(commandPrefix);
+      } else if (name === 'write_file' || name === 'edit_file_diff') {
+        await this.store.update(ALWAYS_EDITS_KEY, true);
+      }
+    }
     return null;
   }
 

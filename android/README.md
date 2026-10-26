@@ -53,10 +53,11 @@ Install on a phone with USB debugging on: `adb install -r app/build/outputs/apk/
 
 `gradle.properties` keeps builds light on a shared machine: a 2 GB Gradle heap, at most four
 workers, and the Kotlin compiler in-process (no extra daemon). On the dev laptop, run
-builds through the machine's memory guard and leave no daemon behind:
+builds through the machine's memory guard and leave no daemon behind (`ANDROID_HOME` because a
+checkout has no `local.properties`):
 
 ```bash
-~/valheim-testbed/heavy.sh 6G dlne-android env JAVA_HOME=$HOME/.local/jdk-17 ./gradlew --no-daemon assembleRelease
+~/valheim-testbed/heavy.sh 6G dlne-android env JAVA_HOME=$HOME/.local/jdk-17 ANDROID_HOME=$HOME/Android/Sdk ./gradlew --no-daemon assembleRelease
 ```
 
 ### Live smoke test
@@ -170,7 +171,10 @@ the Play icon is not exactly the official logo as a 512 x 512 32-bit PNG.
   hostile: flattened to one plain line without control or bidi characters, capped, only
   http(s) URLs become links, and the host shown is the one the link really opens. `[n]` in
   the answer becomes a tappable superscript only when n is in that answer's list. Saved
-  chats keep their sources and notes.
+  chats keep their sources and notes. Under an answer the sources are folded into one
+  tappable line, "› 10 sources · patriots.com, nytimes.com, bostonglobe.com +3" (1.0.3+), and
+  only a tap shows the full list; an unfolded list stays open while the answer streams, once
+  it is saved, and across rotation (not across app restarts).
 - **Links.** Settings > "Website and community" opens the DLNE website
   (`https://live.ravenirongames.com/#dlne`) and the DLNE Discord for news and help
   (`https://discord.gg/RNxvxWn8cw`), and the chat drawer has the same two links under

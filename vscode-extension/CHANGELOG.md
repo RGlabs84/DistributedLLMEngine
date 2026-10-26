@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.3] - 2026-10-26
+
+Pairs with DLNE coordinator **2.4.0** or later.
+
+### Added
+- **Always allow.** A simple task was a run of "Allow" clicks: every shell command asked every time, and "Allow edits for this session" was forgotten when the chat was cleared or VS Code restarted. The approval dialog now remembers, for the project, across restarts:
+  - **Always allow edits in this project**: edits inside the project run without asking (edits elsewhere on the machine still ask).
+  - **Always allow "npm test"**: that one command runs again without asking, with any arguments. What is remembered is the tool and what it does (`npm run build`, `git status`, `python -m pytest`), never more. It is not offered, and does not apply, to a command that chains or redirects (`;`, `&&`, `|`, `>`, `$(...)`), to inline code (`python -c`), or to programs that delete, use `sudo`, fetch from the network, open a shell or control the system.
+  - With no folder open, nothing is remembered.
+- **`dlne.autoApproveAll`** (default off, user settings only): every agent action runs without asking. The agent's next step can come from a volunteer's machine, so with it on a command it sends runs on your computer unseen; the setting says so.
+- **DLNE: Forget Agent Approvals for This Project** shows what is remembered and clears it.
+
+---
+
 ## [1.3.2] - 2026-10-26
 
 Pairs with DLNE coordinator **2.4.0** or later. What a new user met on a first try, seen while recording the DLNE demo.

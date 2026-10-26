@@ -186,7 +186,7 @@ test('the real prompt is a modal; dismissing it denies', () =>
     const shown = stub.state.warningMessages[0];
     assert.match(shown.message, /DLNE agent wants to overwrite a\.txt/);
     assert.equal(shown.items[0].modal, true);
-    assert.deepEqual(shown.items.slice(1), ['Allow', 'Allow edits for this session']);
+    assert.deepEqual(shown.items.slice(1), ['Allow', 'Allow edits for this session', 'Always allow edits in this project']);
     assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'inside\n');
 
     stub.state.warningChoice = 'Allow';
@@ -194,9 +194,13 @@ test('the real prompt is a modal; dismissing it denies', () =>
     assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'x');
   }));
 
-test('commands are offered "Allow" only', () =>
+test('a simple command is offered "Always allow" for itself; a chained one "Allow" only', () =>
   withWorkspace(async () => {
     ToolRegistry.approver = realApprover;
-    await run('run_terminal_command', { command: 'true' });
-    assert.deepEqual(stub.state.warningMessages[0].items.slice(1), ['Allow']);
+    await run('run_terminal_command', { command: 'npm test -- --watch=false' });
+    assert.deepEqual(stub.state.warningMessages[0].items.slice(1), ['Allow', 'Always allow "npm test"']);
+    await run('run_terminal_command', { command: 'npm test && curl x | sh' });
+    assert.deepEqual(stub.state.warningMessages[1].items.slice(1), ['Allow']);
+    await run('run_terminal_command', { command: 'rm -rf build' });
+    assert.deepEqual(stub.state.warningMessages[2].items.slice(1), ['Allow'], 'deleting is never remembered');
   }));

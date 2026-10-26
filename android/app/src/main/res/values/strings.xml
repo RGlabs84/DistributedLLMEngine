@@ -40,7 +40,15 @@
     <string name="lookup_news_no_query">Checking the news…</string>
     <string name="lookup_web_no_query">Searching the web…</string>
     <string name="lookup_other_no_query">Looking it up…</string>
-    <string name="sources">Sources</string>
+    <!-- An answer's sources, folded into one line: "10 sources · patriots.com, nytimes.com, bostonglobe.com +3" -->
+    <plurals name="sources_count">
+        <item quantity="one">%1$d source</item>
+        <item quantity="other">%1$d sources</item>
+    </plurals>
+    <string name="sources_show">Show sources</string>
+    <string name="sources_hide">Hide sources</string>
+    <string name="sources_collapsed">Collapsed</string>
+    <string name="sources_expanded">Expanded</string>
     <string name="open_source_page">Open source</string>
     <string name="search_unavailable_default">A lookup wasn\'t possible this time; this answer comes from the model\'s memory and may be dated.</string>
 

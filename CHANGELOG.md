@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.4.5] - 2026-10-26
+
+### Changed
+- **DLNE Chat folds an answer's sources into one line.** A looked-up answer listed every source under it, ten at a time, and pushed the answer out of view. The list is now one line, "10 sources · patriots.com, nytimes.com, espn.com +3", that opens when tapped (and stays open while the answer streams on). The numbers in the answer still link straight to their sources.
+
+---
+
 ## [2.4.4] - 2026-10-26
 
 ### Fixed

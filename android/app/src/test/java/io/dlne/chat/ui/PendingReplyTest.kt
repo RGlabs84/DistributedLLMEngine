@@ -32,6 +32,14 @@ class PendingReplyTest {
         assertEquals(streaming.lookup, after.lookup)
         assertEquals(streaming.searchNotes, after.searchNotes)
         assertEquals(null, after.notice)
+        // Saved under the same id, so sources the reader unfolded stay unfolded.
+        assertEquals(streaming.messageId, after.messageId)
+    }
+
+    @Test
+    fun `each reply gets its own message id`() {
+        assertTrue(PendingReply("chat-1").messageId != PendingReply("chat-1").messageId)
+        assertTrue(PendingReply("chat-1").messageId.isNotBlank())
     }
 
     @Test

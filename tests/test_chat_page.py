@@ -438,6 +438,13 @@ out.sourceLinks = list.all().filter((n) => n.tagName === 'A')
   .map((a) => ({ href: a.href, rel: a.rel, target: a.target, text: a.textContent }));
 out.sourcePlain = list.all().filter((n) => n.className === 'source plain').map((n) => n.textContent);
 out.sourceTags = [...new Set(list.all().map((n) => n.tagName))].sort();
+out.sourceRoot = list.tagName;
+out.sourceOpen = !!list.open;
+out.sourceSummary = list.all().find((n) => n.tagName === 'SUMMARY').textContent;
+out.sourceReopened = !!C.sourceList(reply.sources, true).open;
+const ten = Array.from({ length: 10 }, (_, i) => ({ n: i + 1, title: 't' + i, url: 'https://site' + (i % 6) + '.test/' + i }));
+out.tenSummary = C.sourceList(C.cleanSources(ten)).all().find((n) => n.tagName === 'SUMMARY').textContent;
+out.oneSummary = C.sourceList(C.cleanSources([ten[0]])).all().find((n) => n.tagName === 'SUMMARY').textContent;
 
 const dated = { role: 'assistant', content: '' };
 C.applyData(dated, JSON.stringify({ dlne: { event: 'searching', query: 'x' } }));
@@ -573,7 +580,18 @@ def test_the_source_list_links_only_http_and_shows_titles_as_text(core_run):
     # The host shown is the link's real host, not whatever the event claimed.
     assert "example.org" in links[1]["text"] and "spoofed.test" not in links[1]["text"]
     assert core_run["sourcePlain"] == ["2<img src=x onerror=alert(1)>Evilevil.test"]
-    assert set(core_run["sourceTags"]) <= {"P", "OL", "LI", "A", "DIV", "SPAN"}
+    assert set(core_run["sourceTags"]) <= {"SUMMARY", "OL", "LI", "A", "DIV", "SPAN"}
+
+
+def test_the_sources_fold_into_one_line_that_opens_when_tapped(core_run):
+    # Ten sources used to stack up under the answer and push it out of view (owner, 26 Oct 2026).
+    assert core_run["sourceRoot"] == "DETAILS"
+    assert core_run["sourceOpen"] is False, "closed until the reader opens it"
+    assert core_run["sourceReopened"] is True, "a list the reader opened stays open when it is replaced"
+    # The line counts the sources and names the first sites (the link's real host, never the claimed one).
+    assert core_run["sourceSummary"] == "›3 sources· example.com, evil.test, example.org"
+    assert core_run["tenSummary"] == "›10 sources· site0.test, site1.test, site2.test +3"
+    assert core_run["oneSummary"] == "›1 source· site0.test"
 
 
 def test_the_lookup_line_is_worded_by_tool_and_shows_the_latest(core_run):

@@ -241,8 +241,21 @@ button { font: inherit; color: inherit; }
   background: var(--surface-2); color: var(--link); font-weight: 650; text-decoration: none;
 }
 .extras { min-width: 0; }
-.sources { margin-top: 14px; }
-.sources-title { margin: 0 0 6px; font-size: .74rem; letter-spacing: .07em; text-transform: uppercase; color: var(--faint); }
+/* Sources fold into one line ("10 sources · patriots.com, espn.com…") and open when tapped. */
+.sources { margin-top: 12px; }
+.sources > summary {
+  display: inline-flex; align-items: center; gap: 8px; max-width: 100%; min-height: 36px; padding: 4px 14px 4px 10px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--muted);
+  font-size: .82rem; cursor: pointer; list-style: none; user-select: none; box-sizing: border-box;
+}
+.sources > summary::-webkit-details-marker { display: none; }
+.sources > summary:hover, .sources > summary:focus-visible { border-color: var(--user-border); color: var(--text); }
+.sources-chevron { flex: none; display: inline-block; width: 1em; text-align: center; transition: transform .15s; }
+.sources[open] .sources-chevron { transform: rotate(90deg); }
+@media (prefers-reduced-motion: reduce) { .sources-chevron { transition: none; } }
+.sources-count { flex: none; color: var(--text); font-weight: 600; }
+.sources-hosts { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sources[open] > summary { margin-bottom: 8px; }
 .source-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .source {
   display: flex; align-items: center; gap: 10px; min-height: 48px; min-width: 0; padding: 6px 12px;
@@ -543,9 +556,22 @@ const DLNEChat = (() => {
     return source.host;
   }
 
-  function sourceList(sources) {
-    const box = el('div', 'sources');
-    box.appendChild(el('p', 'sources-title', 'Sources'));
+  // The sources, folded into one line that opens when tapped: a long list pushed the answer out of view.
+  // ``open``: show it opened (it was open before the list was replaced while the answer streamed).
+  function sourceList(sources, open) {
+    const box = el('details', 'sources');
+    if (open) box.open = true;
+    const summary = el('summary');
+    const chevron = el('span', 'sources-chevron', '›');
+    chevron.setAttribute('aria-hidden', 'true');
+    summary.appendChild(chevron);
+    summary.appendChild(el('span', 'sources-count', sources.length === 1 ? '1 source' : sources.length + ' sources'));
+    const hosts = [...new Set(sources.map(hostOf).filter(Boolean))];
+    if (hosts.length) {
+      const more = hosts.length > 3 ? ' +' + (hosts.length - 3) : '';
+      summary.appendChild(el('span', 'sources-hosts', '· ' + hosts.slice(0, 3).join(', ') + more));
+    }
+    box.appendChild(summary);
     const list = el('ol', 'source-list');
     sources.forEach((s) => {
       const url = safeUrl(s.url);
@@ -1018,8 +1044,10 @@ const DLNEChat = (() => {
     const key = JSON.stringify([m.sources || [], m.lookupNotes || [], m.searchNote || '']);
     if (key !== v.extrasKey) {   // sources are replaced as lookups finish
       v.extrasKey = key;
+      const wasOpen = !!(v.sourcesBox && v.sourcesBox.open);   // a list the reader opened stays open
       clear(v.extras);
-      if (m.sources) v.extras.appendChild(sourceList(m.sources));
+      v.sourcesBox = m.sources ? sourceList(m.sources, wasOpen) : null;
+      if (v.sourcesBox) v.extras.appendChild(v.sourcesBox);
       (m.lookupNotes || []).forEach((note) => v.extras.appendChild(el('p', 'search-note', note)));
       if (m.searchNote) v.extras.appendChild(el('p', 'search-note', m.searchNote));
       v.extras.hidden = !v.extras.firstChild;
