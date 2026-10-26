@@ -141,6 +141,10 @@ floors would be missed. Ladder order is quality order (smallest and least smart 
 - downloads and verifies the chosen tier's files (sha256 + size; split models: every part, using the
   downloader's API, section 9), starts llama-server on loopback with `--fit on`, the coding context, and
   the no-trace arguments (section 8); restarts with backoff; low priority; stops cleanly.
+- starts it with `--alias <the model file's name>` (`engine/model_alias.py`, the same for the coordinator's
+  engine and the phone-pool members), because llama-server otherwise puts the path it loaded the model from
+  (`/home/<user>/...`) in the `model` field of every answer, which the requester opens. Nothing reads that
+  field: clients name the model from the status.
 - runs the **member proxy** on the worker's RPC port: `POST /v1/chat/completions` and
   `POST /v1/completions`, plain JSON or an end-to-end envelope (section 6), streamed to loopback
   llama-server and back; `GET /health`. The proxy never logs request or response bodies. (The
@@ -224,7 +228,11 @@ As built:
   it without one; after that it is tier `cpu` with the CPU rolling window, and is never refused for it
   (`cpu_node_shortfalls` is not applied to a GPU node). A job resets the clock: the next heartbeat or
   request that finds the GPU serving clears it. A member that yields to its owner's game counts as
-  serving. The clock lives in coordinator memory, so a coordinator restart gives every GPU a fresh grace.
+  serving. The clock (one start time per worker id, `engine/standby.py`) survives a coordinator restart: it
+  is kept in `config/gpu_standby.json`, written atomically at most every 30 s while it changes and at a clean
+  shutdown, read once at start. Only workers with no job have an entry, and one not seen for 24 hours is
+  forgotten (it starts again with a fresh grace when it returns). A missing, old or damaged file means no
+  history and never stops the coordinator.
 
 ## 6. End-to-end encryption
 

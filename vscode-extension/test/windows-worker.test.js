@@ -25,6 +25,7 @@ function manager(settings = {}) {
   Object.assign(stub.state.settings, settings);
   const wm = new WorkerManager({ subscriptions: [], globalState: undefined });
   wm.currentState = 'idle';
+  wm.externalWorker = false; // a fake worker another test file runs is not this machine's
   return wm;
 }
 
@@ -173,17 +174,27 @@ test('a stop does not later kill a worker that was started after it', async () =
   wm.workerProcess = oldWorker;
   wm.isSystemdActive = () => false;
   const realExec = childProcess.execSync;
+  const realExecFile = childProcess.execFileSync;
   const realSetTimeout = global.setTimeout;
   const timers = [];
-  childProcess.execSync = () => ''; // no real killall on the machine running the tests
+  const execFiles = [];
+  childProcess.execSync = () => ''; // nothing real runs on the machine running the tests
+  childProcess.execFileSync = (file, args) => { execFiles.push([file, args]); return ''; };
+  wm.findEngineScript = () => path.join(os.tmpdir(), 'dlne engine', 'dlne_server.py');
   global.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return { unref() {} }; };
   try {
     await wm.stopWorker();
   } finally {
     global.setTimeout = realSetTimeout;
     childProcess.execSync = realExec;
+    childProcess.execFileSync = realExecFile;
   }
   assert.deepEqual(kills, [['old', 'SIGTERM']]);
+  // An orphaned engine is stopped by this install's own path, never every ggml-rpc-server on the machine.
+  const exe = path.join(os.tmpdir(), 'dlne engine', 'bin', process.platform === 'win32' ? 'ggml-rpc-server.exe' : 'ggml-rpc-server');
+  assert.equal(execFiles.length, 1);
+  assert.ok(execFiles[0][1].join(' ').includes(process.platform === 'win32' ? exe : exe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+    'the orphan stop names this install\'s engine by its full path');
   assert.equal(timers.length, 1);
   assert.equal(timers[0].ms, process.platform === 'win32' ? 800 : 8000, 'a few seconds for the worker to stop its model server');
 

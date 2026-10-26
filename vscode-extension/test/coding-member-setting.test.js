@@ -39,6 +39,7 @@ function manager(settings = {}) {
   Object.assign(stub.state.settings, settings);
   const wm = new WorkerManager({ subscriptions: [], globalState: undefined });
   wm.currentState = 'idle';
+  wm.externalWorker = false; // a fake worker another test file runs is not this machine's
   return wm;
 }
 

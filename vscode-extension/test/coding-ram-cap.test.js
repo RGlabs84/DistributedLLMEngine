@@ -56,6 +56,7 @@ async function spawnedArgs(settings, engineSource = 'p_worker.add_argument("--co
   fs.writeFileSync(path.join(root, 'dlne_server.py'), engineSource);
   const wm = new WorkerManager({ subscriptions: [], globalState: undefined });
   wm.currentState = 'idle';
+  wm.externalWorker = false; // a fake worker another test file runs is not this machine's
   wm.localGpu = { hasGpu: true, name: 'RTX 4060', vramTotalGb: 8, api: 'vulkan' };
   wm.isSystemdActive = () => false;
   wm.isProcessActive = () => false;

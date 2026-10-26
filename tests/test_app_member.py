@@ -83,6 +83,7 @@ def test_a_tier_is_downloaded_verified_and_served(env):
     args = starts[0]
     assert args[args.index("--device") + 1] == "none" and args[args.index("-ngl") + 1] == "0"
     assert args[args.index("--host") + 1] == "127.0.0.1"
+    assert args[args.index("--alias") + 1] == env.a["file"], "answers carry the file's name, not the volunteer's folder"
     assert (env.base / "logs" / "app_server.log").exists()
 
 

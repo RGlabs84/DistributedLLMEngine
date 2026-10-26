@@ -7,7 +7,7 @@
 
 No account, no API key, no subscription. Install it, open the DLNE sidebar, and ask it to write or fix code. It reads the files in your workspace, and asks before it changes a file, runs a command, or looks outside your workspace.
 
-> **Upgrading to 1.3.0?** `dlne.serverUrl`, `dlne.apiKey`, `dlne.autoApproveReads`, `dlne.autoUpdate` and the `dlne.worker.*` settings are now read only from your user settings. If you set one of them in a workspace's `.vscode/settings.json`, move it to your user settings (`Preferences: Open User Settings`), or DLNE uses the default. This stops a cloned repository from sending your code to another server. [More below](#settings).
+> **Upgrading from 1.2.x?** Since 1.3.0, `dlne.serverUrl`, `dlne.apiKey`, `dlne.autoApproveReads`, `dlne.autoUpdate` and the `dlne.worker.*` settings are read only from your user settings. If you set one of them in a workspace's `.vscode/settings.json`, move it to your user settings (`Preferences: Open User Settings`), or DLNE uses the default. This stops a cloned repository from sending your code to another server. [More below](#settings).
 
 - **Agent chat**: in the DLNE sidebar, or as `@dlne` in VS Code's Chat view.
 - **Ghost-text autocomplete**: suggestions inline as you type.
@@ -26,9 +26,11 @@ DLNE runs on a **swarm**: a coordinator plus the GPUs of the people who use it.
 
 | You lend | Coding agent | When the swarm is busy |
 |---|---|---|
-| **A GPU** | Unlimited | First in line |
+| **A GPU** | Unlimited, while your GPU is in use* | First in line |
 | **A CPU** | 300 chats in any 5 hours (each frees up 5 hours after you used it) | Second in line |
 | Nothing | The 100 free chats | After contributors |
+
+\* "In use" means the swarm has given your GPU a job: a share of the shared model, or a coding member. A newly lent GPU gets the GPU perks for its first 30 minutes while the swarm finds it a job; a GPU still without one after that counts as a CPU contributor until it gets one.
 
 A CPU contributor's chats show how many are left, and at the limit the agent says exactly when the next one frees up.
 

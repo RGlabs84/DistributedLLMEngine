@@ -41,9 +41,10 @@ function manager({ gpu = RTX, state = globalState(), settings = {} } = {}) {
   Object.assign(stub.state.settings, settings);
   const wm = new WorkerManager({ subscriptions: [], globalState: state });
   wm.localGpu = gpu;
-  // The constructor believes a real worker on the machine running the tests (pgrep, systemd); these tests
-  // describe their own machine.
+  // The constructor believes a real worker on the machine running the tests (pgrep, systemd, or the fake worker
+  // another test file has running at the same moment); these tests describe their own machine.
   wm.currentState = 'idle';
+  wm.externalWorker = false;
   wm.vramContributed = 0;
   return { wm, state, done: () => wm.dispose() };
 }

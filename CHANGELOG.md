@@ -10,6 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.4.3] - 2026-10-26
+
+### Changed
+- **A coordinator restart no longer starts the GPU grace again.** The moment each idle GPU worker began standing by
+  (the clock behind `GPU_STANDBY_GRACE_MINUTES`) is kept in `config/gpu_standby.json`: written atomically, at most
+  every 30 s while it changes and at a clean shutdown; read once at start. Only workers with no job have an entry,
+  and one not seen for 24 hours is forgotten. A missing, old or damaged file means no history (never an error).
+
+### Fixed
+- **No file path in an answer.** llama-server reports the path it loaded the model from in every answer
+  (`"model": "/home/<user>/.../X.gguf"`), and those answers reach other people: a phone through the pool, a
+  developer through a coding member. Every llama-server DLNE starts now gets `--alias <the model file's name>`
+  (`Qwen3.6-35B-A3B-UD-IQ3_S.gguf`), so answers and `/v1/models` carry the name and no directory. That covers the
+  coordinator's coding engine, the coordinator host's phone member, volunteers' phone members (light mode too) and
+  coding members. Nothing in DLNE reads the `model` of an answer (the extension and the phone apps name the model
+  from the pool's status), so nothing that matches on a model name changes.
+
+---
+
 ## [2.4.2] - 2026-10-26
 
 ### Added

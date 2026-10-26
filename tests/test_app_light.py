@@ -230,6 +230,7 @@ def test_the_answers_in_flight_get_the_drain_and_then_it_restarts_lighter(env):
     argv = recorded_starts(env.record)[1]
     assert (flag(argv, "-t"), flag(argv, "-tb"), flag(argv, "-np"), flag(argv, "-c")) == ("3", "3", "1", "8192")
     assert argv[-2:] == ["--cache-ram", "0"]
+    assert flag(argv, "--alias") == env.tier["file"], "light mode names the model by its file too, never by its path"
     assert env.lowered[-1] == env.member.process.pid, "the new server is lowest priority from the start"
     assert env.member.status() == {"model": env.tier["id"], "ready": True, "slots": 1, "threads": 3}
 
@@ -472,10 +473,11 @@ def test_a_gpu_node_with_a_coding_member_does_not_light_anything(nodes):
     assert node.app_member.calls == []
 
 
-def test_the_coordinator_hosts_own_member_has_no_light_mode_and_its_arguments_are_unchanged():
+def test_the_coordinator_hosts_own_member_has_no_light_mode_and_its_arguments_are_these():
     assert not hasattr(app_pool.LocalAppServer, "set_light") and not hasattr(app_pool.LocalAppServer, "set_yielding")
     assert app_server_args("/b/ls", "/m/a.gguf", 8099, 4) == [
-        "/b/ls", "-m", "/m/a.gguf", "--host", "127.0.0.1", "--port", "8099", "-c", "16384", "-np", "2", "-t", "4", "-tb", "4",
+        "/b/ls", "-m", "/m/a.gguf", "--alias", "a.gguf", "--host", "127.0.0.1", "--port", "8099", "-c", "16384", "-np", "2",
+        "-t", "4", "-tb", "4",
         "-n", str(app_pool.MAX_OUTPUT_TOKENS), "--device", "none", "-ngl", "0", "--jinja", "--no-webui"]
 
 

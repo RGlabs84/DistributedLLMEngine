@@ -672,7 +672,7 @@ def test_sha256_ok(tmp_path, monkeypatch):
 
 def test_app_server_args_are_cpu_only_and_loopback_only():
     args = app_server_args("/bin/llama-server", "/m/x.gguf", 8099, 6)
-    assert args == ["/bin/llama-server", "-m", "/m/x.gguf", "--host", "127.0.0.1", "--port", "8099",
+    assert args == ["/bin/llama-server", "-m", "/m/x.gguf", "--alias", "x.gguf", "--host", "127.0.0.1", "--port", "8099",
                     "-c", "16384", "-np", "2", "-t", "6", "-tb", "6", "-n", str(ap.MAX_OUTPUT_TOKENS),
                     "--device", "none", "-ngl", "0", "--jinja", "--no-webui"]
 
@@ -755,7 +755,7 @@ def test_local_member_starts_pinned_and_cpu_only_and_becomes_ready(local):
     assert [local.binary] + args == app_server_args(local.binary, str(local.models / "t0.gguf"), srv.port, 3,
                                                     cpu_mask="0x3")
     for flag, value in (("--device", "none"), ("-ngl", "0"), ("--host", "127.0.0.1"),
-                        ("--cpu-mask", "0x3"), ("--cpu-strict", "1")):
+                        ("--cpu-mask", "0x3"), ("--cpu-strict", "1"), ("--alias", "t0.gguf")):
         assert args[args.index(flag) + 1] == value
     assert srv.as_member().ready is False, "not ready until /health answers"
     assert asyncio.run(_wait_ready(srv)) is True

@@ -107,7 +107,9 @@ export class ClusterStatusBar {
 
     const quota = this.client.getQuotaRemaining();
     const contribTag = workerStatus.state === 'contributing'
-      ? workerStatus.cpuPool
+      ? workerStatus.external
+        ? ' [Worker started outside VS Code]'
+        : workerStatus.cpuPool
         ? ` [Phone app ${workerStatus.vramContributedGb}GB]`
         : workerStatus.role === 'coding'
         ? ` [Coding member ${workerStatus.vramContributedGb}GB${workerStatus.alsoCpu ? ' + Phone app' : ''}]`

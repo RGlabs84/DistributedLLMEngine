@@ -35,6 +35,7 @@ function manager({ gpu = RTX, state = globalState(), settings = {} } = {}) {
   const wm = new WorkerManager({ subscriptions: [], globalState: state });
   wm.localGpu = gpu;
   wm.currentState = 'idle';
+  wm.externalWorker = false; // a fake worker another test file runs is not this machine's
   wm.vramContributed = 0;
   return { wm, state, done: () => wm.dispose() };
 }

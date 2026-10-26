@@ -51,6 +51,7 @@ from engine import gguf
 from engine.config import SPEC_DEFAULTS, engine_args_without_placement, get_base_dir, get_worker_limits
 from engine.downloader import download_and_extract_engine
 from engine.logger import log_coordinator, log_error, log_warning
+from engine.model_alias import alias_args
 
 
 # --------------------------------------------------------------------------------------
@@ -1937,6 +1938,9 @@ class InferenceManager:
             cmd = [
                 binary_path,
                 "-m", resolved_path,
+                # Answers name the model by its file's name, not by the path llama-server loaded
+                # it from (engine/model_alias.py).
+                *alias_args(resolved_path),
                 "--host", "127.0.0.1",
                 "--port", str(assigned_port),
                 "-c", str(safe_context),

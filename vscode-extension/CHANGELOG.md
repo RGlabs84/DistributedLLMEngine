@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.1] - 2026-10-26
+
+Pairs with DLNE coordinator **2.4.0** or later. The GPU perks wording below is coordinator 2.4.2's, where a GPU keeps its perks while the swarm uses it.
+
+### Fixed
+- **Start Contributing never starts a `dlne-worker` systemd service.** When a user service by that name existed, Start Contributing started it instead of the worker you chose, so "lend my CPU, 16 GB" ran whatever the service was set up as (an 8 GB GPU worker, on the machine where it was found). The extension now always starts its own worker, with your VS Code settings.
+- **A worker started outside VS Code is described as one.** A worker the extension did not start (a service, a terminal, another editor) was shown as "8.0 GB via VULKAN (system service)", a fixed string, or described from this editor's settings. The sidebar, status bar, tooltip, quick pick and `@dlne /contribute` now say that a worker started outside VS Code is running with its own settings. Start Contributing says so instead of starting a second worker beside it. Stop Contributing stops it if it is the `dlne-worker` service; one started from a terminal or another editor is stopped there.
+- **Stop Contributing stops only this install's engine.** An engine left behind by a killed worker was cleared with `killall -9 ggml-rpc-server` (Windows: `taskkill /F /IM ggml-rpc-server.exe`), which killed every `ggml-rpc-server` on the machine, other installs' and other programs' included. It now stops only the one at this install's own path.
+
+### Changed
+- **The GPU perks say when they apply.** The lend dialog, `@dlne /contribute` and the README now say what coordinator 2.4.2 does: a lent GPU gets unlimited coding, first in line, while the swarm uses it, and for its first 30 minutes while the swarm finds it a job. A GPU still without a job after that counts as a CPU contributor until it gets one.
+
+---
+
 ## [1.3.0] - 2026-10-26
 
 Pairs with DLNE coordinator **2.4.0** or later (coding members, docs/coding-members.md). With an older coordinator, or one with coding members off, requests go exactly as they did in 1.2.5.

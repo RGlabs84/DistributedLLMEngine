@@ -173,6 +173,7 @@ def test_llama_server_is_started_on_loopback_with_the_coding_settings(build):
     assert arg_after(argv, "--fit") == "on"
     assert "-ngl" not in argv and "--n-gpu-layers" not in argv, "a layer count would switch --fit off"
     assert "--no-webui" in argv and "--jinja" in argv
+    assert arg_after(argv, "--alias") == env.tier["file"], "named by the file, so no answer carries the model's folder"
     noise = no_trace.LLAMA_NO_TRACE_ARGS
     assert noise and any(argv[i:i + len(noise)] == noise for i in range(len(argv))), "the no-trace arguments"
 

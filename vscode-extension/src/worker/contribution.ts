@@ -169,6 +169,22 @@ export function powershellExpandCommand(zipPath: string, destDir: string): strin
   return `powershell -NoProfile -Command "Expand-Archive -LiteralPath ${powershellQuote(zipPath)} -DestinationPath ${powershellQuote(destDir)} -Force"`;
 }
 
+/**
+ * How Stop removes an orphaned ggml-rpc-server (its worker was killed before it could stop it): only the one this
+ * install runs, matched by its full path, never another program's or another install's (a machine-wide
+ * `killall ggml-rpc-server` would). `[file, args]` for execFileSync, or null when there is no path to match.
+ */
+export function orphanRpcStopCommand(rpcExe: string, platform: string): [string, string[]] | null {
+  if (!rpcExe) return null;
+  if (platform === 'win32') {
+    const script = `Get-Process -Name ggml-rpc-server -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq ${powershellQuote(rpcExe)} } | Stop-Process -Force`;
+    return ['powershell', ['-NoProfile', '-Command', script]];
+  }
+  // pkill matches an extended regular expression against the whole command line: the path, then an argument or the end.
+  const escaped = rpcExe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return ['pkill', ['-9', '-f', `^${escaped}( |$)`]];
+}
+
 /** `value` in double quotes when it contains whitespace (a command line splits an unquoted path at the first space). */
 export function quoteIfSpaced(value: string): string {
   return /\s/.test(value) && !value.startsWith('"') ? `"${value}"` : value;
@@ -321,7 +337,7 @@ export function ramChoices(totalGb: number): RamChoice[] {
 // ---------------------------------------------------------------------------------------------
 
 export const CPU_POOL_HEADLINE = 'Your computer powers the DLNE phone app';
-/** What a CPU contributor gets back; GPU contributors are 1st in line, with no limit. */
+/** What a CPU contributor gets back; GPU contributors are 1st in line, with no limit, while their GPU has a job. */
 export const CPU_POOL_PERK = 'the coding agent 2nd in line, with 300 chats every 5 hours';
 export const CPU_POOL_PERFORMANCE = 'The model server runs at low priority on half your cores (2 to 8 threads), so your computer stays usable';
 
@@ -362,6 +378,17 @@ export function ramTooSmallText(totalGb: number): string {
     `To lend more anyway, set dlne.worker.maxRamGb yourself.`;
 }
 
+/**
+ * A DLNE worker this editor did not start (a systemd service, a terminal, another editor) is running. It has its
+ * own settings, so nothing about it is described from the settings here: what it lends is not known to this editor.
+ * Stop Contributing stops the dlne-worker service, never another program's process, so a worker started from a
+ * terminal or another editor is stopped where it was started.
+ */
+export const EXTERNAL_WORKER_LINE = 'A DLNE worker started outside VS Code is running on this machine, with its own settings, not the ones here.';
+export const EXTERNAL_WORKER_TEXT =
+  `${EXTERNAL_WORKER_LINE} Stop Contributing stops it if it is the dlne-worker service; one started from a terminal ` +
+  'or another editor stops there. Then start again to contribute with your VS Code settings.';
+
 /** The toast when the worker starts. */
 export function workerStartedNotice(cpuPool: boolean): string {
   return cpuPool
@@ -383,6 +410,8 @@ export interface ContributionView {
   roleDetail?: RoleDetail;
   /** "Both": the worker says the CPU also serves the phone pool next to the GPU's job (see parseAlso). */
   alsoCpu?: boolean;
+  /** The running worker was started outside this editor (EXTERNAL_WORKER_LINE); its settings are not these. */
+  external?: boolean;
 }
 
 /** The sidebar's contribution card: two HTML lines and the button. */
@@ -401,6 +430,13 @@ export function contributionCopy(st: ContributionView): ContributionCopy {
   const active = st.state === 'contributing';
   const starting = st.state === 'starting';
   const buttonText = (idle: string) => (active ? '⏹ Stop Contributing' : starting ? '⏳ Initializing...' : idle);
+  if (active && st.external) {
+    return {
+      deviceHtml: `<strong>Outside VS Code:</strong> ${escapeHtml(EXTERNAL_WORKER_LINE)}`,
+      ruleHtml: 'Stop Contributing stops it; start again to contribute with your settings here.',
+      buttonText: buttonText(''),
+    };
+  }
   if (st.cpuPool) {
     return {
       deviceHtml: `<strong>CPU pool:</strong> ${CPU_POOL_HEADLINE}` +
@@ -429,6 +465,9 @@ export function contributionCopy(st: ContributionView): ContributionCopy {
 /** The "Local Contribution" lines of the status bar tooltip. */
 export function contributionTooltip(st: ContributionView): string[] {
   const active = st.state === 'contributing';
+  if (active && st.external) {
+    return ['Local Contribution: A WORKER STARTED OUTSIDE VS CODE (its own settings)', EXTERNAL_WORKER_TEXT];
+  }
   if (st.cpuPool) {
     return [
       active
@@ -617,7 +656,7 @@ export function lendGpuPrompt(gpuName: string): { message: string; detail: strin
       ...MEMBER_PRIVACY_FACTS.map((fact) => `- ${fact}`),
       '',
       CODING_RAM_SENTENCE,
-      'In return the coding agent is yours first in line, with no limit. You can stop at any time from the sidebar.',
+      'In return the coding agent is yours first in line, with no limit, while the swarm uses your GPU (and for its first 30 minutes while it finds it a job). You can stop at any time from the sidebar.',
       `"${LEND_CPU_ONLY}" keeps your GPU yours: your computer then powers the DLNE phone app instead (it sets dlne.worker.device to "cpu").`,
       LEND_BOTH_SENTENCE,
     ].join('\n'),
@@ -641,6 +680,10 @@ export interface RoleCopy {
 export function roleCopy(st: ContributionView): RoleCopy {
   const active = st.state === 'contributing';
   const starting = st.state === 'starting';
+  if (active && st.external) {
+    // Its job is in its own log; this editor did not start it and cannot say.
+    return { roleHtml: '<strong>Role:</strong> not known here (that worker reports to its own log).', factsHtml: '', trustHtml: '' };
+  }
   if (st.cpuPool) {
     return { roleHtml: `<strong>Role:</strong> ${ROLE_LABEL.app}. ${escapeHtml(roleMeaning('app'))}`, factsHtml: '', trustHtml: '' };
   }

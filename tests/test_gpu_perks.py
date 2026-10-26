@@ -5,6 +5,9 @@ that its owner is a CPU contributor like any other (the CPU rolling window), and
 """
 
 import asyncio
+import inspect
+import json
+import os
 
 import pytest
 from fastapi import FastAPI, Request
@@ -13,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 from engine import config as engine_config
 from engine import coordinator
 from engine.priority import UsageWindow
+from engine.standby import StandbyBook
 from engine.version import VERSION
 from tests.test_coding_endpoint import Clock, env, fakes  # noqa: F401
 
@@ -26,16 +30,18 @@ def gpu_hw(vram=24.0, **extra):
 
 
 @pytest.fixture
-def perks(env, monkeypatch):
+def perks(env, monkeypatch, tmp_path):
     """The real tier middleware in front of a route that reports the tier it was handed, a registry the
-    tests fill, and a clock they move."""
+    tests fill, and a clock they move. The standing-by book keeps its file in the test's own folder (and is
+    not loaded, so it writes nothing, until a test loads it)."""
     env.limits.update({"enforce_contrib_clause": True, "starter_quota_inferences": 5, "cpu_coding_limit": 2,
                        "cpu_coding_window_hours": 5.0, "gpu_standby_grace_minutes": 30.0, "cpu_min_ram_gb": 8.0})
     monkeypatch.setattr(coordinator, "cpu_coding_window", UsageWindow())
-    monkeypatch.setattr(coordinator, "_gpu_standing_by_since", {})
     standby = Clock()
-    standby.t = 5_000.0
-    monkeypatch.setattr(coordinator, "_standby_clock", standby)
+    standby.t = 1_700_000_000.0
+    standby_file = str(tmp_path / "install" / "config" / "gpu_standby.json")
+    monkeypatch.setattr(coordinator, "gpu_standby", StandbyBook(lambda: standby_file, standby))
+    env.standby_file = standby_file
 
     probe = FastAPI()
     probe.add_middleware(coordinator.NonContribBlockerMiddleware)
@@ -211,18 +217,19 @@ def test_the_heartbeat_keeps_the_clock_so_it_starts_when_the_swarm_first_sees_th
 
     beat("idle", "10.9.0.1")
     beat("busy", "10.9.0.2")
-    assert set(coordinator._gpu_standing_by_since) == {"idle"}, "only the one with no job has a clock"
-    started = coordinator._gpu_standing_by_since["idle"]
+    assert set(coordinator.gpu_standby.tracked()) == {"idle"}, "only the one with no job has a clock"
+    started = coordinator.gpu_standby.since("idle")
     perks.standby.t += 10 * MINUTE
     beat("idle", "10.9.0.1")
-    assert coordinator._gpu_standing_by_since["idle"] == started, "a later heartbeat does not restart it"
+    assert coordinator.gpu_standby.since("idle") == started, "a later heartbeat does not restart it"
 
 
-def test_the_tracking_table_is_bounded(perks, monkeypatch):
-    monkeypatch.setattr(coordinator, "MAX_STANDBY_TRACKED", 5)
+def test_the_tracking_table_is_bounded(perks):
+    coordinator.gpu_standby.max_tracked = 5
     for i in range(12):
+        perks.standby.t += 1
         coordinator._gpu_note_job_state({"worker_id": f"w{i}", "ip": "10.7.0.1", "port": i, "hardware": gpu_hw()})
-    assert len(coordinator._gpu_standing_by_since) <= 5
+    assert len(coordinator.gpu_standby) <= 5
 
 
 def test_a_node_with_no_id_is_never_judged(perks):
@@ -240,3 +247,89 @@ def test_the_grace_setting_is_read_from_config(monkeypatch):
     assert limits_for({"GPU_STANDBY_GRACE_MINUTES": "0"}) == 0.0
     for bad in ("-1", "soon", "nan", "99999", ""):
         assert limits_for({"GPU_STANDBY_GRACE_MINUTES": bad}) == 30.0, bad
+
+
+# ======================================================================================
+# A coordinator restart keeps the grace (engine/standby.py)
+# ======================================================================================
+
+def restart(perks, monkeypatch):
+    """What a restart is: a clean shutdown saves the clocks, a new process starts with a new book and loads them."""
+    asyncio.run(coordinator.shutdown_event())
+    book = StandbyBook(lambda: perks.standby_file, perks.standby)
+    monkeypatch.setattr(coordinator, "gpu_standby", book)
+    return coordinator._load_gpu_standby()
+
+
+def test_a_restart_in_the_middle_of_the_grace_does_not_start_it_again(perks, monkeypatch):
+    coordinator._load_gpu_standby()
+    perks.add_worker("g1", gpu_hw())
+    perks.standby.t += 20 * MINUTE
+    assert tier_of(perks.tier("g1")) == "gpu"
+    perks.standby.t += 1 * MINUTE
+    assert restart(perks, monkeypatch) == 1
+    perks.standby.t += 5 * MINUTE                       # 26 minutes since it began standing by
+    assert tier_of(perks.tier("g1")) == "gpu"
+    perks.standby.t += 5 * MINUTE                       # 31: a fresh 30 would still have 25 to go
+    assert tier_of(perks.tier("g1")) == "cpu"
+
+
+def test_without_the_file_a_restart_would_start_the_grace_again(perks, monkeypatch):
+    """The control: what the same steps do when nothing was saved."""
+    perks.add_worker("g1", gpu_hw())
+    perks.standby.t += 25 * MINUTE
+    monkeypatch.setattr(coordinator, "gpu_standby", StandbyBook(lambda: perks.standby_file, perks.standby))
+    perks.standby.t += 10 * MINUTE
+    assert tier_of(perks.tier("g1")) == "gpu"
+
+
+def test_a_gpu_with_a_job_when_the_coordinator_stopped_has_no_clock_when_it_returns(perks, monkeypatch):
+    coordinator._load_gpu_standby()
+    endpoint = perks.add_worker("g1", gpu_hw())
+    perks.standby.t += 40 * MINUTE
+    perks.local.endpoints = [endpoint]
+    assert tier_of(perks.tier("g1")) == "gpu"
+    assert restart(perks, monkeypatch) == 0, "a worker with a job has no entry"
+    perks.local.endpoints = []                          # the engine did not come back with it
+    assert tier_of(perks.tier("g1")) == "gpu", "a fresh grace, from the first sight"
+
+
+def test_a_worker_not_seen_for_a_day_comes_back_to_a_fresh_grace(perks, monkeypatch):
+    coordinator._load_gpu_standby()
+    perks.add_worker("g1", gpu_hw())
+    perks.standby.t += 2 * MINUTE
+    asyncio.run(coordinator.shutdown_event())
+    perks.standby.t += 25 * 60 * MINUTE
+    assert restart(perks, monkeypatch) == 0
+    assert tier_of(perks.tier("g1")) == "gpu"
+
+
+@pytest.mark.parametrize("content", [b"", b"{", b"\xff\xfe\x00 not json", b"[]", b'{"version": 1, "workers": 5}'])
+def test_a_damaged_file_means_no_history_and_never_stops_the_coordinator(perks, content):
+    os.makedirs(os.path.dirname(perks.standby_file))
+    with open(perks.standby_file, "wb") as handle:
+        handle.write(content)
+    assert coordinator._load_gpu_standby() == 0
+    perks.add_worker("g1", gpu_hw())
+    assert tier_of(perks.tier("g1")) == "gpu"
+    asyncio.run(coordinator.shutdown_event())
+    with open(perks.standby_file, encoding="utf-8") as handle:
+        assert list(json.load(handle)["workers"]) == ["g1"], "and the file is whole again"
+
+
+def test_nothing_is_written_until_the_coordinator_has_started(perks):
+    perks.add_worker("g1", gpu_hw())
+    perks.standby.t += 31 * MINUTE
+    assert tier_of(perks.tier("g1")) == "cpu"
+    asyncio.run(coordinator.shutdown_event())
+    assert not os.path.exists(os.path.dirname(perks.standby_file)), "a book that was never loaded writes nothing"
+
+
+def test_the_coordinator_loads_the_clocks_at_start_and_saves_them_at_shutdown():
+    assert "_load_gpu_standby()" in inspect.getsource(coordinator.startup_event)
+    assert "gpu_standby.flush()" in inspect.getsource(coordinator.shutdown_event)
+
+
+def test_the_real_book_keeps_its_file_in_the_installation_config_folder(monkeypatch, tmp_path):
+    monkeypatch.setattr(coordinator, "get_base_dir", lambda: str(tmp_path))
+    assert coordinator.gpu_standby.path_fn() == os.path.join(str(tmp_path), "config", "gpu_standby.json")

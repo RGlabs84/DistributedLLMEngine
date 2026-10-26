@@ -365,6 +365,22 @@ def test_engine_is_spawned_with_the_models_own_chat_template(engine_env):
     assert "--jinja" in engine_env.spawned[0].cmd
 
 
+def test_engine_is_spawned_with_the_models_file_name_as_its_alias(engine_env):
+    """
+    llama-server reports the path it loaded the model from in every answer ("/home/<user>/..."), and the
+    answers reach other people. --alias makes it report the file's name instead (engine/model_alias.py).
+    """
+    manager = engine_env.manager
+    engine_env.add_model("model-a")
+
+    ok, _port, msg = manager.start_model("model-a", [], BIG_VRAM, BIG_SYSRAM)
+    assert ok is True, msg
+
+    cmd = engine_env.spawned[0].cmd
+    assert cmd[cmd.index("-m") + 1] == str(engine_env.models_dir / "model-a.gguf"), "the path is still what is loaded"
+    assert cmd[cmd.index("--alias") + 1] == "model-a.gguf"
+
+
 def _after(cmd, flag):
     return cmd[cmd.index(flag) + 1]
 

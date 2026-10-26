@@ -14,7 +14,7 @@ import {
   ContributionPlan, LEND_CPU_ONLY, LEND_GPU, RoleAssignment, RoleDetail, WorkerRole, cpuReason, installedRamGb,
   lendGpuPrompt, lendLabel, parseRefusal, parseRole, parseVulkanSummary, pickVulkanGpu, planContribution, ramChoices,
   ramOfferText, ramTooSmallText, setConfigValue, workerStartedNotice, powershellExpandCommand, quoteIfSpaced,
-  isRpcExecutablePlatform, takeCompleteLines,
+  isRpcExecutablePlatform, takeCompleteLines, EXTERNAL_WORKER_LINE, EXTERNAL_WORKER_TEXT, orphanRpcStopCommand,
 } from './contribution';
 
 /** Remembered in the editor's global state: the GPU owner has been told what lending a GPU means. */
@@ -123,10 +123,17 @@ export interface WorkerStatus {
    * GPU's job). Undefined on every other machine, and while the worker is not running.
    */
   alsoCpu?: boolean;
+  /**
+   * The running worker was not started by this editor (a systemd service, a terminal, another editor): it has its own
+   * settings, so the status says so instead of describing it from the settings here. Undefined otherwise.
+   */
+  external?: boolean;
 }
 
 export class WorkerManager {
   private workerProcess: child_process.ChildProcess | null = null;
+  /** The worker that is running was started outside this editor (see WorkerStatus.external). */
+  private externalWorker = false;
   private currentState: WorkerState = 'idle';
   private localGpu: LocalGpuInfo = { hasGpu: false, name: 'Probing GPU...', vramTotalGb: 0, api: 'vulkan' };
   private vramContributed = 0;
@@ -145,11 +152,12 @@ export class WorkerManager {
     private options: { releasePublicKeyHex?: string } = {}
   ) {
     this.outputChannel = vscode.window.createOutputChannel('DLNE Compute Worker');
-    // Synchronous immediate detection so initial UI render accurately reflects contributing state
+    // Synchronous immediate detection so initial UI render accurately reflects contributing state. A worker that is
+    // already running was not started by this editor: it is described as such, never from the settings here.
     if (this.isSystemdActive() || this.isProcessActive()) {
       this.currentState = 'contributing';
-      this.vramContributed = 8.0;
-      this.statusMessage = 'Actively contributing 8.0 GB via VULKAN (system service)!';
+      this.externalWorker = true;
+      this.statusMessage = EXTERNAL_WORKER_LINE;
     }
     // The owner's coding-member switch reaches a worker that is already running through the engine's
     // config.txt, which the worker re-reads: writing it when the setting changes needs no restart.
@@ -264,6 +272,12 @@ export class WorkerManager {
       cpuPool,
       message: this.statusMessage
     };
+    if (running && this.externalWorker) {
+      // A worker started outside VS Code: nothing about it is read from the settings here (no CPU pool, no job).
+      status.external = true;
+      status.cpuPool = false;
+      return status;
+    }
     // Only a worker that is running has a job, and a CPU machine's is always the phone app.
     if (running && cpuPool) {
       status.role = 'app';
@@ -475,7 +489,9 @@ export class WorkerManager {
 
     if (isRunning) {
       this.failedChecksCount = 0;
-      if (this.currentState !== 'contributing') {
+      // Not this editor's own worker (that case returned above): one started outside VS Code.
+      if (this.currentState !== 'contributing' || !this.externalWorker) {
+        this.externalWorker = true;
         this.markContributing();
       }
     } else {
@@ -484,6 +500,7 @@ export class WorkerManager {
       if (this.failedChecksCount >= 3) {
         if (this.currentState === 'contributing') {
           this.currentState = 'idle';
+          this.externalWorker = false;
           this.vramContributed = 0;
           this.statusMessage = 'Worker is idle.';
           this.emitChange();
@@ -1143,13 +1160,20 @@ export class WorkerManager {
       await vscode.workspace.getConfiguration('dlne').update('worker.autoStart', true, vscode.ConfigurationTarget.Global);
     } catch {}
 
-    // Check if worker is already running via port, systemd, or process list
+    // This editor's own worker is already running.
+    if (this.workerProcess && !this.workerProcess.killed) {
+      this.markContributing();
+      return true;
+    }
+    // A worker started outside VS Code (a systemd service, a terminal) is running: a second one would fight it for
+    // the port, and that one does not use the settings here. Say so; Stop Contributing stops it.
     const portOpen = await this.isPortListening(50052);
     const sysdActive = this.isSystemdActive();
     const processActive = this.isProcessActive();
-
-    if (portOpen || sysdActive || processActive || (this.workerProcess && !this.workerProcess.killed)) {
+    if (portOpen || sysdActive || processActive) {
+      this.externalWorker = true;
       this.markContributing();
+      vscode.window.showInformationMessage(`DLNE: ${EXTERNAL_WORKER_TEXT}`);
       return true;
     }
 
@@ -1161,37 +1185,15 @@ export class WorkerManager {
       return false;
     }
     this.contributionPlan = plan;
-    // An engine that is already installed (and the systemd service, which starts it below) reads the owner's
-    // coding-member switch from its config.txt; a first-time install gets it written before the spawn.
+    // An engine that is already installed reads the owner's coding-member switch from its config.txt; a first-time
+    // install gets it written before the spawn.
     this.syncCodingMemberSetting();
     this.syncAlsoCpuSetting(plan);
 
-    // 1. Check if systemd user service exists on Linux
-    const homeDir = process.env.HOME || '';
-    const systemdService = path.join(homeDir, '.config', 'systemd', 'user', 'dlne-worker.service');
-    if (process.platform === 'linux' && fs.existsSync(systemdService)) {
-      this.currentState = 'starting';
-      this.statusMessage = 'Starting background dlne-worker service...';
-      this.emitChange();
-
-      try {
-        child_process.execSync('systemctl --user start dlne-worker', { timeout: 4000 });
-        for (let i = 0; i < 10; i++) {
-          await new Promise((r) => setTimeout(r, 400));
-          if (await this.isPortListening(50052)) {
-            this.markContributing();
-            vscode.window.showInformationMessage(
-              plan.cpuOnly ? workerStartedNotice(true) : `⚡ DLNE Worker Started: Contributing ${this.vramContributed} GB via Vulkan!`
-            );
-            return true;
-          }
-        }
-      } catch (err: any) {
-        this.outputChannel.appendLine(`[DLNE] systemd start warning: ${err.message}`);
-      }
-    }
-
-    // 2. Fallback to spawning child process
+    // The worker is always this editor's own child, started with the settings here. (A dlne-worker systemd service,
+    // if the machine has one, is never started from here: it runs with its own fixed arguments, and starting it
+    // used to turn "lend my CPU, 16 GB" into whatever that service was set up to lend.)
+    this.externalWorker = false;
     const config = vscode.workspace.getConfiguration('dlne');
     const serverUrl: string = resolveServerUrl(config);
     const rootWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -1370,6 +1372,13 @@ export class WorkerManager {
 
   private markContributing(): void {
     this.currentState = 'contributing';
+    if (this.externalWorker) {
+      // What it lends is its own settings' business, not these.
+      this.vramContributed = 0;
+      this.statusMessage = EXTERNAL_WORKER_LINE;
+      this.emitChange();
+      return;
+    }
     if (this.contributesCpu()) {
       const ram = vscode.workspace.getConfiguration('dlne').get<number>('worker.maxRamGb') || CPU_MIN_RAM_GB;
       this.vramContributed = ram;
@@ -1505,16 +1514,22 @@ export class WorkerManager {
       }, process.platform === 'win32' ? 800 : WORKER_STOP_GRACE_MS);
     }
 
-    // Ensure no orphaned ggml-rpc-server remains bound to port 50052
-    try {
-      if (process.platform === 'win32') {
-        child_process.execSync('taskkill /F /IM ggml-rpc-server.exe', { timeout: 2000, windowsHide: true });
-      } else {
-        child_process.execSync('killall -9 ggml-rpc-server 2>/dev/null || true', { timeout: 2000 });
-      }
-    } catch {}
+    // An orphaned ggml-rpc-server of THIS install (its worker was killed before it could stop it) would keep port
+    // 50052: it is stopped by its full path, never by name (another program's, or another install's, is not ours).
+    const engineScript = this.findEngineScript();
+    const orphanStop = engineScript
+      ? orphanRpcStopCommand(
+          path.join(path.dirname(engineScript), 'bin', process.platform === 'win32' ? 'ggml-rpc-server.exe' : 'ggml-rpc-server'),
+          process.platform)
+      : null;
+    if (orphanStop) {
+      try {
+        child_process.execFileSync(orphanStop[0], orphanStop[1], { timeout: 4000, windowsHide: true, stdio: 'ignore' });
+      } catch {}   // pkill exits 1 when nothing matched
+    }
 
     this.currentState = 'idle';
+    this.externalWorker = false;
     this.assignedRole = null;
     this.alsoCpuRunning = false;
     this.vramContributed = 0;

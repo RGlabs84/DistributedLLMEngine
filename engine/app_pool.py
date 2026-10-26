@@ -49,6 +49,7 @@ from collections import deque
 from typing import Any, AsyncIterator, Awaitable, Callable, Deque, Dict, List, Optional, Tuple
 
 from engine.logger import log_coordinator, log_error, log_warning
+from engine.model_alias import alias_args
 from engine.priority import UsageWindow
 from engine.throughput import POOL_PHONE, throughput
 
@@ -699,8 +700,9 @@ def sha256_ok(path: str, expected: str, size: int) -> bool:
 def app_server_args(binary: str, model_path: str, port: int, threads: int, ctx: int = 16384,
                     slots: int = 2, cpu_mask: Optional[str] = None) -> List[str]:
     """llama-server for a CPU pool member: CPU only (never a GPU), loopback only, no web page,
-    and never more than MAX_OUTPUT_TOKENS per answer whatever a request asks for."""
-    args = [binary, "-m", model_path, "--host", "127.0.0.1", "--port", str(port),
+    never more than MAX_OUTPUT_TOKENS per answer whatever a request asks for, and named by the model file's
+    name (``--alias``) so no answer carries the folder it was loaded from (engine/model_alias.py)."""
+    args = [binary, "-m", model_path, *alias_args(model_path), "--host", "127.0.0.1", "--port", str(port),
             "-c", str(ctx), "-np", str(slots), "-t", str(threads), "-tb", str(threads),
             "-n", str(MAX_OUTPUT_TOKENS), "--device", "none", "-ngl", "0", "--jinja", "--no-webui"]
     if cpu_mask:

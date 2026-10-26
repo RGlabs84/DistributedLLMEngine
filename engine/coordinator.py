@@ -65,6 +65,7 @@ from engine.inference_manager import (
 from engine.logger import log_coordinator, log_error, log_warning
 from engine.registry import WorkerRegistry, is_app_member, is_coding_member, safe_log_text
 from engine.app_pool import LocalAppServer, app_pool
+from engine.standby import StandbyBook
 from engine.throughput import POOL_CODING, POOL_PHONE, StreamTokenCounter, completion_tokens, throughput
 from engine import coding_router as coding_members_lib
 from engine.coding_router import coding_router
@@ -600,13 +601,19 @@ def use_starter_quota(request: Request, client_id: str, limit: int) -> Tuple[boo
 # last had a job, so a newcomer keeps them while the swarm places it; after that its owner is a CPU
 # contributor like any other, with the CPU rolling window. Getting a job gives the perks back and resets
 # the clock. A GPU handed back to its owner for a game (yielding) is not idle: it keeps them.
+#
+# The clock is one number per worker id (when it was first seen with no job), kept in engine/standby.py
+# and in config/gpu_standby.json, so a coordinator restart does not hand every idle GPU a fresh grace.
 
-_gpu_standing_by_since: Dict[str, float] = {}      # worker id -> when it began standing by (_standby_clock)
-MAX_STANDBY_TRACKED = 8192
+gpu_standby = StandbyBook(lambda: os.path.join(get_base_dir(), "config", "gpu_standby.json"))
 
 
-def _standby_clock() -> float:
-    return time.monotonic()
+def _load_gpu_standby() -> int:
+    """At start-up: read the saved clocks (and allow the book to write). How many workers' history was taken."""
+    taken = gpu_standby.load()
+    if taken:
+        log_coordinator(f"GPU standing-by clocks restored for {taken} worker(s).")
+    return taken
 
 
 def _gpu_has_job(worker: Dict[str, Any]) -> bool:
@@ -628,18 +635,7 @@ def _gpu_note_job_state(worker: Dict[str, Any]) -> Optional[float]:
     worker_id = worker.get("worker_id")
     if not isinstance(worker_id, str) or not worker_id:
         return None
-    if _gpu_has_job(worker):
-        _gpu_standing_by_since.pop(worker_id, None)
-        return None
-    since = _gpu_standing_by_since.get(worker_id)
-    if since is None:
-        if len(_gpu_standing_by_since) >= MAX_STANDBY_TRACKED:
-            for stale in [w for w in _gpu_standing_by_since if w not in registry.workers]:
-                del _gpu_standing_by_since[stale]
-            if len(_gpu_standing_by_since) >= MAX_STANDBY_TRACKED:
-                _gpu_standing_by_since.pop(next(iter(_gpu_standing_by_since)))
-        since = _gpu_standing_by_since[worker_id] = _standby_clock()
-    return since
+    return gpu_standby.note(worker_id, _gpu_has_job(worker))
 
 
 def _gpu_keeps_perks(worker: Dict[str, Any], limits: Dict[str, Any]) -> bool:
@@ -648,7 +644,7 @@ def _gpu_keeps_perks(worker: Dict[str, Any], limits: Dict[str, Any]) -> bool:
     if since is None:
         return True
     grace = float(limits.get("gpu_standby_grace_minutes", 30.0)) * 60.0
-    return _standby_clock() - since < grace
+    return max(0.0, gpu_standby.now() - since) < grace
 
 
 class NonContribBlockerMiddleware(BaseHTTPMiddleware):
@@ -5205,6 +5201,7 @@ async def startup_event():
     """Starts the long-lived monitors once uvicorn's event loop is running."""
     global _auto_swap_task
     log_coordinator("Proactive Worker Tracking & Event Broadcaster is active.")
+    _load_gpu_standby()      # before the first heartbeat is judged: a GPU's grace goes on across a restart
     _apply_rpc_requirement()
     spawn_background_task(monitor_workers_async(), "monitor-workers")
     spawn_background_task(monitor_models_json_async(), "monitor-models-json")
@@ -5231,7 +5228,8 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Stops automatic model switching (and any model download it started)."""
+    """Stops automatic model switching (and any model download it started), and saves the GPU clocks."""
+    gpu_standby.flush()      # first, so nothing below can keep it from being saved; never raises
     auto_swapper.shutdown()
     for task in [_auto_swap_task, *_auto_swap_tasks]:
         if task is not None and not task.done():

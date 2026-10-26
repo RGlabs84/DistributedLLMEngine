@@ -10,7 +10,7 @@ import { SidebarProvider } from './views/sidebarProvider';
 import { registerNativeChatParticipant } from './views/nativeChatParticipant';
 import { ClusterStatusBar } from './statusbar/clusterStatusBar';
 import { WorkerManager } from './worker/workerManager';
-import { CPU_POOL_HEADLINE, CPU_POOL_PERK, ROLE_LABEL, workerStartedNotice } from './worker/contribution';
+import { CPU_POOL_HEADLINE, CPU_POOL_PERK, EXTERNAL_WORKER_LINE, ROLE_LABEL, workerStartedNotice } from './worker/contribution';
 import { phoneChatUrl } from './serverUrl';
 
 function isNewerVersion(current: string, remote: string): boolean {
@@ -182,7 +182,9 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('dlne.toggleWorker', async () => {
       const active = await workerManager.toggle();
       if (active) {
-        vscode.window.showInformationMessage(workerStartedNotice(workerManager.getStatus().cpuPool));
+        // A worker started outside VS Code was already explained when the toggle found it.
+        const st = workerManager.getStatus();
+        if (!st.external) vscode.window.showInformationMessage(workerStartedNotice(st.cpuPool));
       } else {
         vscode.window.showInformationMessage('DLNE Worker Stopped.');
       }
@@ -227,7 +229,9 @@ export function activate(context: vscode.ExtensionContext) {
       const items: vscode.QuickPickItem[] = [
         {
           label: isContrib ? '$(debug-stop) Stop Contributing Compute' : '$(zap) Start Contributing Local Compute',
-          description: workerStatus.cpuPool
+          description: isContrib && workerStatus.external
+            ? EXTERNAL_WORKER_LINE
+            : workerStatus.cpuPool
             ? isContrib ? `Powering the DLNE phone app with ${workerStatus.vramContributedGb}GB of RAM` : CPU_POOL_HEADLINE
             : isContrib
             ? `Actively contributing ${workerStatus.vramContributedGb}GB${workerStatus.role ? ` as a ${ROLE_LABEL[workerStatus.role]}` : ''}${workerStatus.alsoCpu ? ' and powering the phone app with the CPU' : ''}`

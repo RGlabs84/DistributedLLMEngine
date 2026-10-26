@@ -58,6 +58,7 @@ from starlette.background import BackgroundTask
 from engine import coding_member_select as select
 from engine import member_identity, no_trace
 from engine.app_pool import sha256_ok
+from engine.model_alias import alias_args
 from engine.e2e import KeyRing, ResponseSealer
 from engine.fim_warm import fim_warm_body
 from engine.logger import log_error, log_success, log_system, log_warning
@@ -130,10 +131,11 @@ def coding_server_args(binary: str, model_path: str, port: int, ctx: int = DEFAU
     llama-server for a coding member: loopback only, the whole model fitted to this machine's own
     memory (``--fit on`` places layers and experts between the GPU and system RAM; ``-ngl`` is
     left unset on purpose, it would switch that off), the coding context, the settings of the
-    live coding engine, the owner's limits (``threads``, and ``extra`` such as ``--fit-target``) and
-    the no-trace arguments.
+    live coding engine, the owner's limits (``threads``, and ``extra`` such as ``--fit-target``), the
+    no-trace arguments, and the model file's name as its ``--alias`` (without it every answer would
+    carry the path of the owner's model folder, home directory and user name included).
     """
-    args = [binary, "-m", model_path, "--host", "127.0.0.1", "--port", str(port),
+    args = [binary, "-m", model_path, *alias_args(model_path), "--host", "127.0.0.1", "--port", str(port),
             "-c", str(ctx), "-np", str(slots), "--fit", "on",
             "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0",
             "--cache-reuse", "256", "--cache-ram", str(cache_ram_mib),

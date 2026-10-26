@@ -4,7 +4,7 @@ import { DlneClient, formatLoadingTelemetry } from '../client/dlneClient';
 import { SWARM_AUTO_LABEL } from '../client/modelChoice';
 import { WorkerManager } from '../worker/workerManager';
 import { newSessionId } from '../client/session';
-import { ALSO_CPU_LINE, CPU_POOL_HEADLINE, CPU_POOL_PERK, MEMBER_PRIVACY_SUMMARY, ROLE_LABEL, TRUST_ID_HINT, roleMeaning } from '../worker/contribution';
+import { ALSO_CPU_LINE, CPU_POOL_HEADLINE, CPU_POOL_PERK, EXTERNAL_WORKER_LINE, EXTERNAL_WORKER_TEXT, MEMBER_PRIVACY_SUMMARY, ROLE_LABEL, TRUST_ID_HINT, roleMeaning } from '../worker/contribution';
 import { AgentLoop } from '../agent/agentLoop';
 import { ToolCallResult } from '../agent/tools';
 import { isExcludedFile, redactSecrets } from '../privacy';
@@ -71,7 +71,9 @@ export function registerNativeChatParticipant(
 
       const status = detailed.data;
 
-      const contribBadge = worker.cpuPool
+      const contribBadge = worker.external && worker.state === 'contributing'
+        ? `🔌 **${EXTERNAL_WORKER_LINE}**`
+        : worker.cpuPool
         ? worker.state === 'contributing'
           ? `✅ **CONTRIBUTING** (CPU pool, ${worker.vramContributedGb} GB of RAM: ${CPU_POOL_HEADLINE})`
           : `⏸️ **IDLE** (your CPU can power the DLNE phone app)`
@@ -115,7 +117,9 @@ export function registerNativeChatParticipant(
       stream.progress('Toggling local compute contribution...');
       await workerManager.toggle();
       const updated = workerManager.getStatus();
-      if (updated.state === 'contributing' && updated.cpuPool) {
+      if (updated.state === 'contributing' && updated.external) {
+        stream.markdown(`### 🔌 A worker is already running\n${EXTERNAL_WORKER_TEXT}`);
+      } else if (updated.state === 'contributing' && updated.cpuPool) {
         stream.markdown(
           `### 📱 Compute Contribution Active!\n${CPU_POOL_HEADLINE}: **${updated.vramContributedGb} GB** of RAM lent, at low priority on half your cores. You get ${CPU_POOL_PERK}.`
         );
@@ -129,7 +133,7 @@ export function registerNativeChatParticipant(
             : '') +
           (updated.alsoCpu ? `\n\n**Also: ${ROLE_LABEL.app}.** ${ALSO_CPU_LINE}` : '');
         stream.markdown(
-          `### ⚡ Compute Contribution Active!\nContributing **${updated.vramContributedGb} GB VRAM** (${updated.gpu.name}) via **${updated.gpu.api.toUpperCase()}** to the DLNE cluster. Your GPU powers the coding agent, and you are first in line.${job}`
+          `### ⚡ Compute Contribution Active!\nContributing **${updated.vramContributedGb} GB VRAM** (${updated.gpu.name}) via **${updated.gpu.api.toUpperCase()}** to the DLNE cluster. Your GPU powers the coding agent, and you are first in line while the swarm uses it.${job}`
         );
       } else {
         stream.markdown(`### ⏹️ Compute Contribution Stopped\nYour local worker is now idle.`);

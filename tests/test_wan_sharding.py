@@ -417,6 +417,18 @@ def test_no_endpoints_at_all_plans_nothing_instead_of_raising(policy):
     assert yielding.plan_endpoints(required_gb=4.0, policy=policy) == []
 
 
+@pytest.mark.parametrize("required_gb", [0.0, -1.0, float("nan")])
+def test_nothing_local_and_nothing_needed_still_runs_on_the_best_remote_node(required_gb):
+    """
+    The planner's last resort, the only line that reads ``candidates[0]``: with no local node and a "need" the
+    first remote node does not satisfy (zero, negative or not a number), nothing is selected by the loop, and the
+    fallback must pick the best candidate (LAN before WAN), never an empty plan and never an IndexError. An
+    empty plan is for a pool with no eligible node at all (the test above).
+    """
+    registry = _registry_with(("10.8.0.4", 8.0), ("192.168.1.50", 24.0))
+    assert registry.plan_endpoints(required_gb=required_gb) == ["192.168.1.50:50052"]
+
+
 def test_a_coding_member_is_left_out_of_the_plan_but_the_pool_still_plans():
     """Members run whole models of their own; the GPUs that do shard are planned as before."""
     registry = WorkerRegistry()
