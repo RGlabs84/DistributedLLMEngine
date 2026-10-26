@@ -15,7 +15,9 @@ import {
   lendGpuPrompt, lendLabel, parseRefusal, parseRole, parseVulkanSummary, pickVulkanGpu, planContribution, ramChoices,
   ramOfferText, ramTooSmallText, setConfigValue, workerStartedNotice, powershellExpandCommand, quoteIfSpaced,
   isRpcExecutablePlatform, takeCompleteLines, EXTERNAL_WORKER_LINE, EXTERNAL_WORKER_TEXT, orphanRpcStopCommand,
+  MAX_CPU_THREADS_KEY, maxCpuThreadsConfigUpdate, parseClock, clockMessage,
 } from './contribution';
+import { DonateChoice, DonateMachine, DonateSettings, readDonateSettings, settingsToWrite } from './donatePanel';
 
 /** Remembered in the editor's global state: the GPU owner has been told what lending a GPU means. */
 const LEND_NOTICE_KEY = 'dlne.lendGpuNoticeSeen';
@@ -128,6 +130,8 @@ export interface WorkerStatus {
    * settings, so the status says so instead of describing it from the settings here. Undefined otherwise.
    */
   external?: boolean;
+  /** The settings this editor's running worker was started with, so the sidebar can tell when a change needs a restart. */
+  startedWith?: DonateSettings;
 }
 
 export class WorkerManager {
@@ -170,6 +174,10 @@ export class WorkerManager {
       this.settingListener = vscode.workspace.onDidChangeConfiguration((e) => {
         if (e.affectsConfiguration('dlne.worker.allowCodingMember')) {
           this.syncCodingMemberSetting();
+        }
+        // The same for the thread limit: the engine reads MAX_CPU_THREADS again while it runs.
+        if (e.affectsConfiguration('dlne.worker.maxCpuThreads')) {
+          this.syncMaxCpuThreadsSetting();
         }
       });
     }
@@ -247,6 +255,39 @@ export class WorkerManager {
     }
   }
 
+  /**
+   * Write `dlne.worker.maxCpuThreads` into the installed engine's config.txt as MAX_CPU_THREADS, which the running
+   * worker re-reads (no restart). Automatic (-1) is written as -1 or not at all, never 0, which the engine reads as
+   * one thread. Never throws; a config that cannot be written is logged.
+   */
+  private syncMaxCpuThreadsSetting(engineRoot?: string): void {
+    const root = engineRoot ?? (this.findEngineScript() ? path.dirname(this.findEngineScript()) : '');
+    if (!root) {
+      return;
+    }
+    const threads = vscode.workspace.getConfiguration('dlne').get<number>('worker.maxCpuThreads', -1);
+    const file = path.join(root, 'config', 'config.txt');
+    try {
+      const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
+      const next = maxCpuThreadsConfigUpdate(current, threads);
+      if (next === null) {
+        return;
+      }
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const scratch = `${file}.${process.pid}.tmp`;
+      try {
+        fs.writeFileSync(scratch, next, 'utf-8');
+        fs.renameSync(scratch, file);
+      } catch {
+        try { fs.unlinkSync(scratch); } catch {}
+        fs.writeFileSync(file, next, 'utf-8'); // Windows refuses a rename over a file another program has open
+      }
+      this.outputChannel.appendLine(`[DLNE] ${MAX_CPU_THREADS_KEY} updated in ${file}`);
+    } catch (e: any) {
+      this.outputChannel.appendLine(`[DLNE] Could not update ${MAX_CPU_THREADS_KEY} in ${file}: ${e?.message ?? e}`);
+    }
+  }
+
   private async init() {
     await this.detectLocalGpu();
     await this.refreshWorkerState();
@@ -283,6 +324,9 @@ export class WorkerManager {
       status.cpuPool = false;
       return status;
     }
+    if (running && this.startedWith) {
+      status.startedWith = this.startedWith;
+    }
     // Only a worker that is running has a job, and a CPU machine's is always the phone app.
     if (running && cpuPool) {
       status.role = 'app';
@@ -302,6 +346,10 @@ export class WorkerManager {
   /** The running worker's last DLNE_ALSO line says the CPU serves the phone pool too; cleared when it stops. */
   private alsoCpuRunning = false;
   private codingNoticeShown = false;
+  /** The settings the running worker was started with (null when none is running, or it is not this editor's). */
+  private startedWith: DonateSettings | null = null;
+  /** The clock offsets the owner has been told about during this worker run, so each is shown once. */
+  private clockOffsetsShown = new Set<number>();
 
   /** The unfinished last line of each stream of the running worker (a pipe may cut a line in two chunks). */
   private outputTail: { stdout: string; stderr: string } = { stdout: '', stderr: '' };
@@ -330,6 +378,15 @@ export class WorkerManager {
     if (also !== null && also !== this.alsoCpuRunning) {
       this.alsoCpuRunning = also;
       this.emitChange();
+    }
+    // A wrong clock is worth one warning per offset: the worker corrects for it and prints a line only when it changes.
+    for (const line of text.split(/\r?\n/)) {
+      const offset = parseClock(line);
+      const message = offset === null ? null : clockMessage(offset);
+      if (offset !== null && message && !this.clockOffsetsShown.has(offset)) {
+        this.clockOffsetsShown.add(offset);
+        void vscode.window.showWarningMessage(message);
+      }
     }
   }
 
@@ -365,7 +422,7 @@ export class WorkerManager {
    * between lending it and lending only the CPU. Resolves false when the owner closes the dialog (nothing
    * starts). Only asked for a GPU machine, from a click (never when a worker resumes by itself), and only once.
    */
-  private async confirmLendingGpu(): Promise<boolean> {
+  private async confirmLendingGpu(fromPanel: boolean = false): Promise<boolean> {
     const state = this.context.globalState;
     if (state?.get<boolean>(LEND_NOTICE_KEY, false)) {
       return true;
@@ -387,8 +444,9 @@ export class WorkerManager {
       await config.update('worker.device', 'cpu', vscode.ConfigurationTarget.Global);
     } else if (choice === LEND_BOTH) {
       await config.update('worker.device', 'both', vscode.ConfigurationTarget.Global);
-    } else if (config.get<string>('worker.device') === 'both') {
-      await config.update('worker.device', 'gpu', vscode.ConfigurationTarget.Global);   // "Lend my GPU": the GPU alone
+    } else if (!fromPanel && config.get<string>('worker.device') === 'both') {
+      // "Lend my GPU": the GPU alone. (From the Donate panel the owner already chose what to lend with its switches.)
+      await config.update('worker.device', 'gpu', vscode.ConfigurationTarget.Global);
     }
     try {
       await state?.update(LEND_NOTICE_KEY, true);
@@ -1164,9 +1222,10 @@ export class WorkerManager {
    * @param options.interactive the owner asked for this (a click or a command), so a GPU owner who has not
    *   yet been told what lending a GPU means is told now, and may keep the GPU out of it. A worker that
    *   resumes by itself, or restarts after a version change, never asks.
+   * @param options.fromPanel the settings were just set by the sidebar's Donate panel, so the prompt does not undo them.
    */
-  public async startWorker(options: { interactive?: boolean } = {}): Promise<boolean> {
-    if (options.interactive && !(await this.confirmLendingGpu())) {
+  public async startWorker(options: { interactive?: boolean; fromPanel?: boolean } = {}): Promise<boolean> {
+    if (options.interactive && !(await this.confirmLendingGpu(options.fromPanel === true))) {
       return false;
     }
     try {
@@ -1198,10 +1257,14 @@ export class WorkerManager {
       return false;
     }
     this.contributionPlan = plan;
+    // What this worker is started with (after the plan, which may have just set a RAM amount): the sidebar compares
+    // the settings with it to say when a change needs a restart.
+    this.startedWith = readDonateSettings(vscode.workspace.getConfiguration('dlne'));
     // An engine that is already installed reads the owner's coding-member switch from its config.txt; a first-time
     // install gets it written before the spawn.
     this.syncCodingMemberSetting();
     this.syncAlsoCpuSetting(plan);
+    this.syncMaxCpuThreadsSetting();
 
     // The worker is always this editor's own child, started with the settings here. (A dlne-worker systemd service,
     // if the machine has one, is never started from here: it runs with its own fixed arguments, and starting it
@@ -1252,6 +1315,7 @@ export class WorkerManager {
     }
     this.syncCodingMemberSetting(path.dirname(scriptPath));
     this.syncAlsoCpuSetting(plan, path.dirname(scriptPath));
+    this.syncMaxCpuThreadsSetting(path.dirname(scriptPath));
 
     const spawnCmd = pythonPath;
     const args = [scriptPath, 'worker', '--coordinator', coordinatorArg];
@@ -1310,6 +1374,7 @@ export class WorkerManager {
       this.lastRefusal = null;
       this.assignedRole = null;
       this.alsoCpuRunning = false;
+      this.clockOffsetsShown = new Set();
       this.outputTail = { stdout: '', stderr: '' };
       this.workerProcess.stdout?.on('data', (data) => {
         const text = data.toString();
@@ -1359,6 +1424,7 @@ export class WorkerManager {
     this.currentState = 'idle';
     this.assignedRole = null;
     this.alsoCpuRunning = false;
+    this.startedWith = null;
     this.vramContributed = 0;
     this.statusMessage = `Worker stopped (code ${code})`;
     this.workerProcess = null;
@@ -1496,7 +1562,8 @@ export class WorkerManager {
     await this.startWorker();
   }
 
-  public async stopWorker(): Promise<void> {
+  /** @param quiet no "paused" toast: the worker is about to start again (restartWorker). */
+  public async stopWorker(quiet: boolean = false): Promise<void> {
     this.statusMessage = 'Stopping worker...';
     this.outputChannel.appendLine('[DLNE] Stopping compute worker...');
 
@@ -1545,20 +1612,50 @@ export class WorkerManager {
     this.externalWorker = false;
     this.assignedRole = null;
     this.alsoCpuRunning = false;
+    this.startedWith = null;
     this.vramContributed = 0;
     this.statusMessage = 'Worker stopped.';
     this.emitChange();
-    vscode.window.showInformationMessage('DLNE compute contribution paused.');
+    if (!quiet) {
+      vscode.window.showInformationMessage('DLNE compute contribution paused.');
+    }
   }
 
-  public async toggle(): Promise<boolean> {
+  /** @param options.fromPanel the click came from the sidebar's Donate panel (see startWorker). */
+  public async toggle(options: { fromPanel?: boolean } = {}): Promise<boolean> {
     await this.refreshWorkerState();
     if (this.currentState === 'contributing' || this.currentState === 'starting') {
       await this.stopWorker();
       return false;
     } else {
-      return await this.startWorker({ interactive: true });
+      return await this.startWorker({ interactive: true, fromPanel: options.fromPanel });
     }
+  }
+
+  /**
+   * Write what the Donate panel chose (already validated by validateChoice) into the settings, and the thread limit
+   * into the engine's config.txt at once, so a running worker follows it without a restart.
+   */
+  public async applyDonateChoice(choice: DonateChoice, machine: DonateMachine): Promise<void> {
+    const config = vscode.workspace.getConfiguration('dlne');
+    for (const [key, value] of settingsToWrite(choice, machine)) {
+      await config.update(key, value, vscode.ConfigurationTarget.Global);
+    }
+    this.syncMaxCpuThreadsSetting();
+  }
+
+  /**
+   * Stop this editor's worker and start it again with the settings as they are now. A worker that is still shutting
+   * down holds the port, and a start that found it taken would take it for a worker started outside VS Code, so the
+   * start waits for the process to be gone.
+   */
+  public async restartWorker(): Promise<boolean> {
+    await this.stopWorker(true);
+    const giveUp = Date.now() + WORKER_STOP_GRACE_MS + 3000;
+    while ((this.workerProcess || this.isProcessActive() || (await this.isPortListening(50052))) && Date.now() < giveUp) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return this.startWorker({ interactive: false });
   }
 
   private emitChange() {

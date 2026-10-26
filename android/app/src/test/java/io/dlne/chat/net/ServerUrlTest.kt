@@ -13,8 +13,17 @@ class ServerUrlTest {
     }
 
     @Test
-    fun `the public server is dlne dot duckdns dot org`() {
-        assertEquals("https://dlne.duckdns.org", ServerUrl.DEFAULT)
+    fun `the public server is dlne dot rossgilsonlabs dot dev`() {
+        assertEquals("https://dlne.rossgilsonlabs.dev", ServerUrl.DEFAULT)
+    }
+
+    @Test
+    fun `the DuckDNS name is accepted as input and upgraded at start-up`() {
+        assertEquals(ServerUrl.DUCKDNS_DEFAULT, ServerUrl.normalize("dlne.duckdns.org/"))
+        assertEquals(ServerUrl.DEFAULT, ServerUrl.startupAddress("https://dlne.duckdns.org"))
+        assertEquals(ServerUrl.DEFAULT, ServerUrl.startupAddress(" HTTPS://DLNE.DUCKDNS.ORG/ "))
+        assertTrue(ServerUrl.isLegacyDefault("https://dlne.duckdns.org"))
+        assertEquals(ServerUrl.DEFAULT, ServerUrl.startupAddress(ServerUrl.DEFAULT))
     }
 
     @Test

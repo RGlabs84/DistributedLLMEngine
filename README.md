@@ -18,7 +18,8 @@ before anything leaves VS Code, and private repositories stay on machines the op
 - Offline or locked down: the `.vsix` is on the [latest release](https://github.com/RGlabs84/DistributedLLMEngine/releases/latest)
   (Extensions view, the `...` menu, **Install from VSIX...**).
 - Then open the DLNE sidebar, or type `@dlne` in the chat panel. No account needed.
-- **No editor?** [DLNE Chat](https://dlne.duckdns.org/chat) runs in a phone browser.
+- **No editor?** [DLNE Chat](https://dlne.rossgilsonlabs.dev/chat) runs in a phone browser.
+- **Website:** [dlne.rossgilsonlabs.dev](https://dlne.rossgilsonlabs.dev), with the live swarm status.
 
 ## How it fits together
 
@@ -148,7 +149,7 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Seven groups matter for most
   2-5 of a Ryzen 5 7600X: `0xf3c` with 8 threads and 16 GB). The model files go in the models
   folder. The phone page is `/chat` (installable from Chrome, or on an iPhone from Safari:
   Share, Add to Home Screen); the Android app is in `android/` (the APK is on the
-  [website](https://live.ravenirongames.com/#dlne); it is not on Google Play yet). Reported
+  [website](https://dlne.rossgilsonlabs.dev); it is not on Google Play yet). Reported
   answers (`POST /v1/app/report`) are kept in `config/app_reports.jsonl` and read with
   `GET /v1/admin/app_reports`.
 
@@ -213,8 +214,8 @@ their llama.cpp RPC protocol, and the coordinator only routes to workers that sp
   [`docs/privacy.md`](docs/privacy.md). A member has to read a request to answer it; nothing there
   changes that.
 - The phone chat is separate: the volunteer machine that answers a chat sees its text.
-- The public coordinator is reached over HTTPS (`https://dlne.duckdns.org`, Caddy in front
-  of the coordinator). Run your own for anything sensitive.
+- The public coordinator is reached over HTTPS (`https://dlne.rossgilsonlabs.dev`, Caddy in
+  front of the coordinator; the older `https://dlne.duckdns.org` still answers). Run your own for anything sensitive.
 - The agent asks before it edits files, runs a command, or reads outside your workspace.
 - Report security problems privately to the maintainer rather than in a public issue.
 

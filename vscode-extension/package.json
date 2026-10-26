@@ -2,7 +2,7 @@
   "name": "dlne-code-assistant",
   "displayName": "DLNE Coding Assistant: Free AI Agent",
   "description": "A free AI coding agent and autocomplete, running on GPUs its users share. 100 free chats, no account or API key.",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "publisher": "dlne",
   "license": "MIT",
   "repository": {
@@ -140,7 +140,7 @@
         "dlne.serverUrl": {
           "type": "string",
           "scope": "application",
-          "default": "https://dlne.duckdns.org",
+          "default": "https://dlne.rossgilsonlabs.dev",
           "description": "DLNE coordinator URL. The default is the public swarm over HTTPS. Change it only to use your own coordinator. The public swarm's earlier addresses are read as this one automatically."
         },
         "dlne.apiKey": {
@@ -221,6 +221,13 @@
           "scope": "application",
           "default": 4.0,
           "description": "Most system RAM the worker may use, in GB. For a GPU it is the limit of the shared-model job, which only needs a little; the coding-member job is not held to the default 4, it uses the memory that is free when it starts, unless you set this yourself, and then it is limited to what you set. Contributing a CPU needs at least 8, and the more you lend the bigger the phone-app model your computer runs: 16 GB runs the main model, Qwen3.6. When you start, you are offered an amount to suit your machine (never more than half your RAM)."
+        },
+        "dlne.worker.maxCpuThreads": {
+          "type": "number",
+          "scope": "application",
+          "default": -1,
+          "minimum": -1,
+          "description": "Most CPU threads the worker may use, so the rest of your computer stays yours. -1 (the default) lets the engine decide: half your cores, 2 to 8. Memory speed limits the work, so more threads add little. DLNE writes it to the engine's config.txt as MAX_CPU_THREADS, and a running worker follows a change without a restart. The Donate compute panel in the sidebar sets it."
         },
         "dlne.chatModel": {
           "type": "string",

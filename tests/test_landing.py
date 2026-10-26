@@ -81,7 +81,7 @@ def test_the_page_points_at_the_extension_and_the_discord():
 
 
 def test_the_footer_links_the_website_next_to_the_discord():
-    assert landing.WEBSITE_URL == "https://live.ravenirongames.com/#dlne"
+    assert landing.WEBSITE_URL == "https://dlne.rossgilsonlabs.dev"
     assert landing.DISCORD_INVITE_URL == "https://discord.gg/RNxvxWn8cw"
     footer = re.search(r"<footer.*?</footer>", landing.LANDING_HTML, re.S).group(0)
     anchors = re.findall(r'<a href="([^"]+)" rel="([^"]+)">([^<]+)</a>', footer)

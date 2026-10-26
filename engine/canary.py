@@ -5,7 +5,7 @@ A coding member (docs/coding-members.md) answers coding requests on a volunteer'
 that machine sees the code of whoever asked. engine/no_trace.py makes sure the *software* keeps
 nothing; this module covers the person. From time to time the coordinator sends each untrusted
 member an ordinary-looking coding request (a config file to refactor, a deploy script to harden)
-that contains a decoy made for that member alone: a link, ``https://dlne.duckdns.org/c/<token>``.
+that contains a decoy made for that member alone: a link, ``https://dlne.rossgilsonlabs.dev/c/<token>``.
 
 Nobody legitimate ever has it. If the link is opened, the member that was sent it is **flagged**:
 the router stops giving it traffic (:func:`is_flagged`), the coordinator logs it, and the operator

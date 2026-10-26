@@ -38,7 +38,7 @@ from engine.canary import (
 from engine.no_trace import forward_headers
 
 KEY_RE = re.compile(r"dlne_ck_[0-9a-f]{48}")
-URL_RE = re.compile(r"https://dlne\.duckdns\.org/c/([A-Za-z0-9_-]+)")
+URL_RE = re.compile(r"https://dlne\.rossgilsonlabs\.dev/c/([A-Za-z0-9_-]+)")
 ADMIN_KEY = "dlne_ak_canary_test_key"
 LOOPBACK = ("127.0.0.1", 40000)
 REMOTE = ("203.0.113.50", 40000)          # TEST-NET-3: never local
@@ -220,7 +220,7 @@ def test_a_decoy_has_a_dlne_style_key_and_a_link_on_the_public_address():
     d = make_decoy()
     assert re.fullmatch(r"dlne_ck_[0-9a-f]{48}", d.key)
     assert d.key.startswith(KEY_PREFIX)
-    assert d.url == f"https://dlne.duckdns.org/c/{d.token}"
+    assert d.url == f"https://dlne.rossgilsonlabs.dev/c/{d.token}"
     assert re.fullmatch(r"[A-Za-z0-9_-]{24}", d.token)
 
 
@@ -333,7 +333,7 @@ def test_the_read_file_exchange_is_well_formed():
 
 
 def test_the_same_seed_gives_the_same_request_and_other_seeds_differ():
-    d = Decoy(token="t" * 24, key=KEY_PREFIX + "a" * 48, url="https://dlne.duckdns.org/c/" + "t" * 24, id="x")
+    d = Decoy(token="t" * 24, key=KEY_PREFIX + "a" * 48, url="https://dlne.rossgilsonlabs.dev/c/" + "t" * 24, id="x")
     assert build_decoy_request(d, random.Random(5)) == build_decoy_request(d, random.Random(5))
     assert build_decoy_request(d, random.Random(5)) != build_decoy_request(d, random.Random(6))
 
@@ -691,7 +691,7 @@ async def test_a_canary_goes_out_sealed_and_never_as_plain_json(book, clock):
     envelope = json.loads(wire)
     assert list(envelope) == ["dlne_e2e"]
     assert list(envelope["dlne_e2e"]) == ["v", "epk", "nonce", "ct"] and envelope["dlne_e2e"]["v"] == 1
-    for plain in (b"dlne_ck_", b"duckdns", b"messages", b"tools", b"role", b"max_tokens", b"coding agent"):
+    for plain in (b"dlne_ck_", b"rossgilsonlabs", b"messages", b"tools", b"role", b"max_tokens", b"coding agent"):
         assert plain not in wire
 
 

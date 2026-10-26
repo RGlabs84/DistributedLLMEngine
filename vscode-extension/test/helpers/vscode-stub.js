@@ -113,7 +113,9 @@ const vscode = {
         },
         async update(key, value) {
           state.updates.push([`${section}.${key}`, value]);
-          state.settings[`${section}.${key}`] = value;
+          // As in the editor, updating a setting to undefined removes it, so it reads as its default again.
+          if (value === undefined) delete state.settings[`${section}.${key}`];
+          else state.settings[`${section}.${key}`] = value;
         },
         // A setting the test put in state.settings counts as one the user set (its global value).
         inspect(key) {

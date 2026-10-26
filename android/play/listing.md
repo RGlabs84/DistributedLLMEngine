@@ -49,7 +49,7 @@ FAIR USE
 DLNE is shared by everyone, so each network can have one answer in progress at a time and a few questions per minute. If you ask too quickly, the app tells you how long to wait.
 
 RUN YOUR OWN
-DLNE uses the public DLNE server at https://dlne.duckdns.org unless you say otherwise. DLNE is open source under the MIT license. If you run your own DLNE server, enter its address in Settings.
+DLNE uses the public DLNE server at https://dlne.rossgilsonlabs.dev unless you say otherwise. DLNE is open source under the MIT license. If you run your own DLNE server, enter its address in Settings.
 
 HELP DLNE GROW
 The more computers people lend, the bigger and faster the models DLNE can offer. Anyone with a PC can donate spare computing power with the free DLNE extension for VS Code and VSCodium. You can also support the project with a coffee from the app's Settings, which also links to the DLNE website and the DLNE Discord for news and help.
@@ -66,7 +66,7 @@ Source code: https://github.com/RGlabs84/DistributedLLMEngine
 | Category | Productivity |
 | Tags (pick up to 5 offered by Console) | AI assistant, Chat, Productivity |
 | Contact email | *(required, shown publicly: the owner's support address)* |
-| Website | https://github.com/RGlabs84/DistributedLLMEngine |
+| Website | https://dlne.rossgilsonlabs.dev |
 | Privacy policy URL | where `privacy-policy.html` is published (see README.md) |
 
 ## Graphics in this folder

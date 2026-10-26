@@ -1,12 +1,18 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import * as os from 'os';
 import { AgentLoop } from '../agent/agentLoop';
 import { DlneClient } from '../client/dlneClient';
 import { swarmModelLine } from '../client/modelChoice';
 import { QueueUpdate, queueDetail, queueHeadline } from '../client/queue';
 import { WorkerManager, WorkerStatus } from '../worker/workerManager';
 import { contributionCopy, roleCopy } from '../worker/contribution';
+import {
+  DonateChoice, DonateMachine, DonatePanelModel, buildDonatePanel, choiceFromSettings, donateMachine, readDonateSettings,
+  reconcileDraft, validateChoice,
+} from '../worker/donatePanel';
+import { DONATE_CSS, createDonatePanel } from './donateView';
 import { phoneChatUrl } from '../serverUrl';
 import { ToolCallResult } from '../agent/tools';
 import { renderMarkdown } from './markdown';
@@ -45,8 +51,103 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
 
     this.workerManager.onStatusChange((status) => {
-      this._view?.webview.postMessage({ type: 'workerStatus', status, copy: contributionCopy(status), role: roleCopy(status) });
+      this._view?.webview.postMessage({
+        type: 'workerStatus', status, copy: contributionCopy(status), role: roleCopy(status), donate: this._donateModel(status),
+      });
     });
+  }
+
+  /**
+   * What the Donate panel's sliders said last, kept while the panel is open: the amounts of a switched-off job
+   * (the settings do not hold them) and a choice with nothing switched on (no setting can say that). It is dropped
+   * as soon as the settings disagree with it (reconcileDraft).
+   */
+  private draft: DonateChoice | undefined;
+  /** Writes of the panel's settings, one after another, so two quick changes cannot interleave. */
+  private donateWrites: Promise<unknown> = Promise.resolve();
+
+  private _donateMachine(status: WorkerStatus): DonateMachine {
+    return donateMachine(status.gpu, os.totalmem(), os.cpus().length);
+  }
+
+  /** The panel for this status. `choice` is what the sliders say right now, when that is not what the settings say. */
+  private _donateModel(status: WorkerStatus, choice?: DonateChoice): DonatePanelModel {
+    const machine = this._donateMachine(status);
+    const settings = readDonateSettings(vscode.workspace.getConfiguration('dlne'));
+    return buildDonatePanel({
+      machine,
+      settings,
+      state: status.state,
+      external: status.external === true,
+      started: status.startedWith,
+      choice: choice ?? reconcileDraft(this.draft, settings, machine),
+    });
+  }
+
+  private _postDonate(choice?: DonateChoice): void {
+    this._view?.webview.postMessage({ type: 'donatePanel', model: this._donateModel(this.workerManager.getStatus(), choice) });
+  }
+
+  /** What the panel shows now, as a valid choice: the webview's posts are checked against it. */
+  private _shownChoice(machine: DonateMachine): DonateChoice {
+    const settings = readDonateSettings(vscode.workspace.getConfiguration('dlne'));
+    return reconcileDraft(this.draft, settings, machine) ?? choiceFromSettings(settings, machine);
+  }
+
+  private _writeChoice(choice: DonateChoice, machine: DonateMachine): Promise<unknown> {
+    const write = () => this.workerManager.applyDonateChoice(choice, machine);
+    this.donateWrites = this.donateWrites.then(write, write);
+    return this.donateWrites;
+  }
+
+  /** The sliders moved (`commit`: and were let go): check the values, and answer with the panel for them. */
+  private async _onDonateChoice(raw: unknown, commit: boolean): Promise<void> {
+    const status = this.workerManager.getStatus();
+    const machine = this._donateMachine(status);
+    const choice = validateChoice(raw, machine, this._shownChoice(machine));
+    this.draft = choice;
+    if (commit) {
+      await this._writeChoice(choice, machine);
+    }
+    this._postDonate(choice);
+  }
+
+  /**
+   * The big button. Starting sets the settings from the sliders first (checked, like every post), so the old modal
+   * RAM offers do not appear for an amount the panel already holds; stopping needs nothing from the sliders.
+   */
+  private async _onToggleWorker(raw: unknown): Promise<void> {
+    const status = this.workerManager.getStatus();
+    const running = status.state === 'contributing' || status.state === 'starting';
+    if (raw === undefined || running) {
+      await this.workerManager.toggle();
+    } else {
+      const machine = this._donateMachine(status);
+      const choice = validateChoice(raw, machine, this._shownChoice(machine));
+      this.draft = choice;
+      if (!choice.gpuOn && !choice.cpuOn) {
+        this._postDonate(choice);
+        return;
+      }
+      await this._writeChoice(choice, machine);
+      await this.workerManager.toggle({ fromPanel: true });
+    }
+    this._postDonate();
+  }
+
+  /** "Apply (restarts the worker)": the settings follow the sliders, then the worker starts again with them. */
+  private async _onDonateApply(raw: unknown): Promise<void> {
+    const status = this.workerManager.getStatus();
+    const machine = this._donateMachine(status);
+    const choice = validateChoice(raw, machine, this._shownChoice(machine));
+    this.draft = choice;
+    if (!choice.gpuOn && !choice.cpuOn) {
+      this._postDonate(choice);
+      return;
+    }
+    await this._writeChoice(choice, machine);
+    await this.workerManager.restartWorker();
+    this._postDonate();
   }
 
   /** What the queue banner shows for a place in line (null hides it). */
@@ -84,6 +185,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       workerStatus,
       workerCopy: contributionCopy(workerStatus),
       workerRole: roleCopy(workerStatus),
+      donate: this._donateModel(workerStatus),
       modelLine: this._modelLine(),
       queue: this._queueView(this.client.currentQueue?.())
     });
@@ -121,7 +223,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           break;
         }
         case 'toggleWorker': {
-          await this.workerManager.toggle();
+          await this._onToggleWorker(data.choice);
+          break;
+        }
+        case 'donateChoice': {
+          await this._onDonateChoice(data.choice, data.commit === true);
+          break;
+        }
+        case 'donateApply': {
+          await this._onDonateApply(data.choice);
           break;
         }
         case 'installSuite': {
@@ -234,9 +344,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     const badgeClass = isContrib ? 'contributing' : isStarting ? 'starting' : 'idle';
     const badgeText = st.state.toUpperCase();
-    const btnClass = isContrib ? 'contrib-btn stop-btn' : 'contrib-btn';
-    const { deviceHtml: gpuText, ruleHtml: ruleText, buttonText: btnText } = contributionCopy(st);
+    // The status line under the header says what the running worker is doing; the Donate panel is the rest of the card.
+    const live = isContrib || isStarting;
+    const { ruleHtml: ruleText } = contributionCopy(st);
     const role = roleCopy(st);
+    // The panel's first model sits in the script as data. Nothing in it may end the script block (a GPU name comes
+    // from a driver), so the characters that could are written as escapes.
+    const donateModel = JSON.stringify(this._donateModel(st))
+      .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026')
+      .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
     // Shown as the link's tooltip; it comes from a setting, so it is escaped for the attribute.
     const phoneUrl = phoneChatUrl(vscode.workspace.getConfiguration('dlne'))
       .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
@@ -339,6 +455,25 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       gap: 6px;
       margin-top: 4px;
     }
+    /* The card folds away to its header, so a short window can keep the chat in reach. */
+    details.contrib-card > summary {
+      list-style: none;
+      cursor: pointer;
+    }
+    details.contrib-card > summary::-webkit-details-marker { display: none; }
+    details.contrib-card > summary::after {
+      content: '';
+      width: 6px;
+      height: 6px;
+      margin: 0 2px 2px 8px;
+      border-right: 1.5px solid var(--vscode-descriptionForeground);
+      border-bottom: 1.5px solid var(--vscode-descriptionForeground);
+      transform: rotate(45deg);
+    }
+    details.contrib-card[open] > summary::after { transform: rotate(-135deg); margin-bottom: -2px; }
+    details.contrib-card > summary .contrib-title { flex: 1; }
+    #contrib-rule, #role-display { margin-top: 4px; }
+${DONATE_CSS}
     .contrib-card a {
       color: var(--vscode-textLink-foreground);
       cursor: pointer;
@@ -381,6 +516,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     /* Chat Container */
     #chat-container {
       flex: 1;
+      min-height: 140px;
       overflow-y: auto;
       display: flex;
       flex-direction: column;
@@ -690,22 +826,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   </style>
 </head>
 <body>
-  <!-- Compute Contribution Card -->
-  <div class="contrib-card" id="contrib-card">
-    <div class="contrib-header">
-      <span><img class="logo" src="${logoSrc}" alt="" width="24" height="24">Compute Contribution</span>
+  <!-- Donate compute: the panel is drawn by the script from the model in worker/donatePanel.ts -->
+  <details class="contrib-card" id="contrib-card" open>
+    <summary class="contrib-header">
+      <span class="contrib-title"><img class="logo" src="${logoSrc}" alt="" width="24" height="24">Donate compute</span>
       <span class="badge ${badgeClass}" id="worker-badge">${badgeText}</span>
-    </div>
-    <div class="contrib-info" id="gpu-display">${gpuText}</div>
-    <div class="contrib-info" id="contrib-rule">${ruleText}</div>
+    </summary>
+    <div class="dn" id="donate-panel"></div>
+    <div class="contrib-info" id="contrib-rule"${live ? '' : ' style="display:none"'}>${live ? ruleText : ''}</div>
     <div class="contrib-info" id="role-display">${role.roleHtml}</div>
     <div class="contrib-info" id="trust-display"${role.trustHtml ? '' : ' style="display:none"'}>${role.trustHtml}</div>
     <div id="role-facts">${role.factsHtml}</div>
     <div class="contrib-actions">
-      <button class="${btnClass}" id="toggle-worker-btn">${btnText}</button>
       <button class="secondary" id="suite-btn" title="Install the signed DLNE compute engine">Set Up Engine</button>
     </div>
-  </div>
+  </details>
 
   <div id="chat-container">
     <div class="message assistant" id="welcome-msg">
@@ -743,10 +878,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const stopBtn = document.getElementById('stop-btn');
     const clearBtn = document.getElementById('clear-btn');
     const modelLine = document.getElementById('model-line');
-    const toggleWorkerBtn = document.getElementById('toggle-worker-btn');
     const suiteBtn = document.getElementById('suite-btn');
     const workerBadge = document.getElementById('worker-badge');
-    const gpuDisplay = document.getElementById('gpu-display');
+    const contribCard = document.getElementById('contrib-card');
     const contribRule = document.getElementById('contrib-rule');
     const roleDisplay = document.getElementById('role-display');
     const trustDisplay = document.getElementById('trust-display');
@@ -808,14 +942,20 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     if (previousState && previousState.chatHtml) {
       chatContainer.innerHTML = previousState.chatHtml;
     }
-
-    function saveWebviewState() {
-      vscode.setState({ chatHtml: chatContainer.innerHTML });
+    if (previousState && previousState.donateOpen === false) {
+      contribCard.open = false;
     }
 
-    toggleWorkerBtn.addEventListener('click', () => {
-      vscode.postMessage({ type: 'toggleWorker' });
-    });
+    function saveWebviewState() {
+      vscode.setState({ chatHtml: chatContainer.innerHTML, donateOpen: contribCard.open });
+    }
+    contribCard.addEventListener('toggle', saveWebviewState);
+
+    // The Donate panel (src/views/donateView.ts, this same function) draws the model the extension builds from the
+    // machine and the settings. It shows every string as text, and the extension checks every value it posts.
+    ${createDonatePanel.toString()}
+    const donatePanel = createDonatePanel(document.getElementById('donate-panel'), (message) => vscode.postMessage(message));
+    donatePanel.update(${donateModel});
 
     suiteBtn.addEventListener('click', () => {
       vscode.postMessage({ type: 'installSuite' });
@@ -935,14 +1075,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     // The wording comes from the extension (contributionCopy), so the first render and these
     // updates say the same thing, for a GPU contributor and for the CPU pool alike.
-    function applyWorkerStatus(st, copy, role) {
+    function applyWorkerStatus(st, copy, role, donate) {
       if (!st || !copy) return;
       workerBadge.className = 'badge ' + st.state;
       workerBadge.textContent = st.state.toUpperCase();
-      gpuDisplay.innerHTML = copy.deviceHtml;
-      contribRule.innerHTML = copy.ruleHtml;
-      toggleWorkerBtn.textContent = copy.buttonText;
-      toggleWorkerBtn.className = st.state === 'contributing' ? 'contrib-btn stop-btn' : 'contrib-btn';
+      // Only a worker that is starting or running has anything to report here; the panel says the rest.
+      const live = st.state === 'contributing' || st.state === 'starting';
+      contribRule.innerHTML = live ? copy.ruleHtml : '';
+      contribRule.style.display = live ? '' : 'none';
+      if (donate) donatePanel.update(donate);
       if (role) {
         roleDisplay.innerHTML = role.roleHtml;
         trustDisplay.innerHTML = role.trustHtml;
@@ -958,7 +1099,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       const msg = event.data;
       switch (msg.type) {
         case 'workerStatus': {
-          applyWorkerStatus(msg.status, msg.copy, msg.role);
+          applyWorkerStatus(msg.status, msg.copy, msg.role, msg.donate);
+          break;
+        }
+
+        case 'donatePanel': {
+          donatePanel.update(msg.model);
           break;
         }
 
@@ -977,7 +1123,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             modelLine.textContent = msg.modelLine;
           }
           if (msg.workerStatus) {
-            applyWorkerStatus(msg.workerStatus, msg.workerCopy, msg.workerRole);
+            applyWorkerStatus(msg.workerStatus, msg.workerCopy, msg.workerRole, msg.donate);
           }
           showQueue(msg.queue);
           if (msg.history && msg.history.length > 0) {

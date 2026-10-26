@@ -45,13 +45,14 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import io.dlne.chat.BuildConfig
 import io.dlne.chat.R
+import io.dlne.chat.update.UpdateSettingsSection
 
 private const val COFFEE_URL = "https://buymeacoffee.com/wubarrk"
 private const val DONATE_COMPUTE_URL = "https://open-vsx.org/extension/dlne/dlne-code-assistant"
 private const val SOURCE_URL = "https://github.com/RGlabs84/DistributedLLMEngine"
 
 /** The DLNE page on the project's website. Linked from Settings and from the chat drawer. */
-internal const val WEBSITE_URL = "https://live.ravenirongames.com/#dlne"
+internal const val WEBSITE_URL = "https://dlne.rossgilsonlabs.dev"
 
 /** The DLNE Discord server (news and help). Linked from Settings and from the chat drawer. */
 internal const val DISCORD_URL = "https://discord.gg/RNxvxWn8cw"
@@ -91,6 +92,9 @@ fun SettingsScreen(state: ChatUiState, actions: SettingsActions) {
                 .padding(vertical = 8.dp),
         ) {
             ServerSection(state.serverUrl, actions)
+
+            // Sideload build: the Updates section. Play build: nothing (src/play).
+            UpdateSettingsSection()
 
             SectionDivider()
             SectionTitle(stringResource(R.string.settings_privacy_title))
@@ -229,7 +233,7 @@ private fun LinkRow(title: String, subtitle: String, onClick: () -> Unit) {
 }
 
 @Composable
-private fun SectionTitle(text: String) {
+internal fun SectionTitle(text: String) {
     Text(
         text,
         style = MaterialTheme.typography.titleSmall,
@@ -239,11 +243,11 @@ private fun SectionTitle(text: String) {
 }
 
 @Composable
-private fun BodyText(text: String) {
+internal fun BodyText(text: String) {
     Text(text, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
 @Composable
-private fun SectionDivider() {
+internal fun SectionDivider() {
     HorizontalDivider(Modifier.padding(top = 16.dp))
 }

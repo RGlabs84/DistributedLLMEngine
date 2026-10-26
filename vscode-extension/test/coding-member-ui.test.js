@@ -338,7 +338,8 @@ test('the sidebar card explains the jobs and the privacy facts to a GPU owner be
   assert.match(html, /<details class="role-details"><summary>What does lending my GPU mean\?/);
   assert.match(html, /Your machine keeps no trace/);
   assert.match(html, /id="trust-display" style="display:none"/);
-  assert.match(html, /⚡ Contribute Local GPU/);
+  // The old "Contribute Local GPU" button is the Donate compute panel's button now (test/donate-panel.test.js).
+  assert.match(html, /"button":\{"label":"Donate compute","action":"start"/);
 });
 
 test('the sidebar card for a coding member shows the job, the privacy line and the trust id', () => {
@@ -353,7 +354,7 @@ test('the sidebar card for a coding member shows the job, the privacy line and t
 test('the sidebar card for a CPU contributor carries no GPU or coding-request text', () => {
   const html = sidebarFor({ state: 'idle', gpu: CPU_NODE, cpuPool: true, vramContributedGb: 0 })._getHtmlForWebview();
   assert.match(html, /Phone app member/);
-  assert.doesNotMatch(html, /<details/);
+  assert.doesNotMatch(html, /<details class="role-details"/);
   assert.doesNotMatch(html, /Coding member|end-to-end encrypted|lending my GPU/);
 });
 

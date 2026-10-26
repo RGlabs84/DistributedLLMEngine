@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.4.7] - 2026-10-26
+
+### Changed
+- **DLNE's address is now `https://dlne.rossgilsonlabs.dev`.** The same name serves the DLNE website at `/` and passes the coordinator's own paths (`/chat`, `/c/`, `/v1/`, `/worker/`, `/ws/`) straight to it. `/v1/admin` stays closed from outside, as before.
+  - The landing page and DLNE Chat link to it as the website, and give it to link previews.
+  - Canary decoys are written with it.
+  - `scripts/release.py` checks a deploy through it.
+  - `https://dlne.duckdns.org` still answers, and so does every earlier address. Workers and phones already pointed at them keep working; extension 1.3.4 and the Android app 1.0.4 move to the new name on their own.
+
+---
+
 ## [2.4.6] - 2026-10-26
 
 ### Fixed

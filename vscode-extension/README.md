@@ -13,7 +13,7 @@ No account, no API key, no subscription. Install it, open the DLNE sidebar, and 
 - **Ghost-text autocomplete**: suggestions inline as you type.
 - **Fix problems**: `DLNE: Fix Current File Problems` sends the file's errors and warnings to the agent.
 - **Secrets stay in your editor**: API keys, tokens, private keys and passwords in common formats are replaced with `[REDACTED]` before a request leaves VS Code, and files like `.env` and `*.pem` are never sent. Private repositories are answered only by trusted machines unless you opt in. [Details below](#privacy-what-to-know).
-- **On your phone**: [DLNE Chat](https://dlne.duckdns.org/chat) is the same swarm in a phone browser (on an iPhone: Safari, Share, Add to Home Screen), and there is an Android app (the APK is on the [DLNE website](https://live.ravenirongames.com/#dlne); it is not on Google Play yet). In VS Code, use the **Use DLNE on your phone** link in the sidebar, or the command `DLNE: Use DLNE on Your Phone`.
+- **On your phone**: [DLNE Chat](https://dlne.rossgilsonlabs.dev/chat) is the same swarm in a phone browser (on an iPhone: Safari, Share, Add to Home Screen), and there is an Android app (the APK is on the [DLNE website](https://dlne.rossgilsonlabs.dev); it is not on Google Play yet). In VS Code, use the **Use DLNE on your phone** link in the sidebar, or the command `DLNE: Use DLNE on Your Phone`.
 
 ---
 
@@ -36,13 +36,20 @@ A CPU contributor's chats show how many are left, and at the limit the agent say
 
 You choose how much to lend (`dlne.worker.maxVramGb`, `dlne.worker.maxRamGb`, `dlne.worker.allowedGpus`), and you can stop at any time.
 
+**The Donate compute panel.** The top of the DLNE sidebar is where you set it, with sliders that snap to amounts the swarm can use, and a line under them that says what your choice powers and what you get back:
+
+- **GPU** (a switch, the VRAM to lend, and the RAM for the GPU's model: Auto, then 16, 24, 32 GB and up to your RAM less 4 GB). From 8 GB of VRAM a GPU can be a coding member; a smaller one joins the GPU pool.
+- **CPU** (a switch, the RAM to lend, and the threads). The RAM picks the phone-app model it runs: 8 GB Qwen3 4B, 16 GB Qwen3.6, 24 GB Qwen3.6 at full quality. At most half your RAM is offered.
+- **Threads** (`dlne.worker.maxCpuThreads`, Auto by default): how much of your computer stays yours. Memory speed limits the work, so more threads add little. A change applies while the worker runs.
+- One **Donate compute** button starts and stops. A change to the GPU or the RAM while you donate shows **Apply (restarts the worker)**. It needs a GPU with a switch on, or a CPU with at least 4 cores and 16 GB of RAM.
+
 > **Contributing works on Windows and Linux (x64 and ARM64) and on macOS (Apple Silicon and Intel).** GPUs are used through Vulkan on Windows and Linux and Metal on Apple Silicon. Intel Macs contribute their CPU (llama.cpp has no GPU support for them). The ARM64 and Intel Mac builds are the newest and the least tested.
 
 ### 8 GB of GPU memory or more? Be a coding member
 
 A **coding member** runs a whole coding model on your GPU and answers coding requests on its own, so one request touches one machine and ordinary home internet is enough. **Each member adds about two more agents** working at the same time, so the swarm can run more agents as members join.
 
-There is no separate switch to find. Click **Start Contributing** and choose **Lend my GPU**: when the coordinator has coding members turned on and your GPU is not on its own fast network, it gives your GPU this job instead of a share of the big model. The sidebar card, the status bar ("Coding member") and a one-time notice tell you which job you got. If you would rather not answer other people's requests, choose **Lend my CPU only**, or turn off **`dlne.worker.allowCodingMember`** (the extension writes `CODING_MEMBER_ALLOWED=false` into the engine's `config/config.txt` for you). The coding job uses the memory that is free when it starts (it steps aside when you game); set **`dlne.worker.maxRamGb`** to limit it. (That setting is also the limit of the shared-model job, which needs little, and its default of 4 GB does not apply to the coding job; the extension passes the coding limit as `--coding-max-ram`, `-1` meaning none.)
+There is no separate switch to find. Switch on the GPU in the Donate compute panel and click **Donate compute** (the first time you are asked; choose **Lend my GPU**): when the coordinator has coding members turned on and your GPU is not on its own fast network, it gives your GPU this job instead of a share of the big model. The sidebar card, the status bar ("Coding member") and a one-time notice tell you which job you got. If you would rather not answer other people's requests, choose **Lend my CPU only**, or turn off **`dlne.worker.allowCodingMember`** (the extension writes `CODING_MEMBER_ALLOWED=false` into the engine's `config/config.txt` for you). The coding job uses the memory that is free when it starts (it steps aside when you game); set **`dlne.worker.maxRamGb`** to limit it. (That setting is also the limit of the shared-model job, which needs little, and its default of 4 GB does not apply to the coding job; the extension passes the coding limit as `--coding-max-ram`, `-1` meaning none.)
 
 **Lend both.** The third button, **Lend both** (`dlne.worker.device` = `"both"`), lends the GPU and the CPU at the same time: the GPU does the job the swarm gives it, and the CPU also powers the DLNE phone app with the RAM you choose (you are asked on the first start; `dlne.worker.alsoCpuRamGb` holds the amount, at least 8 GB and never more than half your RAM; `dlne.worker.maxRamGb` stays the limit of the GPU's jobs). Your processor's threads are shared between the two jobs (`MAX_CPU_THREADS` is the total), the phone-app model loads before the coding model does, and when you game both step aside. The sidebar card, the status bar (`[Coding member 8GB + Phone app]`) and `@dlne /contribute` show both jobs while both run. On a machine without a usable GPU "both" is the same as "cpu".
 
@@ -57,7 +64,7 @@ What a member can and cannot see of the requests it answers is under [Privacy](#
 
 ### No GPU? Your computer powers the DLNE phone app
 
-A contributor without a usable GPU does not join the coding pipeline. Its worker joins the **CPU pool**, which answers the DLNE phone app (the [chat page](https://dlne.duckdns.org/chat) and the Android app). Each member runs a whole model on its CPU, and the server picks the model from how much RAM you lend:
+A contributor without a usable GPU does not join the coding pipeline. Its worker joins the **CPU pool**, which answers the DLNE phone app (the [chat page](https://dlne.rossgilsonlabs.dev/chat) and the Android app). Each member runs a whole model on its CPU, and the server picks the model from how much RAM you lend:
 
 | RAM you lend | Model your computer runs |
 |---|---|
@@ -185,7 +192,7 @@ The settings that decide where your code or keys go (`dlne.serverUrl`, `dlne.api
 
 | Setting | Default | What it does |
 |---|---|---|
-| `dlne.serverUrl` | `https://dlne.duckdns.org` | The coordinator: the public swarm (over HTTPS), or your own. |
+| `dlne.serverUrl` | `https://dlne.rossgilsonlabs.dev` | The coordinator: the public swarm (over HTTPS), or your own. The older public addresses (the DuckDNS name and before) are read as this one. |
 | `dlne.apiKey` | `""` | Optional API key. Leave blank to use the free trial or your contribution. |
 | `dlne.privacy` | `auto` | Who may answer your coding requests: `auto` (any coding member for a public repository, trusted machines only for everything else), `trustedOnly` (use this for unpublished work in a clone of a public repository), or `anyMember` (any member, for every workspace). A repository's own settings can only narrow it, never widen it. See [Privacy](#privacy-what-to-know). |
 | `dlne.worker.networkKey` | public swarm key | The swarm's shared worker key. Change it only for a private coordinator. |
@@ -194,6 +201,7 @@ The settings that decide where your code or keys go (`dlne.serverUrl`, `dlne.api
 | `dlne.worker.allowedGpus` | `""` | GPU indices to lend (e.g. `0,1`). Blank lends all detected GPUs. |
 | `dlne.worker.maxVramGb` | `-1` | Most VRAM to lend, in GB (`-1`: detect). |
 | `dlne.worker.maxRamGb` | `4.0` | Most system RAM the worker may use, in GB. A CPU-only machine needs at least 8; the more it lends, the bigger the phone-app model it runs (16 GB: Qwen3.6). You're offered an amount when you start. |
+| `dlne.worker.maxCpuThreads` | `-1` | Most CPU threads the worker may use, so the rest of your computer stays yours. `-1`: the engine decides (half your cores, 2 to 8). Applies to a running worker without a restart. Set by the sidebar's Donate compute panel. |
 | `dlne.worker.autoStart` | `false` | Resume contributing when VS Code opens (set for you when you start contributing). |
 | `dlne.worker.pythonPath` | `python3` | Python used for the engine. |
 | `dlne.enableInlineCompletion` | `true` | Ghost-text autocomplete. |
@@ -217,7 +225,7 @@ Two ways to keep it free:
 
 ## Links
 
-- **Website**: [live.ravenirongames.com/#dlne](https://live.ravenirongames.com/#dlne)
+- **Website**: [dlne.rossgilsonlabs.dev](https://dlne.rossgilsonlabs.dev)
 - **Discord**: [discord.gg/RNxvxWn8cw](https://discord.gg/RNxvxWn8cw)
 - **Source**: [RGlabs84/DistributedLLMEngine](https://github.com/RGlabs84/DistributedLLMEngine)
 - **Issues**: [GitHub Issues](https://github.com/RGlabs84/DistributedLLMEngine/issues)

@@ -50,7 +50,7 @@ class PendingReplyTest {
 
     @Test
     fun `website and Discord links are the official ones and open like the other links`() {
-        assertEquals("https://live.ravenirongames.com/#dlne", WEBSITE_URL)
+        assertEquals("https://dlne.rossgilsonlabs.dev", WEBSITE_URL)
         assertEquals("https://discord.gg/RNxvxWn8cw", DISCORD_URL)
         // openInBrowser only follows what Markdown.safeUrl returns unchanged.
         assertEquals(WEBSITE_URL, Markdown.safeUrl(WEBSITE_URL))

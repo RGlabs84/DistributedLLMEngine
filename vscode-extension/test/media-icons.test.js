@@ -111,7 +111,7 @@ test('the sidebar webview shows the logo image and draws no mark of its own', ()
   const images = [...html.matchAll(/<img\b[^>]*>/g)].map((m) => m[0]);
   assert.equal(images.length, 2, 'the card header and the welcome line');
   for (const img of images) assert.match(img, /src="[^"]*media\/dlne_logo\.png"/);
-  assert.match(html, /<img class="logo"[^>]*>Compute Contribution/);
+  assert.match(html, /<img class="logo"[^>]*>Donate compute/);
   assert.match(html, /<img class="logo"[^>]*>DLNE Code Assistant/);
 });
 

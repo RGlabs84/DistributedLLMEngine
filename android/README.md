@@ -5,12 +5,17 @@ The native DLNE chat app: Kotlin, Jetpack Compose, Material 3, one activity. Pho
 
 - Package: `io.dlne.chat` (debug builds install side by side as `io.dlne.chat.debug`)
 - minSdk 26 (Android 8.0), targetSdk / compileSdk 36 (Android 16)
-- Permission: `INTERNET` only. No analytics, ads, Google Play Services, Firebase or tracking.
+- Two builds of the same app (same package, same signing key), see "Flavors and updates" below:
+  `sideload` (the APK on the website, with the in-app updater) and `play` (Google Play, none).
+- Permissions: `play` = `INTERNET` only. `sideload` = `INTERNET` + `REQUEST_INSTALL_PACKAGES`
+  (to hand a verified update to Android's installer; Android still asks for a tap).
+  No analytics, ads, Google Play Services, Firebase or tracking in either.
 - Talks to `POST /v1/app/chat/completions` (Server-Sent Events) and `GET /v1/cluster/status`
-  on `https://dlne.duckdns.org` by default (`ServerUrl.DEFAULT`); the address is editable in
-  Settings (https only) for self-hosters. The service's old address,
-  `https://73-215-216-195.sslip.io`, still works and is still accepted as input; an app that
-  has it saved (an earlier version did) silently switches to the new default at start-up
+  on `https://dlne.rossgilsonlabs.dev` by default (`ServerUrl.DEFAULT`, since 1.0.4); the
+  address is editable in Settings (https only) for self-hosters. The service's older addresses,
+  `https://dlne.duckdns.org` (1.0.1-1.0.3) and `https://73-215-216-195.sslip.io`, still work and
+  are still accepted as input; an app that has one saved (an earlier version did) silently
+  switches to the new default at start-up
   (`ServerUrl.startupAddress`, `SettingsStore`, tests in `ServerUrlTest` and `SettingsStoreTest`).
 - Chats are stored in one JSON file in app-private storage and excluded from cloud backup
   and device transfer.
@@ -43,13 +48,21 @@ All commands run from this `android/` directory.
 ```bash
 export JAVA_HOME=~/.local/jdk-17
 
-./gradlew :app:testDebugUnitTest     # unit tests (SSE parser, Markdown, client, history)
-./gradlew assembleDebug              # app/build/outputs/apk/debug/app-debug.apk
-./gradlew assembleRelease            # app/build/outputs/apk/release/app-release.apk  (signed, R8)
-./gradlew bundleRelease              # app/build/outputs/bundle/release/app-release.aab (for Play)
+./gradlew :app:testDebugUnitTest     # unit tests of both flavors (SSE parser, Markdown, client, history, updater)
+./gradlew assembleSideloadDebug      # app/build/outputs/apk/sideload/debug/app-sideload-debug.apk
+./gradlew assembleRelease            # BOTH release APKs (signed, R8), see the table below
+./gradlew assembleSideloadRelease    # only the website APK
+./gradlew bundlePlayRelease          # app/build/outputs/bundle/playRelease/app-play-release.aab (for Play)
 ```
 
-Install on a phone with USB debugging on: `adb install -r app/build/outputs/apk/release/app-release.apk`.
+| Flavor | Release APK (signed, R8) | For |
+|---|---|---|
+| `sideload` | `app/build/outputs/apk/sideload/release/app-sideload-release.apk` | the DLNE website (publish it as `downloads/DLNE-Chat-<version>.apk`) |
+| `play` | `app/build/outputs/apk/play/release/app-play-release.apk` | testing; Play gets the `.aab` |
+
+Before 1.0.4 there was one APK, `app/build/outputs/apk/release/app-release.apk`; that path no
+longer exists. Install on a phone with USB debugging on:
+`adb install -r app/build/outputs/apk/sideload/release/app-sideload-release.apk`.
 
 `gradle.properties` keeps builds light on a shared machine: a 2 GB Gradle heap, at most four
 workers, and the Kotlin compiler in-process (no extra daemon). On the dev laptop, run
@@ -57,7 +70,7 @@ builds through the machine's memory guard and leave no daemon behind (`ANDROID_H
 checkout has no `local.properties`):
 
 ```bash
-~/valheim-testbed/heavy.sh 6G dlne-android env JAVA_HOME=$HOME/.local/jdk-17 ANDROID_HOME=$HOME/Android/Sdk ./gradlew --no-daemon assembleRelease
+~/valheim-testbed/heavy.sh 6G dlne-android env JAVA_HOME=$HOME/.local/jdk-17 ANDROID_HOME=$HOME/Android/Sdk ./gradlew --no-daemon :app:testDebugUnitTest assembleRelease
 ```
 
 ### Live smoke test
@@ -82,7 +95,7 @@ The release keystore lives **outside the repository**:
 Both files are `chmod 600`. `app/build.gradle.kts` reads `keystore.properties` from that
 path when it exists; point it elsewhere with `-Pdlne.keystoreProperties=/path/to/file` or
 the `DLNE_KEYSTORE_PROPERTIES` environment variable. Without it, release builds are produced
-unsigned (`app-release-unsigned.apk`) instead of failing, so anyone can build.
+unsigned (`app-sideload-release-unsigned.apk`, `app-play-release-unsigned.apk`) instead of failing, so anyone can build.
 `.gitignore` blocks `*.jks`, `*.keystore` and `keystore.properties` as a second lock.
 
 Signing certificate SHA-256:
@@ -98,12 +111,19 @@ upload key can be reset through Play Console support.
 1. In `app/build.gradle.kts`, raise `versionCode` by 1 (Play rejects any upload whose
    versionCode is not higher than every earlier one) and set `versionName` (what people see,
    e.g. `1.0.2`).
-2. `./gradlew :app:testDebugUnitTest assembleRelease bundleRelease`
-3. Upload `app/build/outputs/bundle/release/app-release.aab` to Play Console. The R8
-   mapping file (`app/build/outputs/mapping/release/mapping.txt`) is embedded in the bundle,
-   so Play de-obfuscates crash traces automatically; keep a copy for APKs shared elsewhere.
-4. Record the APK's SHA-256 (`sha256sum app/build/outputs/apk/release/app-release.apk`) if
-   the APK is published anywhere else.
+2. `./gradlew :app:testDebugUnitTest assembleRelease bundlePlayRelease`
+3. **Google Play:** upload `app/build/outputs/bundle/playRelease/app-play-release.aab` to Play
+   Console. The R8 mapping file (`app/build/outputs/mapping/playRelease/mapping.txt`) is
+   embedded in the bundle, so Play de-obfuscates crash traces automatically.
+4. **The website** (people who sideload; this is also how running apps learn about the update):
+   1. Copy `app/build/outputs/apk/sideload/release/app-sideload-release.apk` to the site's
+      `downloads/` folder as `DLNE-Chat-<versionName>.apk`. Keep the older APKs there.
+   2. Write `downloads/android.json` **after** the APK is in place (see "Flavors and updates"):
+      `sha256sum` and `stat -c %s` of exactly the file you copied. Write it last: the moment it
+      says a higher `versionCode`, installed apps start offering the update.
+   3. Check it: `curl -s https://dlne.rossgilsonlabs.dev/downloads/android.json` and
+      `curl -s <url in it> | sha256sum` must give the hash in the manifest.
+   Keep a copy of `mapping/sideload*/mapping.txt` for reading crash traces from that APK.
 
 ## Project layout
 
@@ -118,10 +138,84 @@ app/src/main/java/io/dlne/chat/
   data/                      conversation model (with sources), JSON-file store, settings, history, reports
   markdown/Markdown.kt       the safe Markdown subset parser ([n] citations included)
   ui/                        Compose screens: chat, drawer, settings, report sheet, sources, Markdown, theme
-app/src/test/                unit tests (+ the opt-in LiveSmokeTest)
+app/src/sideload/            the updater, sideload flavor only (manifest with the permission + receiver, strings)
+  java/io/dlne/chat/update/    UpdateManifest (strict parser), UpdateStore (12 h interval, "Later"), UpdateNetwork
+                               (no-redirect OkHttp, hashing downloader), Verification (SHA-256, signer, APK checks),
+                               UpdateInstaller (PackageInstaller session + receiver), UpdateController, UpdateHooks (UI)
+app/src/play/                three empty functions (UpdateHost, UpdateBanner, UpdateSettingsSection): no updater at all
+app/src/test/                unit tests (+ the opt-in LiveSmokeTest); FlavorManifestTest checks both merged manifests
+app/src/testSideload/        updater tests (manifest, interval, "Later", hashing, certificates, downloader)
 play/                        Google Play listing, policy and form answers, upload guide
 tools/generate_dlne_icons.py regenerates every icon asset from the official logo (see "Icons")
 ```
+
+## Flavors and updates
+
+`app/build.gradle.kts` has one flavor dimension, `distribution`, with two flavors. Both use the
+package `io.dlne.chat` and are signed by the same release key here (with Play App Signing, what
+Play installs carries Google's key instead, so the two channels are not interchangeable; see
+`play/README.md`). They differ like this:
+
+| | `sideload` | `play` |
+|---|---|---|
+| Where | the APK on https://dlne.rossgilsonlabs.dev | Google Play |
+| Permissions | `INTERNET`, `REQUEST_INSTALL_PACKAGES` | `INTERNET` |
+| Updater | yes (`BuildConfig.SELF_UPDATE = true`) | none: no permission, no manifest address, no download or installer code |
+
+Google Play does not let an app update itself outside Play, and `REQUEST_INSTALL_PACKAGES` is a
+restricted permission there, so the Play build must never contain any of it. `FlavorManifestTest`
+reads both merged release manifests on every test run and fails if `play` has the permission or
+the receiver, or if `main`/`play` sources mention the installer or the manifest address. To check
+by hand: `aapt2 dump permissions <apk>`.
+
+### How an update reaches a phone (sideload)
+
+1. **Check.** When the app comes to the screen, at most once every 12 hours (the time of the last
+   *successful* check is stored), and when someone taps *Settings > Updates > Check for updates*.
+   *Check for updates automatically* (default on) turns the automatic check off. No service,
+   no WorkManager: it only runs while the app is open.
+2. **The manifest.** `https://dlne.rossgilsonlabs.dev/downloads/android.json`, a static file next to
+   the APKs. The address is fixed in the app (`UpdateSource`); it does **not** follow the server
+   address someone typed into Settings. No cookies or identifiers are sent; no redirect is followed.
+   ```json
+   {"versionCode": 6, "versionName": "1.0.5", "minSdk": 26,
+    "url": "https://dlne.rossgilsonlabs.dev/downloads/DLNE-Chat-1.0.5.apk",
+    "sha256": "<64 hex>", "size": 2017073, "notes": "What changed, one or two lines.", "published": "2026-10-27"}
+   ```
+   It is accepted only if: `versionCode`, `minSdk` and `size` are JSON integers (`versionCode` up
+   to 2147483647, `size` from 100,000 bytes to just under 100 MB); `versionName` is 1-32 characters
+   of letters, digits and `._+-`; `sha256` is 64 hex digits; `url` is `https://dlne.rossgilsonlabs.dev/downloads/<name>.apk`
+   exactly (default port, no user info, query, fragment, `%`, `\`, `..` or subfolder); `notes`
+   (optional) is text, shown flattened to one line of at most 300 characters; `published`
+   (optional) is `yyyy-MM-dd`. Anything else is ignored whole. Extra fields are ignored.
+   Only a **strictly higher `versionCode`** than the installed app is an update, and a `minSdk`
+   above the phone's Android version means "not for this phone" (nothing is offered).
+3. **The offer.** A card at the top of the chat and a row in Settings: "DLNE Chat 1.0.5 is
+   available. <notes> One tap to install: Android will ask you to confirm. [Update] [Later]".
+   *Later* hides the chat card for that version until the next check (Settings still offers it).
+   The offer is remembered (re-validated) across restarts until the next check replaces it.
+4. **Update.** If Android has "install unknown apps" off for DLNE Chat, one sentence explains it
+   and Android's settings page for the app opens (`ACTION_MANAGE_UNKNOWN_APP_SOURCES`); the
+   update continues when the person comes back. Then the APK downloads with OkHttp into
+   `cache/updates/` with a progress bar and a Cancel button (no redirects, so it can only come from
+   the official host). While downloading, the byte count and SHA-256 are checked against the manifest:
+   a different size or hash discards the file. Next, PackageManager reads the file: it must be
+   `io.dlne.chat`, have exactly the manifest's `versionCode`, be newer than the installed app, and be
+   signed by the same certificate as the installed app (`GET_SIGNING_CERTIFICATES` on Android 9+,
+   `GET_SIGNATURES` below; a key rotation is accepted only with a signing lineage that contains the
+   installed certificate). Only then is the file streamed into a `PackageInstaller` session (hashed
+   once more on the way) and committed. Android shows its own confirmation, which the app starts
+   from the visible activity (it waits for the app to be on screen if needed). The file is deleted
+   right after the commit, and on any failure; leftovers and stale sessions are cleaned at start.
+5. **Failure.** Anything that fails (validation, size, hash, package, version, signer, installer)
+   shows a plain message and installs nothing; the current app stays.
+
+Nothing is silent or privileged: Android always asks the person to confirm an install of a
+sideloaded app, and the UI says so ("One tap to install").
+
+Limits to know: an app installed from Play has the Play flavor (no updater); a sideload install
+only updates to APKs signed with the same key; debug builds (`io.dlne.chat.debug`) will refuse the
+update as "not this app". A person on 1.0.3 or older has no updater and installs 1.0.4+ by hand once.
 
 ## Icons
 
@@ -176,7 +270,7 @@ the Play icon is not exactly the official logo as a 512 x 512 32-bit PNG.
   only a tap shows the full list; an unfolded list stays open while the answer streams, once
   it is saved, and across rotation (not across app restarts).
 - **Links.** Settings > "Website and community" opens the DLNE website
-  (`https://live.ravenirongames.com/#dlne`) and the DLNE Discord for news and help
+  (`https://dlne.rossgilsonlabs.dev`) and the DLNE Discord for news and help
   (`https://discord.gg/RNxvxWn8cw`), and the chat drawer has the same two links under
   Settings. They open in the browser through `openInBrowser`, like the coffee link; the URLs
   are the `WEBSITE_URL` and `DISCORD_URL` constants in `ui/SettingsScreen.kt`.

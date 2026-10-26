@@ -230,7 +230,7 @@ const statusOf = (gpu, state, cpuPool, gb) => ({ state, gpu, cpuPool, vramContri
 
 test('the sidebar links to the phone app, with the address as its tooltip', () => {
   const html = sidebarFor(statusOf(RTX, 'idle', false, 0))._getHtmlForWebview();
-  assert.match(html, /<a href="#" id="phone-link" title="https:\/\/dlne\.duckdns\.org\/chat">📱 Use DLNE on your phone<\/a>/);
+  assert.match(html, /<a href="#" id="phone-link" title="https:\/\/dlne\.rossgilsonlabs\.dev\/chat">📱 Use DLNE on your phone<\/a>/);
   assert.match(html, /vscode\.postMessage\(\{ type: 'openPhoneApp' \}\)/);
 });
 
@@ -240,21 +240,43 @@ test('the phone link follows a private coordinator, and its address is escaped',
   assert.ok(provider._getHtmlForWebview().includes('title="https://dlne.example.org/&quot;>&lt;script>/chat"'));
 });
 
-test('the sidebar card tells a CPU contributor their computer powers the phone app', () => {
-  const html = sidebarFor(statusOf(CPU_NODE, 'idle', true, 0))._getHtmlForWebview();
-  assert.match(html, /Your computer powers the DLNE phone app/);
-  assert.match(html, /⚡ Power the DLNE Phone App/);
-  assert.match(html, /the coding agent 2nd in line, with 300 chats every 5 hours/);
-  assert.doesNotMatch(html, /Contribute Local GPU|VULKAN GPU|CPU Compute Node/);
-  const active = sidebarFor(statusOf(CPU_NODE, 'contributing', true, 16))._getHtmlForWebview();
+// The panel's first model sits in the page as data (the old card's text and buttons are the Donate compute panel's
+// now; test/donate-panel.test.js covers the panel itself).
+const panelOf = (html) => JSON.parse(/donatePanel\.update\((\{.*\})\);/.exec(html)[1]);
+
+/** The sidebar page for this status on a 32 GB, 8-core computer (what the panel offers depends on the host). */
+function pageOn32Gb(status) {
+  const realTotalmem = os.totalmem;
+  const realCpus = os.cpus;
+  os.totalmem = () => 32 * GIB;
+  os.cpus = () => new Array(8).fill({});
+  try {
+    return sidebarFor(status)._getHtmlForWebview();
+  } finally {
+    os.totalmem = realTotalmem;
+    os.cpus = realCpus;
+  }
+}
+
+test('the sidebar panel tells a CPU contributor their computer powers the phone app', () => {
+  const html = pageOn32Gb(statusOf(CPU_NODE, 'idle', true, 0));
+  const panel = panelOf(html);
+  assert.equal(panel.cpu.on, true);
+  assert.equal(panel.button.label, 'Donate compute');
+  assert.match(panel.powers.map((p) => p.text).join('\n'), /Phone app: \d+ GB runs/);
+  assert.match(panel.powers.map((p) => p.text).join('\n'), /the coding agent 2nd in line, with 300 chats every 5 hours/);
+  assert.doesNotMatch(html, /Contribute Local GPU|VULKAN GPU|CPU Compute Node|Power the DLNE Phone App/);
+  const active = pageOn32Gb(statusOf(CPU_NODE, 'contributing', true, 16));
   assert.match(active, /16 GB of RAM lent, at low priority on half your cores/);
   assert.doesNotMatch(active, /Inference unlocked/);
+  assert.equal(panelOf(active).button.label, 'Stop donating');
 });
 
-test('the sidebar card for a GPU contributor still says what it always did', () => {
-  const html = sidebarFor(statusOf(RTX, 'idle', false, 0))._getHtmlForWebview();
-  assert.match(html, /⚡ Contribute Local GPU/);
-  assert.match(html, /<strong>VULKAN GPU:<\/strong> RTX 4060 \(8 GB\)/);
+test('the sidebar panel for a GPU contributor offers the GPU', () => {
+  const panel = panelOf(pageOn32Gb(statusOf(RTX, 'idle', false, 0)));
+  assert.equal(panel.gpu.on, true);
+  assert.equal(panel.gpu.detail, 'RTX 4060, 8 GB');
+  assert.doesNotMatch(JSON.stringify(panel), /Contribute Local GPU/);
 });
 
 test('the sidebar sends the card wording with every status, and the phone link opens the app', async () => {
@@ -329,9 +351,10 @@ test('a spent free trial is told about the CPU route as well', () => {
 
 test('the phone chat page is on the configured coordinator', () => {
   const config = (value) => ({ get: (key) => (key === 'serverUrl' ? value : undefined) });
-  assert.equal(phoneChatUrl(config(undefined)), 'https://dlne.duckdns.org/chat');
-  assert.equal(phoneChatUrl(config('http://73.215.216.195:11435')), 'https://dlne.duckdns.org/chat');
-  assert.equal(phoneChatUrl(config('https://73-215-216-195.sslip.io')), 'https://dlne.duckdns.org/chat');
+  assert.equal(phoneChatUrl(config(undefined)), 'https://dlne.rossgilsonlabs.dev/chat');
+  assert.equal(phoneChatUrl(config('http://73.215.216.195:11435')), 'https://dlne.rossgilsonlabs.dev/chat');
+  assert.equal(phoneChatUrl(config('https://73-215-216-195.sslip.io')), 'https://dlne.rossgilsonlabs.dev/chat');
+  assert.equal(phoneChatUrl(config('https://dlne.duckdns.org')), 'https://dlne.rossgilsonlabs.dev/chat');
   assert.equal(phoneChatUrl(config('http://192.168.1.50:11435/')), 'http://192.168.1.50:11435/chat');
   // The coordinator really serves it there (engine/chat_page.py).
   const chatPy = fs.readFileSync(path.join(ROOT, '..', 'engine', 'chat_page.py'), 'utf8');

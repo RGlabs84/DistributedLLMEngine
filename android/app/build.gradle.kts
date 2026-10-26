@@ -1,3 +1,4 @@
+import com.android.build.api.artifact.SingleArtifact
 import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -45,8 +46,29 @@ android {
         targetSdk = 36
         // Bump versionCode by one for every upload to Google Play (it must always increase);
         // versionName is what people see. See android/README.md.
-        versionCode = 4
-        versionName = "1.0.3"
+        versionCode = 5
+        versionName = "1.0.4"
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Two distributions of the same app (same package, same signing key):
+    //   sideload  the APK on the DLNE website. Has the in-app updater and the
+    //             REQUEST_INSTALL_PACKAGES permission it needs (src/sideload).
+    //   play      the Google Play build. No updater, no such permission, no code for it:
+    //             Play forbids an app to update itself outside Play, and the permission is
+    //             restricted there (src/play only holds empty stand-ins for three hooks).
+    // BuildConfig.SELF_UPDATE says which one is running.
+    // ---------------------------------------------------------------------------------
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("sideload") {
+            dimension = "distribution"
+            buildConfigField("boolean", "SELF_UPDATE", "true")
+        }
+        create("play") {
+            dimension = "distribution"
+            buildConfigField("boolean", "SELF_UPDATE", "false")
+        }
     }
 
     signingConfigs {
@@ -104,7 +126,32 @@ kotlin {
     }
 }
 
+// With two flavors Android's plugin no longer provides a plain `testDebugUnitTest`; this one
+// keeps the documented command (`./gradlew :app:testDebugUnitTest`) working and runs both.
+tasks.register("testDebugUnitTest") {
+    group = "verification"
+    description = "Runs the debug unit tests of both flavors (sideload and play)."
+    dependsOn("testSideloadDebugUnitTest", "testPlayDebugUnitTest")
+}
+
+// The merged release manifest of each flavor, for FlavorManifestTest: it proves the play build
+// has no REQUEST_INSTALL_PACKAGES and the sideload build has it. Declared as a task input, so
+// running the unit tests first merges both manifests.
+val mergedReleaseManifests = mutableMapOf<String, Provider<RegularFile>>()
+androidComponents {
+    onVariants { variant ->
+        if (variant.buildType == "release") {
+            mergedReleaseManifests[variant.flavorName.orEmpty()] =
+                variant.artifacts.get(SingleArtifact.MERGED_MANIFEST)
+        }
+    }
+}
+
 tasks.withType<Test>().configureEach {
+    mergedReleaseManifests.forEach { (flavor, manifest) ->
+        inputs.file(manifest).withPropertyName("mergedManifest_$flavor")
+        doFirst { systemProperty("dlne.manifest.$flavor", manifest.get().asFile.absolutePath) }
+    }
     // The live smoke test (LiveSmokeTest) talks to the real DLNE service, so it only runs
     // when asked for: ./gradlew :app:testDebugUnitTest -Pdlne.smoke=true
     systemProperty("dlne.smoke", providers.gradleProperty("dlne.smoke").getOrElse("false"))

@@ -571,9 +571,9 @@ async def test_a_canary_is_sealed_and_handed_to_the_member_along_the_routed_path
     assert decoy.path == "/v1/chat/completions" and decoy.raw.startswith(b'{"dlne_e2e":')
     assert set(decoy.headers) <= {"host", "accept", "accept-encoding", "connection", "content-type",
                                   "content-length", "user-agent"}
-    assert b"dlne.duckdns.org/c/" not in decoy.raw, "the decoy is inside the sealed body"
+    assert b"dlne.rossgilsonlabs.dev/c/" not in decoy.raw, "the decoy is inside the sealed body"
     opened = json.dumps(fake.opened[1])                     # [0] is the user's own sealed request
-    assert "https://dlne.duckdns.org/c/" in opened, "and the member finds its own decoy link in it"
+    assert "https://dlne.rossgilsonlabs.dev/c/" in opened, "and the member finds its own decoy link in it"
     assert "dlne_ck_" not in opened, "(no decoy key: the extension's redactor empties every key, so one would be a tell)"
     assert env.router.in_flight() == 0 and canary_book.sent_since(fake.trust_id, 0) == 1
     (member,) = env.router.members(env.registry, lambda ip, port: 1, env.limits)

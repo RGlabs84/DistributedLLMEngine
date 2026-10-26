@@ -8,8 +8,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * The public server moved from https://73-215-216-195.sslip.io to https://dlne.duckdns.org.
- * An address saved by an earlier version must be upgraded silently when the app starts.
+ * The public server moved from https://73-215-216-195.sslip.io to https://dlne.duckdns.org, then
+ * (1.0.4) to https://dlne.rossgilsonlabs.dev. An address saved by an earlier version must be
+ * upgraded silently when the app starts.
  */
 class SettingsStoreTest {
     private val legacy = "https://73-215-216-195.sslip.io"
@@ -19,7 +20,7 @@ class SettingsStoreTest {
         val prefs = FakePrefs("server_url" to legacy)
         val store = SettingsStore(prefs)
 
-        assertEquals("https://dlne.duckdns.org", store.serverUrl.value)
+        assertEquals("https://dlne.rossgilsonlabs.dev", store.serverUrl.value)
         assertEquals(ServerUrl.DEFAULT, store.serverUrl.value)
         assertFalse("the stale address must not stay saved", prefs.contains("server_url"))
         // A second start finds nothing saved and also uses the default.
@@ -88,7 +89,15 @@ class SettingsStoreTest {
     fun `use default goes to the new default`() {
         val store = SettingsStore(FakePrefs("server_url" to "https://dlne.example.org"))
         store.resetServerUrl()
-        assertEquals("https://dlne.duckdns.org", store.serverUrl.value)
+        assertEquals("https://dlne.rossgilsonlabs.dev", store.serverUrl.value)
+    }
+
+    @Test
+    fun `a saved DuckDNS address (1_0_1 to 1_0_3) moves to the new name and is dropped from storage`() {
+        val prefs = FakePrefs("server_url" to "https://dlne.duckdns.org")
+        val store = SettingsStore(prefs)
+        assertEquals(ServerUrl.DEFAULT, store.serverUrl.value)
+        assertFalse(prefs.contains("server_url"))
     }
 }
 

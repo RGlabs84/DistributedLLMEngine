@@ -12,10 +12,10 @@ export const MAX_LEND_SHARE = 0.5;
  * The CPU pool's models by the RAM a member lends (min_ram_gb in scripts/app_models.json, signed
  * into every release). The server decides which model a member serves; this only tells the owner.
  */
-export const CPU_LADDER: ReadonlyArray<{ gb: number; runs: string }> = [
-  { gb: CPU_MIN_RAM_GB, runs: 'Qwen3 4B, the fast overflow model' },
-  { gb: 16, runs: 'the main phone model, Qwen3.6' },
-  { gb: 24, runs: 'Qwen3.6 at full quality, once 2 volunteers can host it' },
+export const CPU_LADDER: ReadonlyArray<{ gb: number; runs: string; short: string }> = [
+  { gb: CPU_MIN_RAM_GB, runs: 'Qwen3 4B, the fast overflow model', short: 'Qwen3 4B' },
+  { gb: 16, runs: 'the main phone model, Qwen3.6', short: 'Qwen3.6' },
+  { gb: 24, runs: 'Qwen3.6 at full quality, once 2 volunteers can host it', short: 'Qwen3.6 full' },
 ];
 
 /** What a machine with at least this much RAM is offered to lend, biggest first. */
@@ -232,6 +232,23 @@ export function alsoCpuConfigUpdate(text: string, lendBoth: boolean, ramGb: numb
     return null;
   }
   const next = setConfigValue(text, ALSO_CPU_RAM_KEY, wanted);
+  return next === text ? null : next;
+}
+
+/** The engine's config.txt key for the most CPU threads the worker may use (engine/config.py). */
+export const MAX_CPU_THREADS_KEY = 'MAX_CPU_THREADS';
+
+/**
+ * The new text of config.txt for MAX_CPU_THREADS, or null when it needs no change. The engine reads -1 (or no key)
+ * as "automatic" and 0 as ONE thread, never "all", so automatic is written as -1 and never as 0. A config without
+ * the key stays untouched when the setting is automatic, so a machine that never set a limit never gets one.
+ */
+export function maxCpuThreadsConfigUpdate(text: string, threads: unknown): string | null {
+  const manual = typeof threads === 'number' && Number.isFinite(threads) && threads >= 1;
+  if (!manual && !/^\s*MAX_CPU_THREADS\s*=/im.test(text)) {
+    return null;
+  }
+  const next = setConfigValue(text, MAX_CPU_THREADS_KEY, manual ? String(Math.floor(threads as number)) : '-1');
   return next === text ? null : next;
 }
 
@@ -576,6 +593,66 @@ export function parseAlso(output: string): boolean | null {
     else if (word === 'none') found = false;
   }
   return found;
+}
+
+/**
+ * The line the worker prints (engine/worker.py CLOCK_MARKER, 2.4.6+) when this computer's clock is outside the
+ * coordinator's 30 s window: `DLNE_CLOCK: {"offset_seconds": 18000}`, positive when the computer is behind the
+ * swarm. The worker corrects for it and keeps contributing; the owner is told so the clock itself gets fixed. The
+ * worker prints it once per change, so every line is news.
+ */
+export const CLOCK_MARKER = 'DLNE_CLOCK: ';
+
+/** The last clock offset in `output`, in whole seconds (positive: behind the swarm), or null. Nonsense is ignored. */
+export function parseClock(output: string): number | null {
+  let found: number | null = null;
+  for (const line of output.split(/\r?\n/)) {
+    const at = line.indexOf(CLOCK_MARKER);
+    if (at === -1) continue;
+    try {
+      const offset = JSON.parse(line.slice(at + CLOCK_MARKER.length).trim())?.offset_seconds;
+      // Ten years either way is already absurd; anything past it is not a clock reading.
+      if (Number.isFinite(offset) && Math.abs(offset) <= 10 * 365 * 86400) found = Math.round(offset);
+    } catch {
+      // not a clock line after all
+    }
+  }
+  return found;
+}
+
+/** '5 h', '5 h 30 min', '3 min 12 s', '45 s' (engine/swarm_clock.py _duration). */
+function clockDuration(seconds: number): string {
+  const whole = Math.round(Math.abs(seconds));
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const secs = whole % 60;
+  if (hours) return minutes ? `${hours} h ${minutes} min` : `${hours} h`;
+  if (minutes) return secs ? `${minutes} min ${secs} s` : `${minutes} min`;
+  return `${secs} s`;
+}
+
+/** A whole number of 15-minute time-zone steps (90 s either way), at least half an hour (swarm_clock.looks_like_time_zone). */
+function looksLikeTimeZone(offset: number): boolean {
+  const size = Math.abs(offset);
+  if (size < 30 * 60 - 90) return false;
+  const nearest = Math.round(size / (15 * 60)) * (15 * 60);
+  return Math.abs(size - nearest) <= 90;
+}
+
+/**
+ * What the owner is told about a clock `offset` s behind (positive) or ahead of (negative) the swarm: the worker's
+ * own words (engine/swarm_clock.py describe), or null inside the coordinator's 30 s window.
+ */
+export function clockMessage(offset: number): string | null {
+  if (!Number.isFinite(offset) || Math.abs(offset) < 30) return null;
+  const where = offset > 0 ? 'behind' : 'ahead of';
+  let text = `This computer's clock is ${clockDuration(offset)} ${where} the swarm's. DLNE corrects for it, so contributing works. `;
+  text += looksLikeTimeZone(offset)
+    ? 'A difference of whole hours usually comes from a time zone: the computer\'s time zone is set wrong, or, on a PC '
+      + 'that also runs Windows, Windows keeps the hardware clock in local time while Linux reads it as UTC. Turning on '
+      + 'automatic time and time zone in the system settings fixes the clock itself.'
+    : 'Turning on automatic time sync in the system settings fixes the clock itself.';
+  return text;
 }
 
 export const ROLE_LABEL: Record<WorkerRole, string> = {

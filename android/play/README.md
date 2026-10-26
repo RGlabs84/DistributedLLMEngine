@@ -10,8 +10,11 @@ Everything Play Console asks for is prepared in this folder:
 | `data-safety.md` | Data safety form, answer by answer |
 | `content-rating.md` | Content rating questionnaire, target audience, other declarations |
 
-The upload itself is `android/app/build/outputs/bundle/release/app-release.aab`
-(build it with `./gradlew bundleRelease`, see `android/README.md`).
+The upload itself is `android/app/build/outputs/bundle/playRelease/app-play-release.aab`
+(build it with `./gradlew bundlePlayRelease`, see `android/README.md`). **Always upload the
+`play` flavor**: it has no in-app updater and no `REQUEST_INSTALL_PACKAGES` permission, both of
+which Google Play forbids for an app that is updated through Play. The `sideload` flavor (the
+APK on the website) must never go to Play.
 
 ## 0. Before you submit
 
@@ -74,7 +77,7 @@ Play Console > **Create app**:
      without uninstalling. If you want both channels interchangeable, pick *Use a different
      app signing key* instead and upload `dlne-release.jks` with Google's PEPK tool
      (Console shows the exact command), then create a new, separate upload key.
-3. Upload `app-release.aab`. The R8 mapping file is embedded in the bundle, so crash reports
+3. Upload `app-play-release.aab`. The R8 mapping file is embedded in the bundle, so crash reports
    in Console are de-obfuscated automatically.
 4. Release name: `1.0.2 (3)`. Release notes, e.g.: `First release of DLNE for Android.`
 5. Add testers: create an email list (or a Google Group) with your testers, save, and share

@@ -9,13 +9,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 require('./helpers/vscode-stub');
-const { resolveServerUrl, DEFAULT_SERVER_URL, LEGACY_SERVER_URL, SSLIP_SERVER_URL } = require('../dist/serverUrl');
+const { resolveServerUrl, DEFAULT_SERVER_URL, LEGACY_SERVER_URL, SSLIP_SERVER_URL, DUCKDNS_SERVER_URL } = require('../dist/serverUrl');
 const pkg = require('../package.json');
 
 const config = (value) => ({ get: (key) => (key === 'serverUrl' ? value : undefined) });
 
 test('the default is the public swarm over HTTPS, by name', () => {
-  assert.equal(DEFAULT_SERVER_URL, 'https://dlne.duckdns.org');
+  assert.equal(DEFAULT_SERVER_URL, 'https://dlne.rossgilsonlabs.dev');
   assert.equal(resolveServerUrl(config(undefined)), DEFAULT_SERVER_URL);
   assert.equal(resolveServerUrl(config('')), DEFAULT_SERVER_URL);
   assert.equal(resolveServerUrl(config('   ')), DEFAULT_SERVER_URL);
@@ -34,6 +34,12 @@ test('the 1.2.0-1.2.3 sslip.io address is read as the named one', () => {
   assert.equal(SSLIP_SERVER_URL, 'https://73-215-216-195.sslip.io');
   assert.equal(resolveServerUrl(config(SSLIP_SERVER_URL)), DEFAULT_SERVER_URL);
   assert.equal(resolveServerUrl(config(SSLIP_SERVER_URL + '/')), DEFAULT_SERVER_URL);
+});
+
+test('the 1.2.4-1.3.3 DuckDNS name is read as the project name', () => {
+  assert.equal(DUCKDNS_SERVER_URL, 'https://dlne.duckdns.org');
+  assert.equal(resolveServerUrl(config(DUCKDNS_SERVER_URL)), DEFAULT_SERVER_URL);
+  assert.equal(resolveServerUrl(config(DUCKDNS_SERVER_URL + '/')), DEFAULT_SERVER_URL);
 });
 
 test('a private coordinator is used as set, minus trailing slashes', () => {

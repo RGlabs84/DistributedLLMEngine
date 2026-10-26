@@ -37,7 +37,7 @@ from engine import release  # noqa: E402
 DEFAULT_KEY = os.path.expanduser("~/WubarrkCODING/DLNE_RELEASE_KEYS/dlne_release_key.pem")
 DEFAULT_HOST = "archserver-wg"
 DEFAULT_ROOT = "~/DLNEv2"
-DEFAULT_URL = "https://dlne.duckdns.org"
+DEFAULT_URL = "https://dlne.rossgilsonlabs.dev"
 OUT_DIR = "release_dist"
 DEFAULT_BINARIES = os.path.join(REPO_ROOT, OUT_DIR, "assets", "llama")
 # The name the server's llama.cpp build is uploaded under (release_apply.py expects it).

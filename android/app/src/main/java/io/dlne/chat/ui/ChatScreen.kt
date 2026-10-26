@@ -75,6 +75,7 @@ import io.dlne.chat.data.ChatMessage
 import io.dlne.chat.data.ReportReason
 import io.dlne.chat.data.Role
 import io.dlne.chat.net.ClusterStatus
+import io.dlne.chat.update.UpdateBanner
 import kotlinx.coroutines.delay
 
 /** What the chat screen can ask the view model to do. */
@@ -114,6 +115,7 @@ fun ChatScreen(
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
+            Column {
             TopAppBar(
                 title = {
                     Column {
@@ -141,6 +143,9 @@ fun ChatScreen(
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
             )
+            // Sideload build: "DLNE Chat x is available" card when there is an update. Play build: nothing.
+            UpdateBanner()
+            }
         },
         bottomBar = {
             InputBar(

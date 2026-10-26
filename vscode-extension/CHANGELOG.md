@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.4] - 2026-10-26
+
+Pairs with DLNE coordinator **2.4.0** or later.
+
+### Added
+- **Donate compute.** The generic "Contribute" button is gone; the top of the sidebar is now a panel where you set what you give, with a GPU section, a CPU section and one big **Donate compute** button. The sliders snap to amounts the swarm can actually use, and a live line says what your choice powers and what you get back:
+  - **GPU**: a switch, the VRAM to lend (from 8 GB, or the card's size if smaller, up to all of it), and the RAM for the GPU's model (Auto, then 16, 24, 32 GB and up to your RAM less 4 GB). It says plainly when a card is under what the swarm can use (a GPU under 8 GB joins the GPU pool instead of running a coding model), and why a GPU is left out (an integrated one).
+  - **CPU**: a switch, the RAM to lend with what each amount runs under it (8 GB Qwen3 4B, 16 GB Qwen3.6, 24 GB Qwen3.6 at full quality), and the threads (Auto, then 2 up to your logical CPUs).
+  - Starting from the panel does not ask for the RAM again, because the panel already holds the amount. The one-time "lend my GPU?" question stays. Change something while you donate and **Apply (restarts the worker)** appears; threads apply at once.
+- **`dlne.worker.maxCpuThreads`** (default `-1`, automatic): the most CPU threads the worker uses, so the rest of your computer stays yours. It is written to the engine's `config.txt` as `MAX_CPU_THREADS` (`-1` for automatic, never `0`, which the engine reads as one thread) and a running worker follows a change without a restart.
+- **A wrong computer clock is now told to you.** When the engine says this computer's clock is outside the swarm's 30-second window, DLNE shows one warning per offset, with the engine's own wording (a time zone set wrong is the usual cause). Contributing keeps working; the engine corrects for it.
+
+### Changed
+- **DLNE has its own name: `https://dlne.rossgilsonlabs.dev`.** It is the new default for `dlne.serverUrl`, and the DLNE website lives at the same address. The same coordinator still answers at `https://dlne.duckdns.org`, the default from 1.2.4 to 1.3.3, and a setting that holds that address (or one of the earlier ones) is read as the new name. Nothing to change on your side.
+- The README's website and phone-chat links point to the new name.
+
+---
+
 ## [1.3.3] - 2026-10-26
 
 Pairs with DLNE coordinator **2.4.0** or later.

@@ -13,8 +13,8 @@ from engine.landing import LANDING_HTML, OG_IMAGE_URL
 
 
 def test_both_pages_carry_a_preview_card_with_the_official_logo():
-    assert OG_IMAGE_URL.startswith("https://dlne.duckdns.org/chat/icon-512.png")
-    for page, url in ((LANDING_HTML, "https://dlne.duckdns.org/"), (CHAT_HTML, "https://dlne.duckdns.org/chat")):
+    assert OG_IMAGE_URL.startswith("https://dlne.rossgilsonlabs.dev/chat/icon-512.png")
+    for page, url in ((LANDING_HTML, "https://dlne.rossgilsonlabs.dev/"), (CHAT_HTML, "https://dlne.rossgilsonlabs.dev/chat")):
         assert f'<meta property="og:image" content="{OG_IMAGE_URL}">' in page
         assert f'<meta property="og:url" content="{url}">' in page
         assert 'property="og:title"' in page and 'name="twitter:card"' in page

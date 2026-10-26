@@ -238,7 +238,7 @@ def test_the_support_links_are_there_and_open_safely():
 
 
 def test_the_website_and_the_discord_are_linked_from_the_menu_and_the_welcome_screen():
-    assert chat_page.WEBSITE_URL == "https://live.ravenirongames.com/#dlne"
+    assert chat_page.WEBSITE_URL == "https://dlne.rossgilsonlabs.dev"
     assert chat_page.DISCORD_INVITE_URL == "https://discord.gg/RNxvxWn8cw"
     page = chat_page.CHAT_HTML
     # The menu: a "More from DLNE" section of two link rows, above "Support DLNE".

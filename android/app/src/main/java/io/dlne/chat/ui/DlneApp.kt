@@ -10,6 +10,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.dlne.chat.update.UpdateHost
 import kotlinx.coroutines.launch
 
 /** The whole app: the chat (with its conversation drawer) or Settings, plus the first-run notice. */
@@ -45,6 +46,9 @@ fun DlneApp(viewModel: ChatViewModel) {
     if (!state.privacyAcknowledged) {
         PrivacyNoticeDialog(onAcknowledge = viewModel::acknowledgePrivacy)
     }
+
+    // Sideload build: checks for updates and shows the install prompt. Play build: nothing (src/play).
+    UpdateHost()
 }
 
 @Composable

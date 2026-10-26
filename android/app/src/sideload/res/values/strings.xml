@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sideload build only: the in-app updater. The Google Play build has none of these. -->
+<resources>
+    <string name="update_settings_title">Updates</string>
+    <string name="update_auto">Check for updates automatically</string>
+    <string name="update_auto_sub">Asks dlne.rossgilsonlabs.dev for the newest version when the app opens, at most every 12 hours. Nothing else is sent.</string>
+    <string name="update_check_now">Check for updates</string>
+    <string name="update_checking">Checking…</string>
+    <string name="update_up_to_date">You have the latest version.</string>
+    <string name="update_not_for_this_phone">A newer version exists, but it needs a newer Android than this phone has.</string>
+    <string name="update_check_failed">Couldn\'t check for updates. Check your connection and try again.</string>
+    <string name="update_bad_manifest">The update information on the website isn\'t valid, so nothing was changed.</string>
+
+    <string name="update_available">DLNE Chat %1$s is available.</string>
+    <string name="update_one_tap">One tap to install: Android will ask you to confirm.</string>
+    <string name="update_button">Update</string>
+    <string name="update_try_again">Try again</string>
+    <string name="update_later">Later</string>
+    <string name="update_cancel">Cancel</string>
+    <string name="update_dismiss">Dismiss</string>
+    <string name="update_downloading">Downloading DLNE Chat %1$s… %2$d%%</string>
+    <string name="update_verifying">Checking the download…</string>
+    <string name="update_installing">Confirm the install on the next screen. If it doesn\'t appear, open this app again.</string>
+    <string name="update_needs_permission">Android needs your OK once: on the next screen, allow DLNE Chat to install apps, then come back.</string>
+
+    <string name="update_err_download">The download failed. Check your connection and try again. Your current app is unchanged.</string>
+    <string name="update_err_mismatch">The download doesn\'t match what the website published, so it wasn\'t installed. Your current app is unchanged.</string>
+    <string name="update_err_signer">The update isn\'t signed by the same publisher as this app, so it wasn\'t installed. Your current app is unchanged.</string>
+    <string name="update_err_package">The download isn\'t this app, so it wasn\'t installed. Your current app is unchanged.</string>
+    <string name="update_err_unreadable">The download couldn\'t be read as an app, so it wasn\'t installed. Your current app is unchanged.</string>
+    <string name="update_err_permission">DLNE Chat isn\'t allowed to install apps yet. Tap Try again and switch it on.</string>
+    <string name="update_err_cancelled">The update was cancelled. You can try again any time.</string>
+    <string name="update_err_space">There isn\'t enough storage on this phone for the update. Free some space and try again.</string>
+    <string name="update_err_incompatible">Android says this update can\'t replace the installed app. Your current app is unchanged.</string>
+    <string name="update_err_blocked">Android blocked the install. Your current app is unchanged.</string>
+    <string name="update_err_install">The update couldn\'t be installed. Your current app is unchanged.</string>
+    <string name="update_err_install_detail">The update couldn\'t be installed (%1$s). Your current app is unchanged.</string>
+</resources>

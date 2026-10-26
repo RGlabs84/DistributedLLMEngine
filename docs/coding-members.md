@@ -363,7 +363,7 @@ text must say exactly this and must not claim the member cannot see the request.
   `forward_headers(headers) -> dict` (the only headers a member may receive: content type and length).
 - `engine/canary.py` — the coordinator occasionally (config `CODING_CANARY_PER_DAY`, default 4 per
   member) sends a member a normal-looking coding request that embeds a unique decoy bound to that member:
-  a canary URL `https://dlne.duckdns.org/c/<token>`. If the URL is ever fetched, the member that saw it is
+  a canary URL `https://dlne.rossgilsonlabs.dev/c/<token>`. If the URL is ever fetched, the member that saw it is
   flagged and stops receiving traffic; the operator sees it in an admin endpoint. Decoys are never sent to
   trusted members' real users and never to the local engine.
   **Review SR-01 to SR-03: a canary is a request the extension could have sent.** Its system prompt, tools
