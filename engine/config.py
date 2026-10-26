@@ -452,6 +452,10 @@ def get_worker_limits() -> dict:
         # this many hours (engine/priority.UsageWindow). GPU contributors are not limited.
         "cpu_coding_limit": 300,
         "cpu_coding_window_hours": 5.0,
+        # A contributor's GPU gets the GPU tier's perks (first in line, no usage window) while it is
+        # actually used, or for this many minutes after it joined or last had a job; after that it is
+        # treated as the CPU contributor it is (GPU_STANDBY_GRACE_MINUTES, 0 = no grace).
+        "gpu_standby_grace_minutes": 30.0,
         # The CPU pool (engine/app_pool.py). A bigger model tier unlocks once this many members
         # can host it; phone users get one answer at a time and this many requests a minute.
         "app_tier_min_members": 2,
@@ -703,6 +707,15 @@ def get_worker_limits() -> dict:
             value = 0
         if value >= 1:
             limits["cpu_coding_limit"] = value
+
+    if "GPU_STANDBY_GRACE_MINUTES" in config:
+        try:
+            grace = float(config["GPU_STANDBY_GRACE_MINUTES"])
+        except ValueError:
+            grace = -1.0
+        # NaN fails both comparisons and keeps the default.
+        if 0.0 <= grace <= 10080.0:
+            limits["gpu_standby_grace_minutes"] = grace
 
     if "CPU_CODING_WINDOW_HOURS" in config:
         try:

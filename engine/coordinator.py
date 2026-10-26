@@ -63,8 +63,9 @@ from engine.inference_manager import (
     is_retryable_start_failure,
 )
 from engine.logger import log_coordinator, log_error, log_warning
-from engine.registry import WorkerRegistry, is_app_member, safe_log_text
+from engine.registry import WorkerRegistry, is_app_member, is_coding_member, safe_log_text
 from engine.app_pool import LocalAppServer, app_pool
+from engine.throughput import POOL_CODING, POOL_PHONE, StreamTokenCounter, completion_tokens, throughput
 from engine import coding_router as coding_members_lib
 from engine.coding_router import coding_router
 from engine.downloader import download_and_extract_engine, download_verified
@@ -589,6 +590,67 @@ def use_starter_quota(request: Request, client_id: str, limit: int) -> Tuple[boo
     return allowed, remaining
 
 
+# --------------------------------------------------------------------------------------
+# GPU perks follow use
+# --------------------------------------------------------------------------------------
+#
+# A contributor lending a GPU is first in line and has no usage window, for as long as that GPU is
+# actually used. A GPU the swarm has no job for (it is not in the running engine's topology, and is not a
+# ready coding member) keeps the perks for GPU_STANDBY_GRACE_MINUTES (default 30) from when it joined or
+# last had a job, so a newcomer keeps them while the swarm places it; after that its owner is a CPU
+# contributor like any other, with the CPU rolling window. Getting a job gives the perks back and resets
+# the clock. A GPU handed back to its owner for a game (yielding) is not idle: it keeps them.
+
+_gpu_standing_by_since: Dict[str, float] = {}      # worker id -> when it began standing by (_standby_clock)
+MAX_STANDBY_TRACKED = 8192
+
+
+def _standby_clock() -> float:
+    return time.monotonic()
+
+
+def _gpu_has_job(worker: Dict[str, Any]) -> bool:
+    """Whether a GPU worker is serving (the same rule as gpu_pool in /v1/cluster/status): it is a node of the
+    running engine's topology, or a ready coding member; or it is yielding to its owner, which is not idling."""
+    hardware = worker.get("hardware") if isinstance(worker.get("hardware"), dict) else {}
+    if hardware.get("is_yielding") is True:
+        return True
+    if is_coding_member(hardware):
+        if not get_worker_limits().get("coding_members_enabled", False):
+            return False
+        return any(m.worker_id == worker.get("worker_id") for m in _coding_members())
+    return f"{worker.get('ip')}:{worker.get('port')}" in set(manager.current_endpoints)
+
+
+def _gpu_note_job_state(worker: Dict[str, Any]) -> Optional[float]:
+    """Keep this GPU worker's standing-by clock: None (and the clock cleared) when it has a job, else when it
+    began standing by (now, the first time it is seen with none). A node with no worker id has no clock."""
+    worker_id = worker.get("worker_id")
+    if not isinstance(worker_id, str) or not worker_id:
+        return None
+    if _gpu_has_job(worker):
+        _gpu_standing_by_since.pop(worker_id, None)
+        return None
+    since = _gpu_standing_by_since.get(worker_id)
+    if since is None:
+        if len(_gpu_standing_by_since) >= MAX_STANDBY_TRACKED:
+            for stale in [w for w in _gpu_standing_by_since if w not in registry.workers]:
+                del _gpu_standing_by_since[stale]
+            if len(_gpu_standing_by_since) >= MAX_STANDBY_TRACKED:
+                _gpu_standing_by_since.pop(next(iter(_gpu_standing_by_since)))
+        since = _gpu_standing_by_since[worker_id] = _standby_clock()
+    return since
+
+
+def _gpu_keeps_perks(worker: Dict[str, Any], limits: Dict[str, Any]) -> bool:
+    """Whether a GPU contributor still gets the GPU tier: it has a job, or has stood by for less than the grace."""
+    since = _gpu_note_job_state(worker)
+    if since is None:
+        return True
+    grace = float(limits.get("gpu_standby_grace_minutes", 30.0)) * 60.0
+    return _standby_clock() - since < grace
+
+
 class NonContribBlockerMiddleware(BaseHTTPMiddleware):
     """Blocks WebUI and chat traffic from anyone who is not contributing compute, while granting a free starter quota."""
 
@@ -652,7 +714,12 @@ class NonContribBlockerMiddleware(BaseHTTPMiddleware):
                 if missing:
                     return JSONResponse({"detail": cpu_refusal_text(missing)}, status_code=403)
 
-                if _as_number(gpu_section(worker.get("hardware", {})).get("vram_total_gb", 0)) > 0:
+                # A GPU contributor's perks (first in line, no window) last while its GPU is used, or for
+                # GPU_STANDBY_GRACE_MINUTES after it joined or last had a job (_gpu_keeps_perks). A GPU
+                # that has stood idle longer is a CPU contributor like any other; it is never refused
+                # for that (cpu_node_shortfalls above passes any node with a GPU).
+                if (_as_number(gpu_section(worker.get("hardware", {})).get("vram_total_gb", 0)) > 0
+                        and _gpu_keeps_perks(worker, limits)):
                     request.state.dlne_tier = "gpu"
                 else:
                     # A CPU contributor: second in the queue, and its coding chats counted in a
@@ -1287,6 +1354,11 @@ async def worker_heartbeat(request: Request, payload: HeartbeatPayload):
         payload.worker_id, client_ip, payload.port, payload.token, payload.hardware,
         role=payload.role, staged_version=payload.staged_version,
     )
+
+    # Keep the GPU perks' clock: a GPU that has a job has no standing-by time, one that has none starts it.
+    if _as_number(gpu_section(payload.hardware).get("vram_total_gb", 0)) > 0:
+        _gpu_note_job_state({"worker_id": payload.worker_id, "ip": client_ip, "port": payload.port,
+                             "hardware": payload.hardware})
 
     # A CPU pool member is told which model tier to serve (engine/app_pool.py).
     answer: Dict[str, Any] = {"status": "ok"}
@@ -2617,11 +2689,16 @@ async def _chat_completions_impl(request: Request, slot_held: bool = False):
                         # coding model's real speed (engine/coding_speed.py). Only a rolling tail
                         # is kept and nothing is parsed per chunk; it is read once, at the end.
                         tail = bytearray()
+                        # Tokens are counted as they arrive (engine/throughput.py), for the website's
+                        # live figure: only whether a frame carries text, never what it says.
+                        counter = StreamTokenCounter(POOL_CODING, streamed=body.get("stream") is True)
                         async for chunk in response.aiter_bytes():
+                            counter.feed(chunk)
                             tail += chunk
                             if len(tail) > 2 * coding_speed.TAIL_BYTES:
                                 del tail[:-coding_speed.TAIL_BYTES]
                             yield chunk
+                        counter.finish()
                         _measure_coding_speed(model_path, tail)
             except Exception as stream_e:
                 # Report what the exception proves, and nothing beyond it. See
@@ -2789,8 +2866,11 @@ async def completions(request: Request):
                                 err = await response.aread()
                                 yield f"data: {json.dumps({'error': err.decode('utf-8', errors='ignore')})}\n\n".encode()
                                 return
+                            counter = StreamTokenCounter(POOL_CODING)
                             async for chunk in response.aiter_bytes():
+                                counter.feed(chunk)
                                 yield chunk
+                            counter.finish()
                 except Exception as e:
                     log_error(f"Error streaming completion: {e}")
                     yield f"data: {json.dumps({'error': str(e)})}\n\n".encode()
@@ -2808,6 +2888,8 @@ async def completions(request: Request):
                 async with engine_client() as client:
                     engine_timeout = httpx.Timeout(ENGINE_READ_TIMEOUT_SECONDS, connect=ENGINE_CONNECT_TIMEOUT_SECONDS)
                     resp = await client.post(llama_url, json=body, headers=forwarded_headers, timeout=engine_timeout)
+                    if resp.status_code == 200:
+                        throughput.record(POOL_CODING, completion_tokens(resp.content))
                     return Response(
                         content=resp.content,
                         status_code=resp.status_code,
@@ -2943,6 +3025,13 @@ async def get_cluster_status(request: Request):
         "app_pool": app_pool.status(_app_members(), int(get_worker_limits().get("app_tier_min_members", 2))),
         # Coding members (engine/coding_router.py), counts only: {enabled, members, ready, slots, busy}.
         "coding_members": _coding_members_status(),
+        # What the swarm lends and does right now, for the website's two tiles. Counts only, nothing names a
+        # machine or a user: GPUs serving (and standing by without a job), the VRAM of the serving ones, the
+        # coding tokens generated per second over the last minute and in the last hour; the same for the
+        # phone pool's CPUs. Yielding nodes are in no count. See docs/coding-members.md section 5.
+        "gpu_pool": _pool_status_or_empty(lambda: _gpu_pool_status(coding_model.get("tokens_per_second")),
+                                          dict(_EMPTY_GPU_POOL), "GPU pool"),
+        "cpu_pool": _pool_status_or_empty(_cpu_pool_status, dict(_EMPTY_CPU_POOL), "CPU pool"),
         # The phone model's lookups: which tools are on and today's counts. No key, no URL,
         # nothing about any network (engine/search.search_status).
         "app_search": _app_search_status(),
@@ -4552,6 +4641,87 @@ def _coding_members(limits: Optional[Dict[str, Any]] = None):
     limits = limits if limits is not None else get_worker_limits()
     coding_router.trusted_ids = set(limits.get("trusted_members") or ())
     return coding_router.members(registry, reverse_bridge.get_relay_port, limits)
+
+
+def _gpu_pool_status(measured_tokens_per_second: Optional[float]) -> Dict[str, Any]:
+    """
+    ``gpu_pool`` for /v1/cluster/status (the website's GPU tile): counts only, nothing names a machine.
+
+    SERVING GPUs are those with a job: the nodes of the sharded RPC pool that the running engine was started
+    with (``manager.current_endpoints``; this host's own GPUs are among them while its engine runs on them),
+    and every ready coding member's. STANDING BY are live GPU nodes with no job: awake but not in the running
+    engine's topology, or a verified coding member that is not ready. A node handed back to its owner
+    (yielding) is in neither. ``tokens_per_second`` is what the coding engine and the members generated over
+    the last 60 seconds (engine/throughput.py); ``measured_tokens_per_second`` the single-user measurement.
+    """
+    limits = get_worker_limits()
+    in_engine = set(manager.current_endpoints)
+    members_on = bool(limits.get("coding_members_enabled", False))
+    ready_members = {m.worker_id for m in _coding_members(limits)} if members_on else set()
+    verified = {m.worker_id for m in _all_coding_members(limits) if m.trust_id and not coding_router.is_blocked(m)}
+    serving = {"gpus": 0, "vram": 0.0}
+    standing = {"gpus": 0, "vram": 0.0}
+    for node in registry.gpu_inventory():
+        if node["pool"] == "coding":
+            if members_on and node["worker_id"] in ready_members:
+                bucket = serving
+            elif node["worker_id"] in verified:
+                bucket = standing
+            else:
+                continue            # a block that does not verify, or a member a canary caught: not advertised
+        else:
+            bucket = serving if node["endpoint"] in in_engine else standing
+        bucket["gpus"] += node["gpus"]
+        bucket["vram"] += node["vram_gb"]
+    return {
+        "gpus": serving["gpus"],
+        "vram_gb": round(serving["vram"], 1),
+        "gpus_standing_by": standing["gpus"],
+        "vram_standing_by_gb": round(standing["vram"], 1),
+        "tokens_per_second": round(throughput.rate(POOL_CODING, 60), 2),
+        "tokens_last_hour": throughput.total(POOL_CODING, 3600),
+        "measured_tokens_per_second": measured_tokens_per_second,
+    }
+
+
+def _cpu_pool_status() -> Dict[str, Any]:
+    """
+    ``cpu_pool`` for /v1/cluster/status (the website's CPU tile): the phone pool's members, this
+    coordinator's own included. ``machines`` are those ready and serving, ``machines_standing_by`` those
+    registered but not ready; ``cores`` (CPU threads the phone model runs on) and ``ram_gb`` (RAM lent) are
+    the serving machines'. Counts only.
+    """
+    members = _app_members()
+    serving = [m for m in members if m.ready]
+    return {
+        "machines": len(serving),
+        "machines_standing_by": len(members) - len(serving),
+        "cores": sum(m.threads for m in serving),
+        "ram_gb": round(sum(m.ram_gb for m in serving), 1),
+        "tokens_per_second": round(throughput.rate(POOL_PHONE, 60), 2),
+        "tokens_last_hour": throughput.total(POOL_PHONE, 3600),
+    }
+
+
+def _all_coding_members(limits: Dict[str, Any]):
+    from engine.reverse_tunnel import reverse_bridge
+    coding_router.trusted_ids = set(limits.get("trusted_members") or ())
+    return coding_router.all_members(registry, reverse_bridge.get_relay_port, limits)
+
+
+def _pool_status_or_empty(build, empty: Dict[str, Any], label: str) -> Dict[str, Any]:
+    """A pool figure for the status, or all zeros if it cannot be built: the status must always answer."""
+    try:
+        return build()
+    except Exception as exc:  # noqa: BLE001
+        log_warning(f"The {label} status is unavailable ({type(exc).__name__}: {exc}).")
+        return empty
+
+
+_EMPTY_GPU_POOL = {"gpus": 0, "vram_gb": 0.0, "gpus_standing_by": 0, "vram_standing_by_gb": 0.0,
+                   "tokens_per_second": 0.0, "tokens_last_hour": 0, "measured_tokens_per_second": None}
+_EMPTY_CPU_POOL = {"machines": 0, "machines_standing_by": 0, "cores": 0, "ram_gb": 0.0,
+                   "tokens_per_second": 0.0, "tokens_last_hour": 0}
 
 
 def _coding_members_status() -> Dict[str, Any]:

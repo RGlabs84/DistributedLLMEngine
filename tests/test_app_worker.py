@@ -153,7 +153,7 @@ def test_the_heartbeat_says_pool_member_inside_the_signature(node):
 def test_a_real_member_status_passes_the_coordinators_checks(node, tmp_path):
     node.app_member = AppMember(str(tmp_path), lambda: [], threads=2)
     payload = node._build_heartbeat_payload()
-    assert payload["hardware"]["app"] == {"model": None, "ready": False, "slots": 2}
+    assert payload["hardware"]["app"] == {"model": None, "ready": False, "slots": 2, "threads": 2}
     assert authn.validate_hardware_profile(payload["hardware"]) == (True, "ok")
     assert _verify(payload)[0] is True
 

@@ -481,6 +481,15 @@ class WorkerNode:
             set_yielding = getattr(app_member, "set_yielding", None)
             if callable(set_yielding):
                 set_yielding(isinstance(hardware, dict) and hardware.get("is_yielding") is True)
+        elif app_member is not None and coding_member is None:
+            # A volunteer's CPU-only member does not stop while the owner games: it runs lighter (lowest priority,
+            # half the cores, threads, slots and context) until the load is over; see AppMember.set_light. A member
+            # that never sees the probe say so is not touched.
+            set_light = getattr(app_member, "set_light", None)
+            if callable(set_light):
+                # The profile still says the owner is gaming; the coordinator keeps routing to a yielding member whose
+                # status says it is ready (registry.app_members), one slot at a time while it is light.
+                set_light(isinstance(hardware, dict) and hardware.get("is_yielding") is True)
         if isinstance(hardware, dict) and coding_member is not None:
             # A coding member says so, and what it serves, inside the signed profile.
             hardware = {**hardware, "pool": "coding", "coding": coding_member.status()}

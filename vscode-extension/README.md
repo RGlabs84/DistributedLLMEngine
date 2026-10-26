@@ -63,7 +63,7 @@ A contributor without a usable GPU does not join the coding pipeline. Its worker
 | 16 GB | Qwen3.6 35B-A3B, the main phone model |
 | 24 GB | Qwen3.6 35B-A3B at full quality, once 2 volunteers can host it |
 
-In return you get the coding agent **2nd in line** (GPU contributors are 1st), with **300 chats in any 5 hours**. The model server runs at low priority on half your cores (2 to 8 threads), so your computer stays usable.
+In return you get the coding agent **2nd in line** (GPU contributors are 1st), with **300 chats in any 5 hours**. The model server runs at low priority on half your cores (2 to 8 threads), so your computer stays usable, and while you game the phone model drops to the lowest priority and runs lighter until you're done.
 
 When you start, DLNE offers an amount to suit your machine, and never more than half your RAM:
 

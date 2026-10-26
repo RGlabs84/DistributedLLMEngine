@@ -165,7 +165,11 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Seven groups matter for most
   contributors, API keys and the coordinator's own host first, CPU contributors second, and
   free-trial users third (`engine/priority.py`); autocomplete only runs on a slot nobody is
   waiting for. CPU contributors get `CPU_CODING_LIMIT` (300) coding chats in any
-  `CPU_CODING_WINDOW_HOURS` (5) hours. The free trial (`STARTER_QUOTA_INFERENCES`, 100) is
+  `CPU_CODING_WINDOW_HOURS` (5) hours. A GPU contributor is unlimited while its GPU is actually
+  used, and for its first `GPU_STANDBY_GRACE_MINUTES` (30) minutes after it joins or last had a
+  job (a GPU you have handed back for a game counts as used); a GPU that has stood by longer than
+  that is treated as a CPU contributor until the swarm uses it again, and is never turned away
+  for it. The free trial (`STARTER_QUOTA_INFERENCES`, 100) is
   counted once per network address (IPv6 per /64) in `config/starter_quota.json`, never per
   client-supplied token.
 

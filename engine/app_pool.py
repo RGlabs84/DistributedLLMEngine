@@ -50,6 +50,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Deque, Dict, List, O
 
 from engine.logger import log_coordinator, log_error, log_warning
 from engine.priority import UsageWindow
+from engine.throughput import POOL_PHONE, throughput
 
 # A member silent this long (before its first byte, or between chunks) is given up on.
 FIRST_BYTE_TIMEOUT_SECONDS = 60.0
@@ -127,11 +128,21 @@ def _as_number(value: Any) -> float:
         return 0.0
 
 
+def _member_threads(app: Dict[str, Any], hardware: Dict[str, Any]) -> int:
+    """The CPU threads a pool member runs its model on: what it reports (``app.threads``), or for a worker
+    that predates the field, what it would have chosen for itself (engine/app_member.default_threads)."""
+    threads = app.get("threads")
+    if isinstance(threads, int) and not isinstance(threads, bool) and 1 <= threads <= 256:
+        return threads
+    from engine.app_member import default_threads      # imported here: app_member imports this module
+    return default_threads(int(_as_number(hardware.get("cpu_cores"))))
+
+
 class Member:
     """One machine able to answer phone requests."""
 
     def __init__(self, key: str, ram_gb: float, serving: Optional[str], ready: bool,
-                 slots: int, base_url: Optional[str], local: bool = False) -> None:
+                 slots: int, base_url: Optional[str], local: bool = False, threads: int = 0) -> None:
         self.key = key
         self.ram_gb = ram_gb
         self.serving = serving
@@ -139,6 +150,7 @@ class Member:
         self.slots = max(1, slots)
         self.base_url = base_url
         self.local = local
+        self.threads = max(0, int(threads))     # CPU threads it runs the phone model on (0: not known)
 
 
 class AppPool:
@@ -203,6 +215,7 @@ class AppPool:
                 ready=app.get("ready") is True and relay is not None,
                 slots=int(_as_number(app.get("slots")) or 1),
                 base_url=f"http://127.0.0.1:{relay}" if relay else None,
+                threads=_member_threads(app, hw),
             ))
         if self.local is not None:
             found.append(self.local.as_member())
@@ -412,6 +425,10 @@ class AppPool:
                             chunk.pop("timings", None)
                             data = json.dumps(chunk)
                         delta = choice.get("delta") or {}
+                        if delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"):
+                            # One frame of generated text is one token, counted as it arrives (engine/throughput.py)
+                            # whether or not the phone is ever shown it (a held or retracted pass still cost the pool).
+                            throughput.record(POOL_PHONE, 1)
                         if delta.get("tool_calls"):
                             for part in delta["tool_calls"]:
                                 slot = calls.setdefault(int(part.get("index", 0)), {"id": "", "name": "", "arguments": ""})
@@ -717,7 +734,7 @@ class LocalAppServer:
     def as_member(self) -> Member:
         alive = self.process is not None and self.process.poll() is None
         return Member("local", self.ram_gb, self.serving, self.ready and alive, 2,
-                      f"http://127.0.0.1:{self.port}", local=True)
+                      f"http://127.0.0.1:{self.port}", local=True, threads=self.threads)
 
     def stop(self) -> None:
         proc, self.process, self.ready = self.process, None, False

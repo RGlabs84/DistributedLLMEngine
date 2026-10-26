@@ -607,7 +607,13 @@ class WorkerRegistry:
         return selected
 
     def get_total_vram_gb(self) -> float:
-        """Calculates total available dedicated VRAM across all active workers."""
+        """
+        Total dedicated VRAM of the sharded RPC pool: what model admission and KV sizing are computed
+        from. A phone-pool member, a coding member and a companion (the CPU half of a GPU machine) are
+        not part of that pool whatever their profile says, so none of them is counted here even if a
+        profile reports a GPU or its protocol field is missing. (The website's figure for the GPUs lent
+        is gpu_pool in /v1/cluster/status, which counts coding members and the engine's nodes apart.)
+        """
         with self._lock:
             # Prune first so a node that died seconds ago cannot inflate the pool
             # that model admission and KV-cache sizing are computed from.
@@ -615,6 +621,8 @@ class WorkerRegistry:
             total = 0.0
             for w_id, data in self.workers.items():
                 hardware = data.get("hardware", {})
+                if is_app_member(hardware) or is_coding_member(hardware) or is_companion(hardware):
+                    continue
                 if not hardware.get("is_yielding", False) and self.rpc_compatible(hardware):
                     gpu_info = _gpu_section(hardware)
                     if gpu_info.get("has_gpu", False):
@@ -661,12 +669,50 @@ class WorkerRegistry:
             return total
 
     def app_members(self) -> List[Dict[str, Any]]:
-        """Live CPU pool members (worker records), for engine/app_pool.py."""
+        """
+        Live CPU pool members (worker records), for engine/app_pool.py. A member whose owner is gaming
+        (``is_yielding``) stays in while its own status says it is ready: since 2.4.2 a volunteer's CPU-only
+        member runs lighter then instead of stopping (engine/app_member.py, light mode). One that stepped aside
+        (the "both" companion) says it is not ready and is left out.
+        """
         with self._lock:
             self.prune_dead_workers()
-            return [dict(data) for data in self.workers.values()
-                    if is_app_member(data.get("hardware", {}))
-                    and not _as_profile(data.get("hardware", {})).get("is_yielding", False)]
+            members = []
+            for data in self.workers.values():
+                hardware = _as_profile(data.get("hardware", {}))
+                if not is_app_member(hardware):
+                    continue
+                app = hardware.get("app") if isinstance(hardware.get("app"), dict) else {}
+                if hardware.get("is_yielding", False) and app.get("ready") is not True:
+                    continue
+                members.append(dict(data))
+            return members
+
+    def gpu_inventory(self) -> List[Dict[str, Any]]:
+        """
+        The GPUs the swarm has been lent, one row per live node that has some and is not yielding (a node
+        handed back to its owner, Gaming Mode, is in no count): ``{"worker_id", "endpoint", "pool", "gpus",
+        "vram_gb"}``, ``pool`` "coding" for a coding member and None for a node of the sharded RPC pool.
+        ``gpus`` is the node's ``gpu.count`` (1 for a worker that predates the field). A phone-pool member
+        and a companion lend a CPU, never a GPU, whatever their profile says. Counts and sizes only.
+        """
+        rows: List[Dict[str, Any]] = []
+        with self._lock:
+            self.prune_dead_workers()
+            for worker_id, data in self.workers.items():
+                hardware = _as_profile(data.get("hardware", {}))
+                if is_app_member(hardware) or is_companion(hardware) or hardware.get("is_yielding", False):
+                    continue
+                gpu = _gpu_section(hardware)
+                vram = _as_float(gpu.get("vram_total_gb", 0.0))
+                if not gpu.get("has_gpu", False) or vram <= 0:
+                    continue
+                count = gpu.get("count", 1)
+                count = count if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 64 else 1
+                rows.append({"worker_id": worker_id, "endpoint": f"{data.get('ip')}:{data.get('port')}",
+                             "pool": "coding" if is_coding_member(hardware) else None,
+                             "gpus": count, "vram_gb": vram})
+        return rows
 
     def coding_members(self) -> List[Dict[str, Any]]:
         """Live coding members (worker records), for engine/coding_router.py. A member that has

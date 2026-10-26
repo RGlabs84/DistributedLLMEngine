@@ -31,7 +31,11 @@ def registry():
     # Even a member that also has a GPU stays out of the pipeline once it says it is a pool member.
     reg.update_worker("app-gpu", "10.0.0.5", 50053, "t5",
                       app(16.0, gpu={"has_gpu": True, "vram_total_gb": 12.0}))
-    reg.update_worker("app-yield", "10.0.0.6", 50053, "t6", app(8.0, is_yielding=True))
+    # The owner is gaming: one member stepped aside (not ready), one runs lighter and still serves (2.4.2).
+    reg.update_worker("app-yield", "10.0.0.6", 50053, "t6",
+                      app(8.0, is_yielding=True, app={"model": "small", "ready": False, "slots": 2}))
+    reg.update_worker("app-light", "10.0.0.7", 50053, "t7",
+                      app(8.0, is_yielding=True, app={"model": "small", "ready": True, "slots": 1}))
     return reg
 
 
@@ -66,9 +70,10 @@ def test_a_matching_rpc_protocol_does_not_bring_a_member_back(registry):
     assert registry.rpc_compatible(GPU)
 
 
-def test_app_members_lists_only_live_unyielding_members(registry):
+def test_app_members_lists_live_members_and_leaves_out_one_that_stepped_aside(registry):
     found = registry.app_members()
-    assert sorted(r["worker_id"] for r in found) == ["app-gpu", "app1", "app2"]
+    assert sorted(r["worker_id"] for r in found) == ["app-gpu", "app-light", "app1", "app2"], \
+        "a member whose owner games stays while it says it is ready (light mode); one that stepped aside does not"
     for record in found:
         assert record["port"] == 50053 and record["hardware"]["pool"] == "app"
 
@@ -80,7 +85,7 @@ def test_app_members_are_copies(registry):
 
 def test_dead_members_are_pruned(registry):
     registry.workers["app1"]["last_heartbeat"] -= 3600
-    assert sorted(r["worker_id"] for r in registry.app_members()) == ["app-gpu", "app2"]
+    assert sorted(r["worker_id"] for r in registry.app_members()) == ["app-gpu", "app-light", "app2"]
     assert "app1" not in registry.workers
 
 

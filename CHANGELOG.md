@@ -10,6 +10,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.4.2] - 2026-10-26
+
+### Added
+- **Live pool numbers in `/v1/cluster/status`** (counts only): `gpu_pool` {`gpus`, `vram_gb`, `gpus_standing_by`,
+  `vram_standing_by_gb`, `tokens_per_second`, `tokens_last_hour`, `measured_tokens_per_second`} and `cpu_pool`
+  {`machines`, `machines_standing_by`, `cores`, `ram_gb`, `tokens_per_second`, `tokens_last_hour`}. A GPU or CPU is
+  *serving* when it has a job (the coordinator's engine runs on it, a ready coding member, a ready phone-pool
+  member) and *standing by* when it is registered without one. Tokens are counted as they arrive, nothing of the
+  content is kept. The worker reports `gpu.count` and `app.threads` for these counts.
+- **Light mode for a volunteer's CPU-only phone-pool member.** While the owner games the member no longer stops: at
+  once, with no restart, its model server drops to the lowest priority and to half the CPUs it may use, and the
+  member reports one slot; after 10 s for the answers in flight it is restarted lighter (half the threads, one
+  slot, half the context, no prompt cache); 60 s after the load ends it is restarted at full strength. At most one
+  switch per 60 s, so a flickering load cannot cause a restart loop. It stays in the phone app's routing meanwhile:
+  the coordinator keeps a member whose owner is gaming while its status says it is ready. The "both" machine's
+  phone-pool half still steps aside completely, the coordinator host's own member is unchanged, and a member whose
+  owner never games is not touched. Details: [docs/coding-members.md](docs/coding-members.md).
+
+### Changed
+- **GPU-tier perks follow use.** Unlimited coding and first in line while the contributor's GPU is serving, or for
+  its first `GPU_STANDBY_GRACE_MINUTES` (default 30) standing by; after that it is a CPU-tier contributor (300 chats
+  per 5 hours) until it gets a job. A coordinator restart starts the grace again.
+
+### Fixed
+- The VRAM the coordinator sizes its engine from (`total_vram_gb`) no longer counts phone-pool members, coding
+  members or "both" companions, which are not part of the shared model's pool.
+
+---
+
 ## [2.4.1] - 2026-10-26
 
 ### Fixed

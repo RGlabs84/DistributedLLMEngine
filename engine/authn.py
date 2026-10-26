@@ -897,8 +897,8 @@ def validate_hardware_profile(hw: dict) -> Tuple[bool, str]:
     if app is not None:
         if pool == "coding":
             return (False, "a coding member has no app section")
-        if not isinstance(app, dict) or set(app) - {"model", "ready", "slots"}:
-            return (False, "app must be an object with model, ready and slots")
+        if not isinstance(app, dict) or set(app) - {"model", "ready", "slots", "threads"}:
+            return (False, "app must be an object with model, ready, slots and threads")
         model = app.get("model")
         if model is not None and not (isinstance(model, str) and 0 < len(model) <= _MAX_NAME_LENGTH * 2):
             return (False, "app.model must be a short name")
@@ -907,6 +907,16 @@ def validate_hardware_profile(hw: dict) -> Tuple[bool, str]:
         slots = app.get("slots")
         if slots is not None and (isinstance(slots, bool) or not isinstance(slots, int) or not 1 <= slots <= 64):
             return (False, "app.slots must be a whole number from 1 to 64")
+        threads = app.get("threads")      # the threads the member really runs its model with
+        if threads is not None and (isinstance(threads, bool) or not isinstance(threads, int)
+                                    or not 1 <= threads <= 256):
+            return (False, "app.threads must be a whole number from 1 to 256")
+
+    # How many GPUs the node's memory total is made of (the website's count of GPUs lent).
+    if isinstance(gpu, dict) and "count" in gpu:
+        count = gpu["count"]
+        if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 64:
+            return (False, "gpu.count must be a whole number from 0 to 64")
 
     coding = hw.get("coding")
     if coding is not None:

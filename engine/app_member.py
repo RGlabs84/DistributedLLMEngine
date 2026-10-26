@@ -16,6 +16,8 @@ import time
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import psutil
+
 from engine.app_pool import app_server_args, sha256_ok
 from engine.logger import log_error, log_success, log_system, log_warning
 
@@ -39,6 +41,96 @@ def default_threads(physical_cores: int) -> int:
     return max(2, min(8, int(physical_cores) // 2))
 
 
+# ---------------------------------------------------------------------------------------------
+# Light mode: while the owner games, a volunteer's CPU-only member runs lighter instead of stopping
+# ---------------------------------------------------------------------------------------------
+#
+# Driven by the same is_yielding probe as everything else, through set_light() from the heartbeat. At once, with
+# no restart, the running llama-server drops to the lowest priority and is held to half the cores it may use. After
+# YIELD_DRAIN_SECONDS (the answers in flight finish) it is started again in light mode: half the threads, one slot,
+# half the context, no prompt cache, lowest priority from the start. When the load has been over for
+# YIELD_SETTLE_SECONDS it is started again at full strength; a load that flickers costs one switch per settle period
+# at most. Only a CPU-only member of a volunteer's worker does this: the "both" machine's phone-pool half steps aside
+# completely (set_yielding), and the coordinator host's own member (engine/app_pool.LocalAppServer) is not touched.
+
+LIGHT_NICE = 19      # the lowest priority on Linux and macOS
+NORMAL_NICE = 10     # what a member runs at otherwise ("below normal")
+
+
+def light_threads(threads: int) -> int:
+    """Half the threads, at least one."""
+    return max(1, int(threads) // 2)
+
+
+def light_context(ctx: int) -> int:
+    """Half the context."""
+    return max(1024, int(ctx) // 2)
+
+
+def app_member_args(binary: str, model_path: str, port: int, threads: int, light: bool = False,
+                    ctx: int = 16384, slots: int = APP_SLOTS) -> List[str]:
+    """
+    llama-server's arguments for a volunteer's CPU pool member: exactly engine.app_pool.app_server_args at full
+    strength; in light mode half the threads, one slot, half the context and no prompt cache (``--cache-ram 0``).
+    """
+    if not light:
+        return app_server_args(binary, model_path, port, threads, ctx=ctx, slots=slots)
+    return app_server_args(binary, model_path, port, light_threads(threads), ctx=light_context(ctx), slots=1) + [
+        "--cache-ram", "0"]
+
+
+def _on_windows() -> bool:
+    return os.name == "nt"
+
+
+def lower_priority(pid: int) -> Dict[str, Any]:
+    """
+    Drop a running process to the lowest priority (niceness 19 on Linux and macOS, IDLE_PRIORITY_CLASS on Windows
+    through psutil) and hold it to half the CPUs it may use, at least one (psutil's cpu_affinity, which Linux and
+    Windows have). Returns what it changed, for restore_priority. Nothing here may fail the member: a process that
+    has gone, or an operating system that refuses, is skipped.
+    """
+    saved: Dict[str, Any] = {"affinity": None}
+    try:
+        if _on_windows():
+            psutil.Process(pid).nice(getattr(psutil, "IDLE_PRIORITY_CLASS", 0x40))
+        elif hasattr(os, "setpriority"):
+            os.setpriority(os.PRIO_PROCESS, pid, LIGHT_NICE)
+    except Exception:  # noqa: BLE001 - psutil.Error, OSError
+        pass
+    try:
+        proc = psutil.Process(pid)
+        if hasattr(proc, "cpu_affinity"):
+            cpus = list(proc.cpu_affinity())
+            if cpus:
+                proc.cpu_affinity(cpus[:max(1, len(cpus) // 2)])
+                saved["affinity"] = cpus
+    except Exception:  # noqa: BLE001
+        saved["affinity"] = None
+    return saved
+
+
+def restore_priority(pid: int, saved: Optional[Dict[str, Any]]) -> bool:
+    """
+    Undo lower_priority: the member's normal priority and the CPUs it had. False when the priority could not be put
+    back: Linux and macOS do not let a program raise its own niceness back down, so there the answer is a restart.
+    """
+    restored = True
+    try:
+        if _on_windows():
+            psutil.Process(pid).nice(getattr(psutil, "BELOW_NORMAL_PRIORITY_CLASS", 0x4000))
+        elif hasattr(os, "setpriority"):
+            os.setpriority(os.PRIO_PROCESS, pid, NORMAL_NICE)
+    except Exception:  # noqa: BLE001
+        restored = False
+    if saved and saved.get("affinity"):
+        try:
+            psutil.Process(pid).cpu_affinity(saved["affinity"])
+        except Exception:  # noqa: BLE001
+            restored = False
+    return restored
+
+
 class AppMember:
     def __init__(self, base_dir: str, tiers_loader: Callable[[], List[Dict[str, Any]]],
                  threads: int, port: int = APP_PORT, urlopen=urllib.request.urlopen) -> None:
@@ -58,6 +150,13 @@ class AppMember:
         self._yielding = False          # stepped aside for the owner's own load (set_yielding)
         self._yield_since = 0.0
         self._resume_not_before = 0.0   # monotonic time before which a yielded member does not start again
+        # Light mode (set_light): the owner's load is on, so this member runs lighter instead of stopping.
+        self._light = False             # the owner's load is on
+        self._light_since = 0.0         # when it came on
+        self._light_cleared = 0.0       # when it last went off
+        self._proc_light = False        # the running llama-server was started in light mode
+        self._throttle: Optional[Dict[str, Any]] = None   # what lower_priority changed on a full-strength process
+        self._last_switch: Optional[float] = None         # when the running process last changed mode
         self._stopped = threading.Event()
         # tier id -> (failures in a row, monotonic time before which it is not tried again)
         self._backoff: Dict[str, Tuple[int, float]] = {}
@@ -65,7 +164,12 @@ class AppMember:
     # --------------------------------------------------------------------- status
     def status(self) -> Dict[str, Any]:
         alive = self.process is not None and self.process.poll() is None
-        return {"model": self.serving, "ready": bool(self.ready and alive and not self._yielding), "slots": APP_SLOTS}
+        # While the owner's load is on (light mode) the member keeps serving with one slot, so the coordinator keeps
+        # routing to it but less; `threads` are the ones its llama-server really runs on (half of them when light).
+        slots = 1 if (self._light or self._proc_light) else APP_SLOTS
+        threads = light_threads(self.threads) if self._proc_light else self.threads
+        return {"model": self.serving, "ready": bool(self.ready and alive and not self._yielding), "slots": slots,
+                "threads": threads}
 
     def settled(self) -> bool:
         """
@@ -96,6 +200,11 @@ class AppMember:
             if self._yielding or time.monotonic() < self._resume_not_before:
                 return      # stepped aside for the owner's own load: the model starts again once that is over
             if self._busy:
+                return
+            action = self._mode_action()
+            if action is not None:
+                self._busy = True
+                threading.Thread(target=self._switch_mode, args=(action,), name="dlne-app-mode", daemon=True).start()
                 return
             alive = self.process is not None and self.process.poll() is None
             if tier_id is None and self.process is None:
@@ -147,11 +256,96 @@ class AppMember:
             with self._lock:
                 self._busy = False
 
+    # --------------------------------------------------------------------- light mode
+    def set_light(self, light: bool) -> None:
+        """
+        Called with every heartbeat of a volunteer's CPU-only member, with the worker's is_yielding probe. When the
+        owner's load comes on, the running llama-server drops to the lowest priority and to half its CPUs at once, with
+        no restart, and the member reports one slot; assign() then restarts it in light mode after YIELD_DRAIN_SECONDS.
+        When the load has been over for YIELD_SETTLE_SECONDS, assign() puts it back at full strength. A call that
+        changes nothing does nothing at all, so a member whose owner never games is never touched.
+        """
+        light = bool(light)
+        with self._lock:
+            if light == self._light or self._stopped.is_set() or self._yielding:
+                return
+            self._light = light
+            now = time.monotonic()
+            if light:
+                self._light_since = now
+            else:
+                self._light_cleared = now
+            proc = self.process
+            lower = (light and proc is not None and proc.poll() is None and not self._proc_light
+                     and self._throttle is None)
+        if light:
+            log_system("The owner's own load is on: the phone-pool member runs lighter (lowest priority, fewer cores and "
+                       "threads) until it is over.")
+            if lower:
+                self._throttle = lower_priority(proc.pid)       # at once, no restart
+        else:
+            log_system("The owner's load has ended; the phone-pool member returns to full strength after a short wait.")
+
+    def serving_light(self) -> bool:
+        """
+        True while the owner's load is on and the member is serving anyway, lighter. The worker then does not report
+        is_yielding for it: the coordinator leaves a yielding pool member out of the routing altogether
+        (registry.app_members), and a member that runs lighter instead of stopping is meant to stay in it.
+        """
+        return bool(self._light and self.status()["ready"])
+
+    def _mode_action(self) -> Optional[str]:
+        """What a running, ready member should do about light mode now (called with the lock held): "light" (restart
+        in light mode), "full" (restart at full strength), "undo" (put the priority and CPUs back in place) or None.
+        A restart is at most one per YIELD_SETTLE_SECONDS, so a load that flickers cannot make a loop of them."""
+        proc = self.process
+        if self._stopped.is_set() or proc is None or proc.poll() is not None or not self.ready:
+            return None
+        now = time.monotonic()
+        may_restart = self._last_switch is None or now - self._last_switch >= YIELD_SETTLE_SECONDS
+        if self._light:
+            if not self._proc_light and now - self._light_since >= YIELD_DRAIN_SECONDS and may_restart:
+                return "light"
+            return None
+        if self._light_cleared and now - self._light_cleared >= YIELD_SETTLE_SECONDS:
+            if self._proc_light:
+                return "full" if may_restart else None
+            if self._throttle is not None:
+                return "undo"
+        return None
+
+    def _switch_mode(self, action: str) -> None:
+        """Carry out _mode_action on a thread of its own (the member is marked busy meanwhile)."""
+        try:
+            with self._lock:
+                proc, throttle, tier_id = self.process, self._throttle, self.serving
+            if action == "undo":
+                if proc is not None and restore_priority(proc.pid, throttle):
+                    with self._lock:
+                        self._throttle = None
+                    return
+                action = "full"     # the priority cannot be raised again in place on this system: start afresh
+            tier = next((t for t in self.tiers_loader() if t.get("id") == tier_id), None)
+            if tier is None:
+                return
+            path, _ = self._ensure_model(tier)
+            if path is None:
+                return
+            self._start(tier, path, light=(action == "light"))
+            with self._lock:
+                self._last_switch = time.monotonic()
+        except Exception as exc:  # noqa: BLE001 - reported; the next heartbeat decides again
+            log_error(f"CPU pool member: {type(exc).__name__}: {exc}")
+        finally:
+            with self._lock:
+                self._busy = False
+
     def stop(self) -> None:
         self._stopped.set()
         self._stop_process()
 
     def _stop_process(self) -> None:
+        self._throttle, self._proc_light = None, False
         proc, self.process, self.ready = self.process, None, False
         if proc and proc.poll() is None:
             proc.terminate()
@@ -271,10 +465,10 @@ class AppMember:
                 return candidate
         return None
 
-    def _start(self, tier: Dict[str, Any], model_path: str) -> bool:
+    def _start(self, tier: Dict[str, Any], model_path: str, light: Optional[bool] = None) -> bool:
         """Start serving ``tier``. False when the server could not start or died starting (the
         caller backs off); True once it runs, even if it is still loading (later heartbeats
-        check on it again)."""
+        check on it again). ``light``: start in light mode (default: whether the owner's load is on now)."""
         binary = self._binary()
         if binary is None:
             log_error("This engine has no llama-server; the CPU pool needs DLNE 2.3.0's engine files.")
@@ -286,11 +480,17 @@ class AppMember:
         os.makedirs(log_dir, exist_ok=True)
         self._log = open(os.path.join(log_dir, "app_server.log"), "a")
         env = dict(os.environ, GGML_VK_VISIBLE_DEVICES="")
+        light = self._light if light is None else light
         # Below normal priority: the owner's own programs come first on their machine.
         flags = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
-        self.process = subprocess.Popen(app_server_args(binary, model_path, self.port, self.threads, slots=APP_SLOTS),
+        if light:
+            flags = getattr(subprocess, "IDLE_PRIORITY_CLASS", flags)       # (Windows; elsewhere 0 either way)
+        self.process = subprocess.Popen(app_member_args(binary, model_path, self.port, self.threads, light=light),
                                         stdout=self._log, stderr=subprocess.STDOUT, env=env, creationflags=flags)
-        if hasattr(os, "setpriority"):
+        if light:
+            lower_priority(self.process.pid)          # the lowest priority and half the CPUs, from the start
+            self._proc_light = True
+        elif hasattr(os, "setpriority"):
             try:
                 os.setpriority(os.PRIO_PROCESS, self.process.pid, 10)
             except OSError:

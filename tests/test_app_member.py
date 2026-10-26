@@ -50,7 +50,7 @@ def settle(member, timeout=30.0):
 def serve(env, tier):
     env.member.assign(tier["id"])
     settle(env.member)
-    assert env.member.status() == {"model": tier["id"], "ready": True, "slots": APP_SLOTS}
+    assert env.member.status() == {"model": tier["id"], "ready": True, "slots": APP_SLOTS, "threads": 3}
 
 
 def leftovers(env):
@@ -62,7 +62,7 @@ def leftovers(env):
 # ======================================================================================
 
 def test_status_before_any_assignment(env):
-    assert env.member.status() == {"model": None, "ready": False, "slots": 2}
+    assert env.member.status() == {"model": None, "ready": False, "slots": 2, "threads": 3}
 
 
 def test_assigning_nothing_at_first_does_nothing(env):
@@ -119,7 +119,7 @@ def test_assigning_nothing_stops_the_server(env):
     env.member.assign(None)
     settle(env.member)
     assert process.poll() is not None and env.member.process is None
-    assert env.member.status() == {"model": None, "ready": False, "slots": 2}
+    assert env.member.status() == {"model": None, "ready": False, "slots": 2, "threads": 3}
 
 
 def test_a_crashed_server_is_restarted_on_the_next_assignment(env):
@@ -152,7 +152,7 @@ def test_a_download_that_does_not_match_is_deleted_and_never_run(env, served):
     settle(env.member)
     assert leftovers(env) == []
     assert env.member.process is None and recorded_starts(env.record) == []
-    assert env.member.status() == {"model": None, "ready": False, "slots": 2}
+    assert env.member.status() == {"model": None, "ready": False, "slots": 2, "threads": 3}
 
 
 def test_an_oversize_download_is_aborted_early(env):
@@ -189,7 +189,7 @@ def test_a_missing_llama_server_is_reported_not_crashed(env):
     env.member.assign(env.a["id"])
     settle(env.member)
     assert env.member.process is None and env.member.target is None
-    assert env.member.status() == {"model": None, "ready": False, "slots": 2}
+    assert env.member.status() == {"model": None, "ready": False, "slots": 2, "threads": 3}
     assert (env.models / env.a["file"]).exists(), "the verified model is kept for later"
 
 

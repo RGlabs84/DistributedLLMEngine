@@ -79,6 +79,7 @@ import httpx
 from engine import canary, coding_member_select, e2e, member_identity, no_trace, privacy_policy
 from engine.logger import log_warning
 from engine.registry import safe_log_text
+from engine.throughput import SealedFrameCounter
 
 E2E_ALG = "x25519-hkdf-sha256-chacha20poly1305"
 
@@ -894,8 +895,13 @@ class CodingRouter:
     async def _relay(self, opened: _Opened, lease: MemberLease,
                      finish: Callable[[], Awaitable[None]]) -> AsyncIterator[bytes]:
         member = lease.member
+        # Sealed frames are counted as tokens for the website's live figure (engine/throughput.py), but
+        # not a canary's (it is not a user's work, and lease.served is False for it).
+        counter = SealedFrameCounter() if lease.served else None
         try:
             async for piece in _joined(opened.first, opened.rest, opened.deadline):
+                if counter is not None:
+                    counter.feed(piece)
                 yield piece
         except Exception as exc:  # noqa: BLE001 - the member died or the tunnel dropped mid-answer
             log_warning(f"Coding member {safe_log_text(member.key, max_chars=80)} dropped mid-answer "

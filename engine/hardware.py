@@ -794,7 +794,8 @@ def get_gpu_info() -> Dict[str, Any]:
             free_gb = min(free_gb, limit_sum)
         except Exception: pass
 
-    return {"has_gpu": True, "vram_total_gb": round(total_gb, 1), "vram_free_gb": round(free_gb, 1), "name": names, "load_percent": round(avg_load, 1)}
+    return {"has_gpu": True, "vram_total_gb": round(total_gb, 1), "vram_free_gb": round(free_gb, 1), "name": names,
+            "load_percent": round(avg_load, 1), "count": len(gpus)}
 
 
 # --------------------------------------------------------------------------------------

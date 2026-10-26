@@ -265,7 +265,7 @@
     "test:e2e": "tsc -p ./ && node --test --test-force-exit test/e2e/*.e2e.js",
     "watch": "tsc -watch -p ./",
     "publish:ovsx": "bash -c 'set -a && source .env && set +a && npx -y ovsx publish'",
-    "publish:vsce": "bash -c 'set -a && source .env && set +a && npx -y @vscode/vsce publish --allow-missing-repository'"
+    "publish:vsce": "bash -c 'PATH=\"$HOME/.venvs/azcli/bin:$PATH\" npx -y @vscode/vsce publish --azure-credential --allow-missing-repository'"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

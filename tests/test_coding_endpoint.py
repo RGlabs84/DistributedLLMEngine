@@ -27,6 +27,7 @@ from engine import coordinator, e2e, reverse_tunnel
 from engine.coding_router import CodingRouter, E2E_ALG
 from engine.inference_manager import NETWORK_MAXED_OUT_MESSAGE
 from engine.priority import CodingGate, UsageWindow
+from engine.throughput import POOL_CODING, throughput
 from engine.registry import WorkerRegistry
 from engine.version import VERSION
 from tests.coding_router_fakes import FakeMember, make_identity, open_sealed_json, open_sealed_stream, sign_block
@@ -55,7 +56,12 @@ class LocalEngine:
 
     def __init__(self):
         self.starts = []
+        self.endpoints = []         # the RPC endpoints the running engine was started with
         self.breaks = False         # the engine cannot start at all (the handler's HTTP 500)
+
+    @property
+    def current_endpoints(self):
+        return list(self.endpoints)
 
     async def aestimate_model_vram_gb(self, model):
         return 1.0
@@ -120,6 +126,7 @@ def env(fakes, monkeypatch, tmp_path):
     }
     monkeypatch.setattr(coordinator, "get_worker_limits", lambda: dict(limits))
     monkeypatch.setattr(coordinator, "coding_route_window", UsageWindow())
+    throughput.reset()
     monkeypatch.setattr(coordinator, "_engine_http", None)
     monkeypatch.setattr(coordinator, "_coding_tiers", [dict(TIER)])
     monkeypatch.setattr(coordinator, "starter_quota_mgr",
@@ -571,6 +578,33 @@ async def test_a_canary_is_sealed_and_handed_to_the_member_along_the_routed_path
     assert env.router.in_flight() == 0 and canary_book.sent_since(fake.trust_id, 0) == 1
     (member,) = env.router.members(env.registry, lambda ip, port: 1, env.limits)
     assert member.last_served_at == served_at, "a canary does not make a member look busy serving users"
+
+
+@pytest.mark.anyio
+async def test_a_sealed_member_stream_counts_a_token_per_frame_but_not_the_sealed_end(env):
+    fake = env.fakes["a"]
+    env.add(fake)
+    fake.texts = ["t0 ", "t1 ", "t2 ", "t3 ", "t4"]
+    async with client() as c:
+        route = await lookup(c)
+        _raw, key, resp = await sealed(env, c, route, {"messages": [{"role": "user", "content": "x"}]})
+    assert open_sealed_stream(resp.content, key) == fake.texts
+    assert throughput.total(POOL_CODING, 3600) == 5, "five tokens; the sealed end marker and [DONE] are not"
+    assert throughput.total("phone", 3600) == 0
+
+
+@pytest.mark.anyio
+async def test_a_canarys_answer_is_not_counted(env):
+    fake = env.fakes["a"]
+    env.add(fake, "wa")
+    async with client() as c:
+        assert await via_member(env, c) == "a"
+    before = throughput.total(POOL_CODING, 3600)
+    assert before == 2
+    env.wall.t += 60
+    assert await canary_scheduler(env).tick() == [fake.trust_id]
+    assert len(fake.requests) == 2, "the canary reached the member and was answered"
+    assert throughput.total(POOL_CODING, 3600) == before
 
 
 @pytest.mark.anyio

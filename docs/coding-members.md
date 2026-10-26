@@ -40,6 +40,20 @@ Everything here ships **off by default** (`CODING_MEMBERS_ENABLED=false`) until 
   `DLNE_ALSO: none` when the CPU half stops) next to `DLNE_ROLE`, which stays the GPU's job. Without a usable
   GPU, with `MAX_CPU_THREADS` under 2, or on the coordinator's own hybrid worker, "both" does nothing
   (a machine without a GPU is the phone pool's member already).
+- **Light mode** (a volunteer's CPU-only phone-pool member, since 2.4.2): when the owner games (`is_yielding`) the
+  member does not stop, it runs lighter, driven by the same probe through `AppMember.set_light`. At once, with no
+  restart, its llama-server drops to the lowest priority (niceness 19; `IDLE_PRIORITY_CLASS` on Windows) and to half
+  the CPUs it may use (at least one; no affinity on macOS), and the member reports `slots: 1`. After a 10 s drain
+  for the answers in flight it is restarted in light mode: half the threads (at least one), `-np 1` instead of 2,
+  half the context, `--cache-ram 0`, lowest priority from the start. When the load has been over for 60 s it is
+  restarted at full strength (a member that was only lowered has its priority and CPUs put back in place; where the
+  system cannot raise a priority again, as on Linux, it is restarted instead). There is at most one switch per 60 s,
+  so a load that flickers cannot cause a restart loop. While light the member stays `ready: true` and its profile
+  still says `is_yielding: true`; the coordinator keeps a yielding pool member in the routing while its own status
+  says it is ready (`registry.app_members`), one slot at a time, and leaves out one that stepped aside (not ready).
+  `app.threads` reports the threads it really runs on (half while light). The companion of a "both"
+  machine keeps the full step-aside above, the coordinator host's own member (`LocalAppServer`) never lightens, and a
+  member whose owner never games is not touched.
 
 ## 2. Member heartbeat (inside the signed hardware profile)
 
@@ -183,8 +197,34 @@ As built:
   - A member stepping aside (its owner is gaming) reports `ready: false, slots: 0` and is not routable.
   - A member may serve a smaller tier than the one assigned; routing follows what it reports.
 - **Duplicate identities:** only the newest `signed_at` is believed, and neither on a tie.
-- **Owner perk:** an owner whose worker holds a GPU is already tier `gpu` (first in line). A coding
-  member is such a worker, so its owner needs no new link.
+- **Pool figures for the website** (`/v1/cluster/status`, counts only; nothing names a machine or a user):
+  `"gpu_pool": {"gpus", "vram_gb", "gpus_standing_by", "vram_standing_by_gb", "tokens_per_second",
+  "tokens_last_hour", "measured_tokens_per_second"}` and `"cpu_pool": {"machines", "machines_standing_by",
+  "cores", "ram_gb", "tokens_per_second", "tokens_last_hour"}`.
+  - A GPU is **serving** when it has a job: a node of the running engine's `--rpc` topology (this host's
+    own GPUs are among them while its engine runs on them) or a ready coding member's. It is **standing
+    by** when it is awake with none (or a verified member that is not ready). A node handed back to its
+    owner (yielding) is in neither. GPUs per node are the profile's `gpu.count` (1 for an older worker);
+    `vram_*` are the VRAM of exactly those GPUs. `total_vram_gb` keeps meaning the sharded admission pool
+    and counts no member, phone-pool node or companion.
+  - `cpu_pool.machines` are phone-pool members that are ready (the coordinator's own included),
+    `machines_standing_by` those registered but not ready; `cores` are the threads they run the phone
+    model on (`app.threads`; `default_threads` for an older worker) and `ram_gb` the RAM they lend.
+  - `tokens_per_second` is tokens generated per second over the last 60 s, `tokens_last_hour` over 60
+    min (`engine/throughput.py`, one-second buckets). Tokens are counted as they arrive: each streamed
+    SSE frame carrying generated text is one token, a whole answer counts its `usage.completion_tokens`,
+    a sealed member stream counts one per sealed frame (the sealed end marker and `[DONE]` are not
+    tokens), and canaries and warm-ups (`max_tokens` 0) count nothing. A sealed whole answer cannot be
+    read, so it counts nothing. `measured_tokens_per_second` is `coding_model.tokens_per_second`.
+- **Owner perk:** an owner whose worker holds a GPU is tier `gpu` (first in line, no usage window) while
+  that GPU is serving. A coding member is such a worker, so its owner needs no new link, and a member
+  that is ready keeps the perk for as long as it is ready. A GPU that is registered but has no job
+  (not in the running engine's topology, not a ready member) keeps the perk for
+  `GPU_STANDBY_GRACE_MINUTES` (config.txt, default 30; 0 means none) from when the coordinator first saw
+  it without one; after that it is tier `cpu` with the CPU rolling window, and is never refused for it
+  (`cpu_node_shortfalls` is not applied to a GPU node). A job resets the clock: the next heartbeat or
+  request that finds the GPU serving clears it. A member that yields to its owner's game counts as
+  serving. The clock lives in coordinator memory, so a coordinator restart gives every GPU a fresh grace.
 
 ## 6. End-to-end encryption
 
