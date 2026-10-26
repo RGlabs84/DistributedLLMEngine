@@ -26,6 +26,12 @@ APP_SLOTS = 2
 BACKOFF_FIRST_SECONDS = 60.0
 BACKOFF_MAX_SECONDS = 3600.0
 
+# "Both" (engine/companion.py): when the owner's own load (a game) starts, the phone-pool half of the machine says
+# it is not ready at once, gives the answers in flight this long, then stops its model to give the CPU back; when
+# the load ends it starts again after the settle period (a load that flickers costs one restart a minute at most).
+YIELD_DRAIN_SECONDS = 10.0
+YIELD_SETTLE_SECONDS = 60.0
+
 
 def default_threads(physical_cores: int) -> int:
     """Half the machine, 2 to 8 threads: the owner keeps the other half (generation on a CPU is
@@ -49,6 +55,9 @@ class AppMember:
         self._lock = threading.Lock()
         self._busy = False
         self._assigned = False          # assign() has been called at least once
+        self._yielding = False          # stepped aside for the owner's own load (set_yielding)
+        self._yield_since = 0.0
+        self._resume_not_before = 0.0   # monotonic time before which a yielded member does not start again
         self._stopped = threading.Event()
         # tier id -> (failures in a row, monotonic time before which it is not tried again)
         self._backoff: Dict[str, Tuple[int, float]] = {}
@@ -56,7 +65,7 @@ class AppMember:
     # --------------------------------------------------------------------- status
     def status(self) -> Dict[str, Any]:
         alive = self.process is not None and self.process.poll() is None
-        return {"model": self.serving, "ready": bool(self.ready and alive), "slots": APP_SLOTS}
+        return {"model": self.serving, "ready": bool(self.ready and alive and not self._yielding), "slots": APP_SLOTS}
 
     def settled(self) -> bool:
         """
@@ -84,6 +93,8 @@ class AppMember:
                 return
             self.target = tier_id
             self._assigned = True
+            if self._yielding or time.monotonic() < self._resume_not_before:
+                return      # stepped aside for the owner's own load: the model starts again once that is over
             if self._busy:
                 return
             alive = self.process is not None and self.process.poll() is None
@@ -95,6 +106,46 @@ class AppMember:
                 return
             self._busy = True
         threading.Thread(target=self._converge, name="dlne-app-member", daemon=True).start()
+
+    def set_yielding(self, yielding: bool) -> None:
+        """
+        Called with every heartbeat of a "both" machine's phone-pool half (engine/companion.py). While the owner's own
+        load is on, the member reports ``ready: false`` at once, so the coordinator sends it nothing new; the answers
+        in flight get YIELD_DRAIN_SECONDS, then llama-server is stopped to give the CPU back. When the load ends the
+        member waits YIELD_SETTLE_SECONDS, and the next assignment starts the model again.
+        """
+        yielding = bool(yielding)
+        with self._lock:
+            if yielding == self._yielding or self._stopped.is_set():
+                return
+            self._yielding = yielding
+            if not yielding:
+                self._resume_not_before = time.monotonic() + YIELD_SETTLE_SECONDS
+                log_system("The owner's load has ended; the phone-pool member comes back after a short wait.")
+                return
+            self._yield_since = time.monotonic()
+        log_system("The owner's own load is using this machine: the phone-pool member stops taking requests.")
+        threading.Thread(target=self._give_way, name="dlne-app-yield", daemon=True).start()
+
+    def _give_way(self) -> None:
+        """Give the answers in flight YIELD_DRAIN_SECONDS, then stop llama-server (after a model load in progress
+        has finished, so it cannot start the model again behind the stop)."""
+        while not self._stopped.is_set():
+            with self._lock:
+                if not self._yielding:
+                    return      # the load went away within the drain: the model stays
+                if not self._busy and time.monotonic() - self._yield_since >= YIELD_DRAIN_SECONDS:
+                    self._busy = True
+                    break
+            time.sleep(0.1)
+        else:
+            return
+        try:
+            self._stop_process()
+            log_system("The phone-pool member has stopped its model until the owner's load is over.")
+        finally:
+            with self._lock:
+                self._busy = False
 
     def stop(self) -> None:
         self._stopped.set()

@@ -434,7 +434,23 @@ def test_when_the_owner_games_both_halves_report_it_and_the_coding_model_gives_w
     assert gpu._build_heartbeat_payload()["hardware"]["is_yielding"] is True
     assert gpu.coding_member.yields == [True]
     pool_hw = pool._build_heartbeat_payload()["hardware"]
-    assert pool_hw["is_yielding"] is True and pool_hw["pool"] == "app", "the coordinator stops routing phone chats to it too"
+    assert pool_hw["is_yielding"] is True and pool_hw["pool"] == "app"
+
+
+def test_the_phone_pool_half_steps_aside_with_its_gpu_half_and_a_single_job_member_does_not(nodes):
+    nodes.profile["is_yielding"] = True
+    pool = nodes(companion_of="gpu-worker-id", companion_ram_gb=16.0)
+    pool.app_member = Member()
+    pool.app_member.yields = []
+    pool.app_member.set_yielding = pool.app_member.yields.append
+    pool._build_heartbeat_payload()
+    assert pool.app_member.yields == [True], "the companion's model gives the CPU back (AppMember.set_yielding)"
+    single = nodes()
+    single.app_member = Member()
+    single.app_member.yields = []
+    single.app_member.set_yielding = single.app_member.yields.append
+    single._build_heartbeat_payload()
+    assert single.app_member.yields == [], "a machine that lends only its CPU behaves exactly as before"
 
 
 # ======================================================================================

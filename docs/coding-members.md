@@ -33,7 +33,9 @@ Everything here ships **off by default** (`CODING_MEMBERS_ENABLED=false`) until 
   Sharing the machine: `MAX_CPU_THREADS` (or the physical cores) is the total, the phone pool gets what it
   would run on alone but at most half of it and the coding model the rest; the coding model loads only after
   the pool model has loaded (or given up), so the two never read the free RAM at the same moment; when the
-  owner games both halves step aside as each does alone (`is_yielding`). `MAX_RAM_GB`, `CODING_MAX_RAM_GB`
+  owner games (`is_yielding`) both halves step aside: the GPU half as any GPU node does, and the phone-pool half
+  (since 2.4.1) reports `ready: false` at once, gives the answers in flight 10 s, stops its model, and starts it
+  again 60 s after the load ends. A machine that lends only its CPU is unchanged. `MAX_RAM_GB`, `CODING_MAX_RAM_GB`
   and everything the GPU node reports are those of a GPU node alone. The worker prints `DLNE_ALSO: app` (and
   `DLNE_ALSO: none` when the CPU half stops) next to `DLNE_ROLE`, which stays the GPU's job. Without a usable
   GPU, with `MAX_CPU_THREADS` under 2, or on the coordinator's own hybrid worker, "both" does nothing

@@ -475,6 +475,12 @@ class WorkerNode:
             set_yielding = getattr(coding_member, "set_yielding", None)
             if callable(set_yielding):
                 set_yielding(isinstance(hardware, dict) and hardware.get("is_yielding") is True)
+        if app_member is not None and self.companion_of:
+            # The phone-pool half of a "both" machine steps aside with its GPU half when the owner games (the same
+            # probe); see AppMember.set_yielding. A machine that lends only its CPU is not changed by this.
+            set_yielding = getattr(app_member, "set_yielding", None)
+            if callable(set_yielding):
+                set_yielding(isinstance(hardware, dict) and hardware.get("is_yielding") is True)
         if isinstance(hardware, dict) and coding_member is not None:
             # A coding member says so, and what it serves, inside the signed profile.
             hardware = {**hardware, "pool": "coding", "coding": coding_member.status()}

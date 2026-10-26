@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.4.1] - 2026-10-26
+
+### Fixed
+- **"Both": the phone-pool half steps aside while the owner games, as extension 1.3.0 says.** In 2.4.0 only the
+  GPU half did. Now the companion reports `ready: false` at once (the coordinator sends it nothing new), gives the
+  answers in flight 10 s, stops its model to give the CPU back, and starts it again 60 s after the load ends. A
+  machine that lends only its CPU is unchanged.
+
+---
+
 ## [2.4.0] - 2026-10-26
 
 Coding members are off until the operator sets `CODING_MEMBERS_ENABLED=true`. With it off, every endpoint

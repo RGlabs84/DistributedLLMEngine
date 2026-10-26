@@ -306,3 +306,56 @@ def test_the_server_log_handle_is_not_leaked(env, monkeypatch):
     serve(env, env.b)
     env.member.stop()
     assert opened and all(handle.closed for handle in opened)
+
+
+# ======================================================================================
+# "Both": the phone-pool half steps aside while the owner games (engine/companion.py)
+# ======================================================================================
+
+def test_a_yielding_member_is_not_ready_at_once_and_stops_its_model_after_the_drain(env, monkeypatch):
+    monkeypatch.setattr(am, "YIELD_DRAIN_SECONDS", 0.3)
+    serve(env, env.a)
+    process = env.member.process
+    env.member.set_yielding(True)
+    assert env.member.status()["ready"] is False, "the coordinator sends it nothing new from the next heartbeat"
+    assert process.poll() is None, "the answers in flight get the drain"
+    assert wait_for(lambda: process.poll() is not None, 10), "then the model stops and the CPU is the owner's"
+    assert env.member.process is None
+
+
+def test_assignments_while_yielding_start_nothing(env, monkeypatch):
+    monkeypatch.setattr(am, "YIELD_DRAIN_SECONDS", 0.0)
+    serve(env, env.a)
+    env.member.set_yielding(True)
+    assert wait_for(lambda: env.member.process is None, 10)
+    settle(env.member)
+    for _ in range(3):
+        env.member.assign(env.a["id"])
+        assert env.member._busy is False and env.member.process is None
+    assert len(recorded_starts(env.record)) == 1
+
+
+def test_the_model_comes_back_after_the_load_ends_and_the_settle_period_passes(env, monkeypatch):
+    monkeypatch.setattr(am, "YIELD_DRAIN_SECONDS", 0.0)
+    monkeypatch.setattr(am, "YIELD_SETTLE_SECONDS", 0.5)
+    serve(env, env.a)
+    env.member.set_yielding(True)
+    assert wait_for(lambda: env.member.process is None, 10)
+    settle(env.member)
+    env.member.set_yielding(False)
+    env.member.assign(env.a["id"])
+    assert env.member.process is None and env.member._busy is False, "not before the settle period"
+    assert wait_for(lambda: time.monotonic() >= env.member._resume_not_before, 5)
+    serve(env, env.a)
+    assert len(recorded_starts(env.record)) == 2 and env.hub.calls == [env.a["url"]], "the file is not fetched again"
+
+
+def test_a_load_that_ends_within_the_drain_leaves_the_model_running(env, monkeypatch):
+    monkeypatch.setattr(am, "YIELD_DRAIN_SECONDS", 5.0)
+    serve(env, env.a)
+    process = env.member.process
+    env.member.set_yielding(True)
+    env.member.set_yielding(False)
+    time.sleep(0.4)
+    assert env.member.process is process and process.poll() is None
+    assert env.member.status()["ready"] is True
