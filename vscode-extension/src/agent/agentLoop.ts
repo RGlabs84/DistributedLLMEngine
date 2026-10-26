@@ -51,6 +51,30 @@ export function refusalNotice(status: number | undefined, errMsg: string): strin
   return '\n\nError connecting to DLNE cluster: ' + errMsg;
 }
 
+/**
+ * The status line while a tool call is still arriving from the model: which file is being written and how much of
+ * it has come so far. `partial` is the call's JSON arguments as received, unfinished. A write_file call carries
+ * the whole file, so for a big file this is the only sign of life for a minute or more.
+ */
+export function toolProgressLine(name: string, partial: string): string {
+  const quoted = /"path"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(partial);
+  const target = quoted ? quoted[1].replace(/\\(.)/g, '$1') : '';
+  const size = partial.length < 1024 ? `${partial.length} bytes` : `${(partial.length / 1024).toFixed(1)} KB`;
+  switch (name) {
+    case 'write_file':
+      return `✍️ Writing ${target || 'a file'} (${size} so far)…`;
+    case 'edit_file_diff':
+      return `✍️ Preparing an edit to ${target || 'a file'} (${size} so far)…`;
+    case 'run_terminal_command':
+      return '⌨️ Preparing a command…';
+    default:
+      return `🔧 Preparing ${name || 'the next step'}…`;
+  }
+}
+
+/** How often the status line may change while a tool call arrives. */
+const TOOL_PROGRESS_EVERY_MS = 500;
+
 export class AgentLoop {
   private messages: ChatMessage[] = [];
   private abortController: AbortController | null = null;
@@ -271,6 +295,15 @@ Begin with a short <think> plan.`
     const maxTurns = 50;
     let contextOverflowRetries = 0;
 
+    // While a tool call is still arriving, the status line says what is being written and how much has come.
+    let lastToolProgress = 0;
+    const reportToolProgress = (name: string, partial: string) => {
+      const now = Date.now();
+      if (!callbacks.onLoadingProgress || now - lastToolProgress < TOOL_PROGRESS_EVERY_MS) return;
+      lastToolProgress = now;
+      callbacks.onLoadingProgress(toolProgressLine(name, partial));
+    };
+
     while (turns < maxTurns) {
       turns++;
       if (this.abortController.signal.aborted) {
@@ -283,6 +316,7 @@ Begin with a short <think> plan.`
       let inThinking = false;
       let inToolTag = false;
       let activeClosingTag = '';
+      let toolTagText = '';         // a tool call written inline (<tool_call>…), as it arrives
       let streamedRaw = '';
       let buffer = '';
       let streamResult = { content: '', toolCalls: [] as any[] };
@@ -330,6 +364,8 @@ Begin with a short <think> plan.`
                   if (activeClosingTag.startsWith(buffer) && buffer !== '<') {
                     break;
                   }
+                  toolTagText += buffer;
+                  reportToolProgress(/"name"\s*:\s*"([^"]+)"/.exec(toolTagText)?.[1] ?? '', toolTagText);
                   buffer = '';
                 }
               } else {
@@ -358,6 +394,7 @@ Begin with a short <think> plan.`
                   } else {
                     inToolTag = true;
                     activeClosingTag = match.closing;
+                    toolTagText = '';
                   }
                 } else {
                   const prefixes = ['<think>', '<tools>', '<tool_call>', '<function-call>'];
@@ -389,7 +426,7 @@ Begin with a short <think> plan.`
           undefined,
           this.abortController.signal,
           callbacks.onLoadingProgress,
-          { sessionId: this.sessionId, onQueue: callbacks.onQueue }
+          { sessionId: this.sessionId, onQueue: callbacks.onQueue, onToolCallProgress: reportToolProgress }
         );
 
         if (inThinking && buffer) {

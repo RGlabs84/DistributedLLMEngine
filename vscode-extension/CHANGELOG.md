@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.2] - 2026-10-26
+
+Pairs with DLNE coordinator **2.4.0** or later. What a new user met on a first try, seen while recording the DLNE demo.
+
+### Fixed
+- **The chat stays in view while the agent writes a file.** Every file the agent wrote refreshed VS Code's Explorer, which switched the side bar to the Explorer and hid the DLNE chat in the middle of the run (once it came back blank). VS Code shows new files by itself, so the refresh is gone.
+- **A file being written shows that it is being written.** A big file arrives as one tool call: an 82-second snake game showed nothing new for 82 seconds. The status line now says what is happening as it arrives ("✍️ Writing snake.html (9.2 KB so far)…"), for native tool calls and for calls a model writes inline. A "Waiting for the swarm to start your answer" line that used to stay on screen after the answer is now taken down when the next step starts.
+- **The agent's answers are shown as Markdown.** Headings, lists, bold, italics, code and code blocks are rendered instead of showing `**Gameplay**` and backticks. It stays safe: everything the model wrote is escaped first, and the only markup is a fixed set of tags with no attributes (no links, no images; a link shows its text and its address).
+- **Autocomplete inside `{}`.** With the cursor just before the `}` the editor typed for you, autocomplete treated the line as unfinished, stopped at the first new line and never suggested a body. It now suggests the body.
+- **Autocomplete never stops mid-expression.** A suggestion that reaches its length cap keeps only its complete lines (it offered `text.split('').` and `let`), and a block suggestion may run a little longer (64 tokens, was 48).
+- **Autocomplete failures are written down.** A completion that fails (the server is down, an error, a timeout) is noted in the new **DLNE** output channel (View > Output > DLNE), once a minute for the same reason. The editor still just shows no suggestion.
+- **No log line every 5 seconds without a user systemd.** On machines without a user session bus (containers, WSL, some desktops) the 5-second check for a `dlne-worker` service logged "Failed to connect to user scope bus" each time. Its output is no longer shown, and after the first such failure it stops asking.
+
+---
+
 ## [1.3.1] - 2026-10-26
 
 Pairs with DLNE coordinator **2.4.0** or later. The GPU perks wording below is coordinator 2.4.2's, where a GPU keeps its perks while the swarm uses it.

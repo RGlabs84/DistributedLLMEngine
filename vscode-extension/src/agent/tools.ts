@@ -385,10 +385,8 @@ export class ToolRegistry {
           }
 
           fs.writeFileSync(filePath, args.content, 'utf-8');
-
-          try {
-            await vscode.commands.executeCommand('workbench.files.action.refreshFilesExplorer');
-          } catch {}
+          // No explorer refresh: VS Code's file watcher shows the new file by itself, and the refresh command
+          // switches the side bar to the Explorer, which hid the DLNE chat in the middle of the agent's run.
 
           const fileDiff = DiffManager.generateFileDiff(
             relPath,

@@ -2932,6 +2932,17 @@ def _measure_coding_speed(model_path: str, tail: bytearray) -> None:
         log_warning(f"Could not record the coding model's speed ({type(exc).__name__}: {exc}).")
 
 
+def _follow_engine_slots(snapshot: Optional[Dict[str, Any]]) -> None:
+    """
+    The coding gate takes the running engine's slot count as soon as the engine is seen, not only when the first
+    chat after a restart asks for a slot. Until then ``coding_queue.slots`` said 2 (the gate's default) while the
+    engine had 5, and the website showed 2; autocomplete, which runs only while a slot is free, saw 2 as well.
+    """
+    slots = (snapshot or {}).get("dynamic_slots")
+    if isinstance(slots, int) and not isinstance(slots, bool) and slots > 0 and slots != coding_gate.stats()["slots"]:
+        coding_gate.resize(slots)
+
+
 async def _coding_status(running_names: List[str], total_vram_gb: float) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
     ``coding_model`` and ``coding_tiers`` for /v1/cluster/status (websites and apps render
@@ -2952,6 +2963,7 @@ async def _coding_status(running_names: List[str], total_vram_gb: float) -> Tupl
         value = (snapshot or {}).get("safe_context")
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             context = value
+        _follow_engine_slots(snapshot)
     tokens_per_second, measured_at = coding_speed.meter.speed(file)
     active = coding_ladder.tier_for_file(tiers, file)
     coding_model = {

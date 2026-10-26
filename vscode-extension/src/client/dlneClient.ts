@@ -168,6 +168,19 @@ export interface StreamChatOptions {
    * A caller that passes this gets queue news here and not as a line of `onLoadingProgress`.
    */
   onQueue?: (queue: QueueUpdate | null) => void;
+  /**
+   * Called as a native tool call's arguments arrive, with everything received so far. A write_file call is the
+   * whole file, which can take a minute to arrive; this lets the caller show that it is being written.
+   */
+  onToolCallProgress?: (name: string, argumentsSoFar: string) => void;
+}
+
+/** How one autocomplete request ended: why it failed, or why the model stopped writing. */
+export interface CompletionOutcome {
+  /** The model's finish_reason. "length" means it stopped at max_tokens, possibly mid-line. */
+  finishReason?: string;
+  /** Why no suggestion came (an HTTP status, a timeout, a network error). Absent when the request was cancelled. */
+  failure?: string;
 }
 
 /** A refusal that means "that coding member did not serve it", and a plain retry can: gone, moved, or down. */
@@ -485,7 +498,7 @@ export class DlneClient {
           onLoadingProgress,
           forbiddenRetries > 0,
           prepared,
-          { onQueue: options.onQueue, priority: this.queuePriority() }
+          { onQueue: options.onQueue, priority: this.queuePriority(), onToolCallProgress: options.onToolCallProgress }
         );
       } catch (err: any) {
         // Every slot is taken and the coordinator said so (with the place in line): show it, wait, ask
@@ -614,7 +627,11 @@ export class DlneClient {
     onLoadingProgress?: (statusText: string) => void,
     forceWorkerToken: boolean = false,
     prepared?: PreparedRequest,
-    wait?: { onQueue?: (queue: QueueUpdate | null) => void; priority: number }
+    wait?: {
+      onQueue?: (queue: QueueUpdate | null) => void;
+      priority: number;
+      onToolCallProgress?: (name: string, argumentsSoFar: string) => void;
+    }
   ): Promise<{ content: string; toolCalls: StreamedToolCall[]; stillLoading: boolean }> {
     return new Promise((resolve, reject) => {
       const url = new URL(`${base}/v1/chat/completions`);
@@ -794,6 +811,7 @@ export class DlneClient {
                     }
                     if (tc.function?.arguments) {
                       existing.arguments += tc.function.arguments;
+                      wait?.onToolCallProgress?.(existing.name, existing.arguments);
                     }
                     toolCallsMap.set(idx, existing);
                   }
@@ -862,8 +880,8 @@ export class DlneClient {
   }
 
   /**
-   * One FIM completion ('' on any failure: autocomplete degrades silently). `signal` aborts it
-   * when a newer keystroke wants the slot. Completions reuse pooled keep-alive connections,
+   * One FIM completion ('' on any failure: the editor just shows no suggestion; `onOutcome` hears why, and how a
+   * completion ended). `signal` aborts it when a newer keystroke wants the slot. Completions reuse pooled keep-alive connections,
    * saving a TCP handshake per keystroke burst; a pooled socket the coordinator already closed
    * fails before any response byte, and such a request is retried once on a fresh socket.
    * That is safe here because autocomplete never spends the free-trial quota.
@@ -873,11 +891,20 @@ export class DlneClient {
     maxTokens: number = 64,
     stop: string[] = [],
     signal?: AbortSignal,
-    options: { sessionId?: string; workspaceFolder?: vscode.WorkspaceFolder } = {}
+    options: {
+      sessionId?: string;
+      workspaceFolder?: vscode.WorkspaceFolder;
+      onOutcome?: (outcome: CompletionOutcome) => void;
+    } = {}
   ): Promise<string> {
     const base = this.getServerUrl();
     const config = vscode.workspace.getConfiguration('dlne');
     const model = requestedModel(config.get<string>('fimModel', ''));
+    // A cancelled request (a newer keystroke took over) is not a failure, and is not reported as one.
+    const failed = (why: string): string => {
+      if (!signal?.aborted) options.onOutcome?.({ failure: why });
+      return '';
+    };
 
     const payload: Record<string, any> = {
       prompt,
@@ -941,11 +968,11 @@ export class DlneClient {
               // is not about the member and autocomplete simply gives up this time.
               let refusal = '';
               res.on('data', (chunk) => { if (refusal.length < 4096) refusal += chunk; });
-              res.on('end', () => (rerouteReason(refusal) !== null ? retryOnAnotherMember() : resolve('')));
-              res.on('error', () => resolve(''));
+              res.on('end', () => (rerouteReason(refusal) !== null ? retryOnAnotherMember() : resolve(failed('HTTP 503'))));
+              res.on('error', (err: any) => resolve(failed(`connection error (${err?.code || err?.message || err})`)));
             } else {
               res.resume();
-              resolve('');
+              resolve(failed(`HTTP ${res.statusCode}`));
             }
             return;
           }
@@ -954,16 +981,18 @@ export class DlneClient {
           res.on('end', () => {
             try {
               const parsed = prepared.respKey ? openWholeAnswer(data, prepared.respKey) : JSON.parse(data);
-              resolve(parsed.choices?.[0]?.text || '');
+              const choice = parsed.choices?.[0];
+              options.onOutcome?.({ finishReason: typeof choice?.finish_reason === 'string' ? choice.finish_reason : undefined });
+              resolve(choice?.text || '');
             } catch (err) {
               if (err instanceof MemberAnswerError && prepared.route) {
                 retryOnAnotherMember();
               } else {
-                resolve('');
+                resolve(failed('the answer could not be read'));
               }
             }
           });
-          res.on('error', () => resolve(''));
+          res.on('error', (err: any) => resolve(failed(`connection error (${err?.code || err?.message || err})`)));
         });
 
         const onAbort = () => req.destroy();
@@ -976,11 +1005,11 @@ export class DlneClient {
             resolve(attempt(true, memberFailures));
             return;
           }
-          resolve('');
+          resolve(failed(`could not reach ${base} (${err?.code || err?.message || err})`));
         });
         req.on('timeout', () => {
           req.destroy();
-          resolve('');
+          resolve(failed('no answer within 10 s'));
         });
         req.write(prepared.body);
         req.end();

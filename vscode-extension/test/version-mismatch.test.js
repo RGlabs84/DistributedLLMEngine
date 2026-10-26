@@ -14,6 +14,8 @@ function manager() {
   stub.reset();
   stub.state.warnings = [];
   const wm = new WorkerManager({ subscriptions: [] });
+  wm.currentState = 'idle';
+  wm.externalWorker = false; // a fake worker another test file runs is not this machine's
   wm.restarts = 0;
   wm.startWorker = async () => {
     wm.restarts++;

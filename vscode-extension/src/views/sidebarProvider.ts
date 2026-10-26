@@ -9,6 +9,7 @@ import { WorkerManager, WorkerStatus } from '../worker/workerManager';
 import { contributionCopy, roleCopy } from '../worker/contribution';
 import { phoneChatUrl } from '../serverUrl';
 import { ToolCallResult } from '../agent/tools';
+import { renderMarkdown } from './markdown';
 
 export interface ChatMessageItem {
   id: string;
@@ -409,9 +410,45 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       flex-direction: column;
       gap: 8px;
     }
+    /* The answer as Markdown (src/views/markdown.ts makes these tags, and only these) */
     .assistant-body {
-      white-space: pre-wrap;
+      white-space: normal;
+      overflow-wrap: anywhere;
     }
+    .assistant-body p { margin: 0 0 8px; }
+    .assistant-body > :last-child { margin-bottom: 0; }
+    .assistant-body h3, .assistant-body h4, .assistant-body h5, .assistant-body h6 {
+      margin: 10px 0 6px;
+      font-size: 1em;
+      font-weight: 700;
+    }
+    .assistant-body h3 { font-size: 1.15em; }
+    .assistant-body h4 { font-size: 1.05em; }
+    .assistant-body ul, .assistant-body ol { margin: 0 0 8px; padding-left: 20px; }
+    .assistant-body li { margin: 2px 0; }
+    .assistant-body code {
+      font-family: var(--vscode-editor-font-family);
+      font-size: 0.92em;
+      background: rgba(127, 127, 127, 0.15);
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+    .assistant-body pre {
+      white-space: pre;
+      overflow-x: auto;
+      background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.12));
+      padding: 8px;
+      border-radius: 4px;
+      margin: 0 0 8px;
+    }
+    .assistant-body pre code { background: none; padding: 0; }
+    .assistant-body blockquote {
+      margin: 0 0 8px;
+      padding-left: 8px;
+      border-left: 3px solid var(--card-border);
+      color: var(--vscode-descriptionForeground);
+    }
+    .assistant-body hr { border: none; border-top: 1px solid var(--card-border); margin: 8px 0; }
 
     /* Claude Code / Antigravity Style Thinking Drawer */
     .thinking-drawer {
@@ -733,7 +770,38 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     let currentThinkingElem = null;
     let currentThinkingBadge = null;
     let currentContentElem = null;
+    let currentContentRaw = '';     // the answer as the model wrote it; currentContentElem shows it as Markdown
+    let renderTimer = null;
     let activePillElem = null;
+
+    // The agent's answer is shown as Markdown. renderMarkdown (src/views/markdown.ts, this same function) escapes
+    // everything the model wrote before it reads any Markdown, so the text can never become markup of its own.
+    ${renderMarkdown.toString()}
+
+    function renderCurrentAnswer() {
+      if (renderTimer) {
+        clearTimeout(renderTimer);
+        renderTimer = null;
+      }
+      if (currentContentElem) {
+        currentContentElem.innerHTML = renderMarkdown(currentContentRaw);
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+      }
+    }
+
+    // The answer block is done (a tool ran, or the turn ended): show its last words and start a new one next time.
+    function finishAnswerBlock() {
+      renderCurrentAnswer();
+      currentContentElem = null;
+      currentContentRaw = '';
+    }
+
+    function removePill() {
+      if (activePillElem) {
+        activePillElem.remove();
+        activePillElem = null;
+      }
+    }
 
     // Restore state from webview cache on instant reload
     const previousState = vscode.getState();
@@ -950,7 +1018,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 if (item.text) {
                   const body = document.createElement('div');
                   body.className = 'assistant-body';
-                  body.textContent = item.text;
+                  body.innerHTML = renderMarkdown(item.text);   // escaped first, then Markdown (markdown.ts)
                   asstDiv.appendChild(body);
                 }
                 chatContainer.appendChild(asstDiv);
@@ -976,6 +1044,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           currentThinkingElem = null;
           currentThinkingBadge = null;
           currentContentElem = null;
+          currentContentRaw = '';
           activePillElem = null;
           saveWebviewState();
           break;
@@ -1028,18 +1097,17 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         }
 
         case 'contentDelta': {
-          if (activePillElem) {
-            activePillElem.remove();
-            activePillElem = null;
-          }
+          removePill();
           if (!currentContentElem && currentAssistantMsg) {
             currentContentElem = document.createElement('div');
             currentContentElem.className = 'assistant-body';
             currentAssistantMsg.appendChild(currentContentElem);
+            currentContentRaw = '';
           }
           if (currentContentElem) {
-            currentContentElem.textContent += msg.delta;
-            chatContainer.scrollTop = chatContainer.scrollHeight;
+            currentContentRaw += msg.delta;
+            // Re-rendered at most every 50 ms while words arrive, not once per word.
+            if (!renderTimer) renderTimer = setTimeout(renderCurrentAnswer, 50);
           }
           break;
         }
@@ -1048,15 +1116,23 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           if (currentContentElem) {
             const fencedToolPattern = new RegExp('\\x60\\x60\\x60(?:json|tool_call)?\\\\s*\\\\{\\\\s*"name"\\\\s*:[\\\\s\\\\S]*?\\x60\\x60\\x60\\\\s*$', 'g');
             const xmlToolPattern = new RegExp('<tool_call[\\\\s\\\\S]*?<\\\\/tool_call>\\\\s*$', 'g');
-            currentContentElem.textContent = (currentContentElem.textContent || '')
+            currentContentRaw = currentContentRaw
               .replace(fencedToolPattern, '')
               .replace(xmlToolPattern, '')
               .trim();
-            if (!currentContentElem.textContent) {
+            if (!currentContentRaw) {
+              if (renderTimer) {
+                clearTimeout(renderTimer);
+                renderTimer = null;
+              }
               currentContentElem.remove();
               currentContentElem = null;
+            } else {
+              renderCurrentAnswer();
             }
           }
+          // One status line at a time: the "waiting" or "writing" line before this tool gives way to it.
+          removePill();
           if (currentAssistantMsg) {
             activePillElem = document.createElement('div');
             activePillElem.className = 'tool-pill';
@@ -1068,11 +1144,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         }
 
         case 'toolEnd': {
-          if (activePillElem) {
-            activePillElem.remove();
-            activePillElem = null;
-          }
-          currentContentElem = null;
+          removePill();
+          finishAnswerBlock();
           const res = msg.result;
           if (res && res.fileDiff && currentAssistantMsg) {
             renderDiffCard(currentAssistantMsg, res.fileDiff);
@@ -1095,10 +1168,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           if (currentThinkingBadge) {
             currentThinkingBadge.textContent = 'Complete';
           }
-          if (activePillElem) {
-            activePillElem.remove();
-            activePillElem = null;
-          }
+          removePill();
+          finishAnswerBlock();
           sendBtn.style.display = 'inline-block';
           stopBtn.style.display = 'none';
           saveWebviewState();

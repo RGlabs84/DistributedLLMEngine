@@ -98,8 +98,9 @@ TOOLS = [
         {"file_path": {"type": "string", "description": "Optional relative file path"}}),
 ]
 
-# fimProvider.ts
-PREFIX_LINES, PREFIX_CHARS, SUFFIX_LINES, SUFFIX_CHARS, FIM_MAX_TOKENS = 50, 4000, 10, 600, 48
+# fimProvider.ts (MAX_TOKENS_LINE inside a line, MAX_TOKENS_BLOCK at the start of a line or a body)
+PREFIX_LINES, PREFIX_CHARS, SUFFIX_LINES, SUFFIX_CHARS = 50, 4000, 10, 600
+FIM_MAX_TOKENS_LINE, FIM_MAX_TOKENS_BLOCK = 48, 64
 FIM_STOP = ["<|fim_pad|>", "<|file_separator|>", "<|im_end|>", "\n\n\n"]
 QUANTUM = 8                     # the proposed prefix start granularity, in lines (fim_context(quantum=...))
 
@@ -635,7 +636,8 @@ def fim_context(text, offset, quantum=0):
     suffix = "\n".join(alines[:SUFFIX_LINES + 1])
     if len(suffix) > SUFFIX_CHARS:
         suffix = suffix[:SUFFIX_CHARS]
-    return prefix, suffix, bool(alines[0].strip())
+    # closesBlock(): a rest of line that only closes a block (the `}` the editor typed) is the start of a body.
+    return prefix, suffix, bool(alines[0].strip()) and not re.match(r"^\s*}[\s;),\]]*$", alines[0])
 
 
 # Set by main() when requests are pinned to a slot of a live engine: a unique first line, so that a probe prompt can
@@ -661,7 +663,9 @@ def fim_prefix_only(prefix):
     return f"<|fim_prefix|>{_tag('fim')}{prefix}"
 
 
-def fim_request(base, prompt, mid_line, pin_slot, seed=None, max_tokens=FIM_MAX_TOKENS, timeout=300):
+def fim_request(base, prompt, mid_line, pin_slot, seed=None, max_tokens=None, timeout=300):
+    if max_tokens is None:
+        max_tokens = FIM_MAX_TOKENS_LINE if mid_line else FIM_MAX_TOKENS_BLOCK
     stop = FIM_STOP + (["\n"] if mid_line else [])
     body = {"prompt": prompt, "max_tokens": max_tokens, "temperature": 0.1, "stream": False, "stop": stop}
     if pin_slot is not None:

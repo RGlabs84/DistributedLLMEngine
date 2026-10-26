@@ -7,4 +7,4 @@
 # To ship: `python scripts/release.py bump minor|major|patch`, commit, then
 # `python scripts/release.py deploy`. See engine/release.py for how a release is built,
 # signed and verified. (The line below must stay `VERSION = "x.y.z"`; the tool edits it.)
-VERSION = "2.4.3"
+VERSION = "2.4.4"

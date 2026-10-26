@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.4.4] - 2026-10-26
+
+### Fixed
+- **The coding slots are right from the start.** After a restart, `coding_queue.slots` in `/v1/cluster/status` said 2 (the default) until the first coding request, while the engine had 5, and the website's swarm tile showed 2. The count now follows the running engine as soon as the status sees it, and autocomplete (which runs only while a slot is free) uses the real count too.
+
+---
+
 ## [2.4.3] - 2026-10-26
 
 ### Changed

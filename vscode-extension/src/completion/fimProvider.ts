@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { DlneClient } from '../client/dlneClient';
+import { CompletionOutcome, DlneClient } from '../client/dlneClient';
+import { logOnce } from '../log';
 import { REDACTION_MARK, isExcludedFile, redactSecrets } from '../privacy';
 
 // Prompt budget. Prefill is the cost a completion pays before its first token (measured ~250
@@ -9,7 +10,10 @@ const PREFIX_LINES = 50;
 const PREFIX_CHARS = 4000;
 const SUFFIX_LINES = 10;
 const SUFFIX_CHARS = 600;
-const MAX_TOKENS = 48;
+// Token caps: the rest of one line, or a few lines of a block. Every token is waited for (about 38 a second on
+// the public swarm), so these stay short; a completion that reaches its cap keeps only its complete lines.
+const MAX_TOKENS_LINE = 48;
+const MAX_TOKENS_BLOCK = 64;
 // The prompt's first line moves once per this many lines typed, not once per line. The model's cache can reuse a
 // prompt only up to the first token that changed, so a front that moves on every new line re-reads the whole
 // prompt each time (measured: 654 tokens on TheWall instead of about 5).
@@ -41,7 +45,29 @@ export function buildFimContext(document: vscode.TextDocument, position: vscode.
   }
 
   const restOfLine = document.lineAt(position.line).text.slice(position.character);
-  return { prefix, suffix, midLine: restOfLine.trim().length > 0 };
+  return { prefix, suffix, midLine: restOfLine.trim().length > 0 && !closesBlock(restOfLine) };
+}
+
+/**
+ * The rest of the line only closes a block: the `}` the editor typed for you after `{` (and `});`, `},`). The
+ * cursor is then at the start of a body, not inside a line, and a body starts with a new line: completing only
+ * "the rest of this line" stopped at that first new line and never suggested anything.
+ */
+export function closesBlock(restOfLine: string): boolean {
+  return /^\s*}[\s;),\]]*$/.test(restOfLine);
+}
+
+/**
+ * A completion that reached its token cap stops wherever the cap fell, often mid-expression (`text.split('').`).
+ * A block completion then keeps only its complete lines, and one with no complete line is not offered. A
+ * completion inside a line is kept: it ends with that line anyway.
+ */
+export function trimCutOff(text: string, finishReason: string | undefined, midLine: boolean): string {
+  if (finishReason !== 'length' || midLine) {
+    return text;
+  }
+  const lastBreak = text.lastIndexOf('\n');
+  return lastBreak > 0 ? text.slice(0, lastBreak) : '';
 }
 
 export class DlneFimProvider implements vscode.InlineCompletionItemProvider {
@@ -141,7 +167,19 @@ export class DlneFimProvider implements vscode.InlineCompletionItemProvider {
     const cancel = token.onCancellationRequested(() => controller.abort());
     try {
       // `folder` (above) decides the privacy mode. Session and redaction are the client's.
-      const completionText = await this.client.getCompletion(fimPrompt, MAX_TOKENS, stopTokens, controller.signal, { workspaceFolder: folder });
+      let outcome: CompletionOutcome = {};
+      const answer = await this.client.getCompletion(
+        fimPrompt,
+        midLine ? MAX_TOKENS_LINE : MAX_TOKENS_BLOCK,
+        stopTokens,
+        controller.signal,
+        { workspaceFolder: folder, onOutcome: (o) => { outcome = o; } }
+      );
+      if (outcome.failure) {
+        // No suggestion is shown either way; the log says why (once a minute for the same reason).
+        logOnce(`fim:${outcome.failure}`, `Autocomplete: no suggestion, ${outcome.failure}.`);
+      }
+      const completionText = trimCutOff(answer, outcome.finishReason, midLine);
       if (!completionText || token.isCancellationRequested || controller.signal.aborted) {
         return null;
       }

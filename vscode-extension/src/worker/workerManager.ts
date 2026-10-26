@@ -134,6 +134,11 @@ export class WorkerManager {
   private workerProcess: child_process.ChildProcess | null = null;
   /** The worker that is running was started outside this editor (see WorkerStatus.external). */
   private externalWorker = false;
+  /**
+   * This machine has no user systemd to ask (a container, WSL, a desktop without a user session bus): every
+   * `systemctl --user` fails there, so after the first failure the 5-second check stops asking.
+   */
+  private systemdUnavailable = false;
   private currentState: WorkerState = 'idle';
   private localGpu: LocalGpuInfo = { hasGpu: false, name: 'Probing GPU...', vramTotalGb: 0, api: 'vulkan' };
   private vramContributed = 0;
@@ -446,14 +451,22 @@ export class WorkerManager {
   }
 
   private isSystemdActive(): boolean {
-    if (process.platform !== 'linux') return false;
+    if (process.platform !== 'linux' || this.systemdUnavailable) return false;
     try {
       const out = child_process.execSync('systemctl --user is-active dlne-worker', {
         encoding: 'utf-8',
-        timeout: 1500
+        timeout: 1500,
+        // Its complaints ("Failed to connect to user scope bus") went to the extension's log every 5 s.
+        stdio: ['ignore', 'pipe', 'ignore']
       }).trim();
       return out === 'active';
-    } catch {
+    } catch (err: any) {
+      // `is-active` exits non-zero for every state but active and still names the state ("inactive", "failed").
+      // Nothing named, and not a timeout (a busy machine), means systemd itself could not be asked.
+      const said = String(err?.stdout ?? '').trim();
+      if (!said && !err?.signal) {
+        this.systemdUnavailable = true;
+      }
       return false;
     }
   }

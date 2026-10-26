@@ -61,11 +61,14 @@ def test_tool_list_matches_tools_ts():
 def test_fim_budget_and_stops_match_fim_provider():
     src = read_ts("completion", "fimProvider.ts")
     for name, value in (("PREFIX_LINES", cp.PREFIX_LINES), ("PREFIX_CHARS", cp.PREFIX_CHARS), ("SUFFIX_LINES", cp.SUFFIX_LINES),
-                        ("SUFFIX_CHARS", cp.SUFFIX_CHARS), ("MAX_TOKENS", cp.FIM_MAX_TOKENS)):
+                        ("SUFFIX_CHARS", cp.SUFFIX_CHARS), ("MAX_TOKENS_LINE", cp.FIM_MAX_TOKENS_LINE),
+                        ("MAX_TOKENS_BLOCK", cp.FIM_MAX_TOKENS_BLOCK)):
         assert f"const {name} = {value};" in src, name
     for stop in ("<|fim_pad|>", "<|file_separator|>", "<|im_end|>"):
         assert f"'{stop}'" in src
     assert "<|fim_prefix|>${" in src and "<|fim_suffix|>${" in src and "<|fim_middle|>" in src
+    # closesBlock(): the probe reads "inside {}" the way the extension does (the start of a body, not mid-line).
+    assert r"return /^\s*}[\s;),\]]*$/.test(restOfLine);" in src
 
 
 @needs_extension
@@ -186,6 +189,10 @@ def test_fim_context_windows():
     long_text = "a" * 9000 + "|" + "b" * 9000
     prefix, suffix, _ = cp.fim_context(long_text, 9000)
     assert len(prefix) == cp.PREFIX_CHARS and len(suffix) == cp.SUFFIX_CHARS
+    # Just before the `}` the editor typed is the start of a body: not mid-line.
+    body = "function f(text) {}"
+    assert cp.fim_context(body, len(body) - 1)[2] is False
+    assert cp.fim_context("foo(bar)", 4)[2] is True
 
 
 def test_quantized_prefix_start_holds_still_while_the_shipped_one_moves_every_line():

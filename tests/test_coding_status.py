@@ -14,7 +14,7 @@ from fastapi.responses import StreamingResponse
 from httpx import ASGITransport, AsyncClient
 
 import engine.coordinator as coordinator
-from engine import coding_ladder, coding_speed, release
+from engine import coding_ladder, coding_speed, priority, release
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIVE_FILE = "Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
@@ -481,6 +481,40 @@ async def test_no_engine_running_means_no_context_but_still_the_model(cluster):
     assert data["coding_model"]["file"] == LIVE_FILE           # what the next request starts
     assert data["coding_model"]["context"] is None             # never guessed
     assert data["coding_model"]["tokens_per_second"] == 38.0   # the saved measurement, not blanked
+
+
+@pytest.mark.anyio
+async def test_the_queue_shows_the_engines_slots_before_the_first_chat(cluster):
+    # After a restart the gate kept its default of 2 until a chat asked for a slot, while TheWall's engine runs 5:
+    # the status (and the website) said 2 coding slots.
+    gate = priority.CodingGate()
+    cluster.monkeypatch.setattr(coordinator, "coding_gate", gate)
+    entry = engine_entry(163840)
+    entry["dynamic_slots"] = 5
+    cluster.monkeypatch.setattr(coordinator.manager, "running_models", {LIVE_FILE: entry})
+    data = await get_json("/v1/cluster/status")
+    assert data["coding_queue"]["slots"] == 5
+    assert gate.stats()["slots"] == 5
+    assert coordinator._fim_engine_slots() == 5          # autocomplete sees the real count too
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("slots", [0, -1, True, "5", None, 2.5])
+async def test_a_nonsense_slot_count_leaves_the_queue_as_it_was(cluster, slots):
+    gate = priority.CodingGate(slots=3)
+    cluster.monkeypatch.setattr(coordinator, "coding_gate", gate)
+    entry = engine_entry(65536)
+    entry["dynamic_slots"] = slots
+    cluster.monkeypatch.setattr(coordinator.manager, "running_models", {LIVE_FILE: entry})
+    assert (await get_json("/v1/cluster/status"))["coding_queue"]["slots"] == 3
+
+
+@pytest.mark.anyio
+async def test_with_no_engine_running_the_queue_keeps_its_count(cluster):
+    gate = priority.CodingGate(slots=3)
+    cluster.monkeypatch.setattr(coordinator, "coding_gate", gate)
+    cluster.monkeypatch.setattr(coordinator.manager, "running_models", {})
+    assert (await get_json("/v1/cluster/status"))["coding_queue"]["slots"] == 3
 
 
 @pytest.mark.anyio

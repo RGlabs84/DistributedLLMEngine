@@ -32,6 +32,9 @@ function machine(gpu, totalGib, settings = {}) {
   os.totalmem = () => totalGib * GIB;
   const wm = new WorkerManager({ subscriptions: [] });
   wm.localGpu = gpu; // whatever the host really has, the construction probe found
+  // Nor what its pgrep found: a fake worker another test file runs at the same moment is not this machine's.
+  wm.currentState = 'idle';
+  wm.externalWorker = false;
   return { wm, done: () => { os.totalmem = realTotalmem; wm.dispose(); } };
 }
 
