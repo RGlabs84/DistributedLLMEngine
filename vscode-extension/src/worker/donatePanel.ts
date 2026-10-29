@@ -3,8 +3,10 @@
 // everything it posts back goes through validateChoice first, so nothing it sends is trusted.
 
 import {
-  CPU_LADDER, CPU_MIN_RAM_GB, CPU_POOL_PERK, MAX_LEND_SHARE, defaultRamOffer, installedRamGb, ramChoices, roleMeaning,
+  CPU_LADDER, CPU_MIN_RAM_GB, CPU_POOL_PERK, MAX_LEND_SHARE, TRAY_WORKER_LINE, TRAY_WORKER_STOP, defaultRamOffer,
+  installedRamGb, ramChoices, roleMeaning,
 } from './contribution';
+import { TrayPlatform, formatSize } from './trayApp';
 
 /** engine/coding_member_select.py MIN_VRAM_GB: a GPU under this joins the GPU pool instead of running a coding model. */
 export const MIN_CODING_VRAM_GB = 8;
@@ -322,6 +324,62 @@ export interface DonatePanelModel {
   powers: PowerLine[];
   button: { label: string; action: 'start' | 'stop'; disabled: boolean; hint: string };
   apply: { visible: boolean; disabled: boolean; label: string };
+  /** The "Optional add-on" card that offers DLNE Donate; null hides it (macOS and every other platform). */
+  addon: AddonCard | null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The "Optional add-on" card: DLNE Donate, the tray app (worker/trayAddon.ts runs its button)
+// ---------------------------------------------------------------------------------------------
+
+/** What the card needs to know, as worker/trayAddon.ts keeps it. */
+export interface TrayAddonView {
+  /** Where DLNE Donate runs (trayApp.ts trayPlatform); null hides the card. */
+  platform: TrayPlatform | null;
+  /** While a click is being handled: what the button says instead ("Checking...", "Downloading..."); '' otherwise. */
+  busy: string;
+  /** This platform's download size, once a click has read the manifest; null before. */
+  sizeBytes: number | null;
+  /** What the last click came to, in plain words; '' for nothing. */
+  note: string;
+  noteIsError: boolean;
+}
+
+export interface AddonCard {
+  title: string;
+  text: string;
+  /** Windows only: what SmartScreen says about an unsigned app, and how to get past it. '' on Linux. */
+  warning: string;
+  button: { label: string; disabled: boolean };
+  /** The link to the DLNE page's download (trayApp.ts TRAY_PAGE_URL; the extension opens it, never the webview). */
+  pageLink: string;
+  note: string;
+  noteIsError: boolean;
+}
+
+export const ADDON_TITLE = 'Optional add-on';
+export const ADDON_PAGE_LINK = 'Or download it from the DLNE page';
+export const ADDON_TEXT = 'Keep donating when VS Code is closed, with DLNE Donate, a small tray app for Windows and Linux.';
+/** The Windows build is not code-signed yet, so SmartScreen stops it the first time; this says how to go on. */
+export const ADDON_SMARTSCREEN =
+  'The app is not signed yet, so Windows may show "Windows protected your PC". Click More info, then Run anyway.';
+
+/** The card for this computer, or null where there is no DLNE Donate to offer. */
+export function buildAddonCard(view: TrayAddonView | undefined): AddonCard | null {
+  if (!view || !view.platform) return null;
+  // The size is only known once a click has read the manifest (nothing is fetched before the owner asks).
+  const size = view.sizeBytes ? formatSize(view.sizeBytes) : '';
+  return {
+    title: ADDON_TITLE,
+    text: ADDON_TEXT,
+    warning: view.platform === 'windows' ? ADDON_SMARTSCREEN : '',
+    button: view.busy
+      ? { label: view.busy, disabled: true }
+      : { label: size ? `Download DLNE Donate (${size})` : 'Download DLNE Donate', disabled: false },
+    pageLink: ADDON_PAGE_LINK,
+    note: view.note,
+    noteIsError: view.note !== '' && view.noteIsError,
+  };
 }
 
 const GPU_BLURB =
@@ -398,10 +456,14 @@ export interface BuildInput {
   state: string;
   /** A worker this editor did not start is running. */
   external?: boolean;
+  /** That worker is the DLNE Donate tray app's (WorkerStatus.trayApp). */
+  trayApp?: boolean;
   /** The settings the running worker was started with (null: not known). */
   started?: DonateSettings | null;
   /** What the sliders say now, when it is not what the settings say (a draft, or a preview while dragging). */
   choice?: DonateChoice;
+  /** The "Optional add-on" card's state; left out, the card is hidden. */
+  addon?: TrayAddonView;
 }
 
 export function buildDonatePanel(input: BuildInput): DonatePanelModel {
@@ -410,6 +472,8 @@ export function buildDonatePanel(input: BuildInput): DonatePanelModel {
   const c = input.choice ? validateChoice(input.choice, m, base) : base;
   const running = input.state === 'contributing' || input.state === 'starting';
   const locked = running && input.external === true;
+  // The tray app's worker is stopped in the app, not from here (contribution.ts TRAY_WORKER_STOP).
+  const trayApp = locked && input.trayApp === true;
 
   const range = vramRange(m);
   const ramStops = gpuRamStops(m);
@@ -431,7 +495,11 @@ export function buildDonatePanel(input: BuildInput): DonatePanelModel {
   return {
     state: input.state,
     locked,
-    lockedNote: locked ? 'A DLNE worker started outside VS Code is running, with its own settings. Stop it here, then donate again with the settings below.' : '',
+    lockedNote: trayApp
+      ? TRAY_WORKER_LINE
+      : locked
+      ? 'A DLNE worker started outside VS Code is running, with its own settings. Stop it here, then donate again with the settings below.'
+      : '',
     choice: c,
     gpu: {
       available: m.gpu.available,
@@ -461,9 +529,12 @@ export function buildDonatePanel(input: BuildInput): DonatePanelModel {
       },
     },
     powers: powerLines(c, m, s),
-    button: stopping
+    button: trayApp
+      ? { label: 'Donating from the tray app', action: 'stop', disabled: true, hint: TRAY_WORKER_STOP }
+      : stopping
       ? { label: 'Stop donating', action: 'stop', disabled: false, hint: '' }
       : { label: 'Donate compute', action: 'start', disabled: nothing, hint },
     apply: { visible: restart, disabled: nothing, label: APPLY_LABEL },
+    addon: buildAddonCard(input.addon),
   };
 }

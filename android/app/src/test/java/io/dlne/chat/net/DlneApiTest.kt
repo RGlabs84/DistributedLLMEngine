@@ -1,5 +1,6 @@
 package io.dlne.chat.net
 
+import io.dlne.chat.data.PhoneLocation
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
@@ -17,6 +18,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
+
+/** A chat id as the app makes it: the random UUID of a conversation. */
+internal const val CHAT_ID = "6f1c1f0e-3f6a-4d6b-9b52-0a5e2f6d8c11"
 
 /**
  * The client end to end over real HTTP (a local MockWebServer): request shape, streaming
@@ -52,7 +56,7 @@ class DlneApiTest {
                 .throttleBody(7, 5, TimeUnit.MILLISECONDS)
         )
 
-        val events = api.streamChat(baseUrl, listOf(WireMessage("user", "Hi"))).toList()
+        val events = api.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "Hi"))).toList()
 
         assertEquals(
             listOf("Hel", "lo ", "wor", "ld"),
@@ -71,9 +75,66 @@ class DlneApiTest {
     }
 
     @Test
+    fun `every request carries the chat id and no location unless one is given`() = runBlocking {
+        server.enqueue(MockResponse().setBody(sse("x")))
+        api.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "Hi"))).toList()
+
+        val body = Json.parseToJsonElement(server.takeRequest().body.readUtf8()).jsonObject
+        assertEquals(CHAT_ID, body["chat_id"]!!.jsonPrimitive.content)
+        assertEquals(setOf("chat_id", "messages", "max_tokens", "stream", "features"), body.keys)
+    }
+
+    @Test
+    fun `every request says the app shows picture events, with or without a location`() = runBlocking {
+        server.enqueue(MockResponse().setBody(sse("x")))
+        server.enqueue(MockResponse().setBody(sse("x")))
+        api.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "Hi"))).toList()
+        api.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "Hi")), PhoneLocation.of(40.0, -74.0)).toList()
+
+        repeat(2) {
+            val body = Json.parseToJsonElement(server.takeRequest().body.readUtf8()).jsonObject
+            // Always sent (a default value would not be): without it the server offers the model no picture tool.
+            assertEquals(listOf("image_jobs"), body["features"]!!.jsonArray.map { it.jsonPrimitive.content })
+        }
+    }
+
+    @Test
+    fun `picture events arrive from the stream before the reply's text`() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    """data: {"dlne":{"event":"image_job","id":"abc_DEF-1","prompt":"a red fox","size":"768x768","position":1,"eta_seconds":80}}""" + "\n\n" +
+                        sse("A fox is on its way."),
+                )
+                .throttleBody(9, 3, TimeUnit.MILLISECONDS),
+        )
+        val events = api.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "can I get a picture of a red fox"))).toList()
+        assertEquals(
+            listOf(
+                StreamEvent.ImageJob("abc_DEF-1", "a red fox", "768x768", 1, 80),
+                StreamEvent.Content("A fox is on its way."),
+                StreamEvent.Done,
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun `a location is sent as lat and lon exactly as given`() = runBlocking {
+        server.enqueue(MockResponse().setBody(sse("x")))
+        val place = PhoneLocation.of(40.123456, -74.564949)
+        api.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "Hi")), place).toList()
+
+        val body = Json.parseToJsonElement(server.takeRequest().body.readUtf8()).jsonObject
+        assertEquals("""{"lat":40.12346,"lon":-74.56495}""", body["location"]!!.toString())
+        assertEquals(CHAT_ID, body["chat_id"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun `a base URL with a path prefix and trailing slash is respected`() = runBlocking {
         server.enqueue(MockResponse().setBody(sse("x")))
-        api.streamChat(server.url("/dlne/").toString(), listOf(WireMessage("user", "Hi"))).toList()
+        api.streamChat(server.url("/dlne/").toString(), CHAT_ID, listOf(WireMessage("user", "Hi"))).toList()
         assertEquals("/dlne/v1/app/chat/completions", server.takeRequest().path)
     }
 
@@ -86,7 +147,7 @@ class DlneApiTest {
                 .setBody("""{"detail":"One answer at a time: wait for the current one to finish."}""")
         )
         try {
-            api.streamChat(baseUrl, listOf(WireMessage("user", "Hi"))).toList()
+            api.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "Hi"))).toList()
             fail("expected ApiException.Http")
         } catch (e: ApiException.Http) {
             assertEquals(429, e.code)
@@ -102,7 +163,7 @@ class DlneApiTest {
                 .setBody("""{"detail":[{"loc":["body"],"msg":"field required"}]}""")
         )
         try {
-            api.streamChat(baseUrl, listOf(WireMessage("user", "Hi"))).toList()
+            api.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "Hi"))).toList()
             fail("expected ApiException.Http")
         } catch (e: ApiException.Http) {
             assertEquals(400, e.code)
@@ -118,7 +179,7 @@ class DlneApiTest {
         // second response that is never queued.
         val noRetry = DlneApi(DlneApi.defaultHttpClient().newBuilder().retryOnConnectionFailure(false).build())
         try {
-            noRetry.streamChat(baseUrl, listOf(WireMessage("user", "Hi"))).toList()
+            noRetry.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "Hi"))).toList()
             fail("expected ApiException.Network")
         } catch (e: ApiException.Network) {
             assertTrue(e.cause is java.io.IOException)

@@ -139,9 +139,9 @@ test('"Forget Agent Approvals" forgets edits and commands; the list is shown fir
   project(async ({ asked }) => {
     await run('write_file', { path: 'a.txt', content: 'x' });
     await run('run_terminal_command', { command: 'echo a' });
-    assert.deepEqual(ToolRegistry.alwaysApprovals(), { edits: true, commands: ['echo'] });
+    assert.deepEqual(ToolRegistry.alwaysApprovals(), { edits: true, commands: ['echo'], remember: false });
     await ToolRegistry.forgetAlwaysApprovals();
-    assert.deepEqual(ToolRegistry.alwaysApprovals(), { edits: false, commands: [] });
+    assert.deepEqual(ToolRegistry.alwaysApprovals(), { edits: false, commands: [], remember: false });
     await run('run_terminal_command', { command: 'echo b' });
     assert.equal(asked.length, 3, 'asked again');
   }, { answers: ['always', 'always', 'deny'] }));
@@ -158,6 +158,56 @@ test('the full auto switch skips every question; it is off by default and only u
     assert.equal(setting.default, false);
     assert.equal(setting.scope, 'application', 'a cloned repository cannot switch it on');
     assert.match(setting.markdownDescription, /volunteer's machine/);
+  }));
+
+test("a chat's own \"approve everything\" skips every question, for its own calls only", () =>
+  project(async ({ outside, asked }) => {
+    const r = await ToolRegistry.executeTool('run_terminal_command', { command: 'echo chat' }, true);
+    assert.match(r.output, /chat/);
+    await ToolRegistry.executeTool('write_file', { path: path.join(outside, 'z.txt'), content: 'z' }, true);
+    assert.equal(asked.length, 0);
+    await run('run_terminal_command', { command: 'echo again' });
+    assert.equal(asked.length, 1, 'a call without it asks: nothing is left switched on for the other chat');
+
+    // The Chat view hands its permission picker to its own run (read when the message is sent).
+    const native = fs.readFileSync(path.join(__dirname, '..', 'src', 'views', 'nativeChatParticipant.ts'), 'utf8');
+    assert.match(native, /permissionLevel === 'autoApprove' \|\| request\?\.permissionLevel === 'autopilot'/);
+    assert.match(native, /approveAll: \(\) => approves/);
+    const loop = fs.readFileSync(path.join(__dirname, '..', 'src', 'agent', 'agentLoop.ts'), 'utf8');
+    assert.equal((loop.match(/ToolRegistry\.executeTool\([^)]*this\.approveAll\(\)[,)]/g) || []).length, 3, 'read at every tool call');
+  }));
+
+test('the Auto switch (status bar, sidebar button, command) is one setting, read at every step', () =>
+  project(async ({ asked }) => {
+    // 2026-10-27: the Chat view's picker is read only when a message is sent; switched mid-task it changed nothing,
+    // while dlne.autoApproveAll, read at every tool call, had worked. So the toggles flip that setting.
+    await run('run_terminal_command', { command: 'echo before' });
+    assert.equal(asked.length, 1);
+    await ToolRegistry.setAutoApproveAll(true);
+    assert.deepEqual(stub.state.updates.at(-1), ['dlne.autoApproveAll', true]);
+    assert.equal(ToolRegistry.autoApproveAllOn(), true);
+    const r = await run('run_terminal_command', { command: 'echo during' });
+    assert.match(r.output, /during/);
+    assert.equal(asked.length, 1, 'the next step runs without asking');
+    await ToolRegistry.setAutoApproveAll(false);
+    await run('run_terminal_command', { command: 'echo after' });
+    assert.equal(asked.length, 2);
+
+    const sidebar = fs.readFileSync(path.join(__dirname, '..', 'src', 'views', 'sidebarProvider.ts'), 'utf8');
+    assert.match(sidebar, /ToolRegistry\.setAutoApproveAll\(data\.on === true\)/, 'the sidebar button flips the same switch');
+    const ext = fs.readFileSync(path.join(__dirname, '..', 'src', 'extension.ts'), 'utf8');
+    assert.match(ext, /registerCommand\('dlne\.toggleAutoApprove'/);
+    assert.match(ext, /DLNE: Auto/);
+    const pkg = require('../package.json');
+    assert.ok(pkg.contributes.commands.some((c) => c.command === 'dlne.toggleAutoApprove'));
+    // DLNE blue, not the yellow warning background: the status bar's text and icon, and the sidebar button.
+    const blue = pkg.contributes.colors.find((c) => c.id === 'dlne.autoForeground');
+    assert.equal(blue.defaults.dark, '#00F0FF');
+    assert.match(ext, /autoItem\.color = on \? new vscode\.ThemeColor\('dlne\.autoForeground'\)/);
+    assert.doesNotMatch(ext, /autoItem\.backgroundColor/);
+    assert.match(sidebar, /--vscode-dlne-autoForeground/);
+    assert.match(sidebar, /button\.toggle\[aria-pressed="true"\]:hover \{\s*background-color: var\(--vscode-dlne-autoForeground/,
+      'it stays blue under the mouse (the secondary hover background is as specific and comes later)');
   }));
 
 test('the extension keeps the answers in its per-project storage and offers a command to forget them', () => {

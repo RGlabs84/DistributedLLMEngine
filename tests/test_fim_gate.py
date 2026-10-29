@@ -39,10 +39,43 @@ def engine_reached(monkeypatch):
     return reached
 
 
-async def _complete():
+async def _complete(prompt="def f("):
     transport = ASGITransport(app=coordinator.app, client=("127.0.0.1", 5000))
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        return await client.post("/v1/completions", json={"prompt": "def f(", "model": "m.gguf"})
+        return await client.post("/v1/completions", json={"prompt": prompt, "model": "m.gguf"})
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("prompt", [
+    {"prompt_string": "describe <__media__>", "multimodal_data": ["iVBORw0KGgo="]},
+    [{"prompt_string": "x", "multimodal_data": ["AAAA"]}],
+    ["def f(", {"prompt_string": "x"}],
+    [1, 2, True],
+    [[1, 2], [3, True]],                                # no bools in a batch either
+    [[1, 2], {"prompt_string": "x"}],
+    [[{"prompt_string": "x", "multimodal_data": ["AAAA"]}]],
+    [[["a"]]],                                          # one level of nesting only
+    [[1, 2], "abc"],                                    # a batch is all lists
+    [[1.5]],
+])
+async def test_a_completion_prompt_that_is_not_text_or_tokens_is_refused(engine_reached, prompt):
+    # llama-server would read multimodal_data images here that the coordinator never checked.
+    resp = await _complete(prompt)
+    assert resp.status_code == 400 and resp.json()["code"] == "unsupported_content_type"
+    assert engine_reached == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("prompt", [
+    "def f(", ["def f(", 12, 34], [12, 34],
+    [[1, 2, 3], [4, 5]],                                # batches, as 2.5.4 forwarded them
+    [["def f(", "def g("]],
+    [["def f(", 12], [34]],
+    [[]],
+])
+async def test_text_and_token_prompts_still_reach_the_engine(engine_reached, prompt):
+    resp = await _complete(prompt)
+    assert not _busy(resp) and engine_reached == ["m.gguf"]
 
 
 def _busy(resp):
@@ -136,3 +169,17 @@ def test_the_coordinator_keeps_idle_connections_for_reuse(monkeypatch):
     with pytest.raises(Stop):
         coordinator.start_coordinator_server("127.0.0.1", 0)
     assert captured["timeout_keep_alive"] >= 60
+
+
+@pytest.mark.anyio
+async def test_a_clients_id_slot_is_dropped_whatever_the_engine_has(engine_reached):
+    from tests.test_coordinator_counter import FakeRequest
+
+    body = {"prompt": "def f(", "model": "m.gguf", "id_slot": 3}
+
+    try:
+        await coordinator.completions(FakeRequest(body))
+    except Exception:       # the stub engine start fails; the body is what is looked at
+        pass
+
+    assert engine_reached == ["m.gguf"] and "id_slot" not in body

@@ -138,6 +138,27 @@ test('{route: null} sends the plain request, with the privacy mode and session h
   }
 });
 
+test('the route lookup names this machine\'s own coding member (own=<trust id>) while the worker is one', async () => {
+  const w = await world({ route: 'none', chat: (ctx) => swarm.plainStream(ctx.res, ['local']) });
+  try {
+    const trustId = 'ab'.repeat(16);
+    const worker = (status) => ({ isContributing: () => true, getStatus: () => status });
+    w.client.setWorkerManager(worker({ state: 'contributing', role: 'coding', roleDetail: { slots: 2, trustId } }));
+    await ask(w.client, 'q', { sessionId: 's-own' });
+    w.client.setWorkerManager(worker({ state: 'contributing', role: 'rpc' }));
+    await ask(w.client, 'q', { sessionId: 's-rpc' });
+    w.client.setWorkerManager(worker({ state: 'contributing', role: 'coding', roleDetail: { trustId: 'not a trust id' } }));
+    await ask(w.client, 'q', { sessionId: 's-odd' });
+    assert.deepEqual(w.c.of('/v1/coding/route').map((r) => r.query), [
+      { session: 's-own', privacy: 'trusted', own: trustId },
+      { session: 's-rpc', privacy: 'trusted' },           // a shard has no member of its own
+      { session: 's-odd', privacy: 'trusted' },           // only 32 hex characters are ever sent
+    ]);
+  } finally {
+    w.close();
+  }
+});
+
 test('a route lookup that fails (500) leaves the plain path, not an error', async () => {
   const w = await world({ route: () => ({ status: 500, body: { detail: 'boom' } }), chat: (ctx) => swarm.plainStream(ctx.res, ['ok']) });
   try {

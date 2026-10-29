@@ -119,7 +119,7 @@ footer a { display: inline-block; padding: 6px 0; }
     <h2>How it works</h2>
     <ol>
       <li>Install <strong>DLNE Code Assistant</strong> from the Extensions view in VS Code, VSCodium or Cursor.</li>
-      <li>Open the DLNE sidebar, or type <code>@dlne</code> in the chat panel. Your first 100 chats are free, no sign-up.</li>
+      <li>In VS Code, type <code>@dlne</code> in the Chat view, or open the DLNE sidebar (DLNE's own chat, for editors with no Chat view). Your first 100 chats are free, no sign-up.</li>
       <li>To keep going, share your idle GPU with the swarm in one click. That is the whole rule: give compute, receive compute.</li>
     </ol>
   </div>

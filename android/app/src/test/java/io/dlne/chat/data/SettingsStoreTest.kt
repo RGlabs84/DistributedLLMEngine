@@ -86,6 +86,22 @@ class SettingsStoreTest {
     }
 
     @Test
+    fun `sharing the location is off until it is turned on, and is remembered`() {
+        val prefs = FakePrefs()
+        val store = SettingsStore(prefs)
+        assertFalse(store.shareLocation.value)
+        assertEquals(0, prefs.writes)
+
+        store.setShareLocation(true)
+        assertTrue(store.shareLocation.value)
+        assertTrue(SettingsStore(prefs).shareLocation.value)
+
+        store.setShareLocation(false)
+        assertFalse(store.shareLocation.value)
+        assertFalse(SettingsStore(prefs).shareLocation.value)
+    }
+
+    @Test
     fun `use default goes to the new default`() {
         val store = SettingsStore(FakePrefs("server_url" to "https://dlne.example.org"))
         store.resetServerUrl()

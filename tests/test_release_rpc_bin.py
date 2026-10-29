@@ -189,6 +189,10 @@ def test_a_substituted_zip_is_caught(tmp_path, pem):
     # ... but no other llama.cpp tool.
     ("bin/llama-cli", False), ("bin/libllama-cli-impl.so", False), ("bin/libllama-bench-impl.so", False),
     ("bin/llama.exe", False), ("bin/llama-server.sh", False),
+    # The Visual C++ runtime ships app-local in the Windows zips, exactly these three files.
+    ("bin/vcruntime140.dll", True), ("bin/vcruntime140_1.dll", True), ("bin/msvcp140.dll", True),
+    ("bin/msvcp140_1.dll", False), ("bin/concrt140.dll", False), ("bin/vcruntime140.dll.lnk", False),
+    ("bin/vcruntime141.dll", False), ("bin/sub/msvcp140.dll", False),
 ])
 def test_what_an_rpc_zip_may_contain(name, ok):
     assert (release.rpc_members([name]) == []) is ok

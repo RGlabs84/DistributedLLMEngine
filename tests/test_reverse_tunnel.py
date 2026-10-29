@@ -14,7 +14,7 @@ import time
 
 import pytest
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from websockets.exceptions import InvalidStatus
 from websockets.sync.client import connect as ws_connect
 
@@ -200,6 +200,143 @@ def test_a_worker_reconnecting_replaces_its_own_tunnel_within_the_cap(coord):
     finally:
         for conn in held:
             conn.close()
+
+
+# --- PING/PONG: how far a worker reached only through its tunnel is (2.4.9) ------------------------------
+
+def test_the_coordinator_times_a_worker_through_its_tunnel(coord, echo_server):
+    coord["register"]("w1", "tok-w1")
+    stop = threading.Event()
+    reverse_tunnel.start_worker_reverse_tunnel(coord["url"], "w1", echo_server, stop,
+                                               token_provider=lambda: "tok-w1")
+    try:
+        assert _wait(lambda: coord["bridge"].get_relay_port("198.51.100.20", 50052) is not None)
+        rtt = coord["bridge"].measure_rtt_ms("198.51.100.20", 50052)
+        assert rtt is not None and 0.0 <= rtt < 1000.0
+        # Pings share the tunnel with RPC traffic and leave it working.
+        assert _round_trip(coord["bridge"].get_relay_port("198.51.100.20", 50052)) == b"tensor bytes"
+    finally:
+        stop.set()
+
+
+def test_a_worker_that_does_not_answer_pings_is_not_measured(coord):
+    """A worker from before 2.4.9 ignores the PING frame: one unanswered ping, not three, and no figure."""
+    coord["register"]("w1", "tok-w1")
+    with _open(coord, "w1", token="tok-w1"):
+        assert _wait(lambda: coord["bridge"].get_relay_port("198.51.100.20", 50052) is not None)
+        started = time.monotonic()
+        assert coord["bridge"].measure_rtt_ms("198.51.100.20", 50052, timeout=0.3) is None
+        assert time.monotonic() - started < 2.0
+
+
+def test_no_tunnel_means_no_measurement(coord):
+    assert coord["bridge"].measure_rtt_ms("198.51.100.20", 50052) is None
+
+
+def test_a_tunnel_busy_uploading_weights_is_not_timed(coord, echo_server, monkeypatch):
+    """A ping queued behind megabytes of weights would make a LAN machine look far."""
+    coord["register"]("w1", "tok-w1")
+    stop = threading.Event()
+    reverse_tunnel.start_worker_reverse_tunnel(coord["url"], "w1", echo_server, stop,
+                                               token_provider=lambda: "tok-w1")
+    try:
+        assert _wait(lambda: coord["bridge"].get_relay_port("198.51.100.20", 50052) is not None)
+        monkeypatch.setattr(reverse_tunnel._WorkerTunnelSession, "get_speed_mb_s", lambda self: 40.0)
+        assert coord["bridge"].measure_rtt_ms("198.51.100.20", 50052) is None
+    finally:
+        stop.set()
+
+
+def test_a_household_worker_is_dialled_on_its_lan_address(monkeypatch, echo_server):
+    from engine import link_paths
+    routes = link_paths.LanRoutes()
+    monkeypatch.setattr(link_paths, "lan_routes", routes)
+    bridge = reverse_tunnel.ReverseRpcBridgeManager()
+    public = f"198.51.100.20:{echo_server}"                      # the household's public address: unreachable
+    routes.offer("198.51.100.20", echo_server, ["127.0.0.1"])     # 127.0.0.1 standing in for 192.168.x.y
+    assert bridge.resolve_endpoint(public, probe_timeout=0.2) == public, "offered but never confirmed"
+    routes.confirm("198.51.100.20", echo_server, "127.0.0.1")
+    assert bridge.resolve_endpoint(public, probe_timeout=0.2) == f"127.0.0.1:{echo_server}"
+
+
+# --- the tunnel over the coordinator's LAN address (2.5.2) -------------------------------------------------
+# The owner's laptop: its nftables dropped the coordinator's dial to :50052, and its tunnel through the public
+# address (router hairpin, TLS) ran at ~24 MB/s against ~290 MB/s on the LAN, too slow to load a shard in time.
+
+def _relay_works(coord) -> bool:
+    relay = coord["bridge"].get_relay_port("198.51.100.20", 50052)
+    try:
+        return relay is not None and _round_trip(relay) == b"tensor bytes"
+    except OSError:
+        return False
+
+
+@pytest.fixture
+def lan_coord(coord):
+    """A second door to the same coordinator (its LAN address), counting the tunnels that come through it."""
+    hits = []
+
+    async def endpoint(websocket: WebSocket, worker_id: str):
+        hits.append(worker_id)
+        await coordinator.rpc_tunnel_endpoint(websocket, worker_id)
+
+    app = FastAPI()
+    app.add_api_websocket_route("/ws/rpc_tunnel/{worker_id}", endpoint)
+    port = _free_port()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    assert _wait(lambda: server.started)
+    yield {"ws": f"ws://127.0.0.1:{port}", "hits": hits}
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+def test_a_household_worker_tunnels_to_the_coordinators_lan_address(coord, lan_coord, echo_server):
+    coord["register"]("w1", "tok-w1")
+    stop = threading.Event()
+    dead_public = f"http://127.0.0.1:{_free_port()}"
+    reverse_tunnel.start_worker_reverse_tunnel(dead_public, "w1", echo_server, stop, token_provider=lambda: "tok-w1",
+                                               lan_url_provider=lambda: lan_coord["ws"])
+    try:
+        assert _wait(lambda: _relay_works(coord))
+        assert lan_coord["hits"] == ["w1"]
+    finally:
+        stop.set()
+
+
+def test_a_lan_address_that_does_not_answer_leaves_the_tunnel_on_the_public_one(coord, echo_server):
+    coord["register"]("w1", "tok-w1")
+    stop = threading.Event()
+    dead_lan = f"ws://127.0.0.1:{_free_port()}"
+    reverse_tunnel.start_worker_reverse_tunnel(coord["url"], "w1", echo_server, stop, token_provider=lambda: "tok-w1",
+                                               lan_url_provider=lambda: dead_lan)
+    try:
+        assert _wait(lambda: _relay_works(coord))
+    finally:
+        stop.set()
+
+
+def test_an_idle_tunnel_moves_to_the_lan_but_never_cuts_a_running_stream(coord, lan_coord, echo_server, monkeypatch):
+    monkeypatch.setattr(reverse_tunnel, "MOVE_CHECK_SECONDS", 0.1)
+    coord["register"]("w1", "tok-w1")
+    lan = {"url": None}                        # the first answers carry no LAN address yet
+    stop = threading.Event()
+    reverse_tunnel.start_worker_reverse_tunnel(coord["url"], "w1", echo_server, stop, token_provider=lambda: "tok-w1",
+                                               lan_url_provider=lambda: lan["url"])
+    try:
+        assert _wait(lambda: coord["bridge"].get_relay_port("198.51.100.20", 50052) is not None)
+        relay = coord["bridge"].get_relay_port("198.51.100.20", 50052)
+        with socket.create_connection(("127.0.0.1", relay), timeout=5) as running:   # weights on their way
+            running.sendall(b"x")
+            assert running.recv(1) == b"x"
+            lan["url"] = lan_coord["ws"]
+            time.sleep(0.6)
+            assert lan_coord["hits"] == [], "a stream was running: the tunnel stays where it is"
+        assert _wait(lambda: lan_coord["hits"] == ["w1"])
+        assert _wait(lambda: _relay_works(coord))
+    finally:
+        stop.set()
 
 
 @pytest.mark.parametrize("version, key", [("17.3", "additional_headers"), ("14.0", "additional_headers"),

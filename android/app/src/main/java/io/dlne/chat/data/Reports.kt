@@ -42,26 +42,29 @@ object Reports {
      * The report for the assistant message [answerId] in [messages], or null if there is no
      * such answer or it has no text. The question is the user's message right before it; if
      * the person sent several in a row (say, after an attempt that got no answer), the
-     * answer replied to all of them, so they are joined.
+     * answer replied to all of them, so they are joined. A reply that made a picture is reported
+     * with its `[Picture created: ...]` line (the description, never the picture), so a report on
+     * the picture says what it was meant to show.
      */
     fun build(messages: List<ChatMessage>, answerId: String, reason: ReportReason, note: String): ReportRequest? {
         val index = messages.indexOfFirst { it.id == answerId }
         if (index < 0) return null
         val answer = messages[index]
-        if (answer.role != Role.ASSISTANT || answer.content.isBlank()) return null
+        val answerText = answer.textWithPicture()
+        if (answer.role != Role.ASSISTANT || answerText.isBlank()) return null
 
         val questionParts = ArrayDeque<String>()
         var i = index - 1
         while (i >= 0) {
             val message = messages[i]
-            if (message.role == Role.ASSISTANT && message.content.isNotBlank()) break // an earlier answer
+            if (message.role == Role.ASSISTANT && message.textWithPicture().isNotBlank()) break // an earlier answer
             if (message.role == Role.USER && message.content.isNotBlank()) questionParts.addFirst(message.content.trim())
             i--
         }
 
         return ReportRequest(
             question = questionParts.joinToString("\n\n").takeChars(MAX_QUESTION_CHARS),
-            answer = answer.content.trim().takeChars(MAX_ANSWER_CHARS),
+            answer = answerText.takeChars(MAX_ANSWER_CHARS),
             reason = reason,
             note = note.trim().takeChars(MAX_NOTE_CHARS),
         )

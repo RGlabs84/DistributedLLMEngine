@@ -23,6 +23,57 @@ from engine.logger import log_system, log_success, log_error, log_warning
 # and named in the coordinator's signed release (llama_build / rpc_proto); sync_rpc_bin below
 # installs exactly that build.
 
+# Windows' loader exits a program with STATUS_DLL_NOT_FOUND (0xC0000135) when a DLL it imports
+# is not on the machine. llama.cpp's Windows builds import the Visual C++ runtime
+# (VCRUNTIME140, VCRUNTIME140_1, MSVCP140), which a clean Windows does not have.
+DLL_NOT_FOUND_CODES = (0xC0000135, -1073741515)
+VCREDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+# One line of the worker's output the VS Code extension and the tray app act on (like DLNE_ROLE).
+VCREDIST_MARKER = "DLNE_NEEDS: vcredist"
+VCREDIST_TEXT = ("The Visual C++ Runtime is missing from this PC, so the DLNE engine cannot start. "
+                 f"Install \"Microsoft Visual C++ Redistributable (x64)\" from {VCREDIST_URL} and start DLNE again.")
+
+
+def is_dll_not_found(code: Optional[int]) -> bool:
+    """A Windows exit code meaning \"a DLL this program imports was not found\" (0xC0000135)."""
+    return code in DLL_NOT_FOUND_CODES
+
+
+def vcruntime_present(bin_dir: str = "") -> bool:
+    """Whether the Visual C++ runtime the engine needs can be loaded here (always True off Windows).
+
+    True when ``bin_dir`` carries its own copy (a release that ships the runtime beside the
+    programs) or when Windows can load VCRUNTIME140 and MSVCP140 from the system.
+    """
+    if platform.system() != "Windows":
+        return True
+    if bin_dir and all(os.path.exists(os.path.join(bin_dir, n)) for n in ("vcruntime140.dll", "msvcp140.dll")):
+        return True
+    try:
+        import ctypes
+        for name in ("vcruntime140.dll", "msvcp140.dll"):
+            ctypes.WinDLL(name)
+        return True
+    except OSError:
+        return False
+    except Exception:  # noqa: BLE001 - cannot tell: do not claim it is missing
+        return True
+
+
+def explain_dll_not_found(binary_path: str, code: int) -> str:
+    """What to tell the user when a program exits 0xC0000135. Never blames the CPU."""
+    if platform.system() == "Windows" and not vcruntime_present(os.path.dirname(binary_path)):
+        return VCREDIST_TEXT
+    return (f"{os.path.basename(binary_path)} could not start because Windows could not find a DLL it needs "
+            f"(code {code}). The most common cause is the Visual C++ Runtime: install it from {VCREDIST_URL}. "
+            "A missing Vulkan runtime or a damaged bin folder gives the same code.")
+
+
+# Why the last candidate in download_and_extract_engine was refused, so its closing message
+# names the real cause. "" when there was none worth naming.
+_last_failure = ""
+
+
 def test_binary_compatibility(binary_path: str, _allow_dependency_install: bool = True) -> bool:
     """Tests if a binary can run on the host CPU without an illegal instruction crash or missing libs.
 
@@ -31,6 +82,7 @@ def test_binary_compatibility(binary_path: str, _allow_dependency_install: bool 
     retry a single hop. Without it a loader that installs "successfully" but still does not
     satisfy the binary would send the function into unbounded recursion.
     """
+    global _last_failure
     os_name = platform.system()
     if os_name == "Windows":
         import ctypes
@@ -67,9 +119,15 @@ def test_binary_compatibility(binary_path: str, _allow_dependency_install: bool 
                 log_system("Falling back to Pure CPU tier...")
             return False
             
-        elif result.returncode == 127 or result.returncode == 3221225781 or result.returncode == -1073741515:
+        elif os_name == "Windows" and is_dll_not_found(result.returncode):
+            message =explain_dll_not_found(binary_path, result.returncode)
+            _last_failure = "vcredist" if message == VCREDIST_TEXT else "dll"
+            log_error(f"Missing DLL [Code {result.returncode}] for {os.path.basename(binary_path)}: {message}")
+            if _last_failure == "vcredist":
+                print(VCREDIST_MARKER, flush=True)
+        elif result.returncode == 127 or is_dll_not_found(result.returncode):
             log_error(f"Missing Shared Library (DLL) [Code {result.returncode}] for {os.path.basename(binary_path)}: {err_msg}")
-            log_error("Hint: Ensure required .dll files (like libgomp-1.dll, libgcc_s_seh-1.dll, or vulkan-1.dll) are in the 'bin' folder.")
+            log_error("Hint: Ensure required shared libraries (like libgomp, libvulkan or vulkan-1.dll) are in the 'bin' folder.")
         elif result.returncode == 132 or result.returncode == 3221225493 or result.returncode == -1073741795:
             log_error(f"Illegal Instruction Crash [Code {result.returncode}] for {os.path.basename(binary_path)} (Missing CPU instructions like AVX/AVX2).")
             if "-cpu" in binary_path:
@@ -167,6 +225,8 @@ def download_and_extract_engine(role: str, coordinator_url: Optional[str] = None
     coordinator_url: for a worker that is not on the coordinator's host, where to fetch the
     signed ggml-rpc-server build from (see sync_rpc_bin).
     """
+    global _last_failure
+    _last_failure = ""
     os_name = platform.system()
     ext = ".exe" if os_name == "Windows" else ""
     target_bin_base = "llama-server" if role == "coordinator" else "ggml-rpc-server"
@@ -236,7 +296,14 @@ def download_and_extract_engine(role: str, coordinator_url: Optional[str] = None
                 else:
                     log_system(f"Capability mismatch for {candidate}. Checking fallback tier...")
 
-    log_error(f"FATAL: Could not locate a compatible bundled binary for '{target_bin_base}'. Please ensure your CPU supports AVX2.")
+    if _last_failure == "vcredist":
+        log_error(f"FATAL: {target_bin_base} cannot start. {VCREDIST_TEXT}")
+    elif _last_failure == "dll":
+        log_error(f"FATAL: {target_bin_base} cannot start because a DLL it needs is missing (see above). "
+                  f"Installing the Visual C++ Runtime from {VCREDIST_URL} fixes the usual case.")
+    else:
+        log_error(f"FATAL: Could not locate a compatible bundled binary for '{target_bin_base}'. "
+                  "Check the lines above for the reason (an engine that crashes with an illegal instruction needs a CPU with AVX2).")
     return None
 
 

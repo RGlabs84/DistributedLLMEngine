@@ -600,3 +600,14 @@ def test_the_role_tables_stay_consistent_with_each_other():
     assert "coordinator_only" not in setup_core.COMPUTE_MODES
     assert "coordinator_hybrid" in setup_core.COMPUTE_MODES
     assert "coordinator_hybrid" in setup_core.COORDINATOR_MODES
+
+
+def test_the_rpc_port_is_also_opened_to_the_same_subnet_for_a_docked_laptop_on_a_public_network():
+    """Windows leaves a wired office or home network 'Public' until someone says otherwise; a coordinator on that
+    LAN dials the RPC port there. The extra rule reaches that subnet only, never every network (2.5.0)."""
+    script = setup_core.build_security_script(r"C:\DLNE", {"rpc": 50052, "bind": 11435, "discovery": 50051},
+                                              has_wdac=False, marker_path=r"C:\DLNE\.security_done")
+    assert "DLNE Worker RPC (same subnet)" in script
+    assert "-LocalPort 50052 -Profile Any -RemoteAddress LocalSubnet" in script
+    assert script.count("-Profile Any") == 1, "only the subnet-scoped rule; the others stay Private,Domain"
+    assert "-Profile Private,Domain" in script

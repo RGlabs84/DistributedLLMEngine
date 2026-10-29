@@ -41,6 +41,7 @@ import httpx
 
 from engine.config import get_base_dir
 from engine.logger import log_coordinator, log_error, log_warning
+from engine.priority import lane_book
 from engine.wireguard import WG_SUBNET_CIDR
 
 # The prompt every benchmark sends unless a caller supplies one. Fixed on purpose: two runs
@@ -280,6 +281,12 @@ async def run_inference_benchmark(manager, model_path: str,
         "temperature": 0.0,
     }
 
+    # With phone lanes the engine would put an idle request on whichever slot it likes, a phone's included.
+    lane = None
+    if int(snapshot.get("phone_slots") or 0) > 0:
+        lane = lane_book.take(0, int(snapshot.get("dynamic_slots") or 1), short=True)
+        payload["id_slot"] = lane
+
     started = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=BENCHMARK_TIMEOUT) as client:
@@ -291,6 +298,9 @@ async def run_inference_benchmark(manager, model_path: str,
             "ok": False,
             "detail": f"The engine did not complete the benchmark request: {exc}",
         }
+    finally:
+        if lane is not None:
+            lane_book.give(lane, short=True)
     elapsed = time.perf_counter() - started
 
     if response.status_code != 200:

@@ -27,7 +27,7 @@ class LiveSmokeTest {
         var tokens = 0
         val answer = StringBuilder()
         try {
-            api.streamChat(baseUrl, listOf(WireMessage("user", "In one short sentence: what is a volunteer computing network?")), maxTokens = 64)
+            api.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "In one short sentence: what is a volunteer computing network?")), maxTokens = 64)
                 .collect { event ->
                     when (event) {
                         is StreamEvent.Content -> {
@@ -47,6 +47,8 @@ class LiveSmokeTest {
                             answer.clear()
                             println("\nSMOKE retract: the server took the answer back to look it up")
                         }
+                        is StreamEvent.ImageJob -> println("SMOKE picture job ${event.id}: ${event.prompt} (${event.size}, place ${event.position}, about ${event.etaSeconds} s)")
+                        is StreamEvent.ImageRefused -> println("SMOKE picture refused (${event.code}): ${event.detail}")
                         StreamEvent.Done -> println("\nSMOKE [DONE]")
                     }
                 }

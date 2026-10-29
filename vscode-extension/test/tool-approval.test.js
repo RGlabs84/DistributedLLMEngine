@@ -143,7 +143,7 @@ test('clearing the conversation (/clear) withdraws session approval', () =>
   withWorkspace(async () => {
     const { AgentLoop } = require('../dist/agent/agentLoop');
     await run('write_file', { path: 'one.txt', content: '1' });
-    AgentLoop.prototype.clearHistory.call({ initSystemPrompt() {} });
+    new AgentLoop({}).clearHistory();
     await run('write_file', { path: 'two.txt', content: '2' });
     assert.equal(asked.length, 2);
   }, { answer: 'session' }));

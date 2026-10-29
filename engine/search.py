@@ -38,9 +38,11 @@ nowhere else: never a log line, an error or ``search_status``.
 """
 
 import asyncio
+import copy
 import datetime
 import html
 import json
+import logging
 import math
 import os
 import re
@@ -57,9 +59,14 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from engine.config import get_base_dir, get_worker_limits
+from engine import places
 from engine.logger import log_warning
 from engine.priority import UsageWindow
 from engine.version import VERSION
+
+# httpx logs every request's full URL at INFO, and a located forecast's URL holds the coordinates.
+# Nothing here configures that logger, but the guarantee must not depend on who does.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Wikimedia's User-Agent policy asks for "<client>/<version> (<contact>) <library>/<version>";
 # the other services get the same honest name.
@@ -991,9 +998,14 @@ async def _geocode(client: httpx.AsyncClient, location: str) -> Optional[Dict[st
 
 
 def _num(value: Any) -> Optional[float]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    """A finite float, or None: strings and booleans are not numbers, and neither is an int too large for a float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 _WMO = {
@@ -1101,6 +1113,120 @@ def _parse_forecast(data: Any, place: str) -> Optional[_Hit]:
 
 
 # ======================================================================================
+# The phone's own location
+# ======================================================================================
+#
+# A phone may allow its precise location, and only these lookups use it: it never enters the
+# model's prompt, a log line, an exception text or a result. Weather gets the coordinates
+# rounded to about 100 m; searches get a place name and never any coordinates. The location is
+# passed as a (lat, lon) pair that ``clean_location`` produced.
+
+Location = Tuple[float, float]
+
+# Names the model gives for "where the user is" instead of leaving the place out.
+_HERE = frozenset({"", "here", "my location", "my current location", "current location", "near me", "nearby",
+                   "around here", "around me", "my area", "where i am", "where i live", "my place",
+                   "my city", "my town"})
+# Conservative on purpose: a phrase that only means "near the user" in a query. The model's own
+# near_me flag catches the rest. "nearby" counts only at the start or end ("pizza nearby", "nearby
+# restaurants"): in the middle it is mostly an adjective ("how do nearby stars look").
+_NEAR_ME = re.compile(r"\b(?:near me|near here|around here|close to me|around me)\b|^\s*nearby\b|\bnearby\W*$", re.I)
+# A query that already says where ("restaurants in Rome"): a preposition and a capitalised name.
+_OWN_PLACE = re.compile(r"\b(?i:in|at|near|around|within|outside)\s+(?:(?i:the)\s+)?[A-Z]")
+# Said to the model when a local search or a weather "here" cannot be made.
+PLACE_UNKNOWN = ("The user's place is not known: no town on the list is within 50 km of where their phone is. Say you "
+                 "cannot tell where they are, and ask which town or city they mean.")
+NO_LOCATION = ("The user's place is not known: they did not share their location. Say so, and ask them to name a "
+               "town or city, or to turn on location sharing in the app.")
+
+
+def clean_location(raw: Any) -> Optional[Location]:
+    """{"lat": .., "lon": ..} from a request body as a (lat, lon) pair, or None when it is anything else."""
+    if not isinstance(raw, dict):
+        return None
+    lat, lon = _num(raw.get("lat")), _num(raw.get("lon"))
+    if lat is None or lon is None or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return lat, lon
+
+
+def _rounded(location: Location) -> Location:
+    """About 100 m: all that a forecast, or a town, needs."""
+    return round(location[0], 3), round(location[1], 3)
+
+
+def _town(location: Location) -> Optional[str]:
+    """"Town, Region" for the search engines (the country adds length, not precision), else None."""
+    name = places.describe(*_rounded(location))
+    parts = list(dict.fromkeys(part.strip() for part in (name or "").split(",") if part.strip()))
+    return ", ".join(parts[:2]) or None
+
+
+def _is_near_me(arguments: Optional[Dict[str, Any]], query: str) -> bool:
+    flag = (arguments or {}).get("near_me")
+    return flag is True or (isinstance(flag, str) and flag.strip().casefold() == "true") or bool(_NEAR_ME.search(query))
+
+
+def _localize(query: str, location: Location, max_chars: int) -> Optional[Tuple[str, bool]]:
+    """
+    ``(query, from_the_location)`` for a local search, or None when it cannot be made.
+
+    "near me" and the like become "near <town>" (``from_the_location`` True: the result is private, see
+    :func:`run_tool`). A query that already names a place only loses the phrase: no town is added to it. When no
+    town is within reach of the phone the search is NOT made (None): sent as "pizza near me" the engines would answer
+    for this server's own address, and the answer would be cached for everyone. The query is cut before the town
+    is added, so the town is never the part that is lost.
+    """
+    rest = " ".join(_NEAR_ME.sub(" ", query).split()).rstrip(" ?!.,;:")
+    if _OWN_PLACE.search(rest):
+        return rest, False
+    town = _town(location)
+    if town is None:
+        return None
+    suffix = f" near {town}"
+    rest = _clean_query(rest, max_chars - len(suffix)) if rest else ""
+    return (f"{rest}{suffix}" if rest else ""), True
+
+
+# ======================================================================================
+# Where a phone was, for a report
+# ======================================================================================
+#
+# A report (coordinator.app_report) stores the question and the answer as the phone sent them, and an answer to "pizza
+# near me" names the town the lookup used. That town came from the location, which is never stored, so the towns a
+# network's located lookups used are kept here, in memory and for a few hours only, and taken out of its reports.
+
+PLACE_MEMORY_SECONDS = 6 * 3600.0
+PLACE_MEMORY_MAX = 4096
+_places: "OrderedDict[str, Tuple[float, Tuple[str, ...]]]" = OrderedDict()
+
+
+def _remember_place(network_id: str, label: str) -> None:
+    """Note that ``network_id``'s answer was given for ``label`` ("Town, Region, Country"), as every way it may be written."""
+    parts = [part.strip() for part in label.split(",") if part.strip()]
+    names = {", ".join(parts[:count]) for count in range(1, len(parts) + 1)}
+    names = tuple(sorted((n for n in names if len(n) >= 3), key=len, reverse=True))
+    if not names:
+        return
+    _places.pop(network_id, None)
+    _places[network_id] = (_clock() + PLACE_MEMORY_SECONDS, names)
+    while len(_places) > PLACE_MEMORY_MAX:
+        _places.popitem(last=False)
+
+
+def redact_places(network_id: str, text: str) -> str:
+    """``text`` with the towns ``network_id``'s recent located lookups used replaced by "[place]"."""
+    entry = _places.get(network_id)
+    if entry is None:
+        return text
+    if entry[0] < _clock():
+        del _places[network_id]
+        return text
+    pattern = "|".join(re.escape(name) for name in entry[1])
+    return re.sub(rf"(?<!\w)(?:{pattern})(?!\w)", "[place]", text, flags=re.IGNORECASE)
+
+
+# ======================================================================================
 # The tools
 # ======================================================================================
 
@@ -1108,6 +1234,7 @@ def _parse_forecast(data: Any, place: str) -> Optional[_Hit]:
 class _Context:
     client: httpx.AsyncClient
     limits: Dict[str, Any]
+    location: Optional[Location] = None
 
     @property
     def budget(self) -> int:
@@ -1118,7 +1245,23 @@ class _Context:
         return int(self.limits.get("search_cache_minutes", 30))
 
 
+async def _tool_weather_here(ctx: _Context) -> _Evidence:
+    """The forecast where the phone is: no geocoding, coordinates to ~100 m, labelled by town only."""
+    lat, lon = _rounded(ctx.location)
+    place = {"label": places.describe(lat, lon) or "your location", "latitude": lat, "longitude": lon}
+    try:
+        if not await _upstreams["open-meteo"].take():
+            raise _NoAnswer("The weather service's allowance is used up for now; try again later.")
+        hit = await _forecast(ctx.client, place)
+    except _Failed as failure:
+        _service_failed("open-meteo", failure)
+        raise _NoAnswer("The weather service didn't answer just now; try again in a minute.") from None
+    return _Evidence("Weather data", "open-meteo", _fit([hit], "Weather data", ctx.budget))
+
+
 async def _tool_weather(ctx: _Context, location: str) -> _Evidence:
+    if ctx.location is not None and _normalize(location) in _HERE:
+        return await _tool_weather_here(ctx)
     service = _upstreams["open-meteo"]
     key = ("geocode", _normalize(location))
     place = _cache.get(key)
@@ -1283,6 +1426,27 @@ TOOLS: List[Dict[str, Any]] = [
 
 TOOL_NAMES = tuple(_TOOL_SPECS)
 
+NEAR_ME_DESCRIPTION = "true when the user asks about places or things near them (shops, food, services)."
+
+
+def _located_tools() -> List[Dict[str, Any]]:
+    """
+    TOOLS for a phone that gave its location: weather may leave the place out (the user's own),
+    and the searches take near_me. A phone without one is offered TOOLS exactly as they are.
+    """
+    tools = copy.deepcopy(TOOLS)
+    for tool in tools:
+        function = tool["function"]
+        if function["name"] == "weather":
+            function["description"] += " Leave location empty for the user's own place."
+            function["parameters"]["required"] = []
+        elif function["name"] in ("news", "web_search"):
+            function["parameters"]["properties"]["near_me"] = {"type": "boolean", "description": NEAR_ME_DESCRIPTION}
+    return tools
+
+
+TOOLS_LOCATED: List[Dict[str, Any]] = _located_tools()
+
 
 def _failure(tool: str, reason: str) -> SearchResult:
     return SearchResult(ok=False, reason=reason, tool=tool)
@@ -1299,12 +1463,15 @@ def _arguments(arguments: Any) -> Optional[Dict[str, Any]]:
 
 
 async def run_tool(name: str, arguments: Any, *, client: httpx.AsyncClient, network_id: str,
-                   first_n: int = 1) -> SearchResult:
+                   first_n: int = 1, location: Optional[Location] = None) -> SearchResult:
     """
     Runs one tool call and returns its evidence, numbered from ``first_n``. Never raises for
     anything the model or a service does: an unknown tool, bad arguments, a used-up allowance
     or a dead service all come back as ``ok=False`` with a reason. A cached answer is free; any
-    other lookup counts against ``network_id``'s hourly allowance.
+    other lookup counts against ``network_id``'s hourly allowance. With the phone's ``location``
+    (from :func:`clean_location`), weather for "here" or no place is the forecast there, and a
+    search that is local (the model's near_me, or a phrase such as "near me") asks for the
+    town instead; see the section above. Nothing about the location is logged or returned.
     """
     tool = name if isinstance(name, str) else ""
     spec = _TOOL_SPECS.get(tool)
@@ -1316,7 +1483,34 @@ async def run_tool(name: str, arguments: Any, *, client: httpx.AsyncClient, netw
     if not limits.get("search_enabled", True):
         return _failure(tool, NOT_SET_UP)
     args = _arguments(arguments)
-    value = _clean_query(args.get(spec.argument), spec.max_chars) if args is not None else ""
+    given = args.get(spec.argument) if args is not None else None
+    if given is not None and not isinstance(given, str):
+        return _failure(tool, f"The {tool} tool needs a non-empty “{spec.argument}” as text.")
+    value = _clean_query(given, spec.max_chars)
+    # What came from the phone's location is "processed ephemerally": such a lookup (weather here,
+    # a search rewritten with the town) is neither read from nor written to the result cache, so
+    # nothing derived from a location outlives the request or is served to another phone.
+    # (Arguments that did not parse are no place at all: they are never read as "here".)
+    private = False
+    if location is not None:
+        if tool == "weather" and args is not None and _normalize(value) in _HERE:
+            value, private = "here", True
+            _remember_place(network_id, places.describe(*_rounded(location)) or "")
+        elif tool in ("news", "web_search") and value and _is_near_me(args, value):
+            local = _localize(value, location, spec.max_chars)
+            if local is None:
+                return _failure(tool, PLACE_UNKNOWN)
+            value, private = local
+            if private:
+                _remember_place(network_id, _town(location) or "")
+    elif tool == "weather" and value and _normalize(value) in _HERE:
+        # Geocoded, "here" is a place called Here somewhere: with no location the user's own place is not known.
+        return _failure(tool, NO_LOCATION)
+    elif tool in ("news", "web_search") and value and _is_near_me(args, value) \
+            and not _OWN_PLACE.search(" ".join(_NEAR_ME.sub(" ", value).split())):
+        # Sent as it is, "pizza near me" is answered for this server's own address and read as the user's town. Before
+        # the allowance and the cache: nothing is searched, counted or kept.
+        return _failure(tool, NO_LOCATION)
     if not value:
         return _failure(tool, f"The {tool} tool needs a non-empty “{spec.argument}”.")
     try:
@@ -1326,6 +1520,8 @@ async def run_tool(name: str, arguments: Any, *, client: httpx.AsyncClient, netw
 
     setting = int(limits.get("search_cache_minutes", 30))
     minutes = setting if spec.cache_minutes is None else min(spec.cache_minutes, setting)
+    if private:
+        minutes = 0
     key = (tool, _normalize(value))
     if minutes > 0:
         evidence = _cache.get(key)
@@ -1338,7 +1534,7 @@ async def run_tool(name: str, arguments: Any, *, client: httpx.AsyncClient, netw
         return _failure(tool, reason)
     _usage.record_lookup(tool, cache_hit=False)
     try:
-        evidence = await spec.run(_Context(client, limits), value)
+        evidence = await spec.run(_Context(client, limits, location), value)
     except _NoAnswer as refusal:
         return _failure(tool, refusal.reason)
     except Exception as exc:  # noqa: BLE001 - a bug in one lookup must not take the answer down

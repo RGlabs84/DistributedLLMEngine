@@ -126,6 +126,7 @@ def _profile(monkeypatch, has_gpu, bandwidth=33.3):
     monkeypatch.setattr(hardware, "get_gpu_info", lambda: gpu)
     monkeypatch.setattr(hardware, "get_gpu_type", lambda: "vulkan" if has_gpu else "cpu")
     monkeypatch.setattr(hardware, "is_gaming_or_heavy_load", lambda info: False)
+    monkeypatch.setattr(hardware, "get_dock_state", lambda: {"link": "unknown", "power": "unknown"})
     monkeypatch.setattr(hardware, "get_cpu_features", lambda: ["avx2", "fma"])
     measured = []
     monkeypatch.setattr(hardware, "get_memory_bandwidth_gbs", lambda: measured.append(1) or bandwidth)

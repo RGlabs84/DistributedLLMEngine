@@ -142,6 +142,17 @@ export function planContribution(
   };
 }
 
+/** The worker prints this line (engine/downloader.py VCREDIST_MARKER) when a Windows engine exits 0xC0000135 for want of the Visual C++ Runtime. */
+export const VCREDIST_MARKER = 'DLNE_NEEDS: vcredist';
+export const VCREDIST_URL = 'https://aka.ms/vs/17/release/vc_redist.x64.exe';
+export const VCREDIST_MESSAGE =
+  'DLNE can\'t start its engine: the Visual C++ Runtime is missing from this PC. Install "Microsoft Visual C++ Redistributable (x64)", then start DLNE again.';
+
+/** Whether worker output says the Visual C++ Runtime is missing. */
+export function parseVcredistNeeded(output: string): boolean {
+  return output.split(/\r?\n/).some((line) => line.includes(VCREDIST_MARKER));
+}
+
 /** The coordinator's reason for refusing this machine, from worker output, or null. */
 export function parseRefusal(output: string): string | null {
   for (const line of output.split(/\r?\n/)) {
@@ -167,6 +178,27 @@ export function powershellQuote(value: string): string {
 /** The command that unpacks a zip with Windows PowerShell. `-LiteralPath` so `[` and `]` in a folder name are not wildcards. */
 export function powershellExpandCommand(zipPath: string, destDir: string): string {
   return `powershell -NoProfile -Command "Expand-Archive -LiteralPath ${powershellQuote(zipPath)} -DestinationPath ${powershellQuote(destDir)} -Force"`;
+}
+
+/** How long a stopped worker has to shut its coding model server down before it is killed (macOS and Linux). */
+export const WORKER_STOP_GRACE_MS = 8000;
+/**
+ * engine/worker.py LEAVE_GRACE_SECONDS: how long a worker that carries a shard of the model keeps its RPC server up
+ * after SIGTERM, for the answers running on it. The kill waits that long, plus a margin for the engine to wind down.
+ */
+export const WORKER_LEAVE_GRACE_MS = 90_000;
+export const WORKER_LEAVE_MARGIN_MS = 15_000;
+/** Shown while a worker that carries a shard finishes its work before it goes; a second Stop forces it. */
+export const LEAVING_TEXT = "Leaving the swarm... (finishing the shard's work)";
+
+/**
+ * How long Stop waits for the worker to exit before it kills it. Only a worker that may carry a shard (`rpc`) leaves
+ * the swarm gracefully, and only where SIGTERM reaches it: Windows ends the process on the spot, so the short wait
+ * stays. A worker with no shard exits within seconds (its model server), and a hung one is not waited for.
+ */
+export function workerStopGraceMs(mayCarryShard: boolean, platform: string): number {
+  if (platform === 'win32') return 800;
+  return mayCarryShard ? WORKER_LEAVE_GRACE_MS + WORKER_LEAVE_MARGIN_MS : WORKER_STOP_GRACE_MS;
 }
 
 /**
@@ -406,6 +438,17 @@ export const EXTERNAL_WORKER_TEXT =
   `${EXTERNAL_WORKER_LINE} Stop Contributing stops it if it is the dlne-worker service; one started from a terminal ` +
   'or another editor stops there. Then start again to contribute with your VS Code settings.';
 
+/**
+ * The worker running is DLNE Donate's, the tray app for Windows and Linux (desktop/dlne_donate; recognised by
+ * trayApp.ts trayWorkerRunning). It is one of the workers above, named for what it is. It is stopped in the app (its
+ * tray icon or its window): VS Code has no way to ask the app, and ending its worker from here would only make the app
+ * report that the worker died.
+ */
+export const TRAY_WORKER_LINE = 'Donating from the DLNE Donate tray app, with its own settings, not the ones here.';
+/** "Stop donating" is the app's own label, on its window's button and in its tray icon's menu (desktop/dlne_donate). */
+export const TRAY_WORKER_STOP = 'To stop it, click Stop donating in DLNE Donate (its tray icon or its window).';
+export const TRAY_WORKER_TEXT = `${TRAY_WORKER_LINE} ${TRAY_WORKER_STOP} Then you can donate from VS Code with your settings here.`;
+
 /** The toast when the worker starts. */
 export function workerStartedNotice(cpuPool: boolean): string {
   return cpuPool
@@ -429,6 +472,14 @@ export interface ContributionView {
   alsoCpu?: boolean;
   /** The running worker was started outside this editor (EXTERNAL_WORKER_LINE); its settings are not these. */
   external?: boolean;
+  /** That outside worker is the DLNE Donate tray app's (TRAY_WORKER_LINE). */
+  trayApp?: boolean;
+  /** Whether this machine is docked, from the worker's last DLNE_DOCK line (2.5.0). */
+  dock?: DockState;
+  /** Whether this machine is stepping aside for its owner's own load, from the last DLNE_YIELD line (2.5.0). */
+  yielding?: YieldState;
+  /** A newer signed compute engine than the installed one is published by the coordinator (2.5.0). */
+  engineUpdate?: { installed: string | null; available: string };
 }
 
 /** The sidebar's contribution card: two HTML lines and the button. */
@@ -436,6 +487,20 @@ export interface ContributionCopy {
   deviceHtml: string;
   ruleHtml: string;
   buttonText: string;
+  /** The engine button: "Set Up Engine", or "Update Engine → x.y.z" when a newer signed engine is published. */
+  engineButton: { text: string; title: string };
+}
+
+/** What the engine button says (see ContributionCopy.engineButton). */
+export function engineButtonCopy(st: Pick<ContributionView, 'engineUpdate'>): { text: string; title: string } {
+  if (st.engineUpdate) {
+    const installed = st.engineUpdate.installed ? `the installed one is ${st.engineUpdate.installed}` : 'the installed one has no version record';
+    return {
+      text: `Update Engine → ${st.engineUpdate.available}`,
+      title: `A newer signed DLNE compute engine (${st.engineUpdate.available}) is published; ${installed}. Click to update it.`,
+    };
+  }
+  return { text: 'Set Up Engine', title: 'Install the signed DLNE compute engine' };
 }
 
 /** A device name from the driver goes into the sidebar's HTML. */
@@ -447,11 +512,22 @@ export function contributionCopy(st: ContributionView): ContributionCopy {
   const active = st.state === 'contributing';
   const starting = st.state === 'starting';
   const buttonText = (idle: string) => (active ? '⏹ Stop Contributing' : starting ? '⏳ Initializing...' : idle);
+  const engineButton = engineButtonCopy(st);
+  if (active && st.external && st.trayApp) {
+    // The Donate panel already says where to stop it, under its button (TRAY_WORKER_STOP); this line is the status.
+    return {
+      deviceHtml: `<strong>DLNE Donate:</strong> ${escapeHtml(TRAY_WORKER_LINE)}`,
+      ruleHtml: '✅ <strong>Active:</strong> DLNE Donate, the tray app, is donating this computer.',
+      buttonText: buttonText(''),
+      engineButton,
+    };
+  }
   if (active && st.external) {
     return {
       deviceHtml: `<strong>Outside VS Code:</strong> ${escapeHtml(EXTERNAL_WORKER_LINE)}`,
       ruleHtml: 'Stop Contributing stops it; start again to contribute with your settings here.',
       buttonText: buttonText(''),
+      engineButton,
     };
   }
   if (st.cpuPool) {
@@ -464,6 +540,7 @@ export function contributionCopy(st: ContributionView): ContributionCopy {
         ? '⏳ Joining the CPU pool...'
         : `<strong>You get:</strong> ${CPU_POOL_PERK}.`,
       buttonText: buttonText('⚡ Power the DLNE Phone App'),
+      engineButton,
     };
   }
   const apiTag = st.gpu.api ? st.gpu.api.toUpperCase() : 'VULKAN';
@@ -476,12 +553,16 @@ export function contributionCopy(st: ContributionView): ContributionCopy {
       ? '⏳ Connecting local worker to cluster coordinator...'
       : '<strong>Core Rule:</strong> You must give compute to receive compute.',
     buttonText: buttonText('⚡ Contribute Local GPU'),
+    engineButton,
   };
 }
 
 /** The "Local Contribution" lines of the status bar tooltip. */
 export function contributionTooltip(st: ContributionView): string[] {
   const active = st.state === 'contributing';
+  if (active && st.external && st.trayApp) {
+    return ['Local Contribution: THE DLNE DONATE TRAY APP (its own settings)', TRAY_WORKER_TEXT];
+  }
   if (active && st.external) {
     return ['Local Contribution: A WORKER STARTED OUTSIDE VS CODE (its own settings)', EXTERNAL_WORKER_TEXT];
   }
@@ -533,6 +614,11 @@ export interface RoleDetail {
    * machine gives theirs to the operator.
    */
   trustId?: string;
+  /** Tokens of context each request gets on this member (2.5.0: `-c` over its slots). */
+  context?: number;
+  /** The member's own speed from its join test (2.5.0): tokens a second writing and reading. */
+  decodeTps?: number;
+  prefillTps?: number;
 }
 
 /** The hint shown beside a trust id. */
@@ -567,6 +653,11 @@ export function parseRole(output: string): RoleAssignment | null {
         if (typeof detail.tier === 'string' && detail.tier.length <= 128) assignment.tier = detail.tier;
         if (Number.isInteger(detail.slots) && detail.slots >= 1 && detail.slots <= 64) assignment.slots = detail.slots;
         if (typeof detail.trust_id === 'string' && /^[0-9a-f]{32}$/.test(detail.trust_id)) assignment.trustId = detail.trust_id;
+        if (Number.isInteger(detail.context) && detail.context >= 1024 && detail.context <= 2 ** 21) assignment.context = detail.context;
+        for (const [key, field] of [['decode_tps', 'decodeTps'], ['prefill_tps', 'prefillTps']] as const) {
+          const value = detail[key];
+          if (typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 100000) assignment[field] = Math.round(value * 10) / 10;
+        }
       } catch {
         // the role alone stands
       }
@@ -615,6 +706,71 @@ export function parseClock(output: string): number | null {
       if (Number.isFinite(offset) && Math.abs(offset) <= 10 * 365 * 86400) found = Math.round(offset);
     } catch {
       // not a clock line after all
+    }
+  }
+  return found;
+}
+
+/**
+ * The line the worker prints (engine/worker.py DOCK_MARKER, 2.5.0) once per change of whether this machine is docked:
+ * `DLNE_DOCK: {"link": "wired", "power": "ac", "docked": true}`. A fact the worker could not read is left out, and
+ * `docked` only appears when both are known. A docked GPU on the coordinator's LAN shares the swarm's big model; an
+ * undocked one runs a whole model by itself (contract section 1).
+ */
+export const DOCK_MARKER = 'DLNE_DOCK: ';
+
+export interface DockState {
+  link?: 'wired' | 'wifi' | 'cellular';
+  power?: 'ac' | 'battery';
+  docked?: boolean;
+}
+
+/** The last docked facts in `output`, or null. Anything malformed is ignored. */
+export function parseDock(output: string): DockState | null {
+  let found: DockState | null = null;
+  for (const line of output.split(/\r?\n/)) {
+    const at = line.indexOf(DOCK_MARKER);
+    if (at === -1) continue;
+    try {
+      const facts = JSON.parse(line.slice(at + DOCK_MARKER.length).trim());
+      if (!facts || typeof facts !== 'object') continue;
+      const state: DockState = {};
+      if (facts.link === 'wired' || facts.link === 'wifi' || facts.link === 'cellular') state.link = facts.link;
+      if (facts.power === 'ac' || facts.power === 'battery') state.power = facts.power;
+      if (typeof facts.docked === 'boolean') state.docked = facts.docked;
+      found = state;
+    } catch {
+      // not a dock line after all
+    }
+  }
+  return found;
+}
+
+/**
+ * The line the worker prints (engine/worker.py YIELD_MARKER, 2.5.0) once per change of whether this machine is
+ * stepping aside for its owner's own load: `DLNE_YIELD: {"yielding": true, "why": "gpu"}` (why: fullscreen, gpu or
+ * cpu; "" when it is not yielding).
+ */
+export const YIELD_MARKER = 'DLNE_YIELD: ';
+
+export interface YieldState {
+  yielding: boolean;
+  why: '' | 'fullscreen' | 'gpu' | 'cpu';
+}
+
+/** The last yield state in `output`, or null. Anything malformed is ignored. */
+export function parseYield(output: string): YieldState | null {
+  let found: YieldState | null = null;
+  for (const line of output.split(/\r?\n/)) {
+    const at = line.indexOf(YIELD_MARKER);
+    if (at === -1) continue;
+    try {
+      const facts = JSON.parse(line.slice(at + YIELD_MARKER.length).trim());
+      if (!facts || typeof facts.yielding !== 'boolean') continue;
+      const why = ['fullscreen', 'gpu', 'cpu'].includes(facts.why) && facts.yielding ? facts.why : '';
+      found = { yielding: facts.yielding, why };
+    } catch {
+      // not a yield line after all
     }
   }
   return found;
@@ -671,7 +827,7 @@ export function roleMeaning(role: WorkerRole, detail?: RoleDetail): string {
     case 'coding': {
       const model = detail?.model ? ` (${modelTitle(detail.model)})` : '';
       const at = detail?.slots ? `, about ${detail.slots} at a time` : '';
-      return `Your GPU runs a whole coding model${model} by itself and answers other people's coding requests${at}.`;
+      return `Your GPU runs a whole coding model${model} by itself and answers other people's coding requests${at}${memberFacts(detail)}.`;
     }
     case 'app':
       return 'Your computer runs a small model that answers questions in the DLNE phone app.';
@@ -754,6 +910,31 @@ export interface RoleCopy {
   trustHtml: string;
 }
 
+/** " (40,960 tokens each, 24 tok/s)" from the worker's own figures (2.5.0), "" when it has not said. */
+function memberFacts(detail?: RoleDetail): string {
+  if (!detail) return '';
+  const parts: string[] = [];
+  if (detail.context) parts.push(`${detail.context.toLocaleString('en-US')} tokens each`);
+  if (detail.decodeTps) parts.push(`${detail.decodeTps} tok/s`);
+  return parts.length ? ` (${parts.join(', ')})` : '';
+}
+
+/** The sidebar's docked line (2.5.0): what the worker read, and what it means for the GPU's job. */
+export function dockLine(dock?: DockState): string {
+  if (!dock || dock.docked === undefined) return '';
+  if (dock.docked) return 'Docked (wired and plugged in): your GPU may share the swarm\'s big model while it stays docked.';
+  const on = [dock.link === 'wifi' ? 'Wi-Fi' : dock.link === 'cellular' ? 'a phone link' : '',
+              dock.power === 'battery' ? 'battery' : ''].filter(Boolean).join(' and ');
+  return `Not docked${on ? ` (on ${on})` : ''}: your GPU runs a whole model by itself until it is docked again.`;
+}
+
+/** The sidebar's stepping-aside line (2.5.0), "" while the machine is not yielding. */
+export function yieldLine(state?: YieldState): string {
+  if (!state?.yielding) return '';
+  const what = state.why === 'fullscreen' ? 'a full-screen app' : state.why === 'gpu' ? 'your own GPU use' : 'your own CPU use';
+  return `Stepping aside for ${what}: the swarm gets the GPU back once you are done.`;
+}
+
 export function roleCopy(st: ContributionView): RoleCopy {
   const active = st.state === 'contributing';
   const starting = st.state === 'starting';
@@ -776,8 +957,11 @@ export function roleCopy(st: ContributionView): RoleCopy {
     const privacy = role === 'coding' ? ` ${escapeHtml(MEMBER_PRIVACY_SUMMARY)}` : '';
     const trustId = role === 'coding' ? st.roleDetail?.trustId : undefined;
     const also = st.alsoCpu ? `<br><strong>Also:</strong> ${ROLE_LABEL.app}. ${escapeHtml(ALSO_CPU_LINE)}` : '';
+    const dock = dockLine(st.dock);
+    const yielding = yieldLine(st.yielding);
+    const machine = (dock ? `<br>${escapeHtml(dock)}` : '') + (yielding ? `<br><strong>${escapeHtml(yielding)}</strong>` : '');
     return {
-      roleHtml: `<strong>Role:</strong> ${ROLE_LABEL[role]}. ${escapeHtml(roleMeaning(role, st.roleDetail))}${privacy}${also}`,
+      roleHtml: `<strong>Role:</strong> ${ROLE_LABEL[role]}. ${escapeHtml(roleMeaning(role, st.roleDetail))}${privacy}${also}${machine}`,
       factsHtml: facts,
       trustHtml: trustId
         ? `<strong>Trust id:</strong> <code>${escapeHtml(trustId)}</code> <a href="#" class="copy-trust" data-id="${escapeHtml(trustId)}">Copy</a><br>${escapeHtml(TRUST_ID_HINT)}`

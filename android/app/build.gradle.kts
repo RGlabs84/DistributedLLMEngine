@@ -46,8 +46,8 @@ android {
         targetSdk = 36
         // Bump versionCode by one for every upload to Google Play (it must always increase);
         // versionName is what people see. See android/README.md.
-        versionCode = 5
-        versionName = "1.0.4"
+        versionCode = 7
+        versionName = "1.0.6"
     }
 
     // ---------------------------------------------------------------------------------
@@ -164,6 +164,8 @@ tasks.withType<Test>().configureEach {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
+    // Reads a photo's orientation on Android 8 (data/PhotoReader.kt); Android 9 and later turn it upright while decoding.
+    implementation(libs.androidx.exifinterface)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)

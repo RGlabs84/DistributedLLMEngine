@@ -126,3 +126,60 @@ def make_worker_limits(dlne_root):
         return limits
 
     return _make
+
+
+@pytest.fixture(autouse=True)
+def _no_yield_sampler_thread(monkeypatch):
+    """
+    ``engine.hardware`` samples the owner's load on a thread of its own once a profile is built (2.5.0). In the
+    suite that thread would outlive the test that started it and run real subprocesses under later tests' fakes
+    (a recorder standing in for ``subprocess.Popen`` then sees a call it never expected). The detector is tested
+    by calling ``sample()`` directly; here its thread is never started.
+    """
+    import engine.hardware as hardware
+    monkeypatch.setattr(hardware._yield_detector, "start", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_flap_breaker():
+    """
+    The coordinator's flap breaker (engine/auto_swap.py, 2.6.2) counts the engine rebuilds of the last hour in this
+    process and holds the optional ones once there are too many. Many tests rebuild an engine, and the whole suite
+    runs inside one hour: without this the count would carry from one test to the next, and a test late in the run
+    would meet a tripped breaker it did nothing to cause (a GPU that joins would be held, and its test fail).
+    Reset only when the coordinator is already imported: this must not be what imports it.
+    """
+    module = sys.modules.get("engine.coordinator")
+    if module is not None:
+        module.flap_breaker.reset()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _active_model_put_back():
+    """
+    The coordinator's ``global_active_model`` is set by a chat handler that started an engine and by heartbeats that
+    report one, which many tests do. The reconfiguring nudge reads it (2.6.2), so a value one test left behind changed
+    what a later test was told, in some orders only (tests/test_coding_endpoint.py after
+    test_phone_lane_endpoint.py). Put back after every test; the test files import the coordinator while they are
+    collected, so the value saved before the first test is the one it starts with.
+    """
+    module = sys.modules.get("engine.coordinator")
+    saved = module.global_active_model if module is not None else None
+    yield
+    if module is not None:
+        module.global_active_model = saved
+
+
+@pytest.fixture(autouse=True)
+def _fresh_photo_budgets(monkeypatch):
+    """
+    The coordinator's hourly photo budgets (``image_input_window``, ``phone_photo_window``) are kept per network for an
+    hour in this process, and the tests' phones share a few addresses: without this, photos one test sent would count
+    against the next. Only when the coordinator is already imported, as above.
+    """
+    module = sys.modules.get("engine.coordinator")
+    if module is not None:
+        from engine.priority import DistinctWindow, UsageWindow
+        monkeypatch.setattr(module, "image_input_window", DistinctWindow())
+        monkeypatch.setattr(module, "phone_photo_window", UsageWindow())

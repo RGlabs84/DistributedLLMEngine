@@ -27,7 +27,8 @@ file regardless of how large the model is.
                                        two models of identical size can differ 6x
     <arch>.attention.key_length        head dimension, when stated outright
     <arch>.attention.value_length
-    <arch>.embedding_length            used with head_count to derive head dimension
+    <arch>.embedding_length            used with head_count to derive head dimension; also the width a
+                                       vision projector must output (clip.vision.projection_dim)
     <arch>.attention.head_count        when key_length/value_length are absent
     <arch>.full_attention_interval     hybrid models: only every Nth block has attention
     <arch>.ssm.*                       hybrid models: the recurrent (Gated DeltaNet / Mamba)
@@ -89,6 +90,7 @@ _WANTED_SUFFIXES = (
     ".attention.key_length",
     ".attention.value_length",
     ".embedding_length",
+    ".projection_dim",
     ".full_attention_interval",
     ".nextn_predict_layers",
     ".ssm.state_size",
@@ -273,6 +275,23 @@ def read_metadata(path: str) -> Optional[Dict[str, Any]]:
     """
     parsed = _read(path, want_tensors=False)
     return parsed[0] if parsed else None
+
+
+def embedding_length(path: str) -> Optional[int]:
+    """A text model's hidden size (``<arch>.embedding_length``), or None when the header cannot be read."""
+    metadata = read_metadata(path)
+    arch = metadata.get("general.architecture") if metadata else None
+    return _as_int(metadata.get(f"{arch}.embedding_length")) if isinstance(arch, str) else None
+
+
+def projection_dim(path: str) -> Optional[int]:
+    """
+    The width a vision projector (an mmproj file) outputs, ``clip.vision.projection_dim``: llama.cpp's converter
+    writes the text model's hidden size there, so it is what :func:`embedding_length` of the model must equal.
+    None when the header cannot be read or names no such key.
+    """
+    metadata = read_metadata(path)
+    return _as_int(metadata.get("clip.vision.projection_dim")) if metadata else None
 
 
 def _as_int(value: Any) -> Optional[int]:

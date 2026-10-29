@@ -1,105 +1,322 @@
-# DLNE: free AI for your editor
+# DLNE: free AI for coding and for your phone
 
-DLNE is a coding assistant for VS Code (and VSCodium, Cursor, Theia) powered by a swarm of
-shared GPUs. There is no subscription and no token fee. The rule is simple: give a little
-compute, get a lot of AI. New users get 100 free chats to try it; after that, sharing an
-idle GPU with the swarm keeps it free.
+DLNE is a free AI assistant that runs on graphics cards (GPUs) people lend to a shared swarm. It helps
+you write code in VS Code, and it chats on your phone. There is no subscription and no per-message fee.
 
-**New in 2.4:** a GPU lent from home (8 GB or more) can run a whole coding model by itself and serve
-two agents for other people, with requests encrypted end-to-end from the editor. Secrets are redacted
-before anything leaves VS Code, and private repositories stay on machines the operator trusts.
-[What that does and doesn't protect](docs/privacy.md).
+The rule is simple: give a little compute, get a lot of AI. Everyone gets a number of free chats to try
+it. After that, lending an idle GPU or a fast CPU to the swarm keeps it free. You can also run a coordinator
+of your own and keep everything on your own machines (see [Run your own coordinator](#run-your-own-coordinator)).
 
-**Use it:**
-- **VS Code:** search the Extensions view for **DLNE Code Assistant**
-  ([VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=dlne.dlne-code-assistant)).
-- **VSCodium, Cursor, Theia** and other Open VSX editors: the same search finds it on
-  [Open VSX](https://open-vsx.org/extension/dlne/dlne-code-assistant).
-- Offline or locked down: the `.vsix` is on the [latest release](https://github.com/RGlabs84/DistributedLLMEngine/releases/latest)
-  (Extensions view, the `...` menu, **Install from VSIX...**).
-- Then open the DLNE sidebar, or type `@dlne` in the chat panel. No account needed.
-- **No editor?** [DLNE Chat](https://dlne.rossgilsonlabs.dev/chat) runs in a phone browser.
-- **Website:** [dlne.rossgilsonlabs.dev](https://dlne.rossgilsonlabs.dev), with the live swarm status.
+Live status, the current model and the free-chat allowance are on the website, not in this file:
+[dlne.rossgilsonlabs.dev](https://dlne.rossgilsonlabs.dev).
 
-## How it fits together
+## Use the public swarm in your editor
+
+1. **Install the extension.** Search the Extensions view for **DLNE Code Assistant**.
+   - VS Code: the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=dlne.dlne-code-assistant).
+   - VSCodium, Cursor, Theia and other Open VSX editors: [Open VSX](https://open-vsx.org/extension/dlne/dlne-code-assistant).
+   - Offline or locked down: the `.vsix` is on the [latest release](https://github.com/RGlabs84/DistributedLLMEngine/releases/latest)
+     (Extensions view, the `...` menu, **Install from VSIX...**).
+2. **Chat.** There is no account and no sign-up. Pick whichever you like:
+   - Type `@dlne` in VS Code's Chat view, followed by what you want.
+   - Or pick **DLNE Swarm** in the Chat view's model picker. VS Code's own Ask, Edit and Agent modes then run
+     on the swarm. This also lets `@dlne` work for someone who is not signed in to GitHub.
+   - Or open the **DLNE Agent** sidebar (Activity Bar). It is DLNE's own chat, for editors with no Chat view
+     and for anyone who prefers it.
+3. **The free trial.** A new user gets free chats to try DLNE, counted per network address, with no sign-up.
+   The status bar shows what is left. When it runs out, contribute compute (below) or run your own coordinator.
+
+[What each way of chatting is, and when to use it](vscode-extension/README.md#chatting-with-dlne).
+
+**Privacy, honestly.** To answer you, a machine has to read your question and the code sent with it. DLNE
+removes secrets in the editor first. It never reads files such as `.env` or `*.pem`, anything `.gitignore`
+ignores, or anything in `.dlneignore`, when you use `@dlne` or the sidebar. (VS Code's own agent on DLNE Swarm is
+the exception: its tools read the files, so DLNE refuses the excluded ones it can see by path and redacts
+secrets, but VS Code's own tools may still put file text into a request.) Private repositories are answered only
+by machines the operator trusts, unless you choose otherwise with `dlne.privacy`. Requests to a volunteer's
+machine are encrypted on the way. A photo in the phone chat stays on DLNE's own server and is never sent to a
+volunteer's computer. Like every message, it is processed by the shared model, whose layers can run on
+volunteers' graphics cards, and those cards see only intermediate numbers, never the picture. Read the whole
+thing, including what none of this can promise, in [`docs/privacy.md`](docs/privacy.md).
+
+## The phone app
+
+You don't need an editor to use DLNE.
+
+- **In a browser:** open [DLNE Chat](https://dlne.rossgilsonlabs.dev/chat). You can install it as an app:
+  in Chrome use the install option in the menu, on an iPhone use Safari, Share, Add to Home Screen. In VS Code,
+  the command **DLNE: Use DLNE on Your Phone** opens the chat page of the coordinator your extension uses.
+- **Android app:** the APK is on the website (it is not on Google Play). Download it from
+  [dlne.rossgilsonlabs.dev](https://dlne.rossgilsonlabs.dev).
+- **Photos:** add one with the **+** next to the message box and ask about it. It shows only where the server
+  offers it.
+- **Pictures:** ask for one ("can I get a picture of a fox in the snow?"). It shows only where the server
+  offers it.
+- **Location:** the chat asks before it uses where you are, and only when a question needs it (the weather,
+  for example). If you say no, it asks nothing more of your location.
+
+The phone chat is a separate path from the editor: the redaction and encryption above are not promised for it.
+See [`docs/privacy.md`](docs/privacy.md#the-phone-chat-is-separate).
+
+## Contribute compute
+
+Lending compute is how the swarm stays free. You can lend a GPU, a CPU, or both.
+
+| You have | You become | Roughly |
+|---|---|---|
+| A GPU with 8 GB of memory or more | A **coding member**: your GPU runs a whole coding model and answers other people's coding requests, adding agents for everyone | Needs the GPU plus free system memory for the model (the extension tells you if yours is enough) |
+| A smaller or shared GPU | Part of the **GPU pool**: one big model run together with other volunteers | Any GPU the swarm counts |
+| A fast CPU with spare memory | A **phone-app member**: your CPU answers phone chats while the main engine is down, and the memory you lend picks the model | 4 physical cores, AVX2, and 8 GB or more lent |
+
+**Two ways to do it:**
+
+- **DLNE Donate** is a small tray app for Windows and Linux, for people who don't use VS Code. Download it from the
+  website. It does the same job as the extension's worker. See [`desktop/README.md`](desktop/README.md).
+- **The extension's Donate compute panel** (in the DLNE sidebar), or the command **DLNE: Toggle Compute
+  Contribution**. [Details and settings](vscode-extension/README.md).
+
+**What it costs you.** Your machine steps aside when you need it: while you game or render, the swarm gives it
+back. You can cap the memory you lend (`dlne.worker.maxVramGb`, `dlne.worker.maxRamGb`), refuse the coding-member
+job (`dlne.worker.allowCodingMember`), or lend your CPU only. Nothing runs until you switch it on. A volunteer
+who answers a request can read it: see the privacy note above and in [`docs/privacy.md`](docs/privacy.md).
+
+**What you get.** Your own chats go first when the engine is busy: contributors have priority over the free
+trial. Pictures made on your network are free of trial charges. More machines also mean bigger models for
+everyone.
+
+## Run your own coordinator
+
+Everything is open source. A coordinator is the server the extension and the phone app talk to. Run your own to
+keep code on machines you control, to use DLNE without the free-trial limit, or to share one big GPU box with a
+team.
+
+**You need:** Linux, Windows or macOS with Python 3.10 or newer, and a GPU if you want the model on a GPU
+(a CPU-only box runs the phone chat, not the coding agent).
+
+### 1. Install
+
+```bash
+git clone https://github.com/RGlabs84/DistributedLLMEngine.git
+cd DistributedLLMEngine
+python -m venv .venv && . .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+mkdir -p config bin models
+```
+
+### 2. Get the inference programs
+
+The coordinator does not download `llama-server` for itself. It looks in `bin/` and answers "Binary Missing" if it
+is not there. Download a [llama.cpp release](https://github.com/ggml-org/llama.cpp/releases) built for your
+hardware (the Vulkan build works on AMD, Intel and NVIDIA) and put `llama-server` and `ggml-rpc-server`, with the
+libraries that come beside them, into `bin/`. The build the public swarm uses is named in `llama_build` at
+`/v1/release` on the website.
+
+### 3. Set the network key
+
+Create `config/config.txt` (one `KEY=VALUE` per line; it is not in git):
 
 ```
- VS Code extension ──HTTP──▶ coordinator ◀──RPC tunnels── worker nodes (volunteers' GPUs)
- (agent, chat, autocomplete)   (this repo)                 (this repo: engine/worker.py)
-                                   ▲
-                                   └── BarrkBOT (Discord): stats and operator controls
+NETWORK_KEY=pick-a-long-random-secret
 ```
+
+Make the secret long and random, for example the output of `python -c "import secrets; print(secrets.token_hex(32))"`.
+Workers prove they belong to your swarm by signing their messages with this key, and a coordinator with no
+`NETWORK_KEY` refuses all workers. Never use the public swarm's key. Keep the file private.
+
+Other keys you will probably want (the full list is in the [operator reference](docs/operator-reference.md)):
+
+| Key | What it does |
+|---|---|
+| `DEFAULT_MODEL` | The model to start on. Left out, a fresh coordinator starts on the first model of the signed ladder. |
+| `ENGINE_SLOTS`, `ENGINE_CONTEXT` | Coding request slots and total context. `0` (the default) lets the engine size itself from the model and the free GPU memory. |
+| `ENGINE_PHONE_SLOTS` | `0` to `8`, default `0` (off). Lanes reserved for the phone chat. The phone chat needs these, or CPU volunteers, or `APP_LOCAL_ENABLED=true` on this machine. |
+| `ENGINE_MMPROJ` | Path to a vision projector `.gguf`: lets the engine read photos and images. |
+| `IMAGE_GEN_ENABLED` | `true` lets phones and the IDE ask for pictures (off by default; needs a second GPU, see [`docs/image-generation.md`](docs/image-generation.md)). |
+| `ENFORCE_CONTRIB_CLAUSE` | See "Who may use it" below. |
+| `TRUST_PROXY_HEADERS` | `true` when a reverse proxy sits in front. |
+| `CUSTOM_GGUF_DIR` | Where model files live (default: `models/` in the install folder). |
+| `BIND_IP`, `BIND_PORT` | Address and port to listen on (default `0.0.0.0` and `11435`). |
+
+### 4. Start it
+
+```bash
+python dlne_server.py start --port 11435
+```
+
+`start` runs the coordinator and, always, a worker on the same machine (a "hybrid"), so the box's own GPU
+joins your swarm. Open `http://<this-machine>:11435/` for the status page. `python dlne_server.py status` asks a
+running coordinator how it is doing.
+
+### 5. Put a model on it
+
+The coordinator can fetch its own model: with auto-swap on (the default) it downloads the right model from the
+signed ladder (`scripts/coding_models.json`) into `models/` and switches to bigger ones as more GPUs join. It checks free disk first and
+verifies each file. To pick the model yourself, set `DEFAULT_MODEL`, or put a `.gguf` file in `models/` and
+set `AUTO_SWAP=false`. (`download_dlne_models.sh` in the repo is an old script that fetches about 1.3 TB.
+Don't use it.)
+
+### 6. Who may use it
+
+- **Your own machine** (the one running the coordinator) is always let in.
+- **Everyone else** (your laptop on the LAN, a teammate) needs an API key. Make one on the coordinator:
+
+  ```bash
+  python dlne_server.py apikey create --name "my-laptop"    # prints a dlne_sk_... key once
+  python dlne_server.py apikey list
+  python dlne_server.py apikey revoke <key_id>
+  ```
+
+  "This machine" means an address of the coordinator's own computer, not "the local network". A laptop on the same
+  Wi-Fi is not exempt.
+- On a coordinator that is private anyway (a home network, a VPN), `ENFORCE_CONTRIB_CLAUSE=false` lets everyone
+  in without keys and turns off the free-trial limit. Use it only when you trust everyone who can reach the port.
+- Everything under `/v1/admin/*` needs the operator key: `python dlne_server.py adminkey create`. It is accepted
+  only from the coordinator's own machine unless you set `ADMIN_ALLOW_REMOTE=true`.
+
+### 7. Keep it running (systemd)
+
+`python dlne_server.py install-systemd` writes a *system* unit to `daemon/systemd/dlne.service` (copy it to
+`/etc/systemd/system/`). For a service that runs as you, with no root, make a *user* unit at
+`~/.config/systemd/user/dlne.service`:
+
+```ini
+[Unit]
+Description=DLNE coordinator
+After=network.target
+
+[Service]
+WorkingDirectory=/home/you/DistributedLLMEngine
+ExecStart=/home/you/DistributedLLMEngine/.venv/bin/python dlne_server.py start --host 0.0.0.0 --port 11435
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now dlne.service
+loginctl enable-linger "$USER"        # keep it running when you are logged out
+journalctl --user -u dlne.service -f  # the log
+```
+
+### 8. HTTPS and ports
+
+Editors and phones should reach the coordinator over HTTPS. With [Caddy](https://caddyserver.com) on the same
+machine, a `Caddyfile` is enough (it gets the certificate itself):
+
+```
+dlne.example.com {
+    reverse_proxy 127.0.0.1:11435
+}
+```
+
+Then set `TRUST_PROXY_HEADERS=true` in `config/config.txt` so each client is told apart by its address, and keep
+`/v1/admin/*` off the proxy. Workers use WebSockets through the same address, which Caddy passes on by default.
+
+| Port | What | Open it? |
+|---|---|---|
+| 11435 (TCP) | The coordinator: editors, phones and workers. | Yes, or only 443 if everything goes through the proxy. |
+| 80 and 443 | Caddy (certificate and HTTPS). | Yes, if you use it. |
+| 50052 | The coordinator machine's own RPC worker (`RPC_PORT`). | No. Keep it closed to the outside. Remote workers dial out to the coordinator and need no inbound port. |
+
+### 9. Add workers
+
+Other machines join with the command line from a checkout of this repository:
+
+```bash
+python dlne_server.py worker --coordinator https://dlne.example.com --network-key "pick-a-long-random-secret"
+```
+
+Without a proxy, use `host:11435` (the worker adds `http://`). The worker also needs a `ggml-rpc-server` of its own in its `bin/`.
+Useful options are `--allowed-gpus`, `--max-vram` and `--max-ram`.
+
+**A signed-release catch.** The public swarm's workers fetch their engine from the coordinator, and accept it
+only if it is signed with the maintainer's release key, which is built into the extension. A private coordinator
+cannot sign for that key. So a worker started from a checkout (as above) runs the code you checked out, and the
+VS Code extension needs `dlne.worker.allowUnsignedEngine` turned on to install an engine from your coordinator.
+The tray app (DLNE Donate) always talks to the public swarm and cannot join a private one. To publish signed
+releases of your own, you would fork the project and replace the key.
+
+## Point your extension at your own coordinator
+
+Open VS Code settings (JSON) and set:
+
+```json
+{
+  "dlne.serverUrl": "https://dlne.example.com",
+  "dlne.apiKey": "dlne_sk_your_key_here",
+  "dlne.worker.networkKey": "pick-a-long-random-secret",
+  "dlne.worker.allowUnsignedEngine": true,
+  "dlne.privacy": "trustedOnly"
+}
+```
+
+| Setting | Why |
+|---|---|
+| `dlne.serverUrl` | The address of your coordinator, with `http://` or `https://` and no trailing path. Leave it empty and you are on the public swarm. |
+| `dlne.apiKey` | The `dlne_sk_...` key from `apikey create`. Needed unless you set `ENFORCE_CONTRIB_CLAUSE=false` on the coordinator. |
+| `dlne.worker.networkKey` | Only if this machine also lends compute to your coordinator. It must equal your `NETWORK_KEY`. Its default is the public swarm's key. |
+| `dlne.worker.allowUnsignedEngine` | Only if this machine runs the worker through the extension (see the signed-release catch above). Never turn it on for the public swarm. |
+| `dlne.privacy` | `auto` (default), `trustedOnly` or `anyMember`. Only matters when your coordinator has coding members. `trustedOnly` keeps all requests on your own engine and machines you listed in `TRUSTED_MEMBERS`. |
+
+Reload the window after changing them.
+
+### Check that it worked
+
+- **Status bar.** It reads the swarm state from your coordinator. If it cannot reach it, it shows
+  **DLNE: Offline**, and its tooltip names the address it tried ("Could not connect to DLNE Cluster at ...").
+- **`@dlne /status`** in the Chat view, and the **DLNE: Open Swarm Dashboard** command, show the model and the
+  machines of the coordinator you set.
+- **`DLNE: Use DLNE on Your Phone`** opens `<your serverUrl>/chat`. If that is your own address, the extension
+  is pointed at you.
+- **On the coordinator:** watch its log (`journalctl --user -u dlne.service -f`) while you chat. Your request
+  appears there. `curl https://dlne.example.com/v1/cluster/status` shows what it is running.
+
+### Does anything go to the public swarm?
+
+**No, not your chats and code.** The extension has no fallback. If your coordinator is down, it shows
+**Offline** and the chat fails with an error. It never quietly switches to the public swarm. The only way to
+land on the public swarm is an empty `dlne.serverUrl`, or one of three retired public addresses, which are read
+as the public one.
+
+Things to know so it stays that way:
+
+- Keep `dlne.serverUrl` set in your **User** settings, not only in a workspace, or a different workspace can
+  point somewhere else.
+- A key or token is sent to whatever address you set, including a plain `http://` one. Use HTTPS beyond your own
+  network.
+- A worker already running keeps the coordinator it started with. After you change `dlne.serverUrl`, stop the
+  worker and start it again.
+- `dlne.worker.networkKey` defaults to the public key. If this machine lends compute, set it, or it signs for
+  the wrong swarm.
+- Other, smaller calls that are not about your chats: the extension checks for updates on Open VSX
+  (`dlne.autoUpdate`; turn it off to stop that), and, when your coordinator has coding members and
+  `dlne.privacy` is `auto`, asks GitHub, GitLab or Codeberg whether a repository is public.
+- The tray app, DLNE Donate, only ever uses the public swarm.
+
+More on this in [the extension's README](vscode-extension/README.md#your-own-private-coordinator).
+
+## Help, questions and support
+
+- Questions and news: the [Discord](https://discord.gg/RNxvxWn8cw).
+- [Buy a coffee](https://buymeacoffee.com/wubarrk) toward the power and hardware of the public coordinator.
+- Report security problems privately to the maintainer, not in a public issue.
+- Everything about where data goes: [`docs/privacy.md`](docs/privacy.md).
+
+## For developers
 
 | Path | What it is |
 |---|---|
-| `vscode-extension/` | The product: chat/code agent, ghost-text autocomplete, one-click compute sharing |
-| `engine/` | The coordinator and worker: model scheduling, worker registry, free-trial quota, admin API |
-| `dlne_server.py` | Command line: `start` (coordinator), `worker`, `apikey`, `adminkey`, `status` |
-| `docs/` | [`privacy.md`](docs/privacy.md) (what is sent where, and who can see it) and [`coding-members.md`](docs/coding-members.md) (the technical contract for coding members) |
-| `tests/` | Python test suite (`pytest`) |
-| `scripts/` | Release tooling (`release.py`, `release_apply.py`, `package_llama.py`), `publish_public.py` (the scanned snapshot that updates this public repository) and the Discord status tile |
-
-The coordinator's `/` is a small public page that points at the extension and shows live
-swarm status. The OpenAI-compatible API lives under `/v1/*`.
-
-The public swarm's coding model is Qwen3.6-35B-A3B (a UD-IQ3_S quant) on two 8 GB AMD GPUs,
-with a 65,536-token context; bigger models unlock automatically as more GPUs join.
-
-## Coding members: lend a GPU, add agents
-
-A **coding member** is a volunteer's GPU that runs a whole coding model on its own and answers coding
-requests by itself, the way the phone pool's machines already do for chat. One request touches one
-machine, so ordinary home internet is enough, and **each member adds about two more agents** working at
-the same time.
-
-- **Who qualifies:** a GPU with 8 GB of memory or more that is not on the coordinator's own fast network
-  (a GPU that is still joins the shared big model, as before), and about 22 GB of GPU memory plus free
-  system memory together for the first version (for example an 8 GB GPU with 14 GB of RAM free). The model
-  is held whole: GPU memory first, the rest in system RAM. When a machine joins, it is timed on reading a
-  prompt and writing an answer; one under the speed floors is not sent work.
-- **Which model:** the smartest version of Qwen3.6-35B-A3B that the machine can hold whole and run fast
-  enough. About 22 GB of GPU plus free system memory runs the first version (IQ3_S, live today). Higher-quality
-  versions of the same model need more, roughly 26 GB (IQ4_XS), 30 GB (Q4_K_M) and 37 GB (Q6_K), and the
-  larger ones also need a stronger GPU to be fast enough. Open, MIT-licensed heavyweight models are planned
-  from 192 GB; they are not available yet.
-- **Your machine stays yours.** A volunteer can refuse the job (turn off `dlne.worker.allowCodingMember` in
-  the extension, which writes `CODING_MEMBER_ALLOWED=false` into the engine's `config.txt`, or choose "Lend my
-  CPU only"), the lending limits
-  (`dlne.worker.maxVramGb`, `dlne.worker.maxRamGb`) are honoured, and a member steps aside while the
-  owner's own load (a game, a render) needs the machine.
-- **Off by default.** A coordinator uses members only when its operator sets `CODING_MEMBERS_ENABLED=true`;
-  until then every coding request is answered by the coordinator's own engine, as before.
-- **The coordinator's status** (`/v1/cluster/status`) reports `coding_members` with counts only: how many
-  members have joined and are ready, how many agent slots they offer, and how many are in use.
-
-### Privacy, in short
-
-**A coding member has to read a request to run the model, so it sees the code it is sent.** What protects
-you from members:
-
-- **Public repositories** may be answered by any member, including changes you have not pushed yet (for
-  unpublished work in a clone of a public repository, set `dlne.privacy` to `trustedOnly`). **Everything
-  else** is answered only by the coordinator's own engine or by machines the operator has listed as
-  trusted, unless you opt in (`dlne.privacy`). While coding members are off, the extension makes no
-  repository lookup.
-- **Secrets are removed in the editor** before a request leaves it, and files such as `.env`, `*.pem`,
-  `.gitignore`d files and anything in `.dlneignore` are never sent.
-- A member is **not told who asked**: no IP address, no API key, no account.
-- Members run with **no-trace** settings (prompts kept out of logs and off disk), and the coordinator
-  sends **canary** decoys to catch a member that snoops.
-- Requests and answers are **encrypted on the way** to and from a member (X25519, HKDF-SHA256,
-  ChaCha20-Poly1305): the coordinator relays bytes it cannot open, and the tunnel and the internet between
-  it and the member carry nothing readable. That protects the trip, not the machine that answers.
-  Requests answered by the coordinator's own engine go over HTTPS instead.
-- **The coordinator is the operator's own machine and is trusted**: it hands out each member's public key.
-- A volunteer who changes DLNE's software could still read or keep what a member receives. None of this
-  can promise otherwise.
-
-The details, what members can and cannot see, and what none of this can promise are in
-[`docs/privacy.md`](docs/privacy.md). The formats and routes are in
-[`docs/coding-members.md`](docs/coding-members.md).
-
-## Run the tests
+| `vscode-extension/` | The extension: chat agent, autocomplete, one-click compute sharing |
+| `engine/` | The coordinator and worker: scheduling, worker registry, free-trial quota, admin API |
+| `dlne_server.py` | Command line: `start`, `worker`, `apikey`, `adminkey`, `status`, `install-systemd` |
+| `android/`, `desktop/` | The Android app and the DLNE Donate tray app |
+| `docs/` | [`privacy.md`](docs/privacy.md), [`operator-reference.md`](docs/operator-reference.md) (every coordinator setting), [`coding-members.md`](docs/coding-members.md), [`image-generation.md`](docs/image-generation.md), [`agent-memory.md`](docs/agent-memory.md) |
+| `tests/` | The Python test suite |
+| `scripts/` | Release tooling and model lists |
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
@@ -109,121 +326,12 @@ python -m pytest                        # engine and coordinator
 cd vscode-extension
 npm install
 npm test                                # extension unit tests (no VS Code needed)
-npm run test:e2e                        # real venv + pip install of the engine (network)
 ```
 
-## Run a coordinator
-
-```bash
-python dlne_server.py start --port 11435
-python dlne_server.py adminkey create   # prints the operator key once; only its hash is stored
-```
-
-Everything under `/v1/admin/*` needs that operator key as `Authorization: Bearer <key>`, and by
-default only accepts it from the coordinator's own machine (`ADMIN_ALLOW_REMOTE=true` to change
-that). BarrkBOT's `/dlne` command uses it.
-
-Settings live in `config/config.txt` (`KEY=VALUE`). Seven groups matter for most operators:
-
-- **Coding members (off by default)**: volunteers' GPUs that each run a whole coding model and answer
-  coding requests on their own (see [Coding members](#coding-members-lend-a-gpu-add-agents) and
-  [`docs/coding-members.md`](docs/coding-members.md)). `CODING_MEMBERS_ENABLED=false` keeps today's
-  behaviour; set it to `true` to route to members. `TRUSTED_MEMBERS` is a comma-separated list of trust
-  ids, each derived from a member's own identity key (a member shows its trust id in its log and UI): only
-  those machines (and the coordinator's own engine) answer private workspaces. A worker id carries no
-  trust, and a member can never claim it. `CODING_MEMBER_MIN_DECODE_TPS` (15) and
-  `CODING_MEMBER_MIN_PREFILL_TPS` (80) are the speed floors from the join test, and
-  `CODING_CANARY_PER_DAY` (4 per member) sets how many decoy requests each member gets.
-
-- **The CPU pool (the phone app)**: workers with no usable GPU serve the phone app instead of
-  the coding pipeline, each running a whole model on its CPU (`engine/app_pool.py`,
-  `engine/app_member.py`). The tiers are signed into each release from
-  `scripts/app_models.json`: Qwen3 4B (members lending 8 GB), Qwen3.6 35B-A3B (16 GB) and
-  Qwen3.6 at full quality (24 GB). The coordinator's own machine serves the biggest tier its
-  allocation holds; a bigger tier unlocks when `APP_TIER_MIN_MEMBERS` (2) volunteers can host
-  it. A volunteer's member runs at low priority on half its cores, 2 to 8 threads
-  (`APP_MEMBER_THREADS` to override). Phone users are throttled per network: one answer at a
-  time and `APP_RATE_PER_MINUTE` (6) requests a minute. The coordinator's own machine joins
-  with `APP_LOCAL_ENABLED=true`, `APP_LOCAL_THREADS`, `APP_LOCAL_RAM_GB` and
-  `APP_LOCAL_CPU_MASK` (hex, one thread pinned per logical CPU; the public swarm uses cores
-  2-5 of a Ryzen 5 7600X: `0xf3c` with 8 threads and 16 GB). The model files go in the models
-  folder. The phone page is `/chat` (installable from Chrome, or on an iPhone from Safari:
-  Share, Add to Home Screen); the Android app is in `android/` (the APK is on the
-  [website](https://dlne.rossgilsonlabs.dev); it is not on Google Play yet). Reported
-  answers (`POST /v1/app/report`) are kept in `config/app_reports.jsonl` and read with
-  `GET /v1/admin/app_reports`.
-
-- **Lookups (the phone model's search)**: the model is told today's date and may look things
-  up when it is unsure (`engine/search.py`): weather (Open-Meteo), Wikipedia (with Wikidata),
-  news (GDELT) and web search. All are free and run by the coordinator, never by pool
-  members. Web search asks a local SearXNG first (`SEARXNG_URL`; see `deploy/searxng/`), then
-  Brave Search only if `BRAVE_SEARCH_API_KEY` is set and within `SEARCH_DAILY_LIMIT` (33 a
-  day fits Brave's free monthly credit), then Wikipedia. Answers are cached
-  (`SEARCH_CACHE_MINUTES`, 30), each network gets `SEARCH_PER_NETWORK_PER_HOUR` (30) lookups,
-  and `SEARCH_ENABLED=false` turns lookups off.
-
-- **Who goes first, and how much**: when the coding engine is busy, its slots go to GPU
-  contributors, API keys and the coordinator's own host first, CPU contributors second, and
-  free-trial users third (`engine/priority.py`); autocomplete only runs on a slot nobody is
-  waiting for. CPU contributors get `CPU_CODING_LIMIT` (300) coding chats in any
-  `CPU_CODING_WINDOW_HOURS` (5) hours. A GPU contributor is unlimited while its GPU is actually
-  used, and for its first `GPU_STANDBY_GRACE_MINUTES` (30) minutes after it joins or last had a
-  job (a GPU you have handed back for a game counts as used); a GPU that has stood by longer than
-  that is treated as a CPU contributor until the swarm uses it again, and is never turned away
-  for it. The free trial (`STARTER_QUOTA_INFERENCES`, 100) is
-  counted once per network address (IPv6 per /64) in `config/starter_quota.json`, never per
-  client-supplied token.
-
-- **What a CPU-only worker must bring**: `CPU_MIN_RAM_GB` (8), `CPU_MIN_CORES` (4 physical) and
-  `CPU_MIN_BANDWIDTH_GBS` (30, measured by the worker when it joins); x86 CPUs also need AVX2
-  and FMA. These can only be raised. A CPU's speed here is its memory bandwidth, and one slow
-  node holds up every token of the pipeline it is in, so a node below any floor is refused
-  with the exact reason, which the extension shows its owner.
-
-- **Behind a reverse proxy** (Caddy, nginx) on the same machine or LAN: set
-  `TRUST_PROXY_HEADERS=true` so clients are told apart by `X-Forwarded-For` rather than all
-  looking like the proxy. The header is only believed from a loopback or private address, so
-  the coordinator's own port can stay open to the internet alongside the proxy. Keep
-  `/v1/admin/*` off the proxy.
-- **Speculative decoding**: off by default, because whether it pays depends on the GPUs. Give a
-  model a draft companion (`<model>_dflash.gguf` beside it) and set, for example,
-  `SPEC_TYPE=draft-simple` and `SPEC_DRAFT_N_MAX=4`. `SPEC_DRAFT_N_MIN` and `SPEC_DRAFT_P_MIN`
-  are also read, as are the ngram types (`SPEC_TYPE=ngram-mod`, no draft model needed).
-  Measure before and after: with the swarm's earlier model (Qwen2.5-Coder 14B and a 0.5B
-  draft) on its two 8 GB cards, 4-token drafts gave 45 tok/s against 39 without, while 8 and
-  16-token drafts were slower than none. The public swarm now runs Qwen3.6-35B-A3B, which has
-  no draft model, so it runs without speculative decoding (38.5 tok/s for one user, about 27
-  each for two).
-
-## Releases
-
-Workers run code and binaries they download from the coordinator, so every release is signed.
-`scripts/release.py` builds a reproducible engine archive and signs a manifest (Ed25519) naming
-it and the pinned llama.cpp build: one `ggml-rpc-server` zip per worker platform (Windows and
-Linux on x64 and ARM64, macOS on Apple Silicon and Intel, the last CPU-only) and the
-coordinator's own build. The extension and the worker
-refuse anything that does not match the maintainer's key, and never downgrade. Workers report
-their llama.cpp RPC protocol, and the coordinator only routes to workers that speak its own.
-
-## Security and privacy
-
-- Prompts, and the code the agent reads, go to the coordinator you point the extension at. The
-  public coordinator is run by the maintainer; treat it like any hosted AI service. When coding
-  members are on, a request may be answered by a volunteer's machine instead: which requests may go
-  where, what is redacted and encrypted, and what a member can and cannot see are in
-  [`docs/privacy.md`](docs/privacy.md). A member has to read a request to answer it; nothing there
-  changes that.
-- The phone chat is separate: the volunteer machine that answers a chat sees its text.
-- The public coordinator is reached over HTTPS (`https://dlne.rossgilsonlabs.dev`, Caddy in
-  front of the coordinator; the older `https://dlne.duckdns.org` still answers). Run your own for anything sensitive.
-- The agent asks before it edits files, runs a command, or reads outside your workspace.
-- Report security problems privately to the maintainer rather than in a public issue.
-
-## Support
-
-Contribute a GPU (or a fast CPU) from the extension's sidebar, or
-[buy a coffee](https://buymeacoffee.com/wubarrk) toward the coordinator's power and hardware.
-Questions and news are in the [Discord](https://discord.gg/RNxvxWn8cw).
+**Releases.** Workers run code and binaries they download from the coordinator, so every release is signed:
+`scripts/release.py` builds a reproducible engine archive and signs a manifest (Ed25519) with the maintainer's
+key. The extension and the worker refuse anything that does not match it, and never downgrade. Details are in the
+[operator reference](docs/operator-reference.md#releases). The history is in the [changelog](CHANGELOG.md).
 
 ## License
 

@@ -188,6 +188,25 @@ export function compareVersions(a: string, b: string): number | null {
   return 0;
 }
 
+/**
+ * Whether the coordinator publishes a newer signed engine than `installed` (2.5.0). Nothing is downloaded. A worker
+ * that is not running never learns of a new engine otherwise, and the sidebar's engine button says so. `available`
+ * is the published version (null when the coordinator publishes no signed release and that was allowed); `newer`
+ * is only ever true when something is installed and the published version is higher than it.
+ */
+export async function checkEngineUpdate(
+  serverUrl: string,
+  installed: { version: string; sha256: string } | null,
+  options: Pick<FetchOptions, 'publicKeyHex' | 'allowUnsigned' | 'fetchJson'>
+): Promise<{ available: string | null; newer: boolean }> {
+  const manifest = await fetchSignedManifest(serverUrl.replace(/\/+$/, ''), {
+    ...options, installed, download: async () => undefined,
+  });
+  if (!manifest) return { available: null, newer: false };
+  const newer = !!installed && compareVersions(manifest.version, installed.version) === 1;
+  return { available: manifest.version, newer };
+}
+
 export interface FetchOptions {
   /** Trust anchor. Defaults to the baked-in key; tests pass their own. */
   publicKeyHex: string;
@@ -207,7 +226,7 @@ export type FetchResult =
  * The coordinator's verified release manifest, or null when it publishes none and unsigned
  * installs were explicitly allowed. Throws EngineVerificationError for anything untrustworthy.
  */
-async function fetchSignedManifest(base: string, options: FetchOptions): Promise<ReleaseManifest | null> {
+export async function fetchSignedManifest(base: string, options: FetchOptions): Promise<ReleaseManifest | null> {
   let raw: unknown;
   try {
     raw = await options.fetchJson(`${base}/v1/release`);

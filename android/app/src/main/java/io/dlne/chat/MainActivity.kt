@@ -19,6 +19,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // Only on a fresh start: after rotation the shared text is already in the draft.
         if (savedInstanceState == null) handleShare(intent)
+        // Clears leftovers of earlier runs (a camera shot nobody collected, photos no chat refers to).
+        AppGraph.get(this).tidyUp(freshLaunch = savedInstanceState == null)
         setContent {
             DlneTheme {
                 DlneApp(viewModel)

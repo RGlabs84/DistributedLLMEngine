@@ -556,3 +556,73 @@ def test_a_string_vram_value_is_coerced_rather_than_interpolated_raw(registry, c
     assert "w" in registry.workers
     assert registry.get_total_vram_gb() == 0.0
     assert_markup_is_renderable(captured_logs)
+
+
+# ---- 2.5.0: docked laptops shard -----------------------------------------------------------------------------
+
+def test_the_planner_never_places_a_shard_on_an_undocked_laptop():
+    from engine.registry import WorkerRegistry
+    registry = WorkerRegistry()
+    for worker_id, docked in (("desk", True), ("lap", False), ("unsaid", None)):
+        profile = {"gpu": {"has_gpu": True, "vram_total_gb": 8.0}}
+        if docked is not None:
+            profile["docked"] = docked
+        registry.update_worker(worker_id, f"192.168.1.{10 + len(worker_id)}", 50052, f"t-{worker_id}", profile)
+    endpoints = registry.plan_endpoints(required_gb=100.0, policy="always")
+    assert "192.168.1.13:50052" not in endpoints, "lap"
+    assert "192.168.1.14:50052" in endpoints and "192.168.1.16:50052" in endpoints
+
+
+def test_a_registration_time_is_kept_and_starts_over_after_a_prune():
+    from engine.registry import WorkerRegistry
+    registry = WorkerRegistry()
+    assert registry.registered_at("w") == 0.0
+    registry.update_worker("w", "192.168.1.9", 50052, "t", {"gpu": {"has_gpu": True, "vram_total_gb": 8.0}})
+    first = registry.registered_at("w")
+    assert first > 0
+    registry.update_worker("w", "192.168.1.9", 50052, "t", {"gpu": {"has_gpu": True, "vram_total_gb": 8.0}})
+    assert registry.registered_at("w") == first, "a heartbeat does not restart it"
+    registry.workers["w"]["last_heartbeat"] -= 3600
+    registry.prune_dead_workers()
+    registry.update_worker("w", "192.168.1.9", 50052, "t", {"gpu": {"has_gpu": True, "vram_total_gb": 8.0}})
+    assert registry.registered_at("w") >= first
+
+
+def test_a_node_reached_over_a_confirmed_lan_address_ranks_as_lan_whatever_it_registered_from():
+    from engine.registry import WorkerRegistry
+    registry = WorkerRegistry()
+    registry.update_worker("home", "73.215.216.195", 50052, "t-home", {"gpu": {"has_gpu": True, "vram_total_gb": 8.0}})
+    registry.update_worker("far", "151.101.1.69", 50052, "t-far", {"gpu": {"has_gpu": True, "vram_total_gb": 8.0}})
+    registry.record_probe("home", 0.8, "lan")
+    registry.record_probe("far", 0.5, "direct")              # quicker, but on the WAN
+    assert registry.plan_endpoints(required_gb=8.0, policy="always") == ["73.215.216.195:50052", "151.101.1.69:50052"]
+
+
+def test_a_node_stepping_aside_is_in_no_plan_but_is_still_here_to_drain():
+    from engine.registry import WorkerRegistry, stepping_aside
+    gpu = {"gpu": {"has_gpu": True, "vram_total_gb": 8.0}}
+    assert not stepping_aside(gpu)
+    assert stepping_aside({**gpu, "is_yielding": True}) and stepping_aside({**gpu, "leaving": True})
+    assert stepping_aside({**gpu, "docked": False}) and not stepping_aside({**gpu, "docked": True})
+    registry = WorkerRegistry()
+    registry.update_worker("w", "192.168.1.9", 50052, "t", {**gpu, "leaving": True})
+    assert registry.get_active_rpc_endpoints() == [] and registry.plan_endpoints(8.0, "always") == []
+    assert registry.endpoint_is_draining("192.168.1.9:50052") is True
+    assert registry.endpoint_is_draining("192.168.1.10:50052") is False, "not registered: gone, not draining"
+    registry.update_worker("w", "192.168.1.9", 50052, "t", gpu)
+    assert registry.endpoint_is_draining("192.168.1.9:50052") is False
+
+
+def test_the_registry_keeps_when_a_yield_began():
+    from engine.registry import WorkerRegistry
+    registry = WorkerRegistry()
+    gpu = {"gpu": {"has_gpu": True, "vram_total_gb": 8.0}}
+    registry.update_worker("w", "192.168.1.9", 50052, "t", gpu)
+    assert registry.workers["w"]["yielding_since"] is None
+    registry.update_worker("w", "192.168.1.9", 50052, "t", {**gpu, "is_yielding": True})
+    since = registry.workers["w"]["yielding_since"]
+    assert since is not None
+    registry.update_worker("w", "192.168.1.9", 50052, "t", {**gpu, "is_yielding": True})
+    assert registry.workers["w"]["yielding_since"] == since, "the same yield"
+    registry.update_worker("w", "192.168.1.9", 50052, "t", gpu)
+    assert registry.workers["w"]["yielding_since"] is None

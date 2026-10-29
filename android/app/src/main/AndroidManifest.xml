@@ -2,8 +2,21 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- The only permission the app needs: talking to the DLNE service over HTTPS. -->
+    <!-- Talking to the DLNE service over HTTPS. -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+        Location, precise and approximate together (Android 12+ lets the person allow only
+        approximate), and only asked for when the person turns on Settings > Share location or taps
+        "Use my location" on the card the chat shows above the message box for a question about where
+        they are; never at startup, never in the background. The features are optional so that declaring
+        the permissions does not hide the app from Play for devices without location hardware.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+    <uses-feature android:name="android.hardware.location.gps" android:required="false" />
+    <uses-feature android:name="android.hardware.location.network" android:required="false" />
 
     <!--
         allowBackup / dataExtractionRules: conversations stay on this phone. They are kept
@@ -41,5 +54,16 @@
                 <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
+
+        <!-- Share for a generated image: hands one file from the images folder to the share sheet. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

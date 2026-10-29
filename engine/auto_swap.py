@@ -24,19 +24,36 @@ WHY IT IS THIS CAUTIOUS
       and if they don't, the switch is called off and nothing is interrupted.
 
     "The pool" means the *near* GPUs only: the host's own and volunteers within
-    ``AUTO_SWAP_MAX_RTT_MS`` (15 ms, a LAN), measured by the coordinator (see "Near and far
-    GPUs" below). A volunteer across the internet never unlocks a bigger tier.
+    ``AUTO_SWAP_MAX_RTT_MS`` (80 ms), measured by the coordinator (see "Near and far GPUs"
+    below). A volunteer farther away never unlocks a bigger tier.
 
     And the switch itself is bounded: if the new engine is not answering within
-    ``AUTO_SWAP_LOAD_TIMEOUT_SECONDS`` (3 min), the previous model is put back.
+    ``AUTO_SWAP_LOAD_TIMEOUT_SECONDS`` (3 min), the previous model is put back. A move up is
+    also speed-checked before anyone is let in (2.4.9): a short generation timed by llama.cpp
+    must reach ``AUTO_SWAP_MIN_DECODE_TPS`` (10 tokens a second), or the previous model is put
+    back and the tier is held off like any failed switch. A smarter model that crawls because
+    its share of the weights sits across a slow link is not an upgrade.
 
     A down-switch only needs the pool to have been short for ``AUTO_SWAP_DOWN_STABLE_SECONDS``
-    (2 min). It ignores the cooldown, because the served model cannot run properly any more.
+    (2 min), and not even that once the engine already runs on what is left (``engine_short``,
+    2.5.3): losing an endpoint rebuilds the engine at once, so waiting for the GPU to come back
+    protects nothing and only keeps a model that no longer fits, spilling. It ignores the
+    cooldown, because the served model cannot run properly any more.
     After a manual switch (``POST /v1/cluster/swap``, or anything else that changes the served
     model behind the controller's back) it holds off in both directions for the cooldown.
 
     It only ever moves between *enabled* rungs of the ladder, and only while the served
     model is one of them: an operator who picked some other model keeps it.
+
+THE FLAP BREAKER (2.6.2)
+    Whatever the cause, an engine that is rebuilt over and over cuts every answer in flight each
+    time and costs 20 to 50 seconds. On 2026-10-28 the coordinator did that five times in five
+    hours, each time for a small reason of its own. :class:`FlapBreaker` does not look for causes,
+    it counts rebuilds: when the engine has been rebuilt more than ``AUTO_SWAP_MAX_REBUILDS_PER_HOUR``
+    (3) times in an hour, the rebuilds nobody needs (a switch up to a bigger model, a GPU joining a
+    working engine) are held for ``AUTO_SWAP_FLAP_HOLD_SECONDS`` (an hour), and the log and the status
+    ("held") say why. A step down, a restart after the engine stopped and a manual switch are never
+    held, only counted.
 
 THE OFF SWITCH
     ``AUTO_SWAP=false`` in config.txt. It is read on every tick (config.txt is re-read when
@@ -66,8 +83,9 @@ import asyncio
 import math
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 from engine.inference_manager import canonical_model_tag
 
@@ -79,6 +97,15 @@ TICK_SECONDS = 30.0
 DEFAULT_UP_STABLE_SECONDS = 600.0
 DEFAULT_DOWN_STABLE_SECONDS = 120.0
 DEFAULT_COOLDOWN_SECONDS = 1800.0
+
+# The flap breaker (FlapBreaker below): rebuilds allowed in an hour before the optional ones are held, and how
+# long they are held. The hour itself is not a setting.
+DEFAULT_MAX_REBUILDS_PER_HOUR = 3
+DEFAULT_FLAP_HOLD_SECONDS = 3600.0
+FLAP_WINDOW_SECONDS = 3600.0
+
+# The log line and the status name at most this many rebuilds (the latest ones).
+FLAP_LISTED_REBUILDS = 8
 
 # How long an up-switch waits for an idle coding queue before it drains the queue itself.
 QUEUE_WAIT_SECONDS = 900.0
@@ -99,21 +126,45 @@ FAILED_TIER_HOLD_MAX_SECONDS = 48 * 3600.0
 # A failed or rejected download is retried after this long.
 DOWNLOAD_RETRY_SECONDS = 3600.0
 
-STATES = ("off", "steady", "waiting", "downloading", "swapping", "cooldown")
+# "held" (2.6.2) is the flap breaker: the engine was rebuilt too often, so a switch up waits (FlapBreaker below).
+STATES = ("off", "steady", "waiting", "downloading", "swapping", "cooldown", "held")
 
 # ======================================================================================
 # Near and far GPUs
 # ======================================================================================
 #
-# Every tier above the host's own 16 GB needs a volunteer's GPU, reached over RPC. Across the
-# internet that is a bad trade: the volunteer's share of the weights has to be uploaded
-# before the model answers (minutes to hours on a home uplink), and every token then crosses
-# the link, so the "bigger" model can easily decode slower than today's local one. So only
-# GPUs that are *near* count toward the coding pool: the host's own, and volunteers whose
-# measured round trip is at most AUTO_SWAP_MAX_RTT_MS (15 ms, a LAN). A volunteer nobody has
-# measured is far.
+# Every tier above the host's own 16 GB needs a volunteer's GPU, reached over RPC. Every
+# token then crosses the link at least once, so its round trip caps how fast the shared
+# model can answer (one 80 ms hop: about 12 tokens a second at best), and the volunteer's
+# share of the weights has to be uploaded before the model answers. So only GPUs that are
+# *near* count toward the coding pool: the host's own, and volunteers whose round trip, as
+# this coordinator measured it, is at most AUTO_SWAP_MAX_RTT_MS (80 ms, the owner's limit
+# for "good"). A volunteer nobody has measured is far, and so is one that only says it is
+# close: a worker's own link report never decides this.
+#
+# A far GPU is not wasted: a coding member runs a whole model on it, so a request crosses the
+# link once rather than every token, and CODING_MEMBER_MAX_RTT_MS (120 ms, "usable") is the
+# limit there. Past that the machine gets no job at all.
 
-DEFAULT_MAX_RTT_MS = 15.0
+DEFAULT_MAX_RTT_MS = 80.0
+DEFAULT_MEMBER_MAX_RTT_MS = 120.0
+
+# The owner's grades for a link, shown on the status page: (upper bound in ms, grade).
+RTT_GRADES = ((40.0, "best"), (80.0, "good"), (120.0, "usable"))
+
+
+def rtt_grade(rtt_ms: Any) -> str:
+    """"best", "good", "usable" or "too_far" for a measured round trip; "unmeasured" for anything else."""
+    try:
+        rtt = float(rtt_ms)
+    except (TypeError, ValueError):
+        return "unmeasured"
+    if not math.isfinite(rtt) or rtt < 0:
+        return "unmeasured"
+    for bound, grade in RTT_GRADES:
+        if rtt <= bound:
+            return grade
+    return "too_far"
 
 # How often each volunteer's RTT is measured, and how long a good measurement stays valid
 # when later probes fail (one lost probe must not make a LAN machine "far" and trigger a
@@ -393,6 +444,183 @@ def _eta(seconds: float) -> str:
 
 
 # ======================================================================================
+# The flap breaker
+# ======================================================================================
+
+def _clock_text(wall_seconds: float) -> str:
+    """A time of day, '06:31', in this machine's own time: the log's own timestamps are in it too."""
+    try:
+        return time.strftime("%H:%M", time.localtime(wall_seconds))
+    except (OverflowError, OSError, ValueError):
+        return "?"
+
+
+class FlapBreaker:
+    """
+    Counts every rebuild of the coding engine, and holds the optional ones when there have been too many.
+
+    WHY IT EXISTS
+        On 2026-10-28 the coordinator rebuilt its coding engine again and again (06:31, 06:46, 07:16, 10:11, about
+        11:40), each time for a small reason of its own, and every rebuild cut every answer in flight and took 20
+        to 50 seconds. The causes were fixed one at a time (an aged link reading that moved a GPU, a GPU that
+        stepped aside for CPU load); the next cause will be another one. So this does not look for causes, it
+        counts rebuilds.
+
+    THE RULE
+        Every place the coordinator rebuilds the engine tells :meth:`record` (an auto-swap switch either way, a
+        topology rebuild, a restart after the engine stopped, a manual switch). When the last 3600 s hold MORE
+        than ``AUTO_SWAP_MAX_REBUILDS_PER_HOUR`` of them (3: the fourth rebuild in an hour trips it, the third
+        does not) the breaker TRIPS: for ``AUTO_SWAP_FLAP_HOLD_SECONDS`` the OPTIONAL rebuilds are held, and the
+        log says why, once. 0 rebuilds turns it off.
+
+        OPTIONAL are the rebuilds that only make a working engine bigger: a switch up to a bigger model (the
+        controller asks :meth:`holding`) and a topology rebuild that only adds GPUs (the coordinator asks
+        :meth:`hold_back`). NECESSARY ones are never held, because they keep the service up: a step down because
+        the served model no longer fits, a restart because the engine stopped or lost a GPU, a switch an operator
+        asked for. They are counted all the same, so a crash loop is in the numbers too.
+
+        It trips only when a rebuild is recorded, never on a timer. When a hold ends nothing is held again until
+        a rebuild is recorded and the last hour still holds too many (with a hold shorter than the hour, the next
+        optional rebuild after it is let through, and trips it again if the hour is still full).
+
+    The memory is this process's: a coordinator restart starts with an empty hour. Every call is made from the
+    event loop, so nothing here is locked.
+
+    Args (all keyword):
+        settings: ``() -> dict`` with ``auto_swap_max_rebuilds_per_hour`` and ``auto_swap_flap_hold_seconds``
+            (``engine.config.get_worker_limits``). Read on every call; what cannot be read is the default.
+        clock: monotonic seconds. wall_clock: epoch seconds, only for the times named in the log.
+        log / warn: one-line loggers; the trip itself goes to ``warn``.
+    """
+
+    def __init__(
+        self,
+        *,
+        settings: Callable[[], Dict[str, Any]],
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        log: Callable[[str], None] = print,
+        warn: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self._settings = settings
+        self._clock = clock
+        self._wall_clock = wall_clock
+        self._log = log
+        self._warn = warn or log
+        # (monotonic time, wall-clock time, cause) of each rebuild, oldest first. Bounded: a crash loop that
+        # rebuilds every few seconds has long since tripped it.
+        self._rebuilds: Deque[Tuple[float, float, str]] = deque(maxlen=512)
+        # The end of the hold on both clocks (None: never tripped), and the (wall-clock time, cause) of the
+        # rebuilds that tripped it, which the status goes on naming for as long as the hold lasts.
+        self._held_until: Optional[float] = None
+        self._held_until_wall = 0.0
+        self._tripped_by: List[Tuple[float, str]] = []
+        # The optional rebuilds already said to be held in this hold, so the log names each once.
+        self._told: Set[str] = set()
+
+    # ----------------------------------------------------------------------------------
+    # Public surface
+    # ----------------------------------------------------------------------------------
+
+    def record(self, cause: str) -> None:
+        """
+        One engine rebuild happened (or was started): ``cause`` says why, in a few plain words. Trips the
+        breaker when the last hour now holds more than the limit and it is not already holding.
+        """
+        now, wall = self._clock(), self._wall_clock()
+        self._forget_old(now)
+        self._rebuilds.append((now, wall, cause))
+        limit, hold = self._limits()
+        if limit <= 0 or len(self._rebuilds) <= limit or self._is_holding(now):
+            return
+        self._held_until = now + hold
+        self._held_until_wall = wall + hold
+        self._tripped_by = [(when, why) for _, when, why in self._rebuilds]
+        self._told.clear()
+        self._warn(f"Flap breaker: {self._sentence(hold)}")
+
+    def holding(self) -> bool:
+        """True while optional rebuilds are held. False when the breaker is off (0 rebuilds an hour)."""
+        return self._limits()[0] > 0 and self._is_holding(self._clock())
+
+    def hold_back(self, what: str) -> bool:
+        """
+        True when the optional rebuild ``what`` ("redistributing the model for the new GPU", say) must not start
+        now. The first time each ``what`` is held in a hold, the log says so and until when.
+        """
+        if not self.holding():
+            return False
+        if what not in self._told:
+            self._told.add(what)
+            self._log(f"Flap breaker: not {what} until {_clock_text(self._held_until_wall)}; the engine was "
+                      "rebuilt too often in the last hour.")
+        return True
+
+    def until_text(self) -> str:
+        """When the hold ends, as a time of day ('13:05'); '' when not holding."""
+        return _clock_text(self._held_until_wall) if self.holding() else ""
+
+    def detail(self) -> str:
+        """The sentence for ``auto_swap.detail`` in /v1/cluster/status while holding: how many rebuilds, when and
+        why, and until when it holds. '' when not holding."""
+        if not self.holding():
+            return ""
+        return self._sentence(self._held_until - self._clock())
+
+    def recent_rebuilds(self) -> List[str]:
+        """The causes of the rebuilds in the last hour, oldest first."""
+        self._forget_old(self._clock())
+        return [cause for _, _, cause in self._rebuilds]
+
+    def reset(self) -> None:
+        """Forget every rebuild and any hold (the test-suite's fixture; nothing else calls it)."""
+        self._rebuilds.clear()
+        self._held_until = None
+        self._held_until_wall = 0.0
+        self._tripped_by = []
+        self._told.clear()
+
+    # ----------------------------------------------------------------------------------
+    # Bookkeeping
+    # ----------------------------------------------------------------------------------
+
+    def _is_holding(self, now: float) -> bool:
+        return self._held_until is not None and now < self._held_until
+
+    def _forget_old(self, now: float) -> None:
+        """Drop the rebuilds that are an hour old or more: only the last 3600 s count."""
+        while self._rebuilds and now - self._rebuilds[0][0] >= FLAP_WINDOW_SECONDS:
+            self._rebuilds.popleft()
+
+    def _limits(self) -> Tuple[int, float]:
+        """``(rebuilds an hour, hold seconds)``; a value that cannot be read, or is not sane, is the default."""
+        try:
+            raw = self._settings()
+        except Exception:  # noqa: BLE001 - a safety net stays on when its settings cannot be read
+            raw = None
+        raw = raw if isinstance(raw, dict) else {}
+        limit = raw.get("auto_swap_max_rebuilds_per_hour", DEFAULT_MAX_REBUILDS_PER_HOUR)
+        if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit) or limit < 0:
+            limit = DEFAULT_MAX_REBUILDS_PER_HOUR
+        hold = raw.get("auto_swap_flap_hold_seconds", DEFAULT_FLAP_HOLD_SECONDS)
+        if isinstance(hold, bool) or not isinstance(hold, (int, float)) or not math.isfinite(hold) or hold <= 0:
+            hold = DEFAULT_FLAP_HOLD_SECONDS
+        return int(limit), float(hold)
+
+    def _sentence(self, left: float) -> str:
+        """The trip, in one sentence: what was rebuilt and when, what is held, until when."""
+        names = self._tripped_by
+        listed = names[-FLAP_LISTED_REBUILDS:]
+        what = "; ".join(f"{_clock_text(when)} {why}" for when, why in listed)
+        if len(listed) < len(names):
+            what = f"{len(names) - len(listed)} earlier, then {what}"
+        return (f"The engine was rebuilt {len(names)} times within an hour: {what}. So rebuilds that are not "
+                "needed to keep serving (a switch up to a bigger model, a GPU joining) are held until "
+                f"{_clock_text(self._held_until_wall)} ({_eta(left)}). A step down, a restart after the engine "
+                "stopped and a manual switch still go ahead.")
+
+
+# ======================================================================================
 # The controller
 # ======================================================================================
 
@@ -414,6 +642,8 @@ class AutoSwapController:
         fits: ``(tier, pool) -> bool``; defaults to :func:`fits_by_vram`.
         clock: monotonic seconds.
         log / warn: one-line loggers.
+        breaker: the :class:`FlapBreaker` the coordinator also tells about its own rebuilds. Without one the
+            controller keeps its own, from the same ``settings``, ``clock`` and loggers.
     """
 
     def __init__(
@@ -433,6 +663,8 @@ class AutoSwapController:
         log: Callable[[str], None] = print,
         warn: Optional[Callable[[str], None]] = None,
         interval: float = TICK_SECONDS,
+        engine_short: Optional[Callable[[], bool]] = None,
+        breaker: Optional[FlapBreaker] = None,
     ) -> None:
         self._tiers_provider = tiers_provider
         self._pool_provider = pool_provider
@@ -448,6 +680,10 @@ class AutoSwapController:
         self._log = log
         self._warn = warn or log
         self._interval = interval
+        # True when the engine already runs without the GPUs that left (see the module docstring).
+        self._engine_short = engine_short or (lambda: False)
+        # Counts the rebuilds, and holds a switch up when there were too many (see FlapBreaker).
+        self._breaker = breaker or FlapBreaker(settings=settings, clock=clock, log=log, warn=self._warn)
 
         # The enabled rungs as of the last tick. serve_as() reads this on the request path,
         # so it must never call the provider (which may read files).
@@ -493,12 +729,23 @@ class AutoSwapController:
             # Switched back on since the last tick.
             return {"enabled": True, "state": "steady", "target": None,
                     "detail": "Automatic model switching is starting."}
+        if self._breaker.holding():
+            # The flap breaker is tripped (2.6.2): the engine was rebuilt too often and the rebuilds nobody needs
+            # are held, a GPU joining as much as a switch up, so this is said whatever the last tick decided.
+            return {"enabled": True, "state": "held",
+                    "target": decision.target if decision.state == "held" else None,
+                    "detail": self._breaker.detail()}
+        if decision.state == "held":
+            # The hold ended since the last tick, which looks at the pool again within TICK_SECONDS.
+            return {"enabled": True, "state": "steady", "target": None,
+                    "detail": "The hold on rebuilding the engine has ended; looking at the pool again."}
         return {"enabled": True, "state": decision.state, "target": decision.target, "detail": decision.detail}
 
     def note_manual_swap(self, model: Optional[str] = None) -> None:
         """
         Called after a manual switch. Holds off for the cooldown in both directions, so the
-        controller never undoes what an operator (or a client) just chose.
+        controller never undoes what an operator (or a client) just chose. It is an engine rebuild too, so
+        the flap breaker counts it (it is never held).
         """
         settings = self._read_settings()
         self._hold(self._clock(), settings.cooldown)
@@ -507,6 +754,7 @@ class AutoSwapController:
         if settings.enabled:
             self._log(f"Auto-swap: a manual switch to {_bare(model) or 'another model'}; "
                       f"holding off for {_duration(settings.cooldown)}.")
+        self._breaker.record(f"manual switch to {self._model_label(_bare(model)) if model else 'another model'}")
 
     def serve_as(self, requested: Any, current: Any) -> Any:
         """
@@ -639,7 +887,7 @@ class AutoSwapController:
             await self._prefetch(candidates[-1], now)
 
         pool_text = f"The pool ({_gb(vram)} GB of GPU memory) can no longer hold {tier_label(served)}"
-        if short_for < settings.down_stable:
+        if short_for < settings.down_stable and not self._engine_short():
             if fallback is not None:
                 detail = (f"{pool_text}; switching to {tier_label(fallback)} "
                           f"{_eta(settings.down_stable - short_for)} unless it recovers.")
@@ -716,6 +964,14 @@ class AutoSwapController:
                                 f"Switching to {tier_label(target)} {_eta(cooldown_left)} "
                                 "(cooldown after the last switch).")
 
+        if self._breaker.holding():
+            # A switch up is optional, so it is the first thing a flapping engine goes without. The breaker's own
+            # line in the log says how many rebuilds there were; the status shows its sentence (status()).
+            self._busy_since = None
+            return self._decide("held", tier_id(target), "flap-hold",
+                                f"Not switching to {tier_label(target)} for now: the engine was rebuilt too often, "
+                                f"so a switch up is held until {self._breaker.until_text()}.")
+
         if self._queue_busy():
             if self._busy_since is None:
                 self._busy_since = now
@@ -734,10 +990,14 @@ class AutoSwapController:
     async def _switch(self, tier: Dict[str, Any], direction: str, now: float, settings: _Settings) -> Decision:
         label = tier_label(tier)
         why = " because the pool shrank" if direction == "down" else ""
+        previous = self._model_label(_bare(self._current_model()))
         self._swapping = True
         self._decide("swapping", tier_id(tier), f"switch-{direction}", f"Switching to {label} now{why}.")
         try:
-            result = await self._swap(tier, drain_seconds=DRAIN_SECONDS, abort_if_busy=(direction == "up"))
+            # Only a move up is speed-checked: a move down happens because the bigger model no longer
+            # fits, so there is nothing to go back to.
+            result = await self._swap(tier, drain_seconds=DRAIN_SECONDS, abort_if_busy=(direction == "up"),
+                                      check_speed=(direction == "up"))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - reported like any other failed switch
@@ -757,7 +1017,10 @@ class AutoSwapController:
             self._busy_since = None
             self._unfit_since = None
             self._failures.pop(tier_id(tier), None)
-            return self._decide("steady", None, "switched", f"Switched to {label}{why}.")
+            decision = self._decide("steady", None, "switched", f"Switched to {label}{why}.")
+            # After the line above, so the log reads "Switched ..." and then, if this was one too many, the breaker's.
+            self._breaker.record(f"auto-swap {direction} to {label}")
+            return decision
 
         if result.status == "busy":
             # Start the bounded wait again, so a queue that would not drain is not held up
@@ -769,8 +1032,11 @@ class AutoSwapController:
 
         if result.status == "superseded":
             self._hold(now, settings.cooldown)
-            return self._decide("cooldown", None, "manual-hold",
-                                f"A manual model switch took over; holding off {_eta(settings.cooldown)}.")
+            decision = self._decide("cooldown", None, "manual-hold",
+                                    f"A manual model switch took over; holding off {_eta(settings.cooldown)}.")
+            # It was part-way through (the engine stopped), so it counts; the manual switch is counted by its own.
+            self._breaker.record(f"auto-swap {direction} to {label}, taken over by a manual switch")
+            return decision
 
         # failed or refused
         failures = self._failures.get(tier_id(tier), 0) + 1
@@ -783,9 +1049,15 @@ class AutoSwapController:
             self._last_swap_at = now
         self._warn(f"Auto-swap: switching to {label} did not work ({result.status}: {result.detail}); "
                    f"serving {current or 'no model'}. {label} is not tried again {_eta(hold)}.")
-        return self._decide("waiting", tier_id(tier), "switch-failed",
-                            f"Switching to {label} did not work ({result.detail or result.status}); "
-                            f"not trying it again {_eta(hold)}.")
+        decision = self._decide("waiting", tier_id(tier), "switch-failed",
+                                f"Switching to {label} did not work ({result.detail or result.status}); "
+                                f"not trying it again {_eta(hold)}.")
+        if result.status == "failed":
+            # Out and back: the engine was rebuilt on the new model, which did not come up, and again on the old
+            # one. A refused switch touched nothing, so it is not a rebuild.
+            self._breaker.record(f"auto-swap {direction} to {label}, which did not come up")
+            self._breaker.record(f"{previous} put back")
+        return decision
 
     # ----------------------------------------------------------------------------------
     # Downloads
@@ -944,6 +1216,13 @@ class AutoSwapController:
             self._hold(now, settings.cooldown)
             self._log(f"Auto-swap: the served model changed to {current or 'nothing'} outside automatic "
                       f"switching; holding off for {_duration(settings.cooldown)}.")
+
+    def _model_label(self, model_file: str) -> str:
+        """A served model as the log should name it: its rung's name, else its file, else a plain phrase."""
+        for tier in self._enabled_tiers:
+            if _bare(tier.get("file")) == model_file:
+                return tier_label(tier)
+        return model_file or "the previous model"
 
     def _hold(self, now: float, seconds: float) -> None:
         self._hold_until = max(self._hold_until, now + seconds)

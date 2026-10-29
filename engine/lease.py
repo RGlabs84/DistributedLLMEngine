@@ -145,6 +145,16 @@ class InferenceLeaseManager:
                 for lease in self._leases.values()
             ]
 
+    def public_summary(self) -> List[Dict[str, Any]]:
+        """
+        The in-flight tasks as /v1/cluster/status shows them to anyone: each one's kind and timing,
+        nothing that says whose it is. ``client_id`` is the caller's IP address and ``metadata`` the
+        caller's own, so neither leaves this process; until 2.4.9 the public status carried both.
+        """
+        return [{"task_type": item["task_type"], "elapsed_seconds": item["elapsed_seconds"],
+                 "remaining_seconds": item["remaining_seconds"]}
+                for item in self.active_leases_summary()]
+
     async def wait_for_idle(self, timeout: float = 30.0, poll_interval: float = 0.5) -> bool:
         """
         Asynchronously wait until active_count() is 0.

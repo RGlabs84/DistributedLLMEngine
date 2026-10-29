@@ -6,7 +6,8 @@ connection, a peer that closes before answering, a chunked body cut short) are w
 under test sees, not a mock's idea of them.
 
 * :class:`FakeLlamaServer` - a FastAPI app served by uvicorn in a thread (the same pattern
-  as tests/test_reverse_tunnel.py) answering ``POST /v1/chat/completions`` with SSE chunks.
+  as tests/test_reverse_tunnel.py) answering ``POST /v1/chat/completions`` with SSE chunks
+  (``script`` gives each next request its own reply) and ``POST /tokenize`` (``chars_per_token``).
   Its ``mode`` picks the behaviour: ``ok``, ``500``, ``400``, ``die_before_first_chunk``,
   ``die_mid_stream`` and ``hold`` (pause after the first chunk until ``gate`` is set).
 * :class:`ClosingServer` - accepts a connection, reads the request and closes without a
@@ -101,7 +102,7 @@ class FakeLlamaServer:
             self.payloads.append(payload)
             self.entered.set()
             mode = self.mode
-            chunks = list(self.chunks)
+            chunks = self.script.pop(0) if self.script else list(self.chunks)
             if mode == "500":
                 return JSONResponse({"error": {"message": "the model crashed"}}, status_code=500)
             if mode == "400":
@@ -120,6 +121,14 @@ class FakeLlamaServer:
 
             return StreamingResponse(body(), media_type="text/event-stream")
 
+        @app.post("/tokenize")
+        async def tokenize(request: Request):
+            body = await request.json()
+            self.tokenized.append(body)
+            if self.chars_per_token is None:
+                return JSONResponse({"error": "no tokenizer"}, status_code=404)
+            return {"tokens": [0] * -(-len(body["content"]) // self.chars_per_token)}
+
         @app.get("/health")
         async def health():
             return {"status": "ok"}
@@ -132,6 +141,9 @@ class FakeLlamaServer:
         self.mode = "ok"
         self.die_after = 1
         self.chunks = [sse(f"{self.name}-one "), sse(f"{self.name}-two"), DONE]
+        self.script: List[List[bytes]] = []     # replies for the next requests, one list of chunks each
+        self.chars_per_token: Optional[int] = None   # what /tokenize counts by; None: it answers 404
+        self.tokenized: List[dict] = []
         self.payloads.clear()
         self.gate.set()
         self.entered.clear()

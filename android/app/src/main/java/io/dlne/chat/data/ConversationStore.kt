@@ -4,6 +4,7 @@ import android.util.AtomicFile
 import android.util.Log
 import java.io.File
 import java.io.IOException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
@@ -33,19 +34,31 @@ class ConversationStore(private val file: File, scope: CoroutineScope) {
     // CONFLATED: a burst of changes collapses into a single write of the latest state.
     private val writeRequests = Channel<Unit>(Channel.CONFLATED)
 
+    // Completes once the saved history has been read, with whether that was all of it.
+    private val loaded = CompletableDeferred<Boolean>()
+
     init {
         scope.launch(Dispatchers.IO) {
             val fromDisk = read()
             // Anything created in the moment before the file was read is kept as well.
             _conversations.update { inMemory ->
                 val ids = inMemory.mapTo(HashSet()) { it.id }
-                sorted(inMemory + fromDisk.filter { it.id !in ids })
+                sorted(inMemory + fromDisk.conversations.filter { it.id !in ids })
             }
+            loaded.complete(fromDisk.complete)
             // Writes start only now, so an early change can never replace the file with a
             // list that is missing the conversations still being read.
             for (request in writeRequests) write(_conversations.value)
         }
     }
+
+    /**
+     * Waits until the saved history has been read. True when all of it was (no file yet counts: there
+     * is nothing to read), false when the file could not be read or was unreadable, in which case the
+     * list may be missing chats that still exist: anything that clears away what "no chat refers to"
+     * must not run then.
+     */
+    suspend fun awaitLoaded(): Boolean = loaded.await()
 
     fun get(id: String): Conversation? = _conversations.value.firstOrNull { it.id == id }
 
@@ -67,18 +80,21 @@ class ConversationStore(private val file: File, scope: CoroutineScope) {
 
     private fun sorted(list: List<Conversation>) = list.sortedByDescending { it.updatedAt }
 
-    private fun read(): List<Conversation> {
-        if (!file.exists()) return emptyList()
+    /** What reading the saved history gave, and whether that is all of it. */
+    private class Loaded(val conversations: List<Conversation>, val complete: Boolean)
+
+    private fun read(): Loaded {
+        if (!file.exists()) return Loaded(emptyList(), complete = true)
         return try {
             val text = AtomicFile(file).readFully().toString(Charsets.UTF_8)
-            json.decodeFromString(ConversationFile.serializer(), text).conversations
+            Loaded(json.decodeFromString(ConversationFile.serializer(), text).conversations, complete = true)
         } catch (e: IOException) {
             Log.w(TAG, "Could not read chat history", e)
-            emptyList()
+            Loaded(emptyList(), complete = false)
         } catch (e: SerializationException) {
-            preserveUnreadable(e)
+            Loaded(preserveUnreadable(e), complete = false)
         } catch (e: IllegalArgumentException) {
-            preserveUnreadable(e)
+            Loaded(preserveUnreadable(e), complete = false)
         }
     }
 

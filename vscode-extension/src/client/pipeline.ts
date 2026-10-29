@@ -43,6 +43,21 @@ export interface PipelineContext {
   folder?: vscode.WorkspaceFolder;
   /** How long a route answer may be reused (see RouteLookup.lookup). */
   routeTtlMs: number;
+  /**
+   * The widest audience this request may have, whatever the workspace's mode says (see capPrivacy). Set for a request whose
+   * files were picked by someone else's tools (VS Code's own agent, through the model picker).
+   */
+  maxPrivacy?: 'trusted';
+}
+
+/**
+ * `mode` limited to `max`. Only "trusted" can be a cap: it takes "open" down to "trusted" and leaves "any" alone. "open" is
+ * something DLNE worked out from a git remote (auto mode: a public repository may use any member), so a request that
+ * carries whatever VS Code's tools read, a local .env included, must not go to a stranger's machine because of it.
+ * "any" is what the user chose in dlne.privacy, so it stands.
+ */
+export function capPrivacy(mode: PrivacyMode, max?: 'trusted'): PrivacyMode {
+  return max === 'trusted' && mode === 'open' ? 'trusted' : mode;
 }
 
 export interface PipelineEnv {
@@ -50,6 +65,8 @@ export interface PipelineEnv {
   headers: () => Record<string, string>;
   routes: RouteLookup;
   agent?: http.Agent;
+  /** The trust id of this machine's own coding member, when the worker is one: the route lookup names it. */
+  own?: () => string | undefined;
 }
 
 /** The request exactly as it was built, with nothing added: the shape a direct caller gets by default. */
@@ -83,14 +100,14 @@ export async function prepareRequest(
   // With members on, every coding request says how widely its code may travel (the coordinator never
   // upgrades it, and reads a missing header as "trusted").
   // No folder named means the workspace's only folder; with several open the policy answers "trusted".
-  const privacy = await privacyModeFor(ctx.folder);
+  const privacy = capPrivacy(await privacyModeFor(ctx.folder), ctx.maxPrivacy);
   prepared.privacy = privacy;
   headers['X-DLNE-Privacy'] = privacy;
   if (ctx.forcePlain) {
     return prepared;
   }
   try {
-    const offer = await env.routes.lookup(env.base, env.headers(), ctx.sessionId, privacy, ctx.routeTtlMs, env.agent);
+    const offer = await env.routes.lookup(env.base, env.headers(), ctx.sessionId, privacy, ctx.routeTtlMs, env.agent, env.own?.());
     if (offer) {
       const sealed = sealForMember(redacted.payload, offer.pubkey);
       if (sealed) {

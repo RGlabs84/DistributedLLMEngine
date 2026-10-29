@@ -70,7 +70,7 @@ class Member:
     def settled(self):
         return self._settled
 
-    def assign(self, value):
+    def assign(self, value, slots=None):
         self.assigned.append(value)
 
     def stop(self):

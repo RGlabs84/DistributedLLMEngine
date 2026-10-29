@@ -102,7 +102,7 @@ class ReportAndLookupApiTest {
             "data: [DONE]\n\n"
         server.enqueue(MockResponse().setBody(body).throttleBody(5, 2, TimeUnit.MILLISECONDS))
 
-        val events = api.streamChat(baseUrl, listOf(WireMessage("user", "Weather in Philadelphia?"))).toList()
+        val events = api.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "Weather in Philadelphia?"))).toList()
 
         assertEquals(
             listOf("Searching", "Sources", "Searching", "Sources", "SearchNote", "Content", "Done"),

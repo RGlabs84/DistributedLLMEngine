@@ -146,17 +146,27 @@ AUTO_KV_CLAIM_FRACTION = 0.70
 
 _GIB = 1024 ** 3
 
+# llama-server pads a unified context up to a multiple of this many tokens.
+CONTEXT_PAD = 256
+
+
+def pad_context(tokens: int) -> int:
+    return -(-int(tokens) // CONTEXT_PAD) * CONTEXT_PAD
+
 
 @dataclass(frozen=True)
 class SlotPlan:
     """How many request slots an engine gets and how much context each has."""
 
-    slots: int
+    slots: int                  # the coding slots; the phone slots are counted apart
     context_per_slot: int
-    total_context: int          # the engine's -c: slots x context_per_slot
+    total_context: int          # the coding share of the pool: slots x context_per_slot
     cache_type: str             # -ctk / -ctv
-    kv_gb: float                # KV cache plus recurrent state at this size, in GiB
+    kv_gb: float                # KV cache plus recurrent state of the whole pool, in GiB
     mode: str                   # "fixed", "context-fixed", "slots-fixed" or "auto"
+    phone_slots: int = 0        # lanes reserved for the phone app (ENGINE_PHONE_SLOTS)
+    phone_context: int = 0      # tokens each phone lane holds, padded
+    pool_context: int = 0       # the engine's -c; equals total_context while there are no phone lanes
 
 
 def plan_slots_and_context(
@@ -168,6 +178,8 @@ def plan_slots_and_context(
     requested_slots: int,
     fixed_slots: int = 0,
     fixed_context: int = 0,
+    phone_slots: int = 0,
+    phone_context: int = 0,
 ) -> SlotPlan:
     """
     Chooses -np and -c. Pure arithmetic: no files, no locks, so the same call answers the
@@ -195,6 +207,10 @@ def plan_slots_and_context(
         native_context: the context one slot may use at most (the model's own limit).
         requested_slots: the caller's wish for slots, at least 1.
         fixed_slots / fixed_context: the operator's ENGINE_SLOTS / ENGINE_CONTEXT, 0 = auto.
+        phone_slots / phone_context: lanes kept for the phone app (ENGINE_PHONE_SLOTS /
+            ENGINE_PHONE_CONTEXT). They are paid for first, out of the budget, so the coding slots
+            are sized from what is left; with ENGINE_CONTEXT fixed they come on top of it. The
+            coding numbers (``slots``, ``context_per_slot``, ``total_context``) never include them.
     """
     native = max(MIN_CONTEXT_TOKENS, int(native_context))
     floor = min(SLOT_CONTEXT_FLOOR, native)
@@ -204,6 +220,11 @@ def plan_slots_and_context(
 
     def token_bytes(cache_type: str) -> int:
         return max(1, gguf.scale_kv_bytes(int(kv_f16_bytes_per_token), cache_type))
+
+    phone_slots = max(0, int(phone_slots))
+    phone_context = pad_context(phone_context) if phone_slots else 0
+    # Priced at q8_0, the type the coding slots get unless they grow past Q4_KV_SLOT_CONTEXT.
+    budget_bytes = max(0.0, budget_bytes - phone_slots * (state_bytes_per_slot + phone_context * token_bytes("q8_0")))
 
     def fit_per_slot(slots: int) -> int:
         tokens = (budget_bytes / slots - state_bytes_per_slot) / token_bytes("q8_0")
@@ -227,9 +248,30 @@ def plan_slots_and_context(
         per_slot = min(ceiling, max(MIN_CONTEXT_TOKENS, fit_per_slot(slots)))
         total = per_slot * slots
 
+    # --kv-unified-per-slot caps every lane, the phone's too, at the coding slot's padded size, so a phone lane
+    # never holds more than that: the number recorded (and the coordinator's bound) is the one that holds.
+    phone_context = min(phone_context, pad_context(per_slot))
     cache_type = "q4_0" if per_slot >= Q4_KV_SLOT_CONTEXT else "q8_0"
-    kv_gb = (slots * state_bytes_per_slot + total * token_bytes(cache_type)) / _GIB
-    return SlotPlan(slots, per_slot, total, cache_type, kv_gb, mode)
+    # llama-server pads every slot of a unified pool to 256, so the pool is built from padded slots
+    # and each coding slot keeps the context the coordinator advertises. Without phone lanes -c is
+    # the plain total, as it always was.
+    pool = total if not phone_slots else slots * pad_context(per_slot) + phone_slots * phone_context
+    kv_gb = ((slots + phone_slots) * state_bytes_per_slot + pool * token_bytes(cache_type)) / _GIB
+    return SlotPlan(slots, per_slot, total, cache_type, kv_gb, mode, phone_slots, phone_context, pool)
+
+
+def phone_lane_args(phone_slots: int, slot_context: int) -> List[str]:
+    """
+    The flags that give the phone lanes their own slots in one shared cache (and close /slots): nothing without
+    lanes, so the engine starts exactly as before. ``--kv-unified-per-slot`` caps EVERY slot, phone lanes included,
+    at the coding slot's size, so the pool is only safe because the coordinator keeps each phone prompt
+    and answer inside ENGINE_PHONE_CONTEXT and the lanes' gates bound how many run at once.
+    """
+    if phone_slots <= 0:
+        return []
+    # --no-slots closes llama-server's GET /slots, whose JSON carries every slot's prompt and generated text, and
+    # the lanes now hold phone conversations. Nothing in DLNE calls /slots (checked 2.6.1: engine, scripts, tests).
+    return ["--kv-unified", "--kv-unified-per-slot", str(pad_context(slot_context)), "--no-slots"]
 
 
 def cpu_moe_layers(extra_args) -> int:
@@ -457,6 +499,12 @@ class _StartPlan:
     cache_type: str = "q8_0"
     sizing_mode: str = ""
 
+    # PLAN_START only: the phone lanes and the engine's whole -c (see SlotPlan). ``slots`` and
+    # ``safe_context`` stay the coding share.
+    phone_slots: int = 0
+    phone_context: int = 0
+    pool_context: int = 0
+
     # PLAN_START only: set when the operator's fixed slots/context need more than the pool
     # has left by our count. Logged by start_model (not here: the dry run repeats every two
     # seconds); the operator's number still wins.
@@ -540,6 +588,128 @@ def _endpoint_is_remote(endpoint: str) -> bool:
         pass
     from engine.benchmark import classify_endpoint
     return classify_endpoint(endpoint) not in ("local", "unknown")
+
+
+# What the vision projector takes on a card besides its file: the buffer it encodes an image in. Measured on
+# TheWall's RX 580 (2026-10-28, 2.6.0): 0.96 GiB in all for Qwen3.6's mmproj-F16.gguf (0.84 GiB), fixed when the
+# projector loads and no growth while images were encoding. That is 0.12 GiB over the file; 0.15 rounds it up.
+PROJECTOR_WORKING_GB = 0.15
+
+
+# The GPU backends llama.cpp builds ship as libraries beside the binary (libggml-vulkan.so, ggml-cuda.dll, ...).
+_OTHER_GPU_BACKENDS = ("ggml-cuda", "ggml-hip", "ggml-sycl", "ggml-opencl", "ggml-metal", "ggml-musa", "ggml-cann")
+_media_gpu_warned = False
+
+
+def engine_build_is_vulkan() -> bool:
+    """
+    False only when the engine's folder (bin/ of the install, where download_and_extract_engine looks first) holds
+    another GPU backend and no Vulkan one, as a CUDA build does. DLNE's own builds are Vulkan, and a folder that says
+    nothing either way (a monolithic build, none yet) is taken as Vulkan.
+    """
+    try:
+        names = [n.lower() for n in os.listdir(os.path.join(get_base_dir(), "bin"))]
+    except OSError:
+        return True
+    if any("ggml-vulkan" in n for n in names):
+        return True
+    return not any(backend in n for n in names for backend in _OTHER_GPU_BACKENDS)
+
+
+def media_gpu_spec(limits: dict) -> str:
+    """
+    MEDIA_GPU as it applies to this engine: "" when it names no card, or when the engine is not a Vulkan build, whose
+    device names (Vulkan0, ...) are the only ones DLNE writes for the card. Said once, in the log.
+    """
+    global _media_gpu_warned
+    spec = str(limits.get("media_gpu") or "").strip()
+    if spec and not engine_build_is_vulkan():
+        if not _media_gpu_warned:
+            _media_gpu_warned = True
+            log_warning("MEDIA_GPU is ignored: this engine is not a Vulkan build, and DLNE names the media card as a "
+                        "Vulkan device. The vision projector, if any, goes on the first engine card.")
+        return ""
+    return spec
+
+
+# How long the projector stays out after an engine died encoding an image (a load failure stays until a restart).
+PROJECTOR_RETRY_SECONDS = 30 * 60
+_LOG_CHUNK = 256 * 1024
+_LOG_CARRY = 64          # bytes kept between chunks: longer than any line marker below
+
+
+def _projector_log_signs(path: str, offset: int) -> Optional[Dict]:
+    """
+    What an engine's log, from ``offset`` (where this engine's output began) to its end, says about the vision
+    projector. Read in chunks of 256 KiB, so a log that has grown for weeks costs the same as a short one.
+    ``encoding`` and ``encoded`` are the file offsets of the last "encoding image slice" and "image slice
+    encoded" lines (-1 for none). None when the log cannot be read.
+    """
+    signs = {"load_failed": False, "clip": False, "loaded": False, "listening": False, "encoding": -1, "encoded": -1}
+    markers = ((b"failed to load multimodal model", "load_failed"), (b"CLIP using", "clip"),
+               (b"loaded multimodal model", "loaded"), (b"listening on", "listening"))
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            carry, base = b"", offset
+            while True:
+                block = handle.read(_LOG_CHUNK)
+                if not block:
+                    break
+                text = carry + block
+                start = base - len(carry)
+                for marker, key in markers:
+                    if marker in text:
+                        signs[key] = True
+                for key, marker in (("encoding", b"encoding image slice"), ("encoded", b"image slice encoded")):
+                    found = text.rfind(marker)
+                    if found >= 0:
+                        signs[key] = start + found
+                base += len(block)
+                carry = text[-_LOG_CARRY:]
+    except OSError:
+        return None
+    return signs
+
+
+def _private_empty_dir(name: str) -> str:
+    """
+    ``<install>/<name>``, made if need be (owner only) and returned, or "" when it cannot be made. Used for the
+    directory the engine is told to look for ffmpeg in: with nothing in it there is nothing to run.
+    """
+    path = os.path.join(get_base_dir(), name)
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        if os.listdir(path):
+            return ""       # something put a file there: not a directory to point an engine at
+    except OSError:
+        return ""
+    return path
+
+
+def _engine_devices(limits: dict, remote: bool) -> Optional[Tuple[str, str, str]]:
+    """
+    ``(cuda_ids, vulkan_devices, media_device)`` for the engine's environment, or None when the plain
+    ALLOWED_GPU_INDICES mapping in start_model applies (no media card and no PCI address to resolve).
+
+    ``media_device`` is the llama.cpp name of the media card (MEDIA_GPU), "" when none is in use: not
+    named, not found, the only card ALLOWED_GPU_INDICES leaves, or an engine sharded over volunteers'
+    GPUs, which drops the card because ``--device`` would hide the RPC devices from the model.
+    """
+    allowed = str(limits.get("allowed_gpu_indices", "-1")).lower()
+    media_spec = media_gpu_spec(limits)
+    if allowed == "none" or not (media_spec or ":" in allowed):
+        return None
+    from engine.hardware import engine_gpu_devices
+    cuda, vulkan, media_device = engine_gpu_devices(allowed, media_spec)
+    if media_device == "Vulkan0":
+        # Nothing else to run the model on: the "media" card is the engine's after all.
+        cuda, vulkan, media_device = engine_gpu_devices(allowed, "")
+    elif media_device and remote:
+        vulkan, media_device = vulkan.rpartition(",")[0], ""
+    if allowed == "-1" and not (cuda or vulkan):
+        return None
+    return cuda, vulkan, media_device
 
 
 def _get_drm_vram_used_bytes() -> int:
@@ -687,6 +857,14 @@ class InferenceManager:
         # other thread's budget arithmetic from the instant the decision is made, not from
         # the instant Popen returns tens of seconds later.
         self._starting: Dict[str, Dict] = {}
+
+        # The projector file (ENGINE_MMPROJ) an engine died on; later starts leave it out, so a card or a
+        # file that cannot carry it costs the vision and not the coding engine. Cleared by a restart.
+        self._mmproj_failed = ""
+        self._mmproj_retry_at = 0.0         # monotonic time the projector is tried again; 0 = not before a restart
+        # (projector, model) pairs whose headers were compared, with the answer; and the pairs already warned about.
+        self._projector_fit_cache: Dict[Tuple, Tuple] = {}
+        self._projector_fit_warned: set = set()
 
         # Engines that have been detached from running_models and are being stopped RIGHT
         # NOW by some thread that is deliberately not holding _state_lock while it waits for
@@ -1391,6 +1569,146 @@ class InferenceManager:
 
         self._zombies = still_alive
 
+    # ----------------------------------------------------------------------------------
+    # Vision (2.6): the media card and the projector
+    # ----------------------------------------------------------------------------------
+
+    def _projector_path(self, limits: dict, warn: bool = False, model_path: str = "") -> str:
+        """
+        ENGINE_MMPROJ as a path, or "" while vision is off, the file is missing, an engine died on it, or (with
+        ``model_path``, the model about to start) it is a projector for another model.
+        """
+        path = os.path.expanduser(str(limits.get("engine_mmproj") or "").strip())
+        if path and path == self._mmproj_failed:
+            if not self._mmproj_retry_at or time.monotonic() < self._mmproj_retry_at:
+                return ""
+            self._mmproj_failed, self._mmproj_retry_at = "", 0.0       # the pause is over: try it again
+            log_warning(f"Vision is tried again ({os.path.basename(path)}).")
+        if not path:
+            return ""
+        if not os.path.isfile(path):
+            if warn:
+                log_warning(f"ENGINE_MMPROJ names no file ({path}); the engine starts without vision.")
+            return ""
+        if model_path and not self._projector_fits(path, model_path, warn):
+            return ""
+        return path
+
+    def _projector_fits(self, projector: str, model_path: str, warn: bool = False) -> bool:
+        """
+        Whether ``projector`` is for ``model_path``: the width its output is projected to
+        (``clip.vision.projection_dim``, which the converter writes as the text model's hidden size) must be the
+        model's ``<arch>.embedding_length``. llama-server refuses a projector of another width at load and exits,
+        which would take the coding engine down with it. A header that cannot be read on either side gives no
+        answer, and then the projector is tried (the failure fallback is still there).
+        """
+        try:
+            key = (projector, os.stat(projector).st_mtime_ns, model_path, os.stat(model_path).st_mtime_ns)
+        except OSError:
+            return True
+        answer = self._projector_fit_cache.get(key)
+        if answer is None:
+            wanted, have = gguf.projection_dim(projector), gguf.embedding_length(model_path)
+            answer = self._projector_fit_cache[key] = (wanted is None or have is None or wanted == have, wanted, have)
+        fits, wanted, have = answer
+        if not fits and warn and key not in self._projector_fit_warned:
+            self._projector_fit_warned.add(key)
+            log_warning(
+                f"ENGINE_MMPROJ ({os.path.basename(projector)}, for a model of width {wanted}) is not for "
+                f"{os.path.basename(model_path)} (width {have}); that model starts without vision.")
+        return fits
+
+    def vision_configured(self) -> bool:
+        """Whether an engine started now would load a projector (ENGINE_MMPROJ names a file no engine died on).
+        Not whether it fits the model: that is only known once the model is chosen."""
+        return bool(self._projector_path(get_worker_limits()))
+
+    def _projector_charge_gb(self, remote: bool, model_path: str = "") -> float:
+        """
+        What the projector takes from the pool's cards, in GiB: nothing while vision is off, or while it runs
+        on the media card (which is no part of the pool); its file and working buffer otherwise.
+        """
+        limits = get_worker_limits()
+        path = self._projector_path(limits, model_path=model_path)
+        if not path:
+            return 0.0
+        devices = _engine_devices(limits, remote)
+        if devices and devices[2]:
+            return 0.0
+        try:
+            return os.path.getsize(path) / _GIB + PROJECTOR_WORKING_GB
+        except OSError:
+            return 0.0
+
+    def _warm_media_hardware(self) -> None:
+        """
+        Looks at the cards before ``_state_lock`` is taken. The first look can run vulkaninfo, which must not
+        happen inside the lock; the sizer's later look (``_projector_charge_gb``) then reads the cached answer.
+        """
+        limits = get_worker_limits()
+        if limits.get("media_gpu") and limits.get("engine_mmproj"):
+            _engine_devices(limits, False)
+
+    def _media_args(self, limits: dict, devices: Optional[Tuple[str, str, str]],
+                    model_path: str = "") -> Tuple[List[str], str]:
+        """
+        ``(arguments, projector_path)``: ``--device`` for the engine's own cards when a media card is in use
+        (so the model gets none of it), and the projector's arguments when vision is on, on the media card if
+        there is one. ``projector_path`` is "" without vision, and for a model the projector is not for.
+        """
+        args: List[str] = []
+        media_device = devices[2] if devices else ""
+        if media_device:
+            engine_cards = len(devices[1].split(",")) - 1
+            args += ["--device", ",".join(f"Vulkan{i}" for i in range(engine_cards))]
+        projector = self._projector_path(limits, warn=True, model_path=model_path)
+        if projector:
+            no_ffmpeg = _private_empty_dir("no-ffmpeg")
+            if not no_ffmpeg:
+                log_error("Vision is off: a private empty directory for the engine's ffmpeg path could not be made.")
+                return args, ""
+            args += ["--mmproj", projector, "--image-max-tokens", str(limits.get("engine_image_max_tokens", 1024))]
+            # An image stb_image cannot read (every WebP) would otherwise be piped to an ffmpeg found on PATH;
+            # pointed at an empty directory that path cannot start anything, and the image fails as a plain 400.
+            args += ["--video-ffmpeg-dir", no_ffmpeg]
+            if media_device:
+                args += ["--mmproj-device", media_device]
+            # llama.cpp turns both off for the whole engine once a projector is loaded.
+            log_coordinator(
+                f"Vision is on ({os.path.basename(projector)}, on {media_device or 'the first engine card'}): "
+                "the engine's prompt-prefix reuse (--cache-reuse) and context shift are off for every request."
+            )
+        return args, projector
+
+    def _check_projector_failure(self, entry: Dict) -> None:
+        """
+        Called with an engine that has died. If it ran with the projector and its log shows the projector was
+        the trouble, later starts leave the projector out: coding goes on, without vision. That is when it
+        failed to load, started loading (llama.cpp prints "CLIP using <backend>" only after the model's own
+        weights are in) and never finished (both stay off until DLNE restarts), or was encoding an image when
+        the engine ended (off for PROJECTOR_RETRY_SECONDS: that log line cannot tell the projector's card from
+        another crash that came after it, so it is tried again). A death before any of that (weights that do
+        not fit, a port taken) says nothing about the projector and costs no vision.
+        The request that met the crash has had its error; no restart is tried for it.
+        """
+        projector = entry.get("mmproj_path")
+        if not projector or self._process_is_alive(entry.get("process")):
+            return
+        signs = _projector_log_signs(entry.get("log_path") or "", int(entry.get("log_offset") or 0))
+        if signs is None:
+            return
+        died_loading = signs["load_failed"] or (signs["clip"] and not signs["loaded"] and not signs["listening"])
+        died_encoding = signs["encoding"] > signs["encoded"]
+        if died_loading or died_encoding:
+            self._mmproj_failed = projector
+            self._mmproj_retry_at = 0.0 if died_loading else time.monotonic() + PROJECTOR_RETRY_SECONDS
+            again = ("Check the media card (MEDIA_GPU) and restart DLNE to try it again." if died_loading
+                     else f"It is tried again in {PROJECTOR_RETRY_SECONDS // 60} minutes.")
+            log_error(
+                f"The inference engine died {'while loading' if died_loading else 'while encoding an image with'} "
+                f"the vision projector ({projector}). Vision is OFF from the next engine start; coding goes on. {again}"
+            )
+
     def reap_model(self, model_path: str) -> bool:
         """
         Drops a model whose engine process has already died, releasing everything it held.
@@ -1417,6 +1735,8 @@ class InferenceManager:
             if data is None:
                 return False
             handle = self._detach_entry_locked(model_path, data)
+
+        self._check_projector_failure(data)
 
         # The caller only invokes this after observing a dead process, so the stop below is
         # normally a no-op poll; it is still performed in full because "the process looked
@@ -1508,6 +1828,7 @@ class InferenceManager:
         weights = self.estimate_model_vram_gb(model_path)
         host_gb, returned_gb = self._host_memory_gb(model_path, remote)
         weights += returned_gb
+        weights += self._projector_charge_gb(remote, self.resolve_model_path(model_path) or "")
 
         # The part that lives in this machine's RAM has to fit there whatever the cards
         # hold. Skipped when the pool reports no RAM at all, as admission always has.
@@ -1664,6 +1985,8 @@ class InferenceManager:
             # The operator's ENGINE_SLOTS and ENGINE_CONTEXT win outright; 0 is automatic.
             fixed_slots=int(limits.get("engine_slots") or 0),
             fixed_context=int(limits.get("engine_context") or 0),
+            phone_slots=int(limits.get("engine_phone_slots") or 0),
+            phone_context=int(limits.get("engine_phone_context") or 0),
         )
         safe_context = sized.total_context
         reserved_gb = weights + sized.kv_gb
@@ -1694,6 +2017,9 @@ class InferenceManager:
             slot_context=sized.context_per_slot,
             cache_type=sized.cache_type,
             sizing_mode=sized.mode,
+            phone_slots=sized.phone_slots,
+            phone_context=sized.phone_context,
+            pool_context=sized.pool_context,
             sizing_warning=sizing_warning,
             committed_gb=committed,
             budget_gb=budget,
@@ -1761,6 +2087,7 @@ class InferenceManager:
         BLOCKING: takes ``_state_lock`` and performs a handful of stats, one small JSON read
         and at least one loopback bind probe. Call :meth:`acan_admit` from async code.
         """
+        self._warm_media_hardware()
         with self._state_lock:
             plan = self._plan_start_locked(
                 model_path,
@@ -1815,6 +2142,7 @@ class InferenceManager:
         requested_endpoints = sorted(set(rpc_endpoints or []))
 
         handoff_deadline = time.monotonic() + START_HANDOFF_TIMEOUT_SECONDS
+        self._warm_media_hardware()
 
         # ------------------------------------------------------------------------------
         # Phase 1: decide and reserve.
@@ -1892,6 +2220,7 @@ class InferenceManager:
             # cluster's memory at the same time. This is up to four seconds of waiting and it
             # happens here, with the lock released, rather than inside phase 1.
             if plan.stale_handle is not None:
+                self._check_projector_failure(plan.stale_handle["data"])
                 self._stop_and_settle(plan.stale_handle)
 
             binary_path = download_and_extract_engine("coordinator")
@@ -1919,6 +2248,11 @@ class InferenceManager:
             )
             if plan.sizing_warning:
                 log_warning(plan.sizing_warning)
+            if plan.phone_slots:
+                log_coordinator(
+                    f"Phone lanes: {plan.phone_slots} extra slots of {plan.phone_context} tokens, "
+                    f"{plan.pool_context} tokens in the whole pool."
+                )
 
             remote_rpc_endpoints = []
             for e in (requested_endpoints or []):
@@ -1943,8 +2277,8 @@ class InferenceManager:
                 *alias_args(resolved_path),
                 "--host", "127.0.0.1",
                 "--port", str(assigned_port),
-                "-c", str(safe_context),
-                "-np", str(dynamic_slots), # Multiplex parallel slots dynamically based on active users
+                "-c", str(plan.pool_context or safe_context),
+                "-np", str(dynamic_slots + plan.phone_slots), # Multiplex parallel slots dynamically based on active users
                 "--threads", str(cpu_limit), # Apply explicit physical core limits for generation
                 "--threads-batch", str(cpu_limit), # Apply explicit physical core limits for batching
                 "-ngl", "99", # Fully offload all layers to GPU VRAM / RPC backends
@@ -1966,6 +2300,8 @@ class InferenceManager:
                 # model would have landed without this flag.
                 "--jinja",
             ]
+
+            cmd.extend(phone_lane_args(plan.phone_slots, plan.slot_context))
 
             if remote_rpc_endpoints:
                 rpc_str = ",".join(remote_rpc_endpoints)
@@ -2016,6 +2352,17 @@ class InferenceManager:
                         f"({len(remote)} remote backend(s) in this pipeline)."
                     )
 
+            # The media card and the vision projector; with MEDIA_GPU and ENGINE_MMPROJ unset, nothing is added.
+            devices = _engine_devices(limits, bool(remote_rpc_endpoints))
+            media_args, projector = self._media_args(limits, devices, resolved_path)
+            cmd.extend(media_args)
+            if media_gpu_spec(limits) and not (devices and devices[2]):
+                log_warning(
+                    "MEDIA_GPU is not used: "
+                    + ("the engine is running across volunteers' GPUs." if remote_rpc_endpoints
+                       else "it names no card here, or is the only card ALLOWED_GPU_INDICES leaves.")
+                )
+
             # Cheap pre-check: if a shutdown already ran while we were fetching the binary
             # there is no point spawning a process only to kill it a millisecond later.
             with self._state_lock:
@@ -2032,7 +2379,13 @@ class InferenceManager:
             # Prevent AMD RADV Vulkan driver from spilling into slow PCIe GTT; keep strictly in fast HBM
             env.setdefault('RADV_PERFTEST', 'nogttspill')
             allowed_gpu = get_worker_limits().get('allowed_gpu_indices', '-1').lower()
-            if allowed_gpu != '-1' and allowed_gpu != 'none':
+            if devices is not None:
+                # A media card, or cards named by PCI address: hardware.engine_gpu_devices has resolved
+                # every entry, the media card last so the engine's cards keep the names -ts is written for.
+                env['CUDA_VISIBLE_DEVICES'], env['GGML_VK_VISIBLE_DEVICES'] = devices[0], devices[1]
+                if not (devices[0] or devices[1]):
+                    log_warning("ALLOWED_GPU_INDICES names no card here; the engine runs without a GPU.")
+            elif allowed_gpu != '-1' and allowed_gpu != 'none':
                 env['CUDA_VISIBLE_DEVICES'] = str(allowed_gpu)
                 vk_val = str(allowed_gpu)
                 try:
@@ -2068,6 +2421,7 @@ class InferenceManager:
                 pass
 
             # Using open without with to keep the file descriptor alive for the spawned Popen
+            log_offset = os.path.getsize(llama_log_path) if os.path.exists(llama_log_path) else 0
             log_file = open(llama_log_path, "a", encoding="utf-8")
             process = subprocess.Popen(
                 cmd,
@@ -2087,12 +2441,16 @@ class InferenceManager:
                 "log_file": log_file,
                 "safe_context": safe_context,
                 "dynamic_slots": dynamic_slots,
+                "phone_slots": plan.phone_slots,
+                "phone_context": plan.phone_context,
                 "endpoints": requested_endpoints,
                 "remote_endpoints": list(remote_rpc_endpoints),
                 "reserved_gb": reserved_gb,
                 "started_at": time.monotonic(),
                 "resolved_path": resolved_path,
                 "model_size_bytes": model_size_bytes,
+                "mmproj_path": projector,
+                "log_offset": log_offset,
                 "last_io_bytes": 0,
                 "last_io_time": time.monotonic(),
                 "io_speed_mb_s": 0.0,

@@ -227,6 +227,9 @@ def machine(monkeypatch):
     monkeypatch.setattr(hardware.psutil, "cpu_count", lambda logical=True: 8)
     monkeypatch.setattr(hardware.platform, "system", lambda: state.system)
     monkeypatch.setattr(hardware, "get_gpu_type", lambda: state.gpu_type)
+    # The machine says Linux, so without this the test would read the real amdgpu sysfs of whatever box runs
+    # it (TheWall's cards are busy whenever the live engine is).
+    monkeypatch.setattr(hardware, "_linux_gpu_busy_max", lambda: 0.0)
 
     def shell_query(reference):
         reference._obj.value = state.notification

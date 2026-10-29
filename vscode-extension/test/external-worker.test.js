@@ -133,3 +133,92 @@ test('Stop removes an orphaned engine by this install\'s full path, never every 
   assert.ok(!/killall|taskkill \/F \/IM/.test(src), 'no machine-wide kill left in the worker manager');
   assert.ok(!/systemctl --user start/.test(src), 'and no systemd start');
 });
+
+test("this editor's own worker is never called one started outside VS Code, even while it is starting", async () => {
+  // 2026-10-27: a poll in the worker's first seconds (state 'starting') found its process and labelled it external.
+  const wm = manager();
+  wm.isProcessActive = () => true;
+  wm.isPortListening = async () => true;
+  wm.workerProcess = { killed: false };
+  wm.currentState = 'starting';
+  try {
+    const st = await wm.refreshWorkerState();
+    assert.equal(st.external, undefined);
+    assert.equal(st.state, 'starting');
+    wm.workerProcess = null;                        // it exited: a process still found is someone else's
+    assert.equal((await wm.refreshWorkerState()).external, true);
+  } finally {
+    wm.dispose();
+  }
+});
+
+/** A manager whose editor storage says it started worker `ownPid`, on a machine where a worker process is found. */
+function managerWithOwnPid(ownPid) {
+  stub.reset();
+  Object.assign(stub.state.settings, CPU_16);
+  const store = { 'dlne.worker.ownPid': ownPid };
+  const proto = WorkerManager.prototype;
+  const real = { sysd: proto.isSystemdActive, proc: proto.isProcessActive };
+  proto.isSystemdActive = () => false;
+  proto.isProcessActive = () => true;
+  try {
+    const wm = new WorkerManager({ subscriptions: [], globalState: { get: (k) => store[k], update: async (k, v) => { store[k] = v; } } });
+    wm.isSystemdActive = () => false;
+    wm.isProcessActive = () => true;
+    wm.isPortListening = async () => true;
+    wm.localGpu = { hasGpu: true, name: 'RTX 4070 Laptop GPU', vramTotalGb: 8, api: 'vulkan' };
+    return wm;
+  } finally {
+    proto.isSystemdActive = real.sysd;
+    proto.isProcessActive = real.proc;
+  }
+}
+
+test('the worker this editor started before a window reload is still its own, and Stop stops it', { skip: process.platform === 'win32' }, async () => {
+  // 2026-10-27: after a reload the surviving worker was called "started outside VS Code", and the owner told to stop it.
+  const fake = childProcess.spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)', 'dlne_server.py', 'worker']);
+  const exited = new Promise((resolve) => fake.on('exit', (code, signal) => resolve(signal)));
+  const wm = managerWithOwnPid(fake.pid);
+  try {
+    assert.equal(wm.getStatus().state, 'contributing');
+    assert.equal(wm.getStatus().external, undefined);
+    const st = await wm.refreshWorkerState();
+    assert.equal(st.external, undefined, 'its own, not one started outside VS Code');
+    assert.equal(st.state, 'contributing');
+    await wm.stopWorker(true);
+    assert.equal(await exited, 'SIGTERM', 'stopped gracefully');
+  } finally {
+    try { fake.kill('SIGKILL'); } catch {}
+    wm.dispose();
+  }
+});
+
+test('a recorded process id that now belongs to something else is never taken for this editor\'s worker', async () => {
+  const wm = managerWithOwnPid(process.pid);          // alive, but not dlne_server.py worker
+  try {
+    assert.equal((await wm.refreshWorkerState()).external, true);
+  } finally {
+    wm.dispose();
+  }
+});
+
+test('when the adopted worker ends, the window that started it gets time to start the next one before this one does', { skip: process.platform === 'win32' }, async () => {
+  const fake = childProcess.spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)', 'dlne_server.py', 'worker']);
+  const wm = managerWithOwnPid(fake.pid);
+  stub.state.settings['dlne.worker.autoStart'] = true;
+  const starts = [];
+  wm.startWorker = async () => { starts.push(Date.now()); return true; };
+  wm.isProcessActive = () => false;
+  try {
+    assert.equal((await wm.refreshWorkerState()).external, undefined);
+    fake.kill('SIGKILL');
+    await new Promise((resolve) => fake.on('exit', resolve));
+    await wm.refreshWorkerState();
+    assert.equal(starts.length, 0, 'not at once: the other window may be starting the next one (an engine update)');
+    wm.adoptedGoneAt -= 31000;                          // the grace is over and no worker appeared
+    await wm.refreshWorkerState();
+    assert.equal(starts.length, 1, 'then this window starts one');
+  } finally {
+    wm.dispose();
+  }
+});

@@ -17,6 +17,7 @@ coordinator then proxied that model's traffic straight into B's engine.
 
 import atexit
 import os
+import struct
 import subprocess
 import threading
 import time
@@ -267,6 +268,7 @@ def engine_env(isolated_config, dlne_root, make_worker_limits, monkeypatch):
             survives_kill=env.survives_kill,
             wait_gate=env.wait_gate,
         )
+        process.env = kwargs.get("env")
         spawned.append(process)
         env.popen_gate.pass_through()
         return process
@@ -2609,3 +2611,685 @@ def test_cpu_moe_layers_reads_the_operators_flag():
     assert inference_manager.cpu_moe_layers(["--n-cpu-moe"]) == 0
     assert inference_manager.cpu_moe_layers(None) == 0
     assert inference_manager.cpu_moe_layers(["-ot", "exps=CPU"]) == 0     # patterns are not interpreted
+
+
+# --- The media card and the vision projector (2.6) ----------------------------------------------------
+
+MMPROJ_BYTES = 899_283_680          # Qwen3.6's mmproj-F16.gguf
+THEWALL_CARDS = [
+    {"id": 0, "name": "AMD Radeon Graphics (RADV NAVI12)", "address": "0000:03:00.0", "vk_index": 1, "integrated": False},
+    {"id": 1, "name": "AMD Radeon Graphics (RADV NAVI12)", "address": "0000:09:00.0", "vk_index": 2, "integrated": False},
+    {"id": 2, "name": "AMD Radeon RX 580 Series (RADV POLARIS10)", "address": "0000:0c:00.0", "vk_index": 3,
+     "integrated": False},
+    {"id": 3, "name": "AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO)", "address": "0000:15:00.0", "vk_index": 0,
+     "integrated": True},
+]
+RX580 = "0000:0c:00.0"
+VK = "GGML_VK_VISIBLE_DEVICES"
+CUDA = "CUDA_VISIBLE_DEVICES"
+# What 2.5.4 starts on TheWall with these settings, from a run of that release; the model path and port are swapped in.
+THEWALL_2_5_4_COMMAND = [
+    "-m", "<MODEL>", "--alias", "Qwen3.6-35B-A3B-UD-IQ3_S.gguf", "--host", "127.0.0.1", "--port", "<PORT>",
+    "-c", "65536", "-np", "2", "--threads", "4", "--threads-batch", "4", "-ngl", "99", "-b", "2048", "-ub", "512",
+    "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-reuse", "256", "--jinja",
+    "--n-cpu-moe", "5", "-ts", "23,17", "--threads", "4", "--threads-batch", "4", "--cpu-mask", "0xc3",
+    "--cpu-strict", "1", "--chat-template-kwargs", '{"enable_thinking":false}',
+]
+
+
+@pytest.fixture
+def cards(thewall, monkeypatch):
+    """TheWall's four cards for the hardware lookups, and a projector file of the real size."""
+    import engine.hardware as hardware
+
+    monkeypatch.setattr(hardware, "get_all_gpus", lambda: [dict(c) for c in THEWALL_CARDS])
+    projector = str(thewall.models_dir.parent / "mmproj-F16.gguf")
+    with open(projector, "wb") as handle:
+        handle.truncate(MMPROJ_BYTES)
+    thewall.projector = projector
+    thewall.logged, thewall.errors = [], []
+    monkeypatch.setattr(inference_manager, "log_warning", thewall.logged.append)
+    monkeypatch.setattr(inference_manager, "log_error", thewall.errors.append)
+    return thewall
+
+
+def _start(env, endpoints=("127.0.0.1:50052",), **limits):
+    env.limits.update(limits)
+    ok, _port, message = env.manager.start_model(env.tag, list(endpoints), THEWALL_VRAM_GB, THEWALL_SYSRAM_GB)
+    assert ok is True, message
+    process = env.spawned[-1]
+    return process.cmd, next(iter(env.manager.running_models.values())), process.env
+
+
+def _normalised(cmd, entry):
+    return [("<MODEL>" if a == entry["resolved_path"] else "<PORT>" if a == str(entry["port"]) else a) for a in cmd[1:]]
+
+
+@pytest.mark.parametrize("allowed, cuda, vulkan", [
+    ("-1", os.environ.get(CUDA), os.environ.get(VK)), ("0,1", "0,1", "1,2"), ("none", "", "")])
+def test_with_media_and_vision_unset_the_engine_starts_exactly_as_before(cards, allowed, cuda, vulkan):
+    cmd, entry, env = _start(cards, allowed_gpu_indices=allowed)
+
+    assert _normalised(cmd, entry) == THEWALL_2_5_4_COMMAND
+    assert (env.get(CUDA), env.get(VK)) == (cuda, vulkan)
+    assert entry["mmproj_path"] == ""
+    assert cards.logged == []
+
+
+def test_the_target_config_gives_the_engine_two_cards_and_the_projector_the_third(cards):
+    cmd, entry, env = _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cards.projector)
+
+    assert (env[CUDA], env[VK]) == ("0,1", "1,2,3")
+    assert _flag(cmd, "--device") == "Vulkan0,Vulkan1"
+    assert (_flag(cmd, "--mmproj"), _flag(cmd, "--image-max-tokens"), _flag(cmd, "--mmproj-device")) == (
+        cards.projector, "1024", "Vulkan2")
+    assert _flag(cmd, "-ts") == "23,17" and _flag(cmd, "--cache-reuse") == "256"      # -ts keeps its meaning
+    assert entry["mmproj_path"] == cards.projector
+    assert cards.logged == []
+
+
+def test_the_media_card_alone_changes_the_devices_and_nothing_else(cards):
+    cmd, _entry, env = _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580)
+
+    assert (env[CUDA], env[VK], _flag(cmd, "--device")) == ("0,1", "1,2,3", "Vulkan0,Vulkan1")
+    assert "--mmproj" not in cmd and "--mmproj-device" not in cmd
+
+
+def test_the_projector_alone_follows_the_first_engine_card(cards):
+    cmd, _entry, env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector,
+                              engine_image_max_tokens=768)
+
+    assert (env[CUDA], env[VK]) == ("0,1", "1,2")
+    assert "--device" not in cmd and "--mmproj-device" not in cmd
+    assert (_flag(cmd, "--mmproj"), _flag(cmd, "--image-max-tokens")) == (cards.projector, "768")
+
+
+def test_a_home_directory_path_for_the_projector_is_expanded(cards, monkeypatch):
+    monkeypatch.setenv("HOME", os.path.dirname(cards.projector))
+
+    cmd, _entry, _env = _start(cards, engine_mmproj="~/mmproj-F16.gguf")
+
+    assert _flag(cmd, "--mmproj") == cards.projector
+
+
+def test_a_projector_file_that_is_not_there_starts_the_engine_without_vision_and_says_so(cards):
+    cmd, entry, _env = _start(cards, engine_mmproj="/nowhere/mmproj.gguf")
+
+    assert "--mmproj" not in cmd and entry["mmproj_path"] == ""
+    assert any("ENGINE_MMPROJ names no file" in line for line in cards.logged)
+
+
+def test_a_media_card_that_is_not_there_is_warned_about_and_left_out(cards):
+    cmd, _entry, env = _start(cards, allowed_gpu_indices="0,1", media_gpu="0000:ff:00.0", engine_mmproj=cards.projector)
+
+    assert (env[CUDA], env[VK]) == ("0,1", "1,2")
+    assert "--device" not in cmd and "--mmproj-device" not in cmd and "--mmproj" in cmd
+    assert any("MEDIA_GPU is not used" in line for line in cards.logged)
+
+
+def test_a_media_card_that_is_the_only_allowed_card_is_the_engines_after_all(cards):
+    cmd, _entry, env = _start(cards, allowed_gpu_indices="2", media_gpu=RX580)
+
+    assert (env[CUDA], env[VK]) == ("2", "3")
+    assert "--device" not in cmd
+    assert any("MEDIA_GPU is not used" in line for line in cards.logged)
+
+
+def test_cards_named_by_pci_address_are_resolved_for_the_engine(cards):
+    _cmd, _entry, env = _start(cards, allowed_gpu_indices="0000:09:00.0,0000:03:00.0")
+
+    assert (env[CUDA], env[VK]) == ("1,0", "2,1")
+
+
+def test_an_allowed_list_that_names_no_card_here_hides_the_gpus_and_says_so(cards):
+    _cmd, _entry, env = _start(cards, allowed_gpu_indices="0000:ff:00.0")
+
+    assert (env[CUDA], env[VK]) == ("", "")
+    assert any("names no card here" in line for line in cards.logged)
+
+
+def test_no_limit_with_a_media_card_lists_the_engines_cards_so_vulkan_does_not_take_it(cards):
+    cmd, _entry, env = _start(cards, allowed_gpu_indices="-1", media_gpu=RX580)
+
+    assert (env[CUDA], env[VK], _flag(cmd, "--device")) == ("0,1", "1,2,3", "Vulkan0,Vulkan1")
+
+
+SHARDED = ("127.0.0.1:50052", "192.168.1.50:50052")
+
+
+def test_an_engine_sharded_over_volunteers_drops_the_media_card_and_passes_no_device(cards):
+    cmd, entry, env = _start(cards, endpoints=SHARDED, allowed_gpu_indices="0,1", media_gpu=RX580,
+                             engine_mmproj=cards.projector)
+
+    assert (env[CUDA], env[VK]) == ("0,1", "1,2")                 # the RX 580 is not even visible
+    assert "--device" not in cmd and "--mmproj-device" not in cmd
+    assert _flag(cmd, "--mmproj") == cards.projector              # vision stays, on the first engine card
+    assert "--rpc" in cmd and "-ts" not in cmd                    # the operator's card split is dropped too
+    assert any("MEDIA_GPU is not used" in line and "volunteers" in line for line in cards.logged)
+
+
+@pytest.fixture
+def cuda_build(cards, dlne_root, monkeypatch):
+    """The install's bin/ holds a CUDA build of llama.cpp: a CUDA backend library and no Vulkan one."""
+    (dlne_root / "bin").mkdir(exist_ok=True)
+    (dlne_root / "bin" / "libggml-cuda.so").write_bytes(b"")
+    monkeypatch.setattr(inference_manager, "_media_gpu_warned", False)
+    return cards
+
+
+def test_on_a_cuda_build_the_media_card_is_ignored_with_one_warning(cuda_build):
+    cards = cuda_build
+    cmd, entry, env = _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cards.projector)
+    _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cards.projector)
+
+    assert (env[CUDA], env[VK]) == ("0,1", "1,2")                 # the RX 580 is not hidden or named
+    assert "--device" not in cmd and "--mmproj-device" not in cmd  # no Vulkan name reaches a CUDA build
+    assert _flag(cmd, "--mmproj") == cards.projector               # vision stays, on the first engine card
+    assert [line for line in cards.logged if "MEDIA_GPU" in line] == [
+        line for line in cards.logged if "not a Vulkan build" in line]
+    assert len([line for line in cards.logged if "not a Vulkan build" in line]) == 1
+
+
+def test_a_vulkan_build_keeps_the_media_card(cuda_build, dlne_root):
+    (dlne_root / "bin" / "libggml-vulkan.so").write_bytes(b"")     # both backends: Vulkan is there
+    cmd, _entry, _env = _start(cuda_build, allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cuda_build.projector)
+
+    assert _flag(cmd, "--device") == "Vulkan0,Vulkan1" and _flag(cmd, "--mmproj-device") == "Vulkan2"
+    assert cuda_build.logged == []
+
+
+def _reserved(env, **limits):
+    _cmd, entry, _env = _start(env, **limits)
+    return entry["reserved_gb"]
+
+
+def test_the_sizer_charges_the_projector_only_when_it_is_not_on_the_media_card(cards):
+    projector_gb = MMPROJ_BYTES / GIB + inference_manager.PROJECTOR_WORKING_GB
+
+    def reserved(**limits):
+        cards.manager.stop_all_models()
+        return _reserved(cards, allowed_gpu_indices="0,1", **limits)
+
+    base = reserved()
+    assert reserved(engine_mmproj=cards.projector) == pytest.approx(base + projector_gb)
+    assert reserved(media_gpu=RX580, engine_mmproj=cards.projector) == pytest.approx(base)
+    assert reserved(media_gpu="0000:ff:00.0", engine_mmproj=cards.projector) == pytest.approx(base + projector_gb)
+    assert reserved(media_gpu=RX580) == pytest.approx(base)
+    assert reserved(engine_mmproj="/nowhere/mmproj.gguf") == pytest.approx(base)
+
+
+def test_the_sizer_charges_the_pool_for_a_projector_on_a_sharded_engine(cards):
+    """A sharded engine has no media card, so the projector sits in the pool, on this host or a volunteer's."""
+    projector_gb = MMPROJ_BYTES / GIB + inference_manager.PROJECTOR_WORKING_GB
+    cards.limits.update(allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cards.projector)
+
+    assert cards.manager._projector_charge_gb(remote=False) == 0.0
+    assert cards.manager._projector_charge_gb(remote=True) == pytest.approx(projector_gb)
+
+    cards.limits.update(engine_mmproj="")
+    assert cards.manager._projector_charge_gb(remote=True) == 0.0
+
+
+def test_admission_reads_the_same_charge_as_the_start(cards):
+    """A dry run asks the same question: a projector that does not fit the pool is refused before any start."""
+    cards.limits.update(allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    assert cards.manager.can_admit(cards.tag, THEWALL_VRAM_GB, THEWALL_SYSRAM_GB) == (True, "ok")
+
+    # the pool 1.3 GiB short of the model plus the projector, but long enough for the model alone
+    estimate = cards.manager.estimate_model_vram_gb(cards.tag)
+    pool = (estimate + inference_manager.MIN_KV_GB + 0.2) / inference_manager.POOL_SAFETY_FRACTION
+    assert cards.manager.can_admit(cards.tag, pool, 0.0) == (False, inference_manager.NETWORK_MAXED_OUT_MESSAGE)
+    cards.limits.update(engine_mmproj="", media_gpu="")
+    assert cards.manager.can_admit(cards.tag, pool, 0.0) == (True, "ok")
+    cards.limits.update(engine_mmproj=cards.projector, media_gpu=RX580)
+    assert cards.manager.can_admit(cards.tag, pool, 0.0) == (True, "ok")
+
+
+def test_the_hardware_is_looked_at_before_the_state_lock_is_taken(cards, monkeypatch):
+    """The first look can run vulkaninfo; the sizer, which holds the lock, must find the answer cached."""
+    import engine.hardware as hardware
+
+    order = []
+    manager = cards.manager
+    real_lock = manager._state_lock
+
+    class Spy:
+        def __enter__(self):
+            order.append("lock")
+            return real_lock.__enter__()
+
+        def __exit__(self, *exc):
+            return real_lock.__exit__(*exc)
+
+    monkeypatch.setattr(manager, "_state_lock", Spy())
+    monkeypatch.setattr(hardware, "get_all_gpus", lambda: order.append("hardware") or [dict(c) for c in THEWALL_CARDS])
+    cards.limits.update(allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cards.projector)
+
+    manager.can_admit(cards.tag, THEWALL_VRAM_GB, THEWALL_SYSRAM_GB)
+
+    assert order[0] == "hardware"
+
+
+# --- A projector that kills the engine: vision off, coding on ------------------------------------------
+
+def _die(cards, text):
+    """The engine ends with ``text`` as its log since the start (the log is not in the fake process's hands)."""
+    entry = next(iter(cards.manager.running_models.values()))
+    with open(entry["log_path"], "a", encoding="utf-8") as handle:
+        handle.write(text)
+    cards.spawned[-1].returncode = 1
+    return entry
+
+
+LOADED = "srv  load_model: loaded multimodal model\nmain: server is listening on http://127.0.0.1:8081\n"
+
+
+@pytest.mark.parametrize("log, failed", [
+    ("llm_load_tensors: offloaded 41/41 layers\nfailed to load multimodal model\n", True),      # died loading
+    ("llm_load_tensors: offloaded 41/41 layers\nclip_ctx: CLIP using Vulkan2 backend\n", True),     # began loading it
+    ("llama_model_load: error loading model: out of memory\n", False),     # the weights, before the projector
+    ("main: couldn't bind HTTP server socket, hostname: 127.0.0.1, port: 8081\n", False),
+    ("clip_model_loader: model name: Qwen3.6\nllama_model_load: failed to allocate buffer\n", False),   # only sized it
+    ("CLIP using Vulkan2 backend\nloaded multimodal model\n", False),     # loaded; died before it listened, not on it
+    (LOADED + "encoding image slice...\n", True),                                              # died encoding
+    (LOADED + "encoding image slice...\nimage slice encoded in 900 ms\nencoding image slice...\n", True),
+    (LOADED + "encoding image slice...\nimage slice encoded in 900 ms\n", False),             # an unrelated death
+    (LOADED, False),
+])
+def test_an_engine_that_died_on_the_projector_is_restarted_without_it(cards, log, failed):
+    _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cards.projector)
+    _die(cards, log)
+
+    cmd, entry, _env = _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cards.projector)
+
+    assert ("--mmproj" not in cmd) is failed
+    assert (entry["mmproj_path"] == "") is failed
+    assert len([e for e in cards.errors if "vision projector" in e]) == (1 if failed else 0)
+    # the media card stays out of the model's way either way
+    assert _flag(cmd, "--device") == "Vulkan0,Vulkan1"
+    assert ("--mmproj-device" in cmd) is (not failed)
+
+
+def test_the_coordinators_reap_after_a_crash_during_startup_turns_vision_off_too(cards):
+    _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cards.projector)
+    _die(cards, "CLIP using Vulkan2 backend\nggml_vulkan: device lost\n")
+
+    assert cards.manager.reap_model(cards.tag) is True
+    assert cards.manager._mmproj_failed == cards.projector
+
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cards.projector)
+    assert "--mmproj" not in cmd
+
+
+def test_only_the_file_that_failed_is_left_out(cards):
+    _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    _die(cards, "failed to load multimodal model\n")
+    cards.manager.reap_model(cards.tag)
+    other = os.path.join(os.path.dirname(cards.projector), "other-mmproj.gguf")
+    with open(other, "wb") as handle:
+        handle.write(b"x")
+
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=other)
+
+    assert _flag(cmd, "--mmproj") == other
+
+
+def test_an_engine_still_running_is_never_judged_by_its_log(cards):
+    _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    entry = next(iter(cards.manager.running_models.values()))
+    with open(entry["log_path"], "a", encoding="utf-8") as handle:
+        handle.write("encoding image slice...\n")
+
+    cards.manager._check_projector_failure(entry)
+
+    assert cards.manager._mmproj_failed == ""
+
+
+def test_a_line_from_an_earlier_engine_on_the_same_port_is_not_this_engines(cards):
+    log_dir = cards.models_dir.parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    for port in range(8081, 8091):                          # whichever port the start is given
+        (log_dir / f"llama_server_{port}.log").write_text("encoding image slice...\n", encoding="utf-8")
+
+    _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    entry = _die(cards, LOADED)
+    cards.manager.reap_model(cards.tag)
+
+    assert entry["log_offset"] > 0 and cards.manager._mmproj_failed == ""
+
+
+# --- 2.6.1: no ffmpeg path, a projector only for the model it fits, a measured buffer -------------------
+
+def _gguf_file(path, entries):
+    from tests.test_gguf import build_gguf
+
+    with open(path, "wb") as handle:
+        handle.write(build_gguf(entries))
+    return str(path)
+
+
+def _model_header(cards, embedding, arch="qwen35moe"):
+    from tests.test_gguf import T_STRING, T_UINT32, _string
+
+    resolved = cards.manager.resolve_model_path(cards.tag)
+    _gguf_file(resolved, [("general.architecture", T_STRING, _string(arch)),
+                          (f"{arch}.embedding_length", T_UINT32, struct.pack("<I", embedding))])
+
+
+def _projector_header(cards, projection_dim):
+    from tests.test_gguf import T_STRING, T_UINT32, _string
+
+    return _gguf_file(cards.projector, [("general.architecture", T_STRING, _string("clip")),
+                                        ("clip.vision.projection_dim", T_UINT32, struct.pack("<I", projection_dim))])
+
+
+def test_the_measured_projector_buffer_is_what_the_sizer_adds():
+    # TheWall's RX 580, 2.6.0: 0.96 GiB in all for the 0.84 GiB file
+    assert inference_manager.PROJECTOR_WORKING_GB == 0.15
+    assert MMPROJ_BYTES / GIB + inference_manager.PROJECTOR_WORKING_GB == pytest.approx(0.99, abs=0.01)
+
+
+def test_with_vision_on_the_engine_is_told_to_look_for_ffmpeg_in_an_empty_private_directory(cards, dlne_root):
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cards.projector)
+
+    directory = _flag(cmd, "--video-ffmpeg-dir")
+    assert directory == str(dlne_root / "no-ffmpeg") and os.listdir(directory) == []
+    assert oct(os.stat(directory).st_mode & 0o777) == "0o700"
+
+
+def test_without_vision_the_engine_is_given_no_ffmpeg_flag(cards):
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580)
+
+    assert "--video-ffmpeg-dir" not in cmd
+
+
+def test_if_the_empty_directory_cannot_be_made_or_is_not_empty_the_engine_starts_without_vision(cards, dlne_root):
+    (dlne_root / "no-ffmpeg").mkdir()
+    (dlne_root / "no-ffmpeg" / "ffmpeg").write_bytes(b"#!/bin/sh\n")
+
+    cmd, entry, _env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+
+    assert "--mmproj" not in cmd and "--video-ffmpeg-dir" not in cmd and entry["mmproj_path"] == ""
+    assert any("private empty directory" in e for e in cards.errors)
+
+
+def test_the_manager_says_whether_a_start_now_would_have_vision(cards):
+    manager = cards.manager
+    cards.limits.update(engine_mmproj="")
+    assert manager.vision_configured() is False
+    cards.limits.update(engine_mmproj="/nowhere/mmproj.gguf")
+    assert manager.vision_configured() is False
+    cards.limits.update(engine_mmproj=cards.projector)
+    assert manager.vision_configured() is True
+    manager._mmproj_failed = cards.projector                      # an engine died on it
+    assert manager.vision_configured() is False
+
+
+def test_a_projector_for_this_model_is_loaded(cards):
+    _model_header(cards, 2048)
+    _projector_header(cards, 2048)
+
+    cmd, entry, _env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+
+    assert _flag(cmd, "--mmproj") == cards.projector and entry["mmproj_path"] == cards.projector
+    assert cards.logged == []
+
+
+def test_a_projector_for_another_model_starts_that_model_without_vision_and_says_so_once(cards):
+    _model_header(cards, 4096)
+    _projector_header(cards, 2048)
+
+    cmd, entry, _env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    cards.manager.stop_all_models()
+    _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+
+    assert "--mmproj" not in cmd and "--video-ffmpeg-dir" not in cmd and entry["mmproj_path"] == ""
+    assert len([line for line in cards.logged if "is not for" in line]) == 1
+    assert "width 2048" in cards.logged[0] and "width 4096" in cards.logged[0]
+
+
+def test_a_mismatch_is_not_a_projector_failure_and_the_right_model_keeps_its_vision(cards):
+    _model_header(cards, 4096)
+    _projector_header(cards, 2048)
+    _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    _die(cards, "llama_model_load: error loading model\n")
+    cards.manager.reap_model(cards.tag)
+
+    assert cards.manager._mmproj_failed == "" and cards.errors == []
+
+    _model_header(cards, 2048)
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    assert _flag(cmd, "--mmproj") == cards.projector
+
+
+def test_the_projector_is_judged_again_when_the_files_change(cards):
+    _model_header(cards, 4096)
+    _projector_header(cards, 2048)
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    assert "--mmproj" not in cmd
+    cards.manager.stop_all_models()
+
+    _projector_header(cards, 4096)
+    os.utime(cards.projector, ns=(1, 2 * 10 ** 18))
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+
+    assert _flag(cmd, "--mmproj") == cards.projector
+
+
+@pytest.mark.parametrize("model_header, projector_header", [
+    (None, 2048), (2048, None), (None, None),                 # a header that cannot be read gives no answer: tried as before
+])
+def test_headers_that_cannot_be_read_leave_the_projector_to_the_failure_fallback(cards, model_header, projector_header):
+    if model_header:
+        _model_header(cards, model_header)
+    if projector_header:
+        _projector_header(cards, projector_header)
+
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+
+    assert _flag(cmd, "--mmproj") == cards.projector
+
+
+def test_the_sizer_charges_nothing_for_a_projector_that_is_not_for_the_model(cards):
+    _model_header(cards, 4096)
+    _projector_header(cards, 2048)
+    cards.limits.update(allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    resolved = cards.manager.resolve_model_path(cards.tag)
+
+    assert cards.manager._projector_charge_gb(remote=False, model_path=resolved) == 0.0
+    _model_header(cards, 2048)
+    assert cards.manager._projector_charge_gb(remote=False, model_path=resolved) == pytest.approx(
+        os.path.getsize(cards.projector) / GIB + inference_manager.PROJECTOR_WORKING_GB)
+
+
+def test_an_engine_that_died_encoding_gets_its_vision_back_after_the_pause_but_one_that_died_loading_does_not(cards, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(inference_manager.time, "monotonic", lambda: clock[0])
+    _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    _die(cards, LOADED + "encoding image slice...\n")
+    cards.manager.reap_model(cards.tag)
+
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    assert "--mmproj" not in cmd
+    clock[0] += inference_manager.PROJECTOR_RETRY_SECONDS - 1
+    cards.manager.stop_all_models()
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    assert "--mmproj" not in cmd
+
+    clock[0] += 2
+    cards.manager.stop_all_models()
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    assert _flag(cmd, "--mmproj") == cards.projector
+    assert any("tried again" in line for line in cards.logged)
+
+    _die(cards, "failed to load multimodal model\n")
+    cards.manager.reap_model(cards.tag)
+    clock[0] += 10 * inference_manager.PROJECTOR_RETRY_SECONDS
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", engine_mmproj=cards.projector)
+    assert "--mmproj" not in cmd
+
+
+def test_the_log_is_read_in_bounded_chunks_from_the_engines_own_offset(tmp_path, monkeypatch):
+    log = tmp_path / "llama_server_8081.log"
+    old = b"encoding image slice...\n" * 10                       # an earlier engine's lines
+    mine = (b"x" * 700_000) + b"CLIP using Vulkan2 backend\n" + b"y" * 900_000 + b"encoding image slice...\n"
+    log.write_bytes(old + mine)
+    reads = []
+    real_open = open
+
+    class Spy:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def read(self, size=-1):
+            reads.append(size)
+            return self._handle.read(size)
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._handle.close()
+
+    monkeypatch.setattr("builtins.open", lambda *a, **k: Spy(real_open(*a, **k)))
+
+    signs = inference_manager._projector_log_signs(str(log), len(old))
+
+    assert signs["clip"] is True and signs["loaded"] is False and signs["listening"] is False
+    assert signs["encoding"] == len(old) + len(mine) - len(b"encoding image slice...\n") and signs["encoded"] == -1
+    assert reads and all(size == inference_manager._LOG_CHUNK for size in reads)       # never the whole file at once
+    assert len(reads) >= 7
+
+
+def test_a_marker_cut_in_two_by_a_chunk_boundary_is_still_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(inference_manager, "_LOG_CHUNK", 100)
+    log = tmp_path / "log"
+    for split in (1, 7, 15, 19):
+        text = b"a" * (100 - split) + b"failed to load multimodal model" + b"b" * 50
+        log.write_bytes(text)
+
+        assert inference_manager._projector_log_signs(str(log), 0)["load_failed"] is True
+
+
+def test_the_last_encoding_lines_are_ordered_across_chunks(tmp_path, monkeypatch):
+    monkeypatch.setattr(inference_manager, "_LOG_CHUNK", 64)
+    log = tmp_path / "log"
+    log.write_bytes(b"encoding image slice...\n" + b"z" * 300 + b"image slice encoded in 1 ms\n" + b"z" * 200)
+    signs = inference_manager._projector_log_signs(str(log), 0)
+    assert signs["encoding"] < signs["encoded"]
+
+    log.write_bytes(b"image slice encoded in 1 ms\n" + b"z" * 300 + b"encoding image slice...\n")
+    signs = inference_manager._projector_log_signs(str(log), 0)
+    assert signs["encoding"] > signs["encoded"]
+
+
+def test_a_log_that_cannot_be_read_says_nothing(tmp_path):
+    assert inference_manager._projector_log_signs(str(tmp_path / "missing"), 0) is None
+
+
+# ======================================================================================
+# Phone lanes (2.6)
+# ======================================================================================
+
+def test_without_phone_lanes_the_plan_is_what_it_was():
+    plain = _plan(fixed_slots=2, fixed_context=65_536)
+    zero = _plan(fixed_slots=2, fixed_context=65_536, phone_slots=0, phone_context=8192)
+
+    assert zero == plain
+    assert (plain.phone_slots, plain.phone_context, plain.pool_context) == (0, 0, plain.total_context)
+
+
+def test_phone_lanes_are_extra_to_the_coding_slots_and_padded_to_256():
+    # The coordinator advertises 109,226 / 2 = 54,613 a request; llama-server rounds each slot up to 54,784.
+    plan = _plan(fixed_slots=2, fixed_context=109_226, phone_slots=2, phone_context=8192)
+
+    assert (plan.slots, plan.context_per_slot, plan.total_context) == (2, 54_613, 109_226)
+    assert (plan.phone_slots, plan.phone_context) == (2, 8192)
+    assert plan.pool_context == 2 * 54_784 + 2 * 8192 == 125_952
+    assert inference_manager.pad_context(54_613) == 54_784 and inference_manager.pad_context(8192) == 8192
+
+
+def test_the_pool_is_paid_for_with_the_phone_lanes_in_it():
+    token = gguf_module.scale_kv_bytes(QWEN_KV_F16, "q8_0")
+    plain = _plan(fixed_slots=2, fixed_context=65_536)
+    lanes = _plan(fixed_slots=2, fixed_context=65_536, phone_slots=2, phone_context=8192)
+
+    assert lanes.kv_gb - plain.kv_gb == pytest.approx(2 * (QWEN_STATE + 8192 * token) / GIB)
+
+
+def test_automatic_sizing_spends_the_phone_lanes_share_first():
+    """The coding slots get what the budget has left once the phone lanes are paid for, never more than before."""
+    token = gguf_module.scale_kv_bytes(QWEN_KV_F16, "q8_0")
+    plain = _plan(budget_gb=3.0, fixed_slots=2)
+    lanes = _plan(budget_gb=3.0, fixed_slots=2, phone_slots=2, phone_context=8192)
+
+    assert lanes.context_per_slot < plain.context_per_slot
+    assert lanes.kv_gb <= 3.0 + 1e-9
+    assert lanes.slots == 2 and lanes.total_context == lanes.slots * lanes.context_per_slot
+    assert lanes.pool_context == 2 * inference_manager.pad_context(lanes.context_per_slot) + 2 * 8192
+    assert lanes.kv_gb == pytest.approx(
+        (4 * QWEN_STATE + lanes.pool_context * token) / GIB)
+
+
+def test_the_cache_type_follows_the_coding_slot_only():
+    plan = _plan(fixed_slots=2, fixed_context=65_536, phone_slots=8, phone_context=65_536)
+    assert plan.cache_type == "q8_0"
+
+
+def test_a_phone_lane_context_is_padded_when_it_is_odd():
+    assert _plan(fixed_slots=1, fixed_context=32_768, phone_slots=1, phone_context=4100).phone_context == 4352
+
+
+def test_a_phone_lane_never_holds_more_than_the_coding_slot_does():
+    """--kv-unified-per-slot caps every lane at the coding slot's size: the context recorded is the one that holds."""
+    small = _plan(fixed_slots=4, fixed_context=16_384, phone_slots=2, phone_context=8192)
+
+    assert small.context_per_slot == 4096 and small.phone_context == 4096
+    assert small.pool_context == 4 * 4096 + 2 * 4096
+    # an odd slot is capped at its padded size, which is what the engine pads it to
+    odd = _plan(fixed_slots=3, fixed_context=3 * 5000, phone_slots=1, phone_context=65_536)
+    assert odd.phone_context == 5120
+    # roomy slots leave the operator's figure alone
+    assert _plan(fixed_slots=2, fixed_context=65_536, phone_slots=2, phone_context=8192).phone_context == 8192
+
+
+def test_a_small_coding_slot_starts_the_engine_with_the_clamped_phone_context(thewall):
+    thewall.limits.update(engine_slots=4, engine_context=16_384, engine_phone_slots=2, engine_phone_context=8192)
+
+    cmd, entry = _thewall_start(thewall)
+
+    assert entry["phone_context"] == 4096
+    assert _flag(cmd, "--kv-unified-per-slot") == "4096" and _flag(cmd, "-c") == str(4 * 4096 + 2 * 4096)
+
+
+def test_thewall_without_phone_lanes_starts_with_no_lane_flags_and_the_same_numbers(thewall):
+    cmd, entry = _thewall_start(thewall)
+
+    assert "--kv-unified" not in cmd and "--kv-unified-per-slot" not in cmd and "--no-slots" not in cmd
+    assert (_flag(cmd, "-c"), _flag(cmd, "-np")) == ("65536", "2")
+    assert (entry["phone_slots"], entry["phone_context"]) == (0, 0)
+
+
+def test_thewall_with_phone_lanes_adds_slots_a_pool_and_the_unified_cache(thewall):
+    """ENGINE_SLOTS=2 ENGINE_PHONE_SLOTS=2, ENGINE_CONTEXT = 2 x 54,613 coding."""
+    thewall.limits.update(engine_slots=2, engine_context=109_226, engine_phone_slots=2, engine_phone_context=8192)
+
+    cmd, entry = _thewall_start(thewall)
+
+    assert (_flag(cmd, "-np"), _flag(cmd, "-c")) == ("4", "125952")
+    assert "--kv-unified" in cmd and _flag(cmd, "--kv-unified-per-slot") == "54784"
+    assert "--no-slots" in cmd, "phone conversations sit in the lanes: /slots is closed"
+    # what the coordinator sizes coding prompts against is the coding share alone
+    assert (entry["safe_context"], entry["dynamic_slots"]) == (109_226, 2)
+    assert (entry["phone_slots"], entry["phone_context"]) == (2, 8192)
+    assert entry["safe_context"] // entry["dynamic_slots"] == 54_613
+    # and everything the operator wrote in ENGINE_EXTRA_ARGS still reaches the engine
+    assert _flag(cmd, "--n-cpu-moe") == "5"
+
+
+def test_phone_lane_args_are_empty_without_lanes():
+    assert inference_manager.phone_lane_args(0, 54_613) == []
+    assert inference_manager.phone_lane_args(2, 54_613) == ["--kv-unified", "--kv-unified-per-slot", "54784", "--no-slots"]

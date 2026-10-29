@@ -59,6 +59,34 @@ class ReportsAndStorageTest {
     }
 
     @Test
+    fun `a report on a reply that made a picture says what the picture was meant to show`() {
+        val question = user("can I get a picture of a red fox")
+        val reply = ChatMessage("pic", Role.ASSISTANT, "A fox is on its way.", createdAt = clock++, picture = ReplyPicture("a red fox in the snow", "f.png", 768, 768))
+        val report = Reports.build(listOf(question, reply), reply.id, ReportReason.OFFENSIVE, "")!!
+        assertEquals("can I get a picture of a red fox", report.question)
+        assertEquals("A fox is on its way.\n\n[Picture created: a red fox in the snow]", report.answer) // the description, never the picture
+    }
+
+    @Test
+    fun `a reply with only a picture can be reported, one with only a refusal cannot`() {
+        val question = user("a fox please")
+        val onlyPicture = ChatMessage("p1", Role.ASSISTANT, "", createdAt = clock++, picture = ReplyPicture("a red fox"))
+        assertEquals("[Picture created: a red fox]", Reports.build(listOf(question, onlyPicture), "p1", ReportReason.WRONG, "")!!.answer)
+        val onlyRefusal = ChatMessage("p2", Role.ASSISTANT, "", createdAt = clock++, picture = ReplyPicture.refusal("No."))
+        assertNull(Reports.build(listOf(question, onlyRefusal), "p2", ReportReason.WRONG, ""))
+    }
+
+    @Test
+    fun `the question of a report stops at an earlier reply that only made a picture`() {
+        val first = user("a fox please")
+        val firstReply = ChatMessage("p1", Role.ASSISTANT, "", createdAt = clock++, picture = ReplyPicture("a red fox"))
+        val second = user("and what is a fox?")
+        val secondReply = answer("A fox is a small wild dog.")
+        val report = Reports.build(listOf(first, firstReply, second, secondReply), secondReply.id, ReportReason.WRONG, "")!!
+        assertEquals("and what is a fox?", report.question)
+    }
+
+    @Test
     fun `the report body uses the API's field names and reason values`() {
         val body = Json.encodeToString(ReportRequest.serializer(), ReportRequest("q", "a", ReportReason.HARMFUL, ""))
         assertEquals("""{"question":"q","answer":"a","reason":"harmful","note":""}""", body)

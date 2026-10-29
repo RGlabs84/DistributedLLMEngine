@@ -20,6 +20,8 @@ This module multiplexes raw `ggml-rpc` TCP streams over a persistent outbound We
      transparently substitutes `127.0.0.1:<relay_port>`, bridging `llama-server` over the
      worker's outbound WebSocket directly into the worker's local `127.0.0.1:50052`
      (`ggml-rpc-server`).
+  4. The coordinator also times each tunnel with PING/PONG frames (2.4.9): for a worker it can
+     only reach this way, that round trip is how far its GPU is (engine/link_paths.py).
 """
 
 import asyncio
@@ -38,13 +40,29 @@ from engine.logger import log_coordinator, log_warning, log_error
 #   1 = OPEN_STREAM
 #   2 = DATA
 #   3 = CLOSE_STREAM
+#   4 = PING  (coordinator to worker; the id field is the ping's number, no payload)
+#   5 = PONG  (worker to coordinator, sent the moment a PING arrives, with the same number)
+# PING/PONG time the round trip to a worker reached only through its tunnel (2.4.9). A worker
+# from before then ignores frame types it does not know, so a ping to it simply goes unanswered.
 FRAME_OPEN = 1
 FRAME_DATA = 2
 FRAME_CLOSE = 3
+FRAME_PING = 4
+FRAME_PONG = 5
 HEADER_STRUCT = struct.Struct("!BI")
+
+# A tunnel moving at least this much a second is uploading a model's weights, and a ping would
+# wait behind megabytes of them: it is not timed then, and the last good figure stands.
+PING_BUSY_MB_S = 1.0
 
 # 1 MB stream buffer avoids per-64KB WebSocket frame overhead during multi-GB set_tensor uploads
 READ_CHUNK_SIZE = 1048576
+
+# A household worker whose coordinator's LAN address did not take its tunnel uses the public
+# address for this long before it tries the LAN again (2.5.2).
+LAN_RETRY_SECONDS = 600.0
+# How often an idle tunnel checks whether a better way to the coordinator is known.
+MOVE_CHECK_SECONDS = 5.0
 
 RELAY_PORT_MIN = 50100
 RELAY_PORT_MAX = 50199
@@ -98,6 +116,11 @@ class _WorkerTunnelSession:
         self._streams: Dict[int, asyncio.StreamWriter] = {}
         self._send_lock = asyncio.Lock()
         self.closed = False
+        # The event loop this session lives on (set when the WebSocket is accepted), so a probe
+        # thread can time a ping on it; and the pings waiting for their PONG, by number.
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self._pings: Dict[int, "asyncio.Future[None]"] = {}
+        self._next_ping_id = 1
 
         # Live network telemetry counters
         self.total_bytes_tx: int = 0
@@ -135,6 +158,32 @@ class _WorkerTunnelSession:
             oldest = self._tx_samples[0][0]
             span = max(0.25, now - oldest)
             return round((window_bytes / (1024.0 * 1024.0)) / span, 2)
+
+    def moving_data(self) -> bool:
+        """Whether the tunnel is busy with a bulk transfer (see PING_BUSY_MB_S)."""
+        return self.get_speed_mb_s() >= PING_BUSY_MB_S
+
+    async def ping(self, timeout: float) -> Optional[float]:
+        """
+        One round trip to the worker's end of the tunnel, in milliseconds, or None: no PONG
+        within ``timeout`` (a worker from before 2.4.9 never sends one), or the tunnel closed.
+        Runs on the session's own loop.
+        """
+        if self.closed:
+            return None
+        ping_id = self._next_ping_id
+        self._next_ping_id = ping_id % 0xFFFFFFFF + 1
+        answered: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+        self._pings[ping_id] = answered
+        started = time.perf_counter()
+        try:
+            await self.send_frame(FRAME_PING, ping_id)
+            await asyncio.wait_for(answered, timeout)
+        except Exception:
+            return None
+        finally:
+            self._pings.pop(ping_id, None)
+        return (time.perf_counter() - started) * 1000.0
 
     async def start_local_listener(self) -> None:
         self.server = await asyncio.start_server(
@@ -207,6 +256,10 @@ class _WorkerTunnelSession:
                             writer.close()
                         except Exception:
                             pass
+                elif frame_type == FRAME_PONG:
+                    answered = self._pings.get(stream_id)
+                    if answered is not None and not answered.done():
+                        answered.set_result(None)
         except WebSocketDisconnect:
             pass
         except Exception:
@@ -301,6 +354,7 @@ class ReverseRpcBridgeManager:
                 return
             session = _WorkerTunnelSession(worker_id, client_ip, rpc_port, relay_port, websocket)
             session.source_ip = source
+            session.loop = asyncio.get_running_loop()
             self._by_worker_id[worker_id] = session
             self._by_ip_port[(client_ip, rpc_port)] = relay_port
 
@@ -321,6 +375,39 @@ class ReverseRpcBridgeManager:
     def get_relay_port(self, ip: str, port: int) -> Optional[int]:
         with self._lock:
             return self._by_ip_port.get((ip, port))
+
+    def measure_rtt_ms(self, ip: str, port: int, samples: int = 3, timeout: float = 2.0) -> Optional[float]:
+        """
+        The round trip through the tunnel of the worker registered at ``ip:port``, in
+        milliseconds (the best of ``samples`` pings), or None: no tunnel, a worker that does not
+        answer pings, or a tunnel busy with a bulk transfer (PING_BUSY_MB_S).
+
+        Blocking: call it from a thread, never from the event loop the tunnels run on.
+        """
+        with self._lock:
+            relay_port = self._by_ip_port.get((ip, port))
+            session = next((s for s in self._by_worker_id.values()
+                            if relay_port is not None and s.relay_port == relay_port), None)
+        if session is None or session.closed or session.loop is None or session.moving_data():
+            return None
+        try:
+            if asyncio.get_running_loop() is session.loop:
+                return None     # waiting here would block the very loop that has to answer
+        except RuntimeError:
+            pass                # no loop on this thread: the normal case
+        best: Optional[float] = None
+        for _ in range(max(1, samples)):
+            pending = asyncio.run_coroutine_threadsafe(session.ping(timeout), session.loop)
+            try:
+                rtt = pending.result(timeout + 1.0)
+            except Exception:
+                pending.cancel()
+                rtt = None
+            if rtt is None and best is None:
+                return None     # the first ping went unanswered: an older worker, or a dead link
+            if rtt is not None:
+                best = rtt if best is None else min(best, rtt)
+        return best
 
     def reset_load_counters(self) -> None:
         with self._lock:
@@ -345,6 +432,8 @@ class ReverseRpcBridgeManager:
     def resolve_endpoint(self, endpoint: str, probe_timeout: float = 0.5) -> Optional[str]:
         """
         Given a remote `ip:port` endpoint:
+          0. If the worker is in this household and its LAN address was verified
+             (engine/link_paths.py), and that address answers, return `<lan_ip>:port`.
           1. If direct TCP `ip:port` is reachable within `probe_timeout`, return `ip:port`.
           2. Otherwise, if an active outbound reverse tunnel exists for `(ip, port)`, return
              `127.0.0.1:<relay_port>`.
@@ -357,6 +446,17 @@ class ReverseRpcBridgeManager:
             port = int(port_s)
         except (ValueError, TypeError):
             return endpoint
+
+        # 0. The household's own LAN, when this worker has a verified address on it
+        from engine.link_paths import lan_routes
+        lan_host = lan_routes.get(host, port)
+        if lan_host is not None:
+            try:
+                with socket.create_connection((lan_host, port), timeout=probe_timeout):
+                    log_coordinator(f"{endpoint} is in this household; RPC goes over the LAN to {lan_host}:{port}.")
+                    return f"{lan_host}:{port}"
+            except OSError:
+                pass
 
         # 1. Fast direct TCP probe
         try:
@@ -398,11 +498,17 @@ def _auth_header_kwargs(websockets_version: str, token: Optional[str]) -> Dict[s
 
 
 async def _run_worker_tunnel_once(ws_url: str, local_rpc_port: int, stop_event: threading.Event,
-                                  token: Optional[str] = None) -> None:
+                                  token: Optional[str] = None,
+                                  should_move: Optional[Callable[[], bool]] = None) -> bool:
+    """
+    One tunnel session. True once it was open, however it ended; a failure to open raises.
+    ``should_move`` says a better way to the coordinator is known: the session then ends while
+    no stream runs (a model's weights are never cut off) and the caller connects that way.
+    """
     try:
         import websockets
     except ImportError:
-        return
+        return False
 
     streams: Dict[int, asyncio.StreamWriter] = {}
     send_lock = asyncio.Lock()
@@ -442,6 +548,14 @@ async def _run_worker_tunnel_once(ws_url: str, local_rpc_port: int, stop_event: 
                 except Exception:
                     pass
 
+        async def move_when_idle() -> None:
+            while True:
+                await asyncio.sleep(MOVE_CHECK_SECONDS)
+                if not streams and should_move():
+                    await ws.close()
+                    return
+
+        mover = asyncio.create_task(move_when_idle()) if should_move else None
         try:
             async for raw in ws:
                 if stop_event.is_set():
@@ -451,7 +565,10 @@ async def _run_worker_tunnel_once(ws_url: str, local_rpc_port: int, stop_event: 
                 frame_type, stream_id = HEADER_STRUCT.unpack_from(raw, 0)
                 payload = raw[HEADER_STRUCT.size :]
 
-                if frame_type == FRAME_OPEN:
+                if frame_type == FRAME_PING:
+                    # Answered before anything else, so the coordinator times the link, not this loop.
+                    await send_frame(FRAME_PONG, stream_id)
+                elif frame_type == FRAME_OPEN:
                     try:
                         reader, writer = await asyncio.open_connection(
                             "127.0.0.1", local_rpc_port, limit=READ_CHUNK_SIZE * 2
@@ -476,13 +593,29 @@ async def _run_worker_tunnel_once(ws_url: str, local_rpc_port: int, stop_event: 
                             writer.close()
                         except Exception:
                             pass
+        except Exception:
+            pass   # the session ended; the caller connects again
         finally:
+            if mover is not None:
+                mover.cancel()
             for w in list(streams.values()):
                 try:
                     w.close()
                 except Exception:
                     pass
             streams.clear()
+    return True
+
+
+def _tunnel_url(base: str, worker_id: str, local_rpc_port: int) -> str:
+    base = base.strip().rstrip("/")
+    if base.startswith("https://"):
+        base = "wss://" + base[len("https://") :]
+    elif base.startswith("http://"):
+        base = "ws://" + base[len("http://") :]
+    elif not base.startswith(("ws://", "wss://")):
+        base = "ws://" + base
+    return f"{base}/ws/rpc_tunnel/{worker_id}?port={local_rpc_port}"
 
 
 def start_worker_reverse_tunnel(
@@ -491,6 +624,7 @@ def start_worker_reverse_tunnel(
     local_rpc_port: int,
     stop_event: threading.Event,
     token_provider: Optional[Callable[[], Optional[str]]] = None,
+    lan_url_provider: Optional[Callable[[], Optional[str]]] = None,
 ) -> Optional[threading.Thread]:
     """
     Spawns a background daemon thread on a Worker node that maintains a persistent outbound
@@ -500,26 +634,37 @@ def start_worker_reverse_tunnel(
     (re)connect because the token rotates every minute; the Coordinator admits a tunnel only
     for the worker that token is registered to. Until the first heartbeat is accepted the
     tunnel is refused, and the loop below simply tries again three seconds later.
-    """
-    base = coordinator_url.strip().rstrip("/")
-    if base.startswith("https://"):
-        ws_base = "wss://" + base[len("https://") :]
-    elif base.startswith("http://"):
-        ws_base = "ws://" + base[len("http://") :]
-    else:
-        ws_base = "ws://" + base
 
-    ws_url = f"{ws_base}/ws/rpc_tunnel/{worker_id}?port={local_rpc_port}"
+    ``lan_url_provider`` returns the coordinator's own LAN address when it is in this worker's
+    household (2.5.2). The tunnel then goes there, with no router hairpin or TLS in the way,
+    and moves there from the public address as soon as it is idle. If the LAN address does not
+    take it, the public address is used for LAN_RETRY_SECONDS; if the public address does not
+    either, the coordinator itself is away and the LAN gets the first try again.
+    """
+    lan_failed_at = float("-inf")
+
+    def choose() -> str:
+        lan = lan_url_provider() if lan_url_provider else None
+        if lan and time.monotonic() - lan_failed_at >= LAN_RETRY_SECONDS:
+            return lan
+        return coordinator_url
 
     def _runner() -> None:
+        nonlocal lan_failed_at
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         while not stop_event.is_set():
+            base = choose()
+            opened = False
             try:
                 token = token_provider() if token_provider else None
-                loop.run_until_complete(_run_worker_tunnel_once(ws_url, local_rpc_port, stop_event, token))
+                opened = loop.run_until_complete(_run_worker_tunnel_once(
+                    _tunnel_url(base, worker_id, local_rpc_port), local_rpc_port, stop_event, token,
+                    should_move=lambda: choose() != base))
             except Exception:
                 pass
+            if not opened:
+                lan_failed_at = time.monotonic() if base != coordinator_url else float("-inf")
             if stop_event.wait(3.0):
                 break
         try:

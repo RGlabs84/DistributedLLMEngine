@@ -64,7 +64,7 @@ EXCLUDED_FILES = (
 # Never public, wherever they turn up in the tree.
 FORBIDDEN_PATTERNS = (
     ".env", "*.env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*",
-    "api_keys.json", "starter_quota.json", "config.txt", "worker_invite*",
+    "api_keys.json", "starter_quota.json", "contributor_networks.json", "config.txt", "worker_invite*",
     "RESUME_HANDOFF.md", "To-Do.md", "Next direction.md", "implementation_plan.md",
     ".agent_rules.md", "*_backup*", "DLNE Backup*",
 )

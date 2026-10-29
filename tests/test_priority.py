@@ -14,7 +14,7 @@ from httpx import ASGITransport, AsyncClient
 
 from engine import coordinator
 from engine import config as engine_config
-from engine.priority import CodingGate, UsageWindow, tier_priority
+from engine.priority import CodingGate, DistinctWindow, UsageWindow, tier_priority
 
 
 # ======================================================================================
@@ -161,6 +161,38 @@ def test_uses_age_out_one_at_a_time_like_the_big_services():
     assert w.peek("n1", 3, 100, now=150) == (2, 200.5)    # only 100.5 is still inside
 
 
+def test_several_uses_are_spent_all_or_none_and_the_reset_says_when_enough_have_aged_out():
+    w = UsageWindow()
+    assert w.check_and_record("n", 10, 100, now=0, count=4) == (True, 6, 100)
+    assert w.check_and_record("n", 10, 100, now=10, count=4) == (True, 2, 100)
+    # 3 more do not fit (8 spent): refused whole, nothing is spent, and the answer is when 1 of the oldest ages out
+    assert w.check_and_record("n", 10, 100, now=20, count=3) == (False, 2, 100)
+    assert w.peek("n", 10, 100, now=20)[0] == 2
+    assert w.check_and_record("n", 10, 100, now=20, count=2)[0] is True
+    # 5 need the four at 0 and one at 10 to leave: at 110
+    assert w.check_and_record("n", 10, 100, now=30, count=5) == (False, 0, 110)
+    assert w.check_and_record("n", 10, 100, now=110, count=5)[0] is True
+
+
+def test_a_request_bigger_than_the_whole_window_is_never_allowed_and_zero_allows_nothing():
+    w = UsageWindow()
+    assert w.check_and_record("n", 4, 100, now=0, count=5) == (False, 4, 100)
+    assert w.check_and_record("n", 0, 100, now=0)[0] is False
+    assert w.peek("n", 4, 100, now=0) == (4, None)
+
+
+def test_a_refund_gives_back_the_newest_uses_and_never_more_than_were_spent():
+    w = UsageWindow()
+    w.check_and_record("n", 4, 100, now=0)
+    w.check_and_record("n", 4, 100, now=10, count=2)
+    w.refund("n")
+    assert w.peek("n", 4, 100, now=10) == (2, 100), "the newest went back; the oldest still decides the reset"
+    w.refund("n", 5)
+    w.refund("unknown")
+    assert w.peek("n", 4, 100, now=10) == (4, None)
+    assert w.check_and_record("n", 4, 100, now=20, count=4)[0] is True
+
+
 def test_each_contributor_has_its_own_window_and_idle_ones_are_forgotten():
     w = UsageWindow()
     w.check_and_record("a", 1, 100, now=0)
@@ -168,6 +200,64 @@ def test_each_contributor_has_its_own_window_and_idle_ones_are_forgotten():
     w.forget_idle(100, now=500)
     assert w.peek("a", 1, 100, now=500) == (1, None)
     assert w._uses == {}
+
+
+# ======================================================================================
+# DistinctWindow (2.6.2: the image budget counts each distinct image once per window)
+# ======================================================================================
+
+def test_a_name_that_was_counted_is_free_to_use_again_and_a_new_one_costs_one():
+    w = DistinctWindow()
+    assert w.check_and_record("n", ["a", "b"], 3, 100, now=0) == (True, 1, 100)
+    assert w.check_and_record("n", ["a", "b"], 3, 100, now=10) == (True, 1, 100)       # both counted already: nothing spent
+    assert w.check_and_record("n", ["b", "c"], 3, 100, now=20) == (True, 0, 100)       # c is the third name
+    assert w.check_and_record("n", ["a", "b", "c"], 3, 100, now=30)[0] is True         # all counted: free, at the limit
+    allowed, remaining, reset_at = w.check_and_record("n", ["d"], 3, 100, now=40)
+    assert (allowed, remaining, reset_at) == (False, 0, 100)
+
+
+def test_a_name_listed_twice_in_one_use_is_counted_once():
+    w = DistinctWindow()
+    assert w.check_and_record("n", ["a", "a", "a", "a"], 2, 100, now=0) == (True, 1, 100)
+    assert w.check_and_record("n", [], 2, 100, now=1)[0] is True
+
+
+def test_the_new_names_are_spent_all_or_none_and_the_reset_says_when_enough_have_aged_out():
+    w = DistinctWindow()
+    w.check_and_record("n", ["a", "b"], 4, 100, now=0)
+    w.check_and_record("n", ["c"], 4, 100, now=10)
+    # b and c are counted, d and e are new: 3 + 2 does not fit in 4 and nothing at all is spent
+    assert w.check_and_record("n", ["c", "d", "e"], 4, 100, now=20) == (False, 1, 100)
+    assert w.check_and_record("n", ["d"], 4, 100, now=20)[0] is True                   # the refused use counted no d: it is new
+    # e needs one more to leave: the oldest, a, at 100 (the four counted are a, b, c, d)
+    assert w.check_and_record("n", ["e"], 4, 100, now=30) == (False, 0, 100)
+    assert w.check_and_record("n", ["e"], 4, 100, now=100.5)[0] is True
+
+
+def test_a_name_counts_from_its_first_use_whatever_comes_back_in_between_and_is_new_again_after():
+    w = DistinctWindow()
+    w.check_and_record("n", ["a"], 1, 100, now=0)
+    assert w.check_and_record("n", ["a"], 1, 100, now=90)[0] is True                   # free, and it does not renew a
+    assert w.check_and_record("n", ["b"], 1, 100, now=95)[0] is False
+    assert w.check_and_record("n", ["b"], 1, 100, now=100.5)[0] is True                # a aged out an hour after its first use
+    assert w.check_and_record("n", ["a"], 1, 100, now=101)[0] is False                 # and a is a new name again
+
+
+def test_the_new_names_alone_over_the_limit_are_never_allowed_and_zero_allows_nothing():
+    w = DistinctWindow()
+    assert w.check_and_record("n", ["a", "b", "c"], 2, 100, now=0) == (False, 2, 100)
+    assert w.check_and_record("n", ["a"], 0, 100, now=0)[0] is False
+    assert w.check_and_record("n", ["a"], 2, 100, now=0)[0] is True
+
+
+def test_each_key_has_its_own_names_and_quiet_keys_are_dropped_from_the_front():
+    w = DistinctWindow()
+    w.check_and_record("a", ["x"], 1, 100, now=0)
+    assert w.check_and_record("b", ["x"], 1, 100, now=1)[0] is True                    # the same name on another key
+    assert w.check_and_record("a", ["y"], 1, 100, now=2)[0] is False
+    w.check_and_record("c", ["z"], 1, 100, now=500)                                    # a and b went quiet long ago
+    assert list(w._names) == ["c"]
+    assert all(len(names) <= 1 for names in w._names.values())
 
 
 # ======================================================================================

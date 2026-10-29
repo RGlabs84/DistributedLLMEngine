@@ -1,0 +1,26 @@
+{
+  "_comment": "The three model files image generation (2.6.1) loads, pinned to a Hugging Face revision and checked by size and SHA-256 (scripts/fetch_image_models.py). All three are ungated. The text encoder is not listed twice: 'from_app_models' names the CPU pool tier in scripts/app_models.json whose url, sha256 and size are used. engine/image_member.py MODEL_FILES holds the names and sizes the coordinator checks at run time; tests/test_image_models.py keeps the two in step.",
+  "models": [
+    {
+      "role": "diffusion",
+      "name": "Z-Image-Turbo Q4_K",
+      "file": "z_image_turbo-Q4_K.gguf",
+      "url": "https://huggingface.co/leejet/Z-Image-Turbo-GGUF/resolve/c61c0e422dc8b541b7548cf33a4ef8302b0f8085/z_image_turbo-Q4_K.gguf",
+      "sha256": "14b375ab4f226bc5378f68f37e899ef3c2242b8541e61e2bc1aff40976086fbd",
+      "size": 3864250304
+    },
+    {
+      "role": "vae",
+      "name": "Z-Image-Turbo VAE",
+      "file": "ae.safetensors",
+      "url": "https://huggingface.co/Comfy-Org/Z-Image-Turbo/resolve/6fc90a3b1b653e935a0d175e260736de25b84df5/split_files/vae/ae.safetensors",
+      "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+      "size": 335304388
+    },
+    {
+      "role": "llm",
+      "name": "Qwen3 4B Instruct 2507 (text encoder)",
+      "from_app_models": "qwen3-4b"
+    }
+  ]
+}

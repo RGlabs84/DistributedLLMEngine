@@ -11,6 +11,7 @@ stub that records whether it was reached: "fell back to the local engine" means 
 """
 
 import asyncio
+import ipaddress
 import json
 import time
 from collections import deque
@@ -23,7 +24,7 @@ from httpx import ASGITransport, AsyncClient
 from engine import canary
 from engine import config as engine_config
 from engine import coding_router as cr_module
-from engine import coordinator, e2e, reverse_tunnel
+from engine import coordinator, e2e, link_paths, reverse_tunnel
 from engine.coding_router import CodingRouter, E2E_ALG
 from engine.inference_manager import NETWORK_MAXED_OUT_MESSAGE
 from engine.priority import CodingGate, UsageWindow
@@ -36,12 +37,16 @@ seal_request = e2e.seal_request
 generate_keypair = e2e.generate_keypair
 
 REMOTE = ("203.0.113.9", 40000)
+HOUSEHOLD_IP = "198.51.100.200"         # the coordinator's own public address in these tests
 MODEL_FILE = "Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
 TIER = {"id": "qwen36-a3b", "name": "Qwen3.6 35B-A3B", "file": MODEL_FILE, "min_vram_gb": 15, "enabled": True,
         "context": 65536, "blocked": None, "size": 13676723168, "files": [{"file": MODEL_FILE}]}
 CHAT = {"model": MODEL_FILE, "stream": True, "messages": [{"role": "user", "content": "hello"}]}
 JSON_HEADERS = {"Content-Type": "application/json"}
 ANY = {**JSON_HEADERS, "X-DLNE-Privacy": "any"}
+# How the coordinator's own engine answers in these tests: the fake engine cannot fit the swarm's own model, which
+# 2.6.2 tells as an engine between restarts (the reconfiguring nudge, "engine_unavailable"), not "switch your chat".
+LOCAL_ANSWER = b"reorganising"
 
 
 class Clock:
@@ -136,6 +141,13 @@ def env(fakes, monkeypatch, tmp_path):
     monkeypatch.setattr(coordinator, "_planned_endpoints", lambda gb: [])
     monkeypatch.setattr(coordinator, "is_swapping_models", False)
     monkeypatch.setattr(coordinator, "is_recalculating_queue", False)
+    # This coordinator's household (engine/link_paths.py): public address HOUSEHOLD_IP, LAN 192.168.40.0/24.
+    household = link_paths.Household(resolve=lambda: {HOUSEHOLD_IP},
+                                      interfaces=lambda: ([ipaddress.IPv4Network("192.168.40.0/24")], {"192.168.40.23"}),
+                                      refresh_seconds=1e9)
+    household.refresh_now()
+    monkeypatch.setattr(link_paths, "household", household)
+    monkeypatch.setattr(link_paths, "lan_routes", link_paths.LanRoutes())
     count = {"n": 0}
     ips = {}
 
@@ -244,7 +256,7 @@ async def test_a_plain_request_never_goes_to_a_member(env, privacy, with_route, 
             headers["X-DLNE-Route"] = (await lookup(c, "s", "any"))["route"]
         resp = await chat(c, {**CHAT, "stream": streamed}, headers)
     assert env.fakes["a"].requests == [], "the member was sent nothing"
-    assert env.local.starts and b"maxed out" in resp.content, "the coordinator's own engine answered"
+    assert env.local.starts and LOCAL_ANSWER in resp.content, "the coordinator's own engine answered"
     assert "x-dlne-served" not in resp.headers
 
 
@@ -255,7 +267,17 @@ async def test_a_plain_body_that_mentions_the_envelope_key_is_still_plain(env):
     async with client() as c:
         route = await lookup(c)
         resp = await chat(c, body, {**ANY, "X-DLNE-Route": route["route"]})
-    assert env.fakes["a"].requests == [] and env.local.starts and b"maxed out" in resp.content
+    assert env.fakes["a"].requests == [] and env.local.starts and LOCAL_ANSWER in resp.content
+
+
+@pytest.mark.anyio
+async def test_the_swarms_own_model_not_fitting_is_an_engine_between_restarts(env):
+    """2026-10-28 10:11: with the laptop's shard gone, IQ4_XS could not start, and the agent was told "active models
+    are: [None]. Please switch your chat", which it took for the model's answer and ended a 330-step task on."""
+    async with client() as c:
+        resp = await chat(c)
+    assert LOCAL_ANSWER in resp.content and b'"dlne_error": "engine_unavailable"' in resp.content
+    assert b"switch your chat" not in resp.content
 
 
 @pytest.mark.anyio
@@ -756,7 +778,7 @@ async def test_with_members_off_nothing_changes(env, monkeypatch):
         completion = await complete(c)
         route = await c.get("/v1/coding/route", params={"session": "s", "privacy": "any"})
     assert env.fakes["a"].requests == []
-    assert env.local.starts and b"maxed out" in resp.content
+    assert env.local.starts and LOCAL_ANSWER in resp.content
     assert completion.status_code == 500
     assert route.json() == {"route": None}
 
@@ -806,12 +828,42 @@ async def test_no_route_means_the_local_engine(env):
 
 
 @pytest.mark.anyio
+async def test_the_requesters_own_member_is_preferred_while_it_is_as_fast_as_the_engine(env, monkeypatch):
+    """``own=<trust id>`` (2.5.0): the requester's own machine serves them unless this coordinator's engine would
+    write faster for them right now (its measured rate shared among the requests it is answering)."""
+    from engine import coding_speed
+    mine, other = env.fakes["a"], env.fakes["b"]
+    env.add(mine, "mine", slots=4, decode=25.0, prefill=121.0)
+    env.add(other, "other", slots=4, decode=40.0, prefill=300.0)
+    monkeypatch.setattr(coding_speed, "meter", SimpleNamespace(speed=lambda file: (None, None)))
+
+    async def chosen(c, session, own):
+        params = {"session": session, "privacy": "any"}
+        if own is not None:
+            params["own"] = own
+        route = (await c.get("/v1/coding/route", params=params)).json()
+        env.clock.t += 31                       # the route's hold on the member runs out: a clean slate
+        return member_name(env, route["pubkey"])
+
+    async with client() as c:
+        assert await chosen(c, "s1", None) == "b", "nothing said: the faster reader"
+        assert await chosen(c, "s2", mine.trust_id) == "a", "no engine speed measured yet: own"
+        monkeypatch.setattr(coding_speed, "meter", SimpleNamespace(speed=lambda file: (41.5, "2026-10-27T13:00:00Z")))
+        assert await chosen(c, "s3", mine.trust_id) == "b", "the engine writes 41.5 for one user: not own"
+        monkeypatch.setattr(coordinator.coding_gate, "stats", lambda: {"slots": 5, "in_use": 2, "waiting": 0})
+        assert await chosen(c, "s4", mine.trust_id) == "a", "shared by the two requests it is answering, 20.75: own"
+        assert await chosen(c, "s4", None) == "a", "and own is the session's sticky member from then on"
+        for odd in (mine.trust_id.upper(), mine.trust_id[:31], "x" * 32, "", other.trust_id):
+            assert await chosen(c, f"s-{odd[:8]}", odd) == "b", odd
+
+
+@pytest.mark.anyio
 async def test_a_member_with_no_key_is_offered_no_route_and_gets_nothing_in_the_clear(env):
     env.add(env.fakes["a"], pubkey=False)
     async with client() as c:
         assert await lookup(c) == {"route": None}
         resp = await chat(c)
-    assert env.fakes["a"].requests == [] and b"maxed out" in resp.content
+    assert env.fakes["a"].requests == [] and LOCAL_ANSWER in resp.content
 
 
 @pytest.mark.anyio
@@ -1135,7 +1187,7 @@ async def test_a_plain_body_with_a_dead_route_goes_to_the_local_engine(env):
     env.add(env.fakes["a"])
     async with client() as c:
         resp = await chat(c, headers={**ANY, "X-DLNE-Route": "stale"})
-    assert env.fakes["a"].requests == [] and b"maxed out" in resp.content
+    assert env.fakes["a"].requests == [] and LOCAL_ANSWER in resp.content
 
 
 # ======================================================================================
@@ -1159,10 +1211,17 @@ CPU_HW = {"gpu": {"has_gpu": False, "vram_total_gb": 0}, "ram_gb": 12.0, "cpu_co
           "is_yielding": False}
 
 
+def _aged(env, worker_id, seconds):
+    """Pretend ``seconds`` have passed since the coordinator first saw and registered ``worker_id``."""
+    env.router._first_seen[worker_id] = time.time() - seconds
+    if worker_id in env.registry.workers:
+        env.registry.workers[worker_id]["registered_at"] = time.time() - seconds
+
+
 def measured(env, worker_id, ip, rtt_ms, hardware=None):
-    """A worker the coordinator has heard from and measured (a link measurement is only kept for a registered node)."""
+    """A worker the coordinator has heard from and measured itself (a probe is only kept for a registered node)."""
     env.registry.update_worker(worker_id, ip, 50053, f"tok-{worker_id}", hardware or gpu_hw())
-    env.registry.record_link_measurement(worker_id, {"rtt_min_ms": rtt_ms})
+    env.registry.record_probe(worker_id, rtt_ms, "direct")
 
 
 def test_a_gpu_close_to_the_coordinator_is_an_rpc_worker(env):
@@ -1175,6 +1234,24 @@ def test_a_far_gpu_with_8_gb_is_a_coding_member_with_the_tier_it_can_hold(env):
     answer = _heartbeat("far", gpu_hw(8.0, 32.0), "10.0.0.42")
     assert answer["status"] == "ok" and answer["role"] == "coding"
     assert answer["coding_tier"]["id"] == TIER["id"] and answer["coding_tier"]["file"] == MODEL_FILE
+    assert answer["coding_slots"] in (1, 2), "how many requests at once to open the tier for (2.5.0)"
+
+
+def test_the_slot_count_comes_from_choose_slots_and_only_comes_with_a_tier(env, monkeypatch):
+    from engine import coding_member_select
+    seen = []
+
+    def slots(tier, vram, ram):
+        seen.append((tier["id"], vram, ram))
+        return 1
+
+    monkeypatch.setattr(coding_member_select, "choose_slots", slots)
+    measured(env, "far", "10.0.0.42", 80.0)
+    answer = _heartbeat("far", gpu_hw(8.0, 32.0), "10.0.0.42")
+    assert answer["coding_slots"] == 1 and seen == [(TIER["id"], 8.0, 32.0)], "sized on the memory the tier was"
+    measured(env, "near", "10.0.0.41", 3.0, gpu_hw(24.0))
+    assert "coding_slots" not in _heartbeat("near", gpu_hw(24.0), "10.0.0.41"), "no tier, no slot count"
+    assert "coding_slots" not in _heartbeat("cpu", CPU_HW, "10.0.0.49")
 
 
 def test_the_tier_comes_from_choose_tier(env, monkeypatch):
@@ -1200,7 +1277,7 @@ def test_a_far_gpu_too_small_for_any_tier_is_given_no_role(env, vram, ram):
 def test_a_gpu_nobody_has_measured_waits_before_it_is_called_far(env):
     first = _heartbeat("new", gpu_hw(), "10.0.0.44")
     assert first["role"] is None, "a LAN machine must not be sent away in the gap before the probe"
-    env.router._first_seen["new"] = time.time() - 600
+    _aged(env, "new", 600)
     assert _heartbeat("new", gpu_hw(), "10.0.0.44")["role"] == "coding"
 
 
@@ -1222,20 +1299,128 @@ def test_a_member_that_already_serves_is_not_made_to_wait_after_a_coordinator_re
 
 def test_a_measurement_that_arrives_ends_the_wait(env):
     assert _heartbeat("new", gpu_hw(), "10.0.0.45")["role"] is None
-    env.registry.record_link_measurement("new", {"rtt_min_ms": 2.0})     # registered by the heartbeat above
+    env.registry.record_probe("new", 2.0, "direct")                     # registered by the heartbeat above
     assert _heartbeat("new", gpu_hw(), "10.0.0.45")["role"] == "rpc"
 
 
-def test_a_stale_measurement_counts_as_far(env):
+def test_a_stale_measurement_moves_nobody_but_counts_as_far_in_the_pool(env):
+    """2.6.2: an aged reading says nothing about distance now (a tunnel busy carrying a shard is never pinged), so it
+    changes no role ("stay as you are"); only a fresh reading over the limit does. Auto-swap still leaves it out."""
     measured(env, "old", "10.0.0.46", 2.0)
-    env.registry.link_measurements["old"]["reported_at"] = time.time() - 3600
+    env.registry.link_probes["old"]["measured_at"] = time.time() - 3600
+    assert _heartbeat("old", gpu_hw(), "10.0.0.46")["role"] is None
+    assert coordinator._coding_pool()["vram_gb"] == 0.0
+    measured(env, "old", "10.0.0.46", 60.0)                              # fresh, and over this env's 15 ms
     assert _heartbeat("old", gpu_hw(), "10.0.0.46")["role"] == "coding"
+
+
+def _engine_runs_on(monkeypatch, *endpoints):
+    monkeypatch.setattr(type(coordinator.manager), "current_endpoints",
+                        property(lambda self: ["127.0.0.1:50052", *endpoints]), raising=False)
+
+
+def test_a_shard_whose_reading_aged_out_under_load_stays_a_shard_and_stays_in_the_pool(env, monkeypatch):
+    """2026-10-28 06:46 and 10:11: the tunnel carrying the laptop's shard was too busy to ping for 15 minutes, its
+    reading aged out, it was told to become a coding member and stopped its RPC server under the engine."""
+    _engine_runs_on(monkeypatch, "10.0.0.82:50053")
+    measured(env, "shard", "10.0.0.82", 2.0, gpu_hw(8.0, 32.0))
+    env.registry.link_probes["shard"]["measured_at"] = time.time() - 3600
+    assert _heartbeat("shard", gpu_hw(8.0, 32.0), "10.0.0.82")["role"] == "rpc"
+    assert coordinator._coding_pool()["vram_gb"] == 8.0, "auto-swap does not see the pool shrink either"
+
+    # Between two engines (every rebuild empties the engine's list for a few seconds; found in review): an old reading
+    # moves nobody, so the next engine can still be planned onto it. It only stops counting in auto-swap's pool.
+    _engine_runs_on(monkeypatch)
+    assert _heartbeat("shard", gpu_hw(8.0, 32.0), "10.0.0.82")["role"] is None, "stay as you are"
+    assert coordinator._coding_pool()["vram_gb"] == 0.0
+
+
+def test_a_shard_the_engine_runs_on_with_no_reading_yet_is_near(env, monkeypatch):
+    """A coordinator that has just restarted has no reading, and its engine may be on the GPU before the probe can
+    ping the busy tunnel: no reading is not "far" for a GPU the engine is running on (found in review)."""
+    _engine_runs_on(monkeypatch, "10.0.0.85:50053")
+    env.registry.update_worker("fresh", "10.0.0.85", 50053, "tok-fresh", gpu_hw(8.0, 32.0))
+    assert coordinator._coding_pool()["vram_gb"] == 8.0
+    assert _heartbeat("fresh", gpu_hw(8.0, 32.0), "10.0.0.85")["role"] == "rpc"
+
+
+def test_a_shard_measured_far_keeps_its_role_until_the_engine_has_been_moved_off_it(env, monkeypatch):
+    _engine_runs_on(monkeypatch, "10.0.0.83:50053")
+    measured(env, "shard", "10.0.0.83", 60.0, gpu_hw(8.0, 32.0))       # fresh, and over this env's 15 ms
+    assert _heartbeat("shard", gpu_hw(8.0, 32.0), "10.0.0.83")["role"] == "rpc", "a role change would stop the engine"
+    assert coordinator._coding_pool()["vram_gb"] == 0.0, "but auto-swap's pool leaves it out, so the engine moves first"
+
+
+@pytest.mark.parametrize("aside, after", [({"docked": False}, "coding"), ({"is_yielding": True}, None),
+                                          ({"leaving": True}, "rpc")])
+def test_a_shard_stepping_aside_drains_before_it_is_given_another_role(env, monkeypatch, aside, after):
+    _engine_runs_on(monkeypatch, "10.0.0.84:50053")
+    measured(env, "shard", "10.0.0.84", 2.0, gpu_hw(8.0, 32.0))
+    answer = _heartbeat("shard", {**gpu_hw(8.0, 32.0), **aside}, "10.0.0.84")
+    assert answer["draining"] is True and answer["role"] == "rpc"
+    _engine_runs_on(monkeypatch)                      # rebuilt without it: now it is told what to be next
+    assert _heartbeat("shard", {**gpu_hw(8.0, 32.0), **aside}, "10.0.0.84")["role"] == after
 
 
 def test_the_rtt_limit_is_auto_swaps(env):
     env.limits["auto_swap_max_rtt_ms"] = 100.0
     measured(env, "mid", "10.0.0.47", 80.0)
     assert _heartbeat("mid", gpu_hw(), "10.0.0.47")["role"] == "rpc"
+
+
+def test_a_worker_that_only_says_its_link_is_short_is_not_near(env):
+    """/worker/link_report is the worker's own story: it never makes a GPU near enough to share the model."""
+    _heartbeat("boast", gpu_hw(), "10.0.0.50")
+    env.registry.record_link_measurement("boast", {"rtt_min_ms": 0.3})
+    _aged(env, "boast", 600)                 # past the grace
+    assert _heartbeat("boast", gpu_hw(), "10.0.0.50")["role"] == "coding"
+
+
+@pytest.mark.parametrize("rtt, role", [(100.0, "coding"), (120.0, "coding"), (121.0, None), (400.0, None)])
+def test_a_far_gpu_runs_a_coding_model_of_its_own_only_within_the_member_limit(env, rtt, role):
+    measured(env, "away", "10.0.0.51", rtt)
+    assert _heartbeat("away", gpu_hw(), "10.0.0.51")["role"] == role
+
+
+def test_the_member_limit_is_a_setting(env):
+    env.limits["coding_member_max_rtt_ms"] = 200.0
+    measured(env, "away", "10.0.0.52", 150.0)
+    assert _heartbeat("away", gpu_hw(), "10.0.0.52")["role"] == "coding"
+
+
+def test_the_coding_model_is_sized_on_the_coding_ram_not_the_rpc_ram_cap(env):
+    """ram_gb is what the RPC node lends (MAX_RAM_GB, 4 GB by default): 8 GB of VRAM and 4 GB fit no model.
+    coding_ram_gb is what the coding job may use, and it is the figure a model is chosen for."""
+    measured(env, "laptop", "10.0.0.53", 90.0)
+    assert _heartbeat("laptop", gpu_hw(8.0, 4.0), "10.0.0.53")["role"] is None
+    answer = _heartbeat("laptop", {**gpu_hw(8.0, 4.0), "coding_ram_gb": 30.0}, "10.0.0.53")
+    assert answer["role"] == "coding" and answer["coding_tier"]["id"] == TIER["id"]
+
+
+def test_a_gpu_in_this_household_is_asked_for_its_lan_addresses(env):
+    answer = _heartbeat("home", gpu_hw(), HOUSEHOLD_IP, port=50052)
+    assert answer["send_lan"] is True
+    _heartbeat("home", {**gpu_hw(), "lan_ipv4": ["172.17.0.1", "192.168.40.50", "10.13.13.2", "192.168.122.1"]},
+               HOUSEHOLD_IP, port=50052)
+    # Only the address on one of this machine's own subnets is kept (not docker, WireGuard or libvirt).
+    assert link_paths.lan_routes.offers(HOUSEHOLD_IP, 50052) == ["192.168.40.50"]
+
+
+def test_a_household_gpu_is_given_the_coordinators_lan_address_for_its_tunnel(env):
+    """2.5.2: a host firewall drops the coordinator's dial, but the worker's own connection out gets through."""
+    assert "lan_tunnel" not in _heartbeat("home", gpu_hw(), HOUSEHOLD_IP, port=50052), "no LAN address of its own yet"
+    answer = _heartbeat("home", {**gpu_hw(), "lan_ipv4": ["172.17.0.1", "192.168.40.50"]}, HOUSEHOLD_IP, port=50052)
+    assert answer["lan_tunnel"] == "ws://192.168.40.23:11435"
+    stranger = _heartbeat("stranger", {**gpu_hw(), "lan_ipv4": ["192.168.40.50"]}, "203.0.113.77", port=50052)
+    assert "lan_tunnel" not in stranger
+
+
+def test_nobody_else_is_asked_and_nobody_else_can_offer_one(env):
+    answer = _heartbeat("stranger", {**gpu_hw(), "lan_ipv4": ["192.168.40.50"]}, "203.0.113.77", port=50052)
+    assert "send_lan" not in answer
+    assert link_paths.lan_routes.offers("203.0.113.77", 50052) == []
+    cpu = _heartbeat("cpu-home", CPU_HW, HOUSEHOLD_IP)
+    assert "send_lan" not in cpu, "a machine with no GPU has nothing to reach over the LAN"
 
 
 def test_a_cpu_only_machine_is_a_phone_pool_member_as_before(env):
@@ -1288,7 +1473,9 @@ async def test_the_status_counts_members_slots_and_busy(env):
     async with client() as c:
         resp = await c.get("/v1/cluster/status")
     assert resp.status_code == 200
-    assert resp.json()["coding_members"] == {"enabled": True, "members": 4, "ready": 2, "slots": 6, "busy": 1}
+    assert resp.json()["coding_members"] == {
+        "enabled": True, "members": 4, "ready": 2, "slots": 6, "busy": 1,
+        "decode_tps_median": 33.0, "decode_tps_min": 33.0, "prefill_tps_median": 121.0, "prefill_tps_min": 121.0}
 
 
 @pytest.mark.anyio
@@ -1296,7 +1483,9 @@ async def test_the_status_says_when_members_are_off(env):
     env.limits["coding_members_enabled"] = False
     async with client() as c:
         resp = await c.get("/v1/cluster/status")
-    assert resp.json()["coding_members"] == {"enabled": False, "members": 0, "ready": 0, "slots": 0, "busy": 0}
+    assert resp.json()["coding_members"] == {
+        "enabled": False, "members": 0, "ready": 0, "slots": 0, "busy": 0,
+        "decode_tps_median": None, "decode_tps_min": None, "prefill_tps_median": None, "prefill_tps_min": None}
 
 
 @pytest.mark.anyio
@@ -1363,7 +1552,7 @@ async def test_a_streamed_request_that_must_wait_is_told_its_place_before_the_an
         assert set(frame) <= {"position", "waiting", "slots", "in_use", "eta_seconds"}
         assert all(type(value) is int for value in frame.values())
     text = resp.text
-    assert text.rindex('"dlne_queue"') < text.index("maxed out"), "the frames come before the first real chunk"
+    assert text.rindex('"dlne_queue"') < text.index(LOCAL_ANSWER.decode()), "the frames come before the first real chunk"
     assert queue.stats()["in_use"] == 0 and queue.stats()["waiting"] == 0
     assert coordinator.active_inference_requests == base
     assert env.local.starts, "and then the engine's own answer"
@@ -1440,7 +1629,7 @@ def test_the_estimate(monkeypatch):
 async def test_a_request_with_a_free_slot_is_not_queued_and_gets_no_frames(env, queue):
     async with client() as c:
         resp = await chat(c)
-    assert queue_frames(resp.content) == [] and b"maxed out" in resp.content
+    assert queue_frames(resp.content) == [] and LOCAL_ANSWER in resp.content
     assert queue.stats()["in_use"] == 0, "the slot taken at the door was given back"
 
 
@@ -1469,7 +1658,7 @@ async def test_a_caller_that_is_not_the_extension_takes_the_old_path_and_gets_no
         await asyncio.sleep(0.3)
         queue.release()
         resp = await asyncio.wait_for(task, 10)
-    assert resp.status_code == 200 and queue_frames(resp.content) == [] and b"maxed out" in resp.content
+    assert resp.status_code == 200 and queue_frames(resp.content) == [] and LOCAL_ANSWER in resp.content
 
 
 @pytest.mark.anyio
@@ -1550,6 +1739,61 @@ async def test_a_queued_request_waits_for_the_engine_only_though_a_member_has_a_
         resp = await task
     frames = queue_frames(resp.content)
     assert frames and frames[0] == {"position": 1, "waiting": 1, "slots": 1, "in_use": 1}, "the engine's slots only"
-    assert b"maxed out" in resp.content and env.fakes["a"].requests == []
+    assert LOCAL_ANSWER in resp.content and env.fakes["a"].requests == []
     assert queue.stats()["in_use"] == 0
 
+
+
+# ---- 2.5.0: docked laptops shard; a member is not a member for good -----------------------------------------
+
+def test_the_grace_starts_over_when_a_worker_leaves_and_comes_back(env):
+    """Pruned after 20 s of silence and registered again: its first beat is not "far", however long ago this
+    coordinator first heard of it."""
+    assert _heartbeat("back", gpu_hw(), "10.0.0.70")["role"] is None
+    _aged(env, "back", 600)
+    assert _heartbeat("back", gpu_hw(), "10.0.0.70")["role"] == "coding", "past the grace: far"
+    env.registry.workers["back"]["last_heartbeat"] -= 3600
+    env.registry.prune_dead_workers()
+    assert "back" not in env.registry.workers
+    assert _heartbeat("back", gpu_hw(), "10.0.0.70")["role"] is None, "a fresh registration waits for the probe again"
+
+
+def test_a_serving_member_that_is_measured_near_is_called_back_into_the_shared_engine(env):
+    key, identity, _trust = make_identity()
+    block = sign_block({"model": MODEL_FILE, "tier": "qwen36-a3b", "ready": True, "slots": 2, "busy": 0,
+                        "decode_tps": 33.0, "prefill_tps": 121.0, "pubkey": generate_keypair()[1],
+                        "no_trace": True, "identity": identity}, key)
+    serving = {**gpu_hw(8.0, 32.0), "pool": "coding", "coding": block, "docked": True}
+    assert _heartbeat("home", serving, "10.0.0.71")["role"] == "coding", "unmeasured: it keeps serving"
+    assert "10.0.0.71:50053" in coordinator._probe_targets(), "a member is measured like any other GPU"
+    coordinator._record_probed_rtt("10.0.0.71:50053", 2.0)
+    assert _heartbeat("home", serving, "10.0.0.71")["role"] == "rpc", "near: it shards again"
+
+
+def test_an_undocked_near_laptop_does_not_unlock_a_bigger_model(env):
+    measured(env, "docked", "10.0.0.72", 2.0, {**gpu_hw(8.0), "docked": True})
+    measured(env, "undocked", "10.0.0.73", 2.0, {**gpu_hw(8.0), "docked": False})
+    measured(env, "unsaid", "10.0.0.74", 2.0, gpu_hw(8.0))
+    pool = coordinator._coding_pool()
+    assert pool["vram_gb"] == 16.0, "the docked one and the one that could not say; never the undocked one"
+
+
+def test_an_rpc_node_stepping_aside_is_told_it_is_draining_while_the_engine_still_runs_on_it(env, monkeypatch):
+    monkeypatch.setattr(type(coordinator.manager), "current_endpoints",
+                        property(lambda self: ["127.0.0.1:50052", "10.0.0.80:50053"]), raising=False)
+    measured(env, "shard", "10.0.0.80", 2.0, gpu_hw(8.0))
+    quiet = _heartbeat("shard", gpu_hw(8.0), "10.0.0.80")
+    assert quiet["shard"] is True and "draining" not in quiet
+    assert _heartbeat("shard", {**gpu_hw(8.0), "is_yielding": True}, "10.0.0.80")["draining"] is True
+    assert _heartbeat("shard", {**gpu_hw(8.0), "leaving": True}, "10.0.0.80")["draining"] is True
+    other = _heartbeat("other", {**gpu_hw(8.0), "is_yielding": True}, "10.0.0.81")
+    assert "draining" not in other and "shard" not in other, "the engine does not run on it"
+
+
+def test_a_near_laptop_off_its_dock_is_a_coding_member_and_a_docked_one_shards(env):
+    measured(env, "docked", "10.0.0.90", 2.0, {**gpu_hw(8.0, 32.0), "docked": True})
+    measured(env, "loose", "10.0.0.91", 2.0, {**gpu_hw(8.0, 32.0), "docked": False})
+    assert _heartbeat("docked", {**gpu_hw(8.0, 32.0), "docked": True}, "10.0.0.90")["role"] == "rpc"
+    answer = _heartbeat("loose", {**gpu_hw(8.0, 32.0), "docked": False}, "10.0.0.91")
+    assert answer["role"] == "coding" and answer["coding_tier"]["id"] == TIER["id"]
+    assert _heartbeat("loose", {**gpu_hw(8.0, 32.0), "docked": False, "is_yielding": True}, "10.0.0.91")["role"] is None

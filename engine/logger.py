@@ -1,5 +1,7 @@
 from engine.config import get_base_dir
 import logging
+import os
+import sys
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.markup import escape as _escape_markup, render as _render_markup
@@ -14,6 +16,40 @@ custom_theme = Theme({
     "worker": "bold blue",
     "coordinator": "bold yellow"
 })
+
+
+class _StdoutThatSurvives:
+    """
+    A worker's stdout is a pipe to the editor that started it, and the editor can go away (a window reload) while
+    the node runs on, by design. A write to that broken pipe raised BrokenPipeError in the heartbeat loop, and Rich
+    answers one with SystemExit, which ended the loop (2.5.3). From the first failed write on, output goes nowhere.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def _gone(self):
+        self._stream = open(os.devnull, "w")
+
+    def write(self, text):
+        try:
+            return self._stream.write(text)
+        except (OSError, ValueError):     # ValueError: the stream was closed
+            self._gone()
+            return len(text)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except (OSError, ValueError):
+            self._gone()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+if sys.stdout is not None and not isinstance(sys.stdout, _StdoutThatSurvives):
+    sys.stdout = _StdoutThatSurvives(sys.stdout)
 
 console = Console(theme=custom_theme)
 

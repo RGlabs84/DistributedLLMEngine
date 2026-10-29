@@ -2,10 +2,14 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as child_process from 'child_process';
+import { forgetSudoPassword, withAskpass } from './askpass';
 import * as os from 'os';
+import { getSystemErrorName } from 'util';
 import { DiffManager, FileDiffData } from './diffManager';
 import { allowedAlways, alwaysPrefix } from './commandRules';
 import { ToolDefinition } from '../client/dlneClient';
+import { MemoryChange, MemoryMode, checkRemember, memoryMode, rememberFact, riskyFact } from './memory';
+import { ImageApi, ImageArgs, prepareImageArgs, runImageJob, savedText } from './imageTool';
 import { REDACTION_MARK, excludedNotice, excludedReason, isExcludedFile, redactSecrets, redactionNote } from '../privacy';
 
 export interface ToolCallResult {
@@ -15,6 +19,23 @@ export interface ToolCallResult {
   is_error?: boolean;
   fileDiff?: FileDiffData;
   terminalCommand?: string;
+  /** What `remember` changed in a memory file: the chats offer Undo for it (docs/agent-memory.md 7.6). */
+  /** A long fact saved in parts (splitFact) is several changes, undone together. */
+  memoryChange?: MemoryChange | MemoryChange[];
+  /** The workspace-relative path of a picture `generate_image` saved: the chats offer to open it. */
+  imagePath?: string;
+}
+
+/** What a tool call may need from the run it belongs to; only generate_image uses it. */
+export interface ToolContext {
+  /** The coordinator's image endpoints. Absent: the tool is not offered, and a call to it is refused. */
+  images?: ImageApi;
+  /** The run was stopped: a running image job is cancelled at the coordinator. */
+  signal?: AbortSignal;
+  /** The status line while a long tool runs. */
+  onProgress?: (text: string) => void;
+  /** Replaces the 2 s wait between two polls of an image job (tests). */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 export function resolvePath(rootPath: string | undefined, targetPath: string): string {
@@ -33,7 +54,7 @@ export function resolvePath(rootPath: string | undefined, targetPath: string): s
 }
 
 /** `text` with this machine's workspace and home folders replaced by `<workspace>` and `~`. */
-function withoutLocalPaths(text: string, workspace: string | undefined): string {
+export function withoutLocalPaths(text: string, workspace: string | undefined): string {
   let out = String(text);
   for (const [folder, label] of [[workspace, '<workspace>'], [os.homedir(), '~']] as Array<[string | undefined, string]>) {
     if (folder && folder.length > 1) {
@@ -41,6 +62,180 @@ function withoutLocalPaths(text: string, workspace: string | undefined): string 
     }
   }
   return out;
+}
+
+/** What a tool call comes to when Stop was pressed before it ran (the loop answers the rest of a reply with the same words). */
+export const STOPPED_NOTICE = 'Not run: the user stopped the task.';
+
+const STOPPED = Symbol('stopped');
+
+/** `pending`'s answer, or STOPPED as soon as `signal` aborts (the wait for `pending` goes on unseen, and its answer is dropped). */
+function untilStopped<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T | typeof STOPPED> {
+  if (!signal) return pending;
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return resolve(STOPPED);
+    const onAbort = () => resolve(STOPPED);
+    signal.addEventListener('abort', onAbort, { once: true });
+    pending.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (err) => { signal.removeEventListener('abort', onAbort); reject(err); }
+    );
+  });
+}
+
+/** Whether the process group `pgid` has a member (signal 0 sends nothing: it only asks). EPERM is a member we may not signal. */
+function groupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function signalGroup(pgid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pgid, signal);
+  } catch {
+    // the last member has just gone
+  }
+}
+
+/**
+ * Ends a command and what it started. Only ever signals what it can show is the command's:
+ *  - POSIX: the shell was started as the leader of a process group of its own (runShell), and everything the command
+ *    starts joins that group, backgrounded jobs (`npm run dev &`) included. The group is signalled, never a single process
+ *    number: the shell may be long gone (a background job holds the output open and the callback waits), and its number
+ *    may have been given to something else, but a group number is not reused while the group has a member. With no
+ *    member left there is nobody to signal. SIGTERM first; what ignored it gets SIGKILL after `graceMs`, to the same
+ *    group and only if it still has a member.
+ *  - Windows (no groups): `taskkill /T` follows the tree of the shell, so it is asked only for a shell that is still running;
+ *    Node keeps the handle of a process it has not seen exit, so its number cannot have been reused. One that has exited
+ *    has no tree to follow, and its number may be someone else's by now.
+ */
+export function endCommand(child: Pick<child_process.ChildProcess, 'pid' | 'exitCode' | 'signalCode'>, graceMs = 1500): void {
+  const pid = child.pid;
+  if (!pid || pid <= 0) return;
+  if (process.platform === 'win32') {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    child_process.execFile('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true }, () => undefined);
+    return;
+  }
+  if (!groupAlive(pid)) return;
+  signalGroup(pid, 'SIGTERM');
+  setTimeout(() => {
+    if (groupAlive(pid)) signalGroup(pid, 'SIGKILL');
+  }, graceMs).unref();
+}
+
+/** What a shell command came to, as child_process.exec reports it: its error, with the same fields. */
+export interface ShellFailure extends Error {
+  code?: number | string | null;
+  killed?: boolean;
+  signal?: NodeJS.Signals | null;
+  cmd?: string;
+}
+
+/** A shell command that is running (runShell). */
+export interface ShellRun {
+  readonly child: child_process.ChildProcess;
+  /** Stop: the command and everything it started end now (endCommand), and the callback does not wait for pipes a job holds open. */
+  stop(): void;
+}
+
+/**
+ * Runs `command` in the user's shell exactly as child_process.exec does (the same shell, output, errors, buffer limit, and
+ * the same kill of the shell at `timeout`), except that on POSIX the shell leads a process group of its own, so that Stop can
+ * end everything the command started (endCommand). exec cannot do that: it has no `detached`. The callback gets exec's
+ * arguments; only the shell is signalled at the timeout, as before (a background job a command leaves running is its own
+ * business; a Stop is the user's word that it is not).
+ */
+export function runShell(
+  command: string,
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number },
+  done: (error: ShellFailure | null, stdout: string, stderr: string) => void
+): ShellRun {
+  const maxBuffer = options.maxBuffer ?? 1024 * 1024;
+  const child = child_process.spawn(command, { cwd: options.cwd, env: options.env, shell: true, detached: process.platform !== 'win32' });
+  const out: string[] = [];
+  const err: string[] = [];
+  let outLength = 0;
+  let errLength = 0;
+  let killed = false;
+  let exited = false;
+  let failure: ShellFailure | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const closePipes = () => {
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+  };
+  const finish = (code?: number | null, signal?: NodeJS.Signals | null) => {
+    if (exited) return;
+    exited = true;
+    if (timer) clearTimeout(timer);
+    const stdout = out.join('');
+    const stderr = err.join('');
+    if (!failure && code === 0 && signal === null) {
+      done(null, stdout, stderr);
+      return;
+    }
+    failure ||= Object.assign(new Error(`Command failed: ${command}\n${stderr}`), {
+      code: typeof code === 'number' && code < 0 ? getSystemErrorName(code) : code,
+      killed: child.killed || killed,
+      signal,
+    }) as ShellFailure;
+    failure.cmd = command;
+    done(failure, stdout, stderr);
+  };
+  const killShell = () => {
+    closePipes();
+    killed = true;
+    try {
+      child.kill('SIGTERM');
+    } catch (e) {
+      failure = e as ShellFailure;
+      finish();
+    }
+  };
+  const collect = (stream: 'stdout' | 'stderr') => (chunk: string) => {
+    const kept = stream === 'stdout' ? out : err;
+    const bytes = Buffer.byteLength(chunk);
+    const length = stream === 'stdout' ? (outLength += bytes) : (errLength += bytes);
+    if (length > maxBuffer) {
+      kept.push(chunk.slice(0, maxBuffer - (length - bytes)));
+      failure = Object.assign(new RangeError(`${stream} maxBuffer length exceeded`), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }) as ShellFailure;
+      killShell();
+    } else {
+      kept.push(chunk);
+    }
+  };
+
+  if (options.timeout && options.timeout > 0) {
+    timer = setTimeout(() => {
+      killShell();
+      timer = undefined;
+    }, options.timeout);
+  }
+  child.stdout?.setEncoding('utf8');
+  child.stderr?.setEncoding('utf8');
+  child.stdout?.on('data', collect('stdout'));
+  child.stderr?.on('data', collect('stderr'));
+  child.addListener('close', finish);
+  child.addListener('error', (e) => {
+    failure = e as ShellFailure;
+    closePipes();
+    finish();
+  });
+
+  return {
+    child,
+    stop() {
+      if (exited) return;
+      closePipes();
+      endCommand(child);
+    },
+  };
 }
 
 /** What the user is asked to allow before a tool runs. */
@@ -64,6 +259,7 @@ export type ApprovalAnswer = 'once' | 'session' | 'always' | 'deny';
 const ALLOW = 'Allow';
 const ALLOW_SESSION = 'Allow edits for this session';
 const ALWAYS_EDITS = 'Always allow edits in this project';
+const ALWAYS_REMEMBER = 'Always allow remembering in this project';
 
 async function promptForApproval(req: ApprovalRequest): Promise<ApprovalAnswer> {
   const buttons = [ALLOW];
@@ -80,6 +276,22 @@ async function promptForApproval(req: ApprovalRequest): Promise<ApprovalAnswer> 
   return 'deny';
 }
 
+/**
+ * What the model is told when sudo gave up for want of a password. Plain `sudo <command>` works in these commands
+ * (VS Code asks the user, askpass.ts), but a model that once saw sudo fail tries -n, -S or a piped password, which
+ * never reach the user, or tells the user to run the command themselves.
+ */
+function sudoHint(command: string, output: string): string {
+  if (process.platform === 'win32') return '';
+  if (/\bpkexec\b/.test(command)) {
+    return '\n\nNote: use plain `sudo <command>` rather than pkexec: VS Code asks the user for the password and can ' +
+      'remember it for the session, while pkexec asks every time.';
+  }
+  if (!/sudo: (a password is required|no password was provided|a terminal is required)/.test(output)) return '';
+  return '\n\nNote: plain `sudo <command>` works here: VS Code asks the user for the password in a password box. ' +
+    'Do not use `sudo -S`, `sudo -n` or a piped or echoed password, and do not ask the user to run the command themselves.';
+}
+
 /** Where "Always allow" answers live: the extension's storage for this project (VS Code's workspaceState). */
 export interface ApprovalStore {
   get<T>(key: string): T | undefined;
@@ -88,6 +300,7 @@ export interface ApprovalStore {
 
 const ALWAYS_EDITS_KEY = 'dlne.agent.alwaysAllowEdits';
 const ALWAYS_COMMANDS_KEY = 'dlne.agent.alwaysAllowCommands';
+const ALWAYS_REMEMBER_KEY = 'dlne.agent.alwaysAllowRemember';
 const MAX_ALWAYS_COMMANDS = 100;
 
 /** Until the extension hands over its project storage (and in tests): kept for this window only. */
@@ -129,8 +342,29 @@ function insideWorkspace(root: string | undefined, target: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
+/** The `dlne.agent.memory` setting, in the form memory.ts takes it. */
+/**
+ * True for the files that make up the agent's persistent memory (docs/agent-memory.md section 7): AGENTS.md at the
+ * workspace root, anything in its .dlne folder, and ~/.dlne/memory.md, judged on where the path really leads. The
+ * file tools never write these, whatever edits are allowed: a fact goes in only through `remember`, which the user
+ * approves one by one, so text the agent read cannot plant standing instructions through an "Allow edits" answer.
+ */
+function isMemoryPath(root: string | undefined, target: string): boolean {
+  const caseless = process.platform === 'win32' || process.platform === 'darwin';
+  const real = (p: string) => (caseless ? realPathOf(p).toLowerCase() : realPathOf(p));
+  const file = real(target);
+  if (file === real(path.join(os.homedir(), '.dlne', 'memory.md'))) return true;
+  if (!root) return false;
+  if (file === real(path.join(root, 'AGENTS.md'))) return true;
+  const rel = path.relative(real(path.join(root, '.dlne')), file);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function memoryOptions(): { mode: MemoryMode } {
+  return { mode: memoryMode(vscode.workspace.getConfiguration('dlne').get<unknown>('agent.memory', 'auto')) };
+}
+
 export class ToolRegistry {
-  private static terminal: vscode.Terminal | null = null;
 
   /**
    * The model's tool calls arrive over the network (and the agent reads files that may contain
@@ -142,6 +376,19 @@ export class ToolRegistry {
   /** "Always allow" answers for this project (extension.ts hands over workspaceState at activation). */
   static store: ApprovalStore = memoryStore();
 
+  /**
+   * The one switch for running every agent action without asking: dlne.autoApproveAll in the user's settings, read
+   * at every tool call, so flipping it (status bar, the sidebar's Auto button, "DLNE: Toggle Auto-Approve") takes
+   * effect at the agent's next step. User settings only: a project's settings cannot turn it on.
+   */
+  static autoApproveAllOn(): boolean {
+    return vscode.workspace.getConfiguration('dlne').get<boolean>('autoApproveAll', false) === true;
+  }
+
+  static async setAutoApproveAll(on: boolean): Promise<void> {
+    await vscode.workspace.getConfiguration('dlne').update('autoApproveAll', on, vscode.ConfigurationTarget.Global);
+  }
+
   /** Forget "allow for this session" (called when the conversation is cleared). "Always allow" answers stay. */
   static resetApprovals(): void {
     this.editsAllowedForSession = false;
@@ -151,13 +398,16 @@ export class ToolRegistry {
   static async forgetAlwaysApprovals(): Promise<void> {
     await this.store.update(ALWAYS_EDITS_KEY, undefined);
     await this.store.update(ALWAYS_COMMANDS_KEY, undefined);
+    await this.store.update(ALWAYS_REMEMBER_KEY, undefined);
+    forgetSudoPassword();
   }
 
   /** What "Always allow" holds for this project, for showing it to the user. */
-  static alwaysApprovals(): { edits: boolean; commands: string[] } {
+  static alwaysApprovals(): { edits: boolean; commands: string[]; remember: boolean } {
     const commands = this.store.get<unknown>(ALWAYS_COMMANDS_KEY);
     return {
       edits: this.store.get<unknown>(ALWAYS_EDITS_KEY) === true,
+      remember: this.store.get<unknown>(ALWAYS_REMEMBER_KEY) === true,
       commands: Array.isArray(commands) ? commands.filter((c): c is string => typeof c === 'string') : [],
     };
   }
@@ -168,11 +418,17 @@ export class ToolRegistry {
     await this.store.update(ALWAYS_COMMANDS_KEY, commands.slice(-MAX_ALWAYS_COMMANDS));
   }
 
-  /** null when the call may run; otherwise the refusal to hand back to the model. */
-  private static async checkApproval(name: string, args: Record<string, any>, root: string | undefined): Promise<string | null> {
+  /**
+   * null when the call may run; otherwise the refusal to hand back to the model. `signal`: Stop was pressed. A call
+   * that was waiting for the user's answer is over at once (VS Code has no way to withdraw a modal dialog, so it stays
+   * until the user closes it, but nothing waits for it and whatever it is answered later changes nothing).
+   */
+  private static async checkApproval(name: string, args: Record<string, any>, root: string | undefined,
+    approveAll: boolean, signal?: AbortSignal): Promise<string | null> {
     const config = vscode.workspace.getConfiguration('dlne');
-    // The full auto switch (off by default, user settings only): every tool runs without asking.
-    if (config.get<boolean>('autoApproveAll', false) === true) return null;
+    // The full auto switch (off by default, user settings only), or the chat's own "approve everything" (the Chat view's
+    // permission picker, the sidebar's Auto button): every tool runs without asking.
+    if (approveAll || this.autoApproveAllOn()) return null;
     const autoReads = config.get<boolean>('autoApproveReads', true);
     const always = this.alwaysApprovals();
     let req: ApprovalRequest | null = null;
@@ -213,6 +469,20 @@ export class ToolRegistry {
         };
         break;
       }
+      case 'generate_image': {
+        // The same answer as write_file for the file it saves (executeTool has made `args.path` absolute and inside the
+        // workspace), asked before the picture is made: a declined save should not cost minutes of the coordinator's GPU.
+        const target = String(args.path);
+        if (this.editsAllowedForSession || always.edits) return null;
+        req = {
+          tool: name,
+          summary: `${fs.existsSync(target) ? 'overwrite' : 'create'} ${path.relative(root!, target)} with a generated image`,
+          detail: `${target}\n\nPrompt: ${String(args.prompt).slice(0, 600)}\n\nThe prompt is sent to the DLNE coordinator's image engine (not to a volunteer's machine). The picture takes 1 to 3 minutes.`,
+          sessionAllowed: true,
+          always: ALWAYS_EDITS,
+        };
+        break;
+      }
       case 'run_terminal_command': {
         const command = String(args.command ?? '');
         // Remembered per project: with no folder open, a command is asked about every time.
@@ -228,11 +498,43 @@ export class ToolRegistry {
         };
         break;
       }
+      case 'remember': {
+        // A fact that would be refused anyway (bad arguments, memory off, a secret, a duplicate, a full file) is not
+        // asked about: the call goes on and executeToolInternal hands the model the reason.
+        const options = memoryOptions();
+        const check = checkRemember(args.scope, args.fact ?? '', root, options, args.replaces);
+        if (!check.ready) return null;
+        const whole = check.fact;
+        // The user's own file asks every time. A workspace opened at the home folder makes the project's file the
+        // user's own, so that one asks every time too.
+        const projectFile = check.scope === 'project'
+          && path.resolve(check.file) !== path.resolve(path.join(os.homedir(), '.dlne', 'memory.md'));
+        // A link or a fetch-and-run command is shown first, whatever the mode: text the agent read could plant one.
+        const risky = riskyFact(`${whole} ${check.replacedText ?? ''}`);
+        // Automatic (the default): project facts are saved at once, and the chat shows each with an Undo.
+        if (projectFile && !risky && (options.mode === 'auto' || always.remember)) return null;
+        const where = check.scope === 'project' ? 'for this project' : 'about you, for every project';
+        req = {
+          tool: name,
+          summary: !check.replaced
+            ? `remember ${where}: "${whole}"`
+            : check.fact
+              ? `update a remembered fact ${where}: "${check.replacedText}" → "${whole}"`
+              : `forget a remembered fact ${where}: "${check.replacedText}"`,
+          detail: `${check.file}\n\nIt is sent with every DLNE request, to the coordinator or a volunteer's coding member.`,
+          sessionAllowed: false,
+          always: projectFile ? ALWAYS_REMEMBER : undefined,
+        };
+        break;
+      }
       default:
         return null; // unknown tools fail on their own in executeToolInternal
     }
 
-    const answer = await this.approver(req);
+    if (signal?.aborted) return STOPPED_NOTICE;
+    const answer = await untilStopped(this.approver(req), signal);
+    // Stopped while the dialog was open, or answered just after: not run, and an "Always allow" is not remembered.
+    if (answer === STOPPED || signal?.aborted) return STOPPED_NOTICE;
     if (answer === 'deny') {
       return `The user declined: ${req.summary}. Do not retry it; ask the user or choose another approach.`;
     }
@@ -240,8 +542,10 @@ export class ToolRegistry {
     if (answer === 'always' && req.always) {
       if (name === 'run_terminal_command' && commandPrefix) {
         await this.rememberCommand(commandPrefix);
-      } else if (name === 'write_file' || name === 'edit_file_diff') {
+      } else if (name === 'write_file' || name === 'edit_file_diff' || name === 'generate_image') {
         await this.store.update(ALWAYS_EDITS_KEY, true);
+      } else if (name === 'remember') {
+        await this.store.update(ALWAYS_REMEMBER_KEY, true);
       }
     }
     return null;
@@ -350,6 +654,23 @@ export class ToolRegistry {
             }
           }
         }
+      },
+      // Kept word for word as docs/agent-memory.md section 3 has it: the coordinator's canary decoys copy it.
+      {
+        type: 'function',
+        function: {
+          name: 'remember',
+          description: 'Save, update or remove one lasting fact for later sessions. scope "project" keeps it in this project\'s .dlne/memory.md (how to build and test it, where things live, its conventions, the user\'s corrections); it is saved at once and shown to the user, who can undo it. scope "user" keeps it in ~/.dlne/memory.md, for the user\'s own preferences that hold in every project; the user approves it. To update a fact you saved earlier, give it in replaces; to remove it, give it in replaces and leave fact empty.',
+          parameters: {
+            type: 'object',
+            properties: {
+              fact: { type: 'string', description: 'One short, self-contained sentence (at most 500 characters); empty to remove the fact given in replaces.' },
+              scope: { type: 'string', enum: ['project', 'user'], description: 'Where it is kept: project or user.' },
+              replaces: { type: 'string', description: 'Optional: a fact you saved earlier that this one updates or removes. Its opening words are enough to pick it out.' }
+            },
+            required: ['fact', 'scope']
+          }
+        }
       }
     ];
   }
@@ -383,7 +704,11 @@ export class ToolRegistry {
       }
       if (reason) return excludedNotice(args.path, reason);
     }
-    if (name === 'write_file' || name === 'edit_file_diff') {
+    if (name === 'write_file' || name === 'edit_file_diff' || name === 'generate_image') {
+      if (isMemoryPath(root, target)) {
+        return `Refused: ${args.path} is part of the agent's persistent memory, which the file tools never change. ` +
+          'Save a fact with the remember tool instead (the user approves each one); AGENTS.md is the user\'s to edit.';
+      }
       const writes = [args.content, args.search_block, args.replace_block].map((s) => String(s ?? '')).join('\n');
       if (writes.includes(REDACTION_MARK)) {
         let existing = '';
@@ -405,19 +730,35 @@ export class ToolRegistry {
     return result;
   }
 
-  static async executeTool(name: string, args: Record<string, any>): Promise<ToolCallResult> {
+  /** `approveAll`: the chat this call comes from approves everything for now (see checkApproval). */
+  static async executeTool(name: string, args: Record<string, any>, approveAll = false, context: ToolContext = {}): Promise<ToolCallResult> {
+    if (context.signal?.aborted) return { name, output: STOPPED_NOTICE, is_error: true };
     const folders = vscode.workspace.workspaceFolders;
     const root = folders && folders.length > 0 ? folders[0].uri.fsPath : undefined;
+    if (name === 'generate_image') {
+      if (!context.images) {
+        return { name, output: 'Image generation is not available on this coordinator.', is_error: true };
+      }
+      // From here on `args` is what will happen: a cleaned prompt, a valid size, the absolute path of a .png inside the workspace.
+      const prepared = prepareImageArgs(args || {}, root);
+      if (!prepared.ok) return { name, output: prepared.error, is_error: true };
+      // Judged on where the path really leads: a link in the workspace that points elsewhere is not inside it.
+      if (!insideWorkspace(root, prepared.args.path)) {
+        return { name, output: `Error: ${args.path} leads outside the workspace: pictures are saved inside it.`, is_error: true };
+      }
+      // Secrets never leave the editor, and this prompt goes to the coordinator.
+      args = { ...prepared.args, prompt: redactSecrets(prepared.args.prompt).text };
+    }
     // An excluded file is refused before the user is even asked: its contents are not the user's to give away.
     const hidden = this.privacyRefusal(name, args || {}, root);
     if (hidden) return { name, output: hidden, is_error: true };
-    const refusal = await this.checkApproval(name, args || {}, root);
+    const refusal = await this.checkApproval(name, args || {}, root, approveAll, context.signal);
     if (refusal) return { name, output: refusal, is_error: true };
-    const result = await this.executeToolInternal(name, args);
+    const result = await this.executeToolInternal(name, args, context);
     return this.capOutput(this.scrub(result));
   }
 
-  private static async executeToolInternal(name: string, args: Record<string, any>): Promise<ToolCallResult> {
+  private static async executeToolInternal(name: string, args: Record<string, any>, context: ToolContext = {}): Promise<ToolCallResult> {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     const rootPath = (workspaceFolders && workspaceFolders.length > 0) ? workspaceFolders[0].uri.fsPath : os.homedir();
 
@@ -473,6 +814,19 @@ export class ToolRegistry {
             output: `Successfully ${exists ? 'updated' : 'created'} file: ${relPath} (+${fileDiff.additions} lines, -${fileDiff.deletions} lines)`,
             fileDiff
           };
+        }
+
+        case 'generate_image': {
+          // executeTool has checked the arguments and the path, and the user has approved the save.
+          const image = args as ImageArgs;
+          const outcome = await runImageJob(context.images!, image, { signal: context.signal, onProgress: context.onProgress, sleep: context.sleep });
+          if (!outcome.ok || !outcome.png) {
+            return { name, output: outcome.text, is_error: true };
+          }
+          fs.mkdirSync(path.dirname(image.path), { recursive: true });
+          fs.writeFileSync(image.path, outcome.png);
+          const relPath = path.relative(rootPath, image.path).split(path.sep).join('/');
+          return { name, output: savedText(relPath, outcome), imagePath: relPath };
         }
 
         case 'edit_file_diff': {
@@ -541,38 +895,47 @@ export class ToolRegistry {
             return { name, output: 'Error: No command provided', is_error: true };
           }
 
-          // Echo command to VS Code terminal for transparency
-          try {
-            if (!this.terminal || this.terminal.exitStatus !== undefined) {
-              this.terminal = vscode.window.createTerminal({ name: 'DLNE Agent Terminal' });
-            }
-            this.terminal.show(true);
-            this.terminal.sendText(`# DLNE Agent executing: ${cmd}`);
-          } catch {}
-
-          // Execute synchronously via child_process and return actual stdout and stderr to the model
+          // Nothing is typed into a VS Code terminal: the chats show the command and its output. An echo there once
+          // commented out only a command's first line, so bash ran the rest of a heredoc (`import struct` started
+          // ImageMagick's screen grab, and a `for …:` line left the shell waiting).
+          // Execute synchronously via child_process and return actual stdout and stderr to the model.
+          // There is no terminal, so sudo asks for its password through VS Code (askpass.ts).
           const cwd = rootPath;
-          const output = await new Promise<string>((resolve) => {
-            child_process.exec(
+          const signal = context.signal;
+          const run = await withAskpass(cmd, 60000, (askpassEnv) => new Promise<{ text: string; stopped: boolean }>((resolve) => {
+            const shell = runShell(
               cmd,
-              { cwd, timeout: 60000, maxBuffer: 10 * 1024 * 1024 },
+              { cwd, timeout: 60000, maxBuffer: 10 * 1024 * 1024, env: { ...process.env, ...askpassEnv } },
               (error, stdout, stderr) => {
+                signal?.removeEventListener('abort', stop);
                 const outStr = stdout ? stdout.trim() : '';
                 const errStr = stderr ? stderr.trim() : '';
                 if (error) {
                   const combined = [outStr, errStr, error.message].filter(Boolean).join('\n');
-                  resolve(`Command failed (exit code ${error.code ?? 1}):\n${combined}`);
+                  resolve({ text: `Command failed (exit code ${error.code ?? 1}):\n${combined}`, stopped: false });
                 } else {
                   const combined = [outStr, errStr].filter(Boolean).join('\n');
-                  resolve(combined || '(Command completed successfully with no output)');
+                  resolve({ text: combined || '(Command completed successfully with no output)', stopped: false });
                 }
               }
             );
-          });
+            // Stop: the command and everything it started are ended (runShell/endCommand: its process group, jobs it left in
+            // the background included), and the run does not wait for them to say so (VS Code closes the response a second
+            // after Stop).
+            function stop(): void {
+              resolve({ text: '', stopped: true });
+              shell.stop();
+            }
+            if (signal?.aborted) stop();
+            else signal?.addEventListener('abort', stop, { once: true });
+          }));
+          if (run.stopped) {
+            return { name, output: 'Stopped: the user stopped the task while this command was running, so it was ended.', terminalCommand: cmd, is_error: true };
+          }
 
           return {
             name,
-            output,
+            output: run.text + sudoHint(cmd, run.text),
             terminalCommand: cmd
           };
         }
@@ -597,6 +960,14 @@ export class ToolRegistry {
             name,
             output: reports.length > 0 ? reports.join('\n') : 'No errors or warnings found.'
           };
+        }
+
+        case 'remember': {
+          // The workspace root, not rootPath: with no folder open there is no project to remember anything for.
+          const root = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : undefined;
+          const replaces = typeof args.replaces === 'string' ? args.replaces : undefined;
+          const saved = rememberFact(args.scope, args.fact ?? '', root, memoryOptions(), replaces);
+          return { name, output: saved.message, is_error: saved.ok ? undefined : true, memoryChange: saved.change };
         }
 
         default:

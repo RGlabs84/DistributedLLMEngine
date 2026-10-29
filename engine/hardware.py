@@ -41,6 +41,7 @@ import time
 import GPUtil
 from typing import Dict, Any, List, Optional, Tuple
 from engine.config import get_worker_limits
+from engine.logger import log_warning
 
 
 def _hidden_process_kwargs() -> dict:
@@ -653,7 +654,7 @@ def _probe_all_gpus() -> Tuple[List[Dict[str, Any]], bool]:
                 result = []
                 for card in drm_cards:
                     c = {key: card[key] for key in
-                         ("id", "name", "vram_total_gb", "vram_free_gb", "load_percent")}
+                         ("id", "name", "vram_total_gb", "vram_free_gb", "load_percent", "address")}
                     pci_b = card.get("pci_bus")
                     if pci_b is not None and pci_b in bus_to_vk:
                         c["vk_index"] = bus_to_vk[pci_b]
@@ -725,7 +726,7 @@ def _probe_all_gpus() -> Tuple[List[Dict[str, Any]], bool]:
         # box, and previously the point at which DLNE declared a GPU rig CPU-only.
         if not gpus and drm_cards:
             gpus = [{key: card[key] for key in
-                     ("id", "name", "vram_total_gb", "vram_free_gb", "load_percent")}
+                     ("id", "name", "vram_total_gb", "vram_free_gb", "load_percent", "address")}
                     for card in drm_cards]
 
     # Apple Silicon only. llama.cpp's Intel Mac build has no Metal backend, so an Intel Mac's
@@ -752,6 +753,135 @@ def _probe_all_gpus() -> Tuple[List[Dict[str, Any]], bool]:
     # most expensive answer to produce on Windows — is static.
     return gpus, False
 
+def find_gpu(spec: str, gpus: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    The GPU one ALLOWED_GPU_INDICES or MEDIA_GPU entry names, or None. The entry is a DLNE GPU id
+    ("1") or a PCI address ("0000:03:00.0", or "03:00.0" without the domain). The id follows the
+    order the kernel lists the cards in, so fitting another card can shift it; the address is where
+    the card sits, and stays.
+
+    A PCI address is known only where the probe reads it: on Linux, from sysfs, for the cards the Vulkan
+    probe lists (AMD and Intel; nvidia-smi, clinfo, Windows and macOS give ids only). Elsewhere an address
+    matches nothing, and the entry is left out (``engine_gpu_devices`` says so in the log); use the id.
+    """
+    spec = (spec or "").strip().lower()
+    if spec.isdigit():
+        return next((g for g in gpus if g.get("id") == int(spec)), None)
+    if ":" in spec:
+        return next((g for g in gpus
+                     if (g.get("address") or "").lower() == spec
+                     or (g.get("address") or "").lower().endswith(":" + spec)), None)
+    return None
+
+
+def select_gpus(setting: str, gpus: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The GPUs a comma-separated ALLOWED_GPU_INDICES value names, in the order written, each once.
+    An entry that matches no card is skipped."""
+    chosen: List[Dict[str, Any]] = []
+    for spec in setting.split(","):
+        gpu = find_gpu(spec, gpus)
+        if gpu is not None and gpu not in chosen:
+            chosen.append(gpu)
+    return chosen
+
+
+_dropped_warned: set = set()
+
+
+def _warn_dropped(why: str) -> None:
+    """One warning per ALLOWED_GPU_INDICES entry left out of the engine's cards, so a typo or a card that is
+    not there is never silent (and a start every few minutes does not repeat it)."""
+    if why not in _dropped_warned:
+        _dropped_warned.add(why)
+        log_warning(f"ALLOWED_GPU_INDICES entry left out, {why}.")
+
+
+def engine_gpu_devices(allowed: str, media_spec: str = "") -> Tuple[str, str, str]:
+    """
+    The devices the coordinator's engine sees, as ``(cuda_ids, vulkan_devices, media_device)``.
+
+    ``allowed`` is ALLOWED_GPU_INDICES (not "none"; ids and PCI addresses mix freely) and
+    ``media_spec`` is MEDIA_GPU. With no limit ("-1") and no media card, all three are "": the engine
+    is left to see what Vulkan gives it. The media card comes last in ``vulkan_devices``, after the engine's
+    cards, so the engine's cards keep the llama.cpp names Vulkan0, Vulkan1... that the operator's
+    ``-ts`` is written for; ``media_device`` is the name llama.cpp gives it (Vulkan<position in the
+    list>), or "" when no media card is in use. A card named in both lists is the media card.
+    """
+    try:
+        gpus = get_all_gpus()
+    except Exception:
+        gpus = []
+
+    media = find_gpu(media_spec, gpus)
+    cuda: List[str] = []
+    vulkan: List[str] = []
+    named = allowed.strip() != "-1"          # the operator wrote the list, so a card left out of it is worth saying
+    if not named:
+        if media is None:
+            return "", "", ""
+        # Vulkan's own default is every dedicated GPU, which would include the media card, so with
+        # one in use the list has to be written out.
+        chosen = [g for g in gpus if counts_as_gpu(g.get("name") or "", g.get("integrated"))]
+        tokens = [str(g["id"]) for g in chosen]
+    else:
+        tokens = [t.strip() for t in allowed.split(",") if t.strip()]
+    seen: set = set()
+    for token in tokens:
+        gpu = find_gpu(token, gpus)
+        if gpu is not None and media is not None and gpu["id"] == media["id"]:
+            if named:
+                _warn_dropped(f"{token}: it is the media card (MEDIA_GPU), which the engine never uses")
+            continue
+        if gpu is not None:
+            # A card named twice (an index and its address, say) is one device: llama.cpp would split
+            # the model across it twice, and CUDA refuses a repeated id.
+            if gpu["id"] in seen:
+                _warn_dropped(f"{token}: that card is already listed")
+                continue
+            seen.add(gpu["id"])
+            cuda.append(str(gpu["id"]))
+            vulkan.append(str(gpu.get("vk_index", gpu["id"])))
+        elif token.isdigit():
+            # A card the probe did not list (or no probe at all) is passed through as written.
+            if ("raw", token) in seen:
+                _warn_dropped(f"{token}: that card is already listed")
+                continue
+            seen.add(("raw", token))
+            cuda.append(token)
+            vulkan.append(token)
+        else:
+            _warn_dropped(f"{token}: it names no card here (a PCI address resolves only on Linux, from sysfs, for "
+                          "the cards the Vulkan probe lists; elsewhere use the id)")
+
+    media_device = ""
+    if media is not None:
+        media_device = f"Vulkan{len(vulkan)}"
+        vulkan.append(str(media.get("vk_index", media["id"])))
+    return ",".join(cuda), ",".join(vulkan), media_device
+
+
+def media_card(media_spec: str) -> Optional[Dict[str, Any]]:
+    """
+    The media card (MEDIA_GPU) as image generation needs it: ``{"vk_index", "total_gb", "free_gb"}``, or None when
+    ``media_spec`` names no card here. ``vk_index`` is the card's GLOBAL Vulkan device number, the one
+    GGML_VK_VISIBLE_DEVICES takes (the same mapping engine_gpu_devices uses for the engine's own list). ``free_gb`` is
+    read live from the card (amdgpu's sysfs counters beside its PCI address; nvidia-smi's figure otherwise) and None
+    when no live figure exists: the probe's other paths report a size that never changes, which is not "free".
+    """
+    media = find_gpu(media_spec, get_all_gpus())
+    if media is None:
+        return None
+    free_gb = None
+    device_dir = os.path.join("/sys/bus/pci/devices", media.get("address") or "-")
+    total, used = _read_sysfs(os.path.join(device_dir, "mem_info_vram_total")), _read_sysfs(os.path.join(device_dir, "mem_info_vram_used"))
+    if total.isdigit() and used.isdigit():
+        free_gb = max(0.0, (int(total) - int(used)) / (1024 ** 3))
+    elif "address" not in media and media.get("vram_free_gb"):
+        free_gb = float(media["vram_free_gb"])           # the nvidia-smi path: live
+    return {"vk_index": int(media.get("vk_index", media["id"])), "total_gb": float(media.get("vram_total_gb") or 0.0),
+            "free_gb": free_gb}
+
+
 def get_gpu_info() -> Dict[str, Any]:
     """
     Returns a filtered summary dictionary for backwards compatibility.
@@ -771,8 +901,14 @@ def get_gpu_info() -> Dict[str, Any]:
     if allowed.lower() == "none":
         return {"has_gpu": False, "vram_total_gb": 0, "vram_free_gb": 0, "name": None, "load_percent": 0.0}
     elif allowed != "-1":
-        allowed_ids = [int(x.strip()) for x in allowed.split(",") if x.strip().isdigit()]
-        gpus = [g for g in gpus if g["id"] in allowed_ids]
+        gpus = select_gpus(allowed, gpus)
+
+    # The media card is never the engine's memory, so the pool this node advertises leaves it out. On a build
+    # that is not Vulkan the engine ignores MEDIA_GPU (the card is the model's then), and so does this.
+    from engine.inference_manager import media_gpu_spec
+    media = find_gpu(media_gpu_spec(limits), gpus)
+    if media is not None:
+        gpus = [g for g in gpus if g["id"] != media["id"]]
 
     # Integrated GPUs (other than the allowed few) are not GPU contributions: a machine with
     # only those contributes its CPU (counts_as_gpu).
@@ -784,6 +920,7 @@ def get_gpu_info() -> Dict[str, Any]:
     total_gb = sum(g["vram_total_gb"] for g in gpus)
     free_gb = sum(g["vram_free_gb"] for g in gpus)
     avg_load = sum(g["load_percent"] for g in gpus) / len(gpus)
+    max_load = max(g["load_percent"] for g in gpus)       # the yield check judges the busiest card, not the average
     names = " + ".join(list(set(g["name"] for g in gpus)))
 
     # Apply VRAM limits if specified (e.g. "24,8" -> sum is 32)
@@ -795,7 +932,7 @@ def get_gpu_info() -> Dict[str, Any]:
         except Exception: pass
 
     return {"has_gpu": True, "vram_total_gb": round(total_gb, 1), "vram_free_gb": round(free_gb, 1), "name": names,
-            "load_percent": round(avg_load, 1), "count": len(gpus)}
+            "load_percent": round(avg_load, 1), "load_max_percent": round(max_load, 1), "count": len(gpus)}
 
 
 # --------------------------------------------------------------------------------------
@@ -825,9 +962,39 @@ _tracked_llama_processes: Dict[Tuple[int, Any], psutil.Process] = {}
 _LLAMA_PROCESS_TAGS = ("llama-server", "rpc-server")
 
 
+def _own_process_ids() -> set:
+    """
+    This process and everything it started: the RPC server, a member's or the pool's llama-server, the
+    probes (nvidia-smi, PowerShell), the bandwidth test. All of it is DLNE's own work, never the owner's,
+    whatever the processes are called. Never raises.
+    """
+    try:
+        me = psutil.Process(os.getpid())
+        return {me.pid} | {child.pid for child in me.children(recursive=True)}
+    except Exception:  # noqa: BLE001
+        return {os.getpid()}
+
+
+def _is_engine_process(proc: Any) -> bool:
+    """Whether ``proc`` is an inference server (llama-server or an RPC server) rather than another process of
+    ours. Unknown (a process that cannot be named) counts as one: the safe side is "DLNE is on the GPU"."""
+    try:
+        name = proc.info.get("name") if isinstance(getattr(proc, "info", None), dict) else None
+        if name is None and callable(getattr(proc, "name", None)):
+            name = proc.name()
+    except Exception:  # noqa: BLE001
+        name = None
+    if not name:
+        return True
+    return any(tag in str(name).lower() for tag in _LLAMA_PROCESS_TAGS)
+
+
 def _collect_llama_processes() -> List[psutil.Process]:
     """
-    Returns live handles for DLNE's own compute processes, reusing them between calls.
+    Returns live handles for DLNE's own processes, reusing them between calls: this process and its
+    descendants (2.5.0: so the worker never yields to its own probes, downloads or bandwidth test), and,
+    as a fallback for an engine started by someone else (a co-hosted coordinator), anything named like
+    llama.cpp's servers.
 
     Reuse is what makes the non-blocking CPU measurement meaningful: a handle created in
     this call reports 0.0 (it has no previous read to diff against) and only starts
@@ -835,10 +1002,11 @@ def _collect_llama_processes() -> List[psutil.Process]:
     """
     global _tracked_llama_processes
 
+    own = _own_process_ids()
     current: Dict[Tuple[int, Any], psutil.Process] = {}
     for proc in psutil.process_iter(['name', 'create_time']):
         name = (proc.info.get('name') or "").lower()
-        if not any(tag in name for tag in _LLAMA_PROCESS_TAGS):
+        if proc.pid not in own and not any(tag in name for tag in _LLAMA_PROCESS_TAGS):
             continue
 
         key = (proc.pid, proc.info.get('create_time'))
@@ -923,52 +1091,89 @@ def _external_nvidia_load(own_pids: List[int]) -> Optional[float]:
     return max(per_card.values(), default=0.0)
 
 
-def is_gaming_or_heavy_load(gpu_info: Optional[Dict[str, Any]] = None) -> bool:
-    """
-    Reports whether the machine is busy with work that is not DLNE's own inference.
+def _yield_thresholds() -> Tuple[float, float]:
+    """The GPU and CPU load (percent, by anyone but DLNE) above which this machine steps aside (YIELD_*_PERCENT)."""
+    try:
+        limits = get_worker_limits()
+        return float(limits.get("yield_gpu_percent", 60.0)), float(limits.get("yield_cpu_percent", 60.0))
+    except Exception:  # noqa: BLE001
+        return 60.0, 60.0
 
-    A True result makes the worker yield (``is_yielding`` in the hardware profile), which
-    the Coordinator honours by excluding this node from the compute pool. Only *external*
-    load counts: DLNE's own llama.cpp processes are subtracted, otherwise a node would
-    yield because of the very work it was asked to do.
 
-    Args:
-        gpu_info: An already-computed :func:`get_gpu_info` result to reuse. Callers that
-            need the profile anyway pass theirs in, which is why the same GPU state is no
-            longer looked up twice per heartbeat (audit item 3.5). Left at None the value
-            is fetched here, so every existing caller keeps working unchanged.
+def _linux_gpu_busy_max() -> float:
+    """The busiest card's load from amdgpu's ``gpu_busy_percent`` in sysfs (AMD on Linux; "" elsewhere), 0.0 when
+    no card says. Read fresh: the card list itself is cached for minutes, this number moves every second."""
+    if platform.system() != "Linux":
+        return 0.0
+    busiest = 0.0
+    for entry in _listdir(_DRM_ROOT):
+        if not _DRM_CARD_PATTERN.match(entry):
+            continue
+        value = _read_sysfs(os.path.join(_DRM_ROOT, entry, "device", "gpu_busy_percent"))
+        if value.isdigit():
+            busiest = max(busiest, float(value))
+    return busiest
+
+
+class _Reading(tuple):
     """
-    llama_processes = _collect_llama_processes()
+    ``(busy, why)``, compared and unpacked as before, plus ``gpu_seen``: whether the owner's load on the GPU
+    itself could be read this time (NVIDIA's per-process figures, or the driver's total while nothing of ours is
+    on the card). A GPU node goes by that rather than by the CPU when it can (see _YieldDetector.sample).
+    """
+    gpu_seen: bool = False
+
+    def __new__(cls, busy: bool, why: str, gpu_seen: bool = False) -> "_Reading":
+        reading = super().__new__(cls, (busy, why))
+        reading.gpu_seen = gpu_seen
+        return reading
+
+
+def _load_signal(gpu_info: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+    """
+    One raw reading: whether the machine is busy with work that is not DLNE's own, and why ("fullscreen",
+    "gpu", "cpu", or "" when it is not), as a _Reading that also says whether the GPU's own load was seen.
+    See is_gaming_or_heavy_load for the rule; the debounce is the detector's (is_yielding_now).
+    """
+    own_processes = _collect_llama_processes()
+    engine_processes = [p for p in own_processes if _is_engine_process(p)]
+    gpu_limit, cpu_limit = _yield_thresholds()
 
     # Windows: a full-screen game (or a presentation) is running. Vendor-neutral, and the one signal
     # that works while our own llama-server is using the GPU, which hides the GPU's total load.
     if _windows_fullscreen_app_running():
-        return True
+        return _Reading(True, "fullscreen")
 
     if gpu_info is None:
         gpu_info = get_gpu_info()
+    gpu_seen = False
     if gpu_info["has_gpu"]:
-        if not llama_processes:
-            # With no inference running, a hot GPU can only be someone else's workload.
-            if gpu_info["load_percent"] > 60.0:
-                return True
+        if not engine_processes:
+            # With no inference running, a hot GPU can only be someone else's workload. The busiest card
+            # decides (a game on one of two cards is a game), from the driver's figure or amdgpu's sysfs.
+            load = max(float(gpu_info.get("load_max_percent", gpu_info.get("load_percent", 0.0)) or 0.0),
+                       _linux_gpu_busy_max())
+            if load > gpu_limit:
+                return _Reading(True, "gpu", True)
+            gpu_seen = get_gpu_type().startswith("nvidia")      # nvidia-smi's figure is a real reading
         else:
             # Our own llama-server is on the GPU, so the total says nothing about the owner's load. On
             # NVIDIA each process's share is known (when the driver tells it): what the other processes
             # use is the owner's. Where it cannot be told (AMD, Intel, Apple; NVIDIA on Windows) this is
             # None and only the signals above and below apply. Known gap on Linux and macOS: a GPU-bound
-            # game that leaves the CPU under 60% is not seen there while we are serving.
-            outside = _external_nvidia_load([p.pid for p in llama_processes])
-            if outside is not None and outside > 60.0:
-                return True
+            # game that leaves the CPU under the limit is not seen there while we are serving.
+            outside = _external_nvidia_load([p.pid for p in own_processes])
+            if outside is not None and outside > gpu_limit:
+                return _Reading(True, "gpu", True)
+            gpu_seen = outside is not None
 
-    # Non-blocking: covers the window since the previous heartbeat instead of sleeping.
+    # Non-blocking: covers the window since the previous reading instead of sleeping.
     total_cpu_percent = psutil.cpu_percent(interval=None)
 
-    llama_cpu_percent = 0.0
-    for proc in llama_processes:
+    own_cpu_percent = 0.0
+    for proc in own_processes:
         try:
-            llama_cpu_percent += proc.cpu_percent(interval=None)
+            own_cpu_percent += proc.cpu_percent(interval=None)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             # The process exited between the sweep and this read; it will be gone from
             # the tracking dict on the next call.
@@ -977,12 +1182,132 @@ def is_gaming_or_heavy_load(gpu_info: Optional[Dict[str, Any]] = None) -> bool:
     # Per-process percentages are relative to a single core, system percentage is relative
     # to the whole machine, so the process figure has to be normalised before subtracting.
     actual_threads = psutil.cpu_count(logical=True)
-    normalized_llama_load = llama_cpu_percent / actual_threads if actual_threads else 0
-    external_load = total_cpu_percent - normalized_llama_load
+    normalized_own_load = own_cpu_percent / actual_threads if actual_threads else 0
+    external_load = total_cpu_percent - normalized_own_load
 
-    if external_load > 60.0:
-        return True
-    return False
+    if external_load > cpu_limit:
+        return _Reading(True, "cpu", gpu_seen)
+    return _Reading(False, "", gpu_seen)
+
+
+def is_gaming_or_heavy_load(gpu_info: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    Reports whether the machine is busy, right now, with work that is not DLNE's own inference.
+
+    Only *external* load counts: DLNE's own processes (this one and everything it started, and
+    llama.cpp's servers by name) are subtracted, otherwise a node would yield because of the very work
+    it was asked to do. The limits are YIELD_GPU_PERCENT and YIELD_CPU_PERCENT (60 each by default).
+    This is one raw reading; the profile's ``is_yielding`` is the debounced verdict (is_yielding_now).
+
+    Args:
+        gpu_info: An already-computed :func:`get_gpu_info` result to reuse. Callers that
+            need the profile anyway pass theirs in, which is why the same GPU state is no
+            longer looked up twice per heartbeat (audit item 3.5). Left at None the value
+            is fetched here, so every existing caller keeps working unchanged.
+    """
+    return _load_signal(gpu_info)[0]
+
+
+# One raw reading every _YIELD_SAMPLE_SECONDS, on a thread of its own, shared by every node in this
+# process (the two halves of a "both" machine used to each read once per heartbeat, splitting psutil's
+# CPU window and sometimes disagreeing). A full-screen app yields at once; other load has to last
+# _YIELD_ON_SAMPLES readings, and the owner has to be quiet for _YIELD_OFF_SAMPLES readings before the
+# node comes back: one spike used to cost an RPC node a whole engine redistribution, and a coding
+# member an unload, a settle, a reload and a new speed measurement.
+_YIELD_SAMPLE_SECONDS = 3.0
+_YIELD_ON_SAMPLES = 2
+_YIELD_OFF_SAMPLES = 10
+
+
+class _Debounce:
+    """One debounced yes/no: on after _YIELD_ON_SAMPLES busy readings in a row (a full-screen app at once), off
+    after _YIELD_OFF_SAMPLES quiet ones."""
+
+    def __init__(self) -> None:
+        self.on = False
+        self.why = ""
+        self._busy = 0
+        self._quiet = 0
+
+    def feed(self, busy: bool, why: str) -> bool:
+        if busy and why == "fullscreen":
+            self.on, self.why, self._busy, self._quiet = True, why, _YIELD_ON_SAMPLES, 0
+        elif busy:
+            self._busy, self._quiet = self._busy + 1, 0
+            if self._busy >= _YIELD_ON_SAMPLES:
+                self.on, self.why = True, why
+        else:
+            self._busy, self._quiet = 0, self._quiet + 1
+            if self._quiet >= _YIELD_OFF_SAMPLES:
+                self.on, self.why = False, ""
+        return self.on
+
+
+class _YieldDetector:
+    """
+    Two verdicts from the same readings. ``yielding`` is the machine's: any load of the owner's, which is what a
+    CPU contributor (and the CPU half of a "both" machine) steps aside for. ``gpu_yielding`` is a GPU node's: the
+    same, except that CPU load alone does not count when the GPU's own load was read and found quiet (2.6.2). A
+    shard's work is on the GPU, and its stepping aside costs every user an engine rebuild: on 2026-10-28 a laptop
+    whose GPU only drove its display left the pool every few minutes while builds and test runs used its CPU.
+    Where the GPU's load cannot be read, the CPU still stands in for it, as before.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._machine = _Debounce()
+        self._gpu = _Debounce()
+        self.yielding = False
+        self.why = ""
+        self.gpu_yielding = False
+
+    def sample(self, gpu_info: Optional[Dict[str, Any]] = None) -> bool:
+        """Take one reading and fold it into both verdicts; returns the machine's."""
+        try:
+            reading = _load_signal(gpu_info)
+            raw, why = reading
+        except Exception:  # noqa: BLE001 - a failed reading says nothing
+            reading, raw, why = None, False, ""
+        gpu_busy = raw and not (why == "cpu" and getattr(reading, "gpu_seen", False))
+        with self._lock:
+            self.yielding = self._machine.feed(raw, why)
+            self.why = self._machine.why
+            self.gpu_yielding = self._gpu.feed(gpu_busy, why if gpu_busy else "")
+            return self.yielding
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(target=self._run, name="dlne-yield", daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            self.sample()
+            time.sleep(_YIELD_SAMPLE_SECONDS)
+
+
+_yield_detector = _YieldDetector()
+
+
+def is_yielding_now(gpu_info: Optional[Dict[str, Any]] = None, cpu_node: bool = False) -> bool:
+    """
+    The debounced verdict for the profile's ``is_yielding``; starts the sampler the first time it is asked. A
+    machine with a GPU reports its GPU node's verdict (which CPU load alone does not trip when the GPU can be
+    read); a machine without one, and the CPU half of a "both" machine (``cpu_node``), the machine's.
+    """
+    _yield_detector.start()
+    if not cpu_node and isinstance(gpu_info, dict) and gpu_info.get("has_gpu"):
+        return _yield_detector.gpu_yielding
+    return _yield_detector.yielding
+
+
+def yield_reason() -> str:
+    """Why the machine is yielding ("fullscreen", "gpu" or "cpu"), "" when it is not."""
+    return _yield_detector.why if _yield_detector.yielding else ""
+
 
 def get_cpu_threads() -> int:
     """Returns number of logical CPU threads, capped by config limits."""
@@ -1160,6 +1485,286 @@ def get_memory_bandwidth_gbs() -> Optional[float]:
     return _cached_bandwidth
 
 
+# ======================================================================================
+# Docked: a wired link and mains power (docs/coding-members.md sections 1 and 2)
+# ======================================================================================
+#
+# A LAN GPU shards into the coordinator's engine only while it is docked: on a wired link and on
+# mains power. A laptop on Wi-Fi or on battery becomes a coding member (or nothing), because a
+# shard that leaves takes every user's running answer with it. The worker reports the two facts
+# and the coordinator decides; a fact that cannot be read is left out of the profile, never
+# guessed, and the coordinator then behaves as before this signal existed.
+
+_NET_ROOT = "/sys/class/net"
+_POWER_SUPPLY_ROOT = "/sys/class/power_supply"
+_PROC_NET_ROUTE = "/proc/net/route"
+_DMI_ROOT = "/sys/class/dmi/id"
+_PROC_CPUINFO = "/proc/cpuinfo"
+
+# Tunnel interfaces (the same names engine/link_paths.py skips): a default route over one says
+# nothing about the physical link underneath it.
+_TUNNEL_IFACE_PREFIXES = ("wg", "tun", "tap", "tailscale", "zt", "utun", "ppp")
+# USB-tethered phones register as Ethernet-class devices but are cellular links.
+_TETHER_DRIVERS = ("rndis_host", "ipheth")
+# Hypervisors as DMI and WMI name them. A guest looks wired and has no battery whatever its host does.
+_VM_VENDORS = ("qemu", "vmware", "innotek", "virtualbox", "virtual machine", "xen", "kvm", "parallels",
+               "bochs", "bhyve", "hyper-v")
+
+_DOCK_TTL_SECONDS: float = 20.0      # Windows and macOS ask a subprocess; sysfs is cheap but needs no faster
+# A change is reported only once it has held this long: a dock replugged, a charger brushed, or
+# a DHCP renew must not move a shard (a role change costs the engine a restart, section 1).
+_DOCK_HOLD_SECONDS: float = 60.0
+
+_dock_lock = threading.Lock()
+_dock_cache: Optional[Dict[str, str]] = None
+_dock_cache_expiry: float = 0.0
+_dock_reported: Optional[Dict[str, str]] = None   # what the profile says now
+_dock_pending: Optional[Dict[str, str]] = None    # a different reading, waiting out the hold
+_dock_pending_since: float = 0.0
+
+
+def _linux_default_interface() -> str:
+    """The interface the default route leaves by (lowest metric), skipping tunnels; "" when none."""
+    best: Tuple[int, str] = (1 << 30, "")
+    for line in _read_sysfs(_PROC_NET_ROUTE).splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 8 or fields[1] != "00000000" or fields[7] != "00000000":
+            continue
+        try:
+            flags, metric = int(fields[3], 16), int(fields[6])
+        except ValueError:
+            continue
+        if not flags & 0x1 or fields[0].lower().startswith(_TUNNEL_IFACE_PREFIXES):
+            continue
+        if metric < best[0]:
+            best = (metric, fields[0])
+    return best[1]
+
+
+def _linux_real_interface(name: str) -> str:
+    """The physical interface under a bridge, bond or VLAN (a few levels at most)."""
+    for _ in range(4):
+        base = os.path.join(_NET_ROOT, name)
+        lower = ""
+        if os.path.isdir(os.path.join(base, "brif")):
+            ports = sorted(_listdir(os.path.join(base, "brif")))
+            lower = ports[0] if ports else ""
+        elif _read_sysfs(os.path.join(base, "bonding", "slaves")):
+            lower = _read_sysfs(os.path.join(base, "bonding", "slaves")).split()[0]
+        else:
+            lowers = sorted(e[len("lower_"):] for e in _listdir(base) if e.startswith("lower_"))
+            lower = lowers[0] if lowers else ""
+        if not lower or lower == name:
+            return name
+        name = lower
+    return name
+
+
+def _listdir(path: str) -> List[str]:
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
+def _linux_link() -> str:
+    name = _linux_default_interface()
+    if not name:
+        return "unknown"
+    name = _linux_real_interface(name)
+    base = os.path.join(_NET_ROOT, name)
+    uevent = _read_sysfs(os.path.join(base, "uevent")).lower()
+    if os.path.isdir(os.path.join(base, "wireless")) or os.path.isdir(os.path.join(base, "phy80211")) \
+            or "devtype=wlan" in uevent:
+        return "wifi"
+    driver = os.path.basename(os.path.realpath(os.path.join(base, "device", "driver")))
+    if "devtype=wwan" in uevent or driver in _TETHER_DRIVERS:
+        return "cellular"
+    if _read_sysfs(os.path.join(base, "type")) == "1" and _read_sysfs(os.path.join(base, "carrier")) == "1":
+        return "wired"       # Ethernet-class with the link up: a NIC, or a dock's USB Ethernet
+    return "unknown"
+
+
+def _linux_power() -> str:
+    """ac, battery or unknown from /sys/class/power_supply. No system battery at all is a desktop: ac."""
+    ac_online = False
+    battery_status = None
+    for entry in _listdir(_POWER_SUPPLY_ROOT):
+        base = os.path.join(_POWER_SUPPLY_ROOT, entry)
+        kind = _read_sysfs(os.path.join(base, "type"))
+        if kind == "Mains" or kind.startswith("USB"):
+            ac_online = ac_online or _read_sysfs(os.path.join(base, "online")) == "1"
+        elif kind == "Battery" and _read_sysfs(os.path.join(base, "scope")) != "Device":   # Device: a mouse, a headset
+            battery_status = _read_sysfs(os.path.join(base, "status"))
+    if ac_online:
+        return "ac"
+    if battery_status is None:
+        return "ac"
+    if battery_status == "Discharging":
+        return "battery"
+    if battery_status in ("Charging", "Full", "Not charging"):
+        return "ac"
+    return "unknown"
+
+
+def _linux_is_vm() -> bool:
+    vendor = (_read_sysfs(os.path.join(_DMI_ROOT, "sys_vendor")) + " "
+              + _read_sysfs(os.path.join(_DMI_ROOT, "product_name"))).lower()
+    if any(v in vendor for v in _VM_VENDORS):
+        return True
+    for line in _read_sysfs(_PROC_CPUINFO).splitlines():
+        if line.startswith("flags"):
+            return " hypervisor" in line
+    return False
+
+
+def _windows_power() -> str:
+    """ac, battery or unknown from GetSystemPowerStatus (what psutil's sensors_battery reads too)."""
+    try:
+        import ctypes
+
+        class _PowerStatus(ctypes.Structure):
+            _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                        ("BatteryLifePercent", ctypes.c_ubyte), ("SystemStatusFlag", ctypes.c_ubyte),
+                        ("BatteryLifeTime", ctypes.c_ulong), ("BatteryFullLifeTime", ctypes.c_ulong)]
+
+        status = _PowerStatus()
+        query = ctypes.windll.kernel32.GetSystemPowerStatus
+        if not query(ctypes.byref(status)):
+            return "unknown"
+        if status.BatteryFlag & 128:           # no system battery: a desktop
+            return "ac"
+        return {1: "ac", 0: "battery"}.get(int(status.ACLineStatus), "unknown")
+    except Exception:  # noqa: BLE001 - no signal is left out, never guessed
+        return "unknown"
+
+
+_WINDOWS_LINK_SCRIPT = (
+    "$ErrorActionPreference='SilentlyContinue';"
+    "$r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1;"
+    "$a = $r | Get-NetAdapter;"
+    "$m = (Get-CimInstance Win32_ComputerSystem).Model;"
+    "@{media=[string]$a.PhysicalMediaType; virtual=[bool]$a.Virtual; status=[string]$a.Status; model=[string]$m}"
+    " | ConvertTo-Json -Compress"
+)
+
+
+def _windows_link_and_vm() -> Tuple[str, bool]:
+    """The default route's adapter medium (802.3 wired, Native 802.11 Wi-Fi, Wireless WAN) and whether
+    this is a virtual machine, from one PowerShell call. Never WMI AdapterTypeID (many Wi-Fi drivers
+    say Ethernet) and never wmic (gone since Windows 11 24H2)."""
+    try:
+        import json as _json
+        result = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _WINDOWS_LINK_SCRIPT],
+                                capture_output=True, text=True, timeout=20, **_hidden_process_kwargs())
+        info = _json.loads(result.stdout.strip() or "{}")
+    except Exception:  # noqa: BLE001
+        return "unknown", False
+    model = str(info.get("model") or "").lower()
+    is_vm = any(v in model for v in _VM_VENDORS)
+    if info.get("virtual") or str(info.get("status") or "").lower() not in ("up", ""):
+        return "unknown", is_vm        # a Hyper-V vEthernet over Wi-Fi reports as Ethernet: no claim
+    media = str(info.get("media") or "")
+    if media == "802.3":
+        return "wired", is_vm
+    if "802.11" in media:
+        return "wifi", is_vm
+    if "wireless wan" in media.lower():
+        return "cellular", is_vm
+    return "unknown", is_vm
+
+
+def _macos_power() -> str:
+    try:
+        out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    first = out.splitlines()[0] if out.strip() else ""
+    if "AC Power" in first:
+        return "ac"
+    if "Battery Power" in first:
+        return "battery"
+    return "unknown"
+
+
+def _macos_link() -> str:
+    try:
+        route = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True, timeout=5).stdout
+        ports = subprocess.run(["networksetup", "-listallhardwareports"], capture_output=True, text=True,
+                               timeout=5).stdout
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    device = ""
+    for line in route.splitlines():
+        if line.strip().startswith("interface:"):
+            device = line.split(":", 1)[1].strip()
+    if not device or device.startswith(_TUNNEL_IFACE_PREFIXES):
+        return "unknown"
+    port = ""
+    for line in ports.splitlines():
+        if line.startswith("Hardware Port:"):
+            port = line.split(":", 1)[1].strip().lower()
+        elif line.startswith("Device:") and line.split(":", 1)[1].strip() == device:
+            if "wi-fi" in port or "airport" in port or "bluetooth" in port:
+                return "wifi"
+            if "iphone" in port or "ipad" in port:
+                return "cellular"
+            if "ethernet" in port or "lan" in port or "thunderbolt" in port:
+                return "wired"
+            return "unknown"
+    return "unknown"
+
+
+def _macos_is_vm() -> bool:
+    try:
+        return subprocess.run(["sysctl", "-n", "kern.hv_vmm_present"], capture_output=True, text=True,
+                              timeout=5).stdout.strip() == "1"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _probe_dock() -> Dict[str, str]:
+    system = platform.system()
+    if system == "Linux":
+        link, power, is_vm = _linux_link(), _linux_power(), _linux_is_vm()
+    elif system == "Windows":
+        (link, is_vm), power = _windows_link_and_vm(), _windows_power()
+    elif system == "Darwin":
+        link, power, is_vm = _macos_link(), _macos_power(), _macos_is_vm()
+    else:
+        return {"link": "unknown", "power": "unknown"}
+    if is_vm:
+        link = "unknown"       # a guest's virtio NIC looks wired whatever the host is on
+    return {"link": link, "power": power}
+
+
+def get_dock_state() -> Dict[str, str]:
+    """
+    ``{"link": wired|wifi|cellular|unknown, "power": ac|battery|unknown}`` for the profile. Probed at most
+    every _DOCK_TTL_SECONDS; the first reading is reported at once, a later change only after it has held
+    _DOCK_HOLD_SECONDS, so a replugged dock does not move a shard twice. Never raises.
+    """
+    global _dock_cache, _dock_cache_expiry, _dock_reported, _dock_pending, _dock_pending_since
+    with _dock_lock:
+        now = time.monotonic()
+        if _dock_cache is None or now >= _dock_cache_expiry:
+            try:
+                _dock_cache = _probe_dock()
+            except Exception:  # noqa: BLE001
+                _dock_cache = {"link": "unknown", "power": "unknown"}
+            _dock_cache_expiry = now + _DOCK_TTL_SECONDS
+        reading = dict(_dock_cache)
+        if _dock_reported is None:
+            _dock_reported, _dock_pending = reading, None
+        elif reading == _dock_reported:
+            _dock_pending = None
+        elif reading != _dock_pending:
+            _dock_pending, _dock_pending_since = reading, now
+        elif now - _dock_pending_since >= _DOCK_HOLD_SECONDS:
+            _dock_reported, _dock_pending = reading, None
+        return dict(_dock_reported)
+
+
 def get_hardware_profile() -> Dict[str, Any]:
     """
     Builds the profile a worker sends on every heartbeat.
@@ -1182,7 +1787,7 @@ def get_hardware_profile() -> Dict[str, Any]:
         "ram_gb": get_system_ram(),
         "gpu": gpu_info,
         "gpu_type": get_gpu_type(),
-        "is_yielding": is_gaming_or_heavy_load(gpu_info)
+        "is_yielding": is_yielding_now(gpu_info)
     }
     # Measured only where it decides admission: a node with no usable GPU. It costs a few
     # seconds and up to 2 GiB once, so GPU nodes never pay it.
@@ -1190,4 +1795,13 @@ def get_hardware_profile() -> Dict[str, Any]:
         bandwidth = get_memory_bandwidth_gbs()
         if bandwidth is not None:
             profile["mem_bandwidth_gbs"] = bandwidth
+    # Docked (2.5.0): a wired link and mains power. A fact that could not be read is left out, and
+    # "docked" is only said when both are known; the coordinator keeps its older behaviour otherwise.
+    dock = get_dock_state()
+    if dock["link"] != "unknown":
+        profile["link"] = dock["link"]
+    if dock["power"] != "unknown":
+        profile["power"] = dock["power"]
+    if dock["link"] != "unknown" and dock["power"] != "unknown":
+        profile["docked"] = dock["link"] == "wired" and dock["power"] == "ac"
     return profile

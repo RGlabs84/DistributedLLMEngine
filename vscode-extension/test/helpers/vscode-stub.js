@@ -21,6 +21,13 @@ const state = {
 };
 
 function reset() {
+  // The DLNE log keeps its output channel between calls; a new case starts with none (the module is only asked if a test loaded it).
+  try {
+    const log = require.cache[require.resolve('../../dist/log.js')];
+    if (log && typeof log.exports.forgetLogChannel === 'function') log.exports.forgetLogChannel();
+  } catch {
+    // dist is not built yet: nothing to forget
+  }
   state.settings = {};
   state.updates = [];
   state.infoMessages = [];
@@ -33,6 +40,7 @@ function reset() {
   state.statusBarItems = [];
   state.commands = [];
   state.clipboard = undefined;
+  state.opened = [];
 }
 
 class EventEmitter {
@@ -82,6 +90,9 @@ const vscode = {
   ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
   // Just enough of Uri for media files: a base ({ fsPath }) plus path segments, as a string.
   Uri: {
+    parse(text) {
+      return { toString: () => text };
+    },
     joinPath(base, ...parts) {
       const text = [base.fsPath, ...parts].join('/');
       return { fsPath: text, toString: () => text };
@@ -91,6 +102,10 @@ const vscode = {
     },
   },
   env: {
+    async openExternal(uri) {
+      (state.opened = state.opened || []).push(String(uri));
+      return true;
+    },
     clipboard: {
       async writeText(text) {
         state.clipboard = text;

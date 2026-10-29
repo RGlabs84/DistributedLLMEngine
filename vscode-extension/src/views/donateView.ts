@@ -9,7 +9,8 @@ declare const document: any;
 /**
  * Builds the panel inside `root` and returns `update(model)`. It is written into the sidebar's script with
  * `.toString()` (like renderMarkdown), so it must not use anything outside itself.
- * `post` receives {type:'donateChoice', commit, choice}, {type:'toggleWorker', choice?} and {type:'donateApply', choice}.
+ * `post` receives {type:'donateChoice', commit, choice}, {type:'toggleWorker', choice?}, {type:'donateApply', choice}
+ * and {type:'trayAddon'} (the "Optional add-on" card's button; worker/trayAddon.ts does the rest).
  */
 export function createDonatePanel(root: any, post: (message: any) => void) {
   const make = (tag: string, cls?: string, text?: string): any => {
@@ -78,7 +79,18 @@ export function createDonatePanel(root: any, post: (message: any) => void) {
   const donate = make('button', 'dn-donate');
   const hint = make('p', 'dn-hint');
   const apply = make('button', 'secondary dn-apply');
-  add(root, lockedNote, gpu.el, cpu.el, powers, donate, hint, apply);
+
+  // The "Optional add-on" card: DLNE Donate, the tray app. Hidden where there is none (the model's addon is null).
+  const addon = make('section', 'dn-addon');
+  const addonTitle = make('h4');
+  const addonText = make('p', 'dn-addon-text');
+  const addonWarning = make('p', 'dn-addon-warn');
+  const addonButton = make('button', 'secondary dn-addon-btn');
+  const addonPage = make('button', 'dn-addon-link');
+  const addonNote = make('p', 'dn-addon-note');
+  add(addon, addonTitle, addonText, addonWarning, addonButton, addonPage, addonNote);
+
+  add(root, lockedNote, gpu.el, cpu.el, powers, donate, hint, apply, addon);
 
   // What the sliders say now, as the webview posts it (the extension validates it).
   const stopAt = (slider: any, row: any, fallback: number) => {
@@ -195,6 +207,19 @@ export function createDonatePanel(root: any, post: (message: any) => void) {
     apply.textContent = m.apply.label;
     apply.disabled = m.apply.disabled;
     apply.style.display = m.apply.visible ? 'block' : 'none';
+
+    const card = m.addon;
+    addon.style.display = card ? 'flex' : 'none';
+    if (card) {
+      addonTitle.textContent = card.title;
+      addonText.textContent = card.text;
+      setNote(addonWarning, card.warning);
+      addonButton.textContent = card.button.label;
+      addonButton.disabled = card.button.disabled;
+      addonPage.textContent = card.pageLink;
+      setNote(addonNote, card.note);
+      addonNote.className = 'dn-addon-note' + (card.noteIsError ? ' dn-addon-error' : '');
+    }
   }
 
   // Moving a slider shows its value at once and asks the extension for the matching text; letting go commits it.
@@ -224,6 +249,14 @@ export function createDonatePanel(root: any, post: (message: any) => void) {
   });
   apply.addEventListener('click', () => {
     if (model) post({ type: 'donateApply', choice: collect() });
+  });
+  // Only the click is posted: the extension fetches, checks and asks everything itself.
+  addonButton.addEventListener('click', () => {
+    if (model && model.addon && !model.addon.button.disabled) post({ type: 'trayAddon' });
+  });
+  // The page's address is the extension's own (TRAY_PAGE_URL); the webview only asks for it to be opened.
+  addonPage.addEventListener('click', () => {
+    if (model && model.addon) post({ type: 'trayPage' });
   });
 
   return { update };
@@ -318,4 +351,30 @@ export const DONATE_CSS = `
     button.dn-donate:disabled, button.dn-apply:disabled { opacity: 0.5; cursor: not-allowed; }
     button.dn-apply { width: 100%; display: none; }
     .dn-hint { text-align: center; }
+    .dn-addon {
+      border: 1px dashed var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
+      border-radius: 6px;
+      padding: 7px 10px 9px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .dn-addon h4 {
+      margin: 0;
+      font-size: 0.72em;
+      font-weight: 600;
+      letter-spacing: 0.6px;
+      text-transform: uppercase;
+      color: var(--vscode-descriptionForeground, #9d9d9d);
+    }
+    .dn-addon-text { margin: 0; font-size: 0.84em; line-height: 1.4; }
+    .dn-addon-warn, .dn-addon-note { margin: 0; font-size: 0.78em; line-height: 1.4; color: var(--vscode-descriptionForeground, #9d9d9d); }
+    .dn-addon-note.dn-addon-error { color: var(--vscode-editorWarning-foreground, #cca700); }
+    button.dn-addon-btn { width: 100%; }
+    button.dn-addon-link {
+      align-self: flex-start; background: none; border: none; padding: 0; cursor: pointer; font-size: 0.8em;
+      color: var(--vscode-textLink-foreground, #3794ff); text-decoration: underline;
+    }
+    button.dn-addon-link:hover { color: var(--vscode-textLink-activeForeground, #3794ff); }
+    button.dn-addon-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 `;

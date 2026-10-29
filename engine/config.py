@@ -227,12 +227,61 @@ SPEC_DEFAULTS = {
 # per slot, so the 65,536 TheWall runs today is still 2 x 32,768. ENGINE_EXTRA_ARGS adds
 # llama-server flags, only from this list and only while the engine runs on this host's own
 # GPUs: a split like -ts names local cards.
+#
+# The media card (2.6): MEDIA_GPU is a card, named by PCI address, that the engine can see but never
+# puts a layer on and never counts as its memory; the vision projector (ENGINE_MMPROJ, a .gguf path)
+# runs there so the other cards keep their memory for the model, and later image and voice work
+# gets the card to itself. ENGINE_IMAGE_MAX_TOKENS caps what one image costs in context. All three
+# are off (empty) by default, and then the engine starts exactly as it did before.
+# IMAGE_INPUT_PER_HOUR (2.6.1, default 30, 0 to 600) is how many different images one network may send the coding
+# engine in an hour, in the coding chat and (2.6.2) the phone chat; 0 refuses images. An image counts once an hour
+# however often it is sent again. Encoding an image stalls every slot of the engine for about a second.
+#
+# ENGINE_PHONE_SLOTS adds request slots reserved for the phone app (2.6), each ENGINE_PHONE_CONTEXT
+# tokens long, so a phone answers on the engine's GPU without ever waiting behind coding. They are
+# extra to ENGINE_SLOTS, and with ENGINE_CONTEXT set they come on top of it. 0 keeps today's engine.
 ENGINE_DEFAULTS = {
     "engine_context": 0,
     "engine_slots": 0,
+    "engine_phone_slots": 0,
+    "engine_phone_context": 8192,
     "engine_extra_args": (),
+    "media_gpu": "",
+    "engine_mmproj": "",
+    "engine_image_max_tokens": 1024,
+    "image_input_per_hour": 30,
+}
+ENGINE_IMAGE_MAX_TOKENS_CEILING = 8192
+IMAGE_INPUT_PER_HOUR_MAX = 600
+
+# Image generation (2.6.1, docs/image-generation.md): off unless IMAGE_GEN_ENABLED=true, and then only on the
+# media card (MEDIA_GPU) with vision on, the sd build installed and its three model files present. With none
+# of these keys set nothing here is read and the coordinator behaves exactly as 2.6.0. IMAGE_MODEL_DIR ""
+# means models/image under the install; IMAGE_CPU_MASK "" pins nothing. Each number has the range below:
+# a value outside it keeps the default rather than starting sd-server with something nobody asked for.
+IMAGE_DEFAULTS = {
+    "image_gen_enabled": False,
+    "image_model_dir": "",
+    "image_threads": 4,
+    "image_cpu_mask": "",
+    "image_per_hour": 6,
+    "image_queue_max": 4,
+    "image_job_timeout_seconds": 300,
+    "image_idle_unload_minutes": 20,
+    # 30 min (2.6.2; was 10): the Android app checks on a picture only while it is on screen, so a reader who asked for
+    # one and left the app came back to "expired" after 10 minutes, the free-trial chat spent (found in review).
+    "image_result_ttl_seconds": 1800,
+}
+IMAGE_RANGES = {
+    "IMAGE_THREADS": (1, 16),
+    "IMAGE_PER_HOUR": (1, 60),
+    "IMAGE_QUEUE_MAX": (1, 16),
+    "IMAGE_JOB_TIMEOUT_SECONDS": (60, 900),
+    "IMAGE_IDLE_UNLOAD_MINUTES": (0, 1440),      # 0: never unload
+    "IMAGE_RESULT_TTL_SECONDS": (60, 3600),
 }
 ENGINE_SLOTS_MAX = 32
+ENGINE_PHONE_SLOTS_MAX = 8
 ENGINE_ARG_FLAGS_WITH_VALUE = frozenset({
     "--n-cpu-moe", "-ncmoe", "-ts", "--tensor-split", "-ot", "--override-tensor", "-sm", "--split-mode",
     "-mg", "--main-gpu", "-t", "--threads", "-tb", "--threads-batch", "-C", "--cpu-mask", "--cpu-strict",
@@ -399,6 +448,20 @@ def get_worker_limits() -> dict:
         # instantly to a flapping node is expensive; see the monitor loop for why only
         # growth is debounced and shrinkage is not.
         "topology_settle_seconds": 30,
+        # How long the Coordinator keeps a shard that is stepping aside (yielding to its owner, a
+        # laptop off its dock, a worker that says it is leaving) while the answers running on it
+        # finish, before the engine is rebuilt without it. A shard that is gone still restarts at once.
+        "shard_drain_seconds": 60,
+        # How long a gained GPU may wait behind running answers before the engine is rebuilt to
+        # take it anyway (only with REBALANCE_ON_JOIN=true).
+        "topology_rejoin_max_seconds": 600,
+        # Yielding to the owner (engine/hardware.py, 2.5.0): the GPU and CPU load, by anyone but DLNE's
+        # own processes, above which this machine steps aside; and how long a yield counts as "having a
+        # job" for the owner's GPU perks (a long gaming session costs nothing; a node that claims to
+        # yield for ever earns nothing).
+        "yield_gpu_percent": 60.0,
+        "yield_cpu_percent": 60.0,
+        "yield_perks_max_hours": 6.0,
         # Whether new worker connections trigger auto-rebalance/restart of running models.
         # False by default (zero-rework policy): existing running inference continues undisturbed.
         "rebalance_on_join": False,
@@ -413,13 +476,27 @@ def get_worker_limits() -> dict:
         "auto_swap_up_stable_seconds": 600,
         "auto_swap_down_stable_seconds": 120,
         "auto_swap_cooldown_seconds": 1800,
-        # Only GPUs this close (measured round trip, milliseconds) count toward the coding
-        # pool; the default is a LAN. A volunteer across the internet would make the bigger
-        # model slower than the local one, and loading it would take minutes or hours.
-        "auto_swap_max_rtt_ms": 15.0,
+        # The flap breaker (engine/auto_swap.py, 2.6.2): when the engine has been rebuilt more than this many
+        # times in an hour (an auto-swap switch either way, a topology rebuild, a restart after the engine
+        # stopped, a manual switch), the rebuilds nobody needs to keep serving (a switch up to a bigger model, a
+        # GPU joining) are held for AUTO_SWAP_FLAP_HOLD_SECONDS. A step down, a restart after a crash and a manual
+        # switch are never held. 0 turns the breaker off.
+        "auto_swap_max_rebuilds_per_hour": 3,
+        "auto_swap_flap_hold_seconds": 3600,
+        # Only GPUs this close (round trip measured by this coordinator, milliseconds) share
+        # the coding model; every token crosses each link, so 80 ms caps it near 12 tokens a
+        # second. The owner's grades: 40 and under best, 80 good, 120 usable, more is too far.
+        "auto_swap_max_rtt_ms": 80.0,
+        # A farther GPU can still run a whole coding model of its own (a coding member), up
+        # to this round trip; past it the machine gets no job. An unmeasured one still may.
+        "coding_member_max_rtt_ms": 120.0,
         # A switched-to model that is not answering within this long is replaced by the one
         # it replaced, so users are never held for longer than this.
         "auto_swap_load_timeout_seconds": 180,
+        # A model switched UP to must then generate at least this many tokens a second (a short
+        # generation timed by llama.cpp) or the previous one is put back. 10 sits under the ~12 a
+        # GPU 80 ms away allows, so it catches a switch far slower than its links promise. 0: off.
+        "auto_swap_min_decode_tps": 10.0,
         # "auto"   - shard only when the model does not fit the cheapest devices alone.
         # "always" - hand every registered endpoint to llama-server, the pre-1.1.0
         #            behaviour, kept for demos and for exercising the sharding path.
@@ -440,6 +517,7 @@ def get_worker_limits() -> dict:
         # types need no second model. See SPEC_DEFAULTS for why it ships switched off.
         **SPEC_DEFAULTS,
         **ENGINE_DEFAULTS,
+        **IMAGE_DEFAULTS,
         # What a node with no usable GPU must bring to be admitted. Generating a token reads
         # every weight a node holds, so a CPU node's speed is its memory bandwidth, and one
         # slow node holds up every token of the pipeline it sits in. These are floors: an
@@ -615,6 +693,27 @@ def get_worker_limits() -> dict:
         if settle >= 0:
             limits["topology_settle_seconds"] = settle
 
+    for key, name in (("SHARD_DRAIN_SECONDS", "shard_drain_seconds"),
+                      ("TOPOLOGY_REJOIN_MAX_SECONDS", "topology_rejoin_max_seconds")):
+        if key in config:
+            try:
+                value = int(config[key])
+            except ValueError:
+                value = -1
+            if value >= 0:
+                limits[name] = value
+
+    for key, name, low, high in (("YIELD_GPU_PERCENT", "yield_gpu_percent", 1.0, 100.0),
+                                 ("YIELD_CPU_PERCENT", "yield_cpu_percent", 1.0, 100.0),
+                                 ("YIELD_PERKS_MAX_HOURS", "yield_perks_max_hours", 0.0, 168.0)):
+        if key in config:
+            try:
+                value = float(config[key])
+            except ValueError:
+                value = -1.0
+            if low <= value <= high:        # NaN fails both and keeps the default
+                limits[name] = value
+
     if "SHARD_POLICY" in config:
         policy = config["SHARD_POLICY"].strip().lower()
         if policy in ("auto", "always"):
@@ -785,8 +884,69 @@ def get_worker_limits() -> dict:
         if 0 <= slots <= ENGINE_SLOTS_MAX:
             limits["engine_slots"] = slots
 
+    if "ENGINE_PHONE_SLOTS" in config:
+        try:
+            phone_slots = int(config["ENGINE_PHONE_SLOTS"])
+        except ValueError:
+            phone_slots = -1
+        if 0 <= phone_slots <= ENGINE_PHONE_SLOTS_MAX:
+            limits["engine_phone_slots"] = phone_slots
+
+    if "ENGINE_PHONE_CONTEXT" in config:
+        try:
+            phone_context = int(config["ENGINE_PHONE_CONTEXT"])
+        except ValueError:
+            phone_context = -1
+        if 4096 <= phone_context <= 65536:
+            limits["engine_phone_context"] = phone_context
+
     if "ENGINE_EXTRA_ARGS" in config:
         limits["engine_extra_args"] = parse_engine_args(config["ENGINE_EXTRA_ARGS"])
+
+    if "MEDIA_GPU" in config:
+        limits["media_gpu"] = config["MEDIA_GPU"].strip()
+
+    if "ENGINE_MMPROJ" in config:
+        limits["engine_mmproj"] = config["ENGINE_MMPROJ"].strip()
+
+    if "ENGINE_IMAGE_MAX_TOKENS" in config:
+        try:
+            image_tokens = int(config["ENGINE_IMAGE_MAX_TOKENS"])
+        except ValueError:
+            image_tokens = 0
+        # A typo keeps the default rather than starting the engine with an image budget nobody asked for.
+        if 1 <= image_tokens <= ENGINE_IMAGE_MAX_TOKENS_CEILING:
+            limits["engine_image_max_tokens"] = image_tokens
+
+    if "IMAGE_INPUT_PER_HOUR" in config:
+        try:
+            per_hour = int(config["IMAGE_INPUT_PER_HOUR"])
+        except ValueError:
+            per_hour = -1
+        if 0 <= per_hour <= IMAGE_INPUT_PER_HOUR_MAX:         # out of range or a typo keeps the default
+            limits["image_input_per_hour"] = per_hour
+
+    if "IMAGE_GEN_ENABLED" in config:
+        limits["image_gen_enabled"] = _as_bool(config["IMAGE_GEN_ENABLED"])
+
+    if "IMAGE_MODEL_DIR" in config:
+        limits["image_model_dir"] = os.path.expanduser(config["IMAGE_MODEL_DIR"].strip())
+
+    for key, (low, high) in IMAGE_RANGES.items():
+        if key in config:
+            try:
+                value = int(config[key].strip())
+            except ValueError:
+                continue
+            if low <= value <= high:
+                limits[key.lower()] = value
+
+    if "IMAGE_CPU_MASK" in config:
+        mask = config["IMAGE_CPU_MASK"].strip().lower()
+        mask = mask if mask.startswith("0x") else "0x" + mask
+        # Hex, as `taskset` takes it; anything else keeps the default (no pinning).
+        if len(mask) > 2 and all(c in "0123456789abcdef" for c in mask[2:]):
+            limits["image_cpu_mask"] = mask
 
     if "REBALANCE_ON_JOIN" in config:
         limits["rebalance_on_join"] = _as_bool(config["REBALANCE_ON_JOIN"])
@@ -798,10 +958,14 @@ def get_worker_limits() -> dict:
 
     # The floors keep a typo from making the coordinator switch models every few seconds; a
     # value outside the range keeps the default.
+    # The flap breaker's two keys are here too: a count of 0 is a real setting (the breaker off), 100 is as many
+    # as an hour of rebuilds could ever hold, and a hold under five minutes would not stop a flap.
     for key, low, high in (("AUTO_SWAP_UP_STABLE_SECONDS", 60, 7 * 86400),
                            ("AUTO_SWAP_DOWN_STABLE_SECONDS", 30, 7 * 86400),
                            ("AUTO_SWAP_COOLDOWN_SECONDS", 300, 7 * 86400),
-                           ("AUTO_SWAP_LOAD_TIMEOUT_SECONDS", 30, 3600)):
+                           ("AUTO_SWAP_LOAD_TIMEOUT_SECONDS", 30, 3600),
+                           ("AUTO_SWAP_MAX_REBUILDS_PER_HOUR", 0, 100),
+                           ("AUTO_SWAP_FLAP_HOLD_SECONDS", 300, 7 * 86400)):
         if key in config:
             try:
                 value = int(config[key])
@@ -818,6 +982,22 @@ def get_worker_limits() -> dict:
         # NaN fails both comparisons and keeps the default.
         if 0.1 <= rtt <= 1000.0:
             limits["auto_swap_max_rtt_ms"] = rtt
+
+    if "AUTO_SWAP_MIN_DECODE_TPS" in config:
+        try:
+            floor = float(config["AUTO_SWAP_MIN_DECODE_TPS"])
+        except ValueError:
+            floor = -1.0
+        if 0.0 <= floor <= 1000.0:
+            limits["auto_swap_min_decode_tps"] = floor
+
+    if "CODING_MEMBER_MAX_RTT_MS" in config:
+        try:
+            rtt = float(config["CODING_MEMBER_MAX_RTT_MS"])
+        except ValueError:
+            rtt = -1.0
+        if 0.1 <= rtt <= 5000.0:
+            limits["coding_member_max_rtt_ms"] = rtt
 
     if "TRUST_PROXY_HEADERS" in config:
         limits["trust_proxy_headers"] = _as_bool(config["TRUST_PROXY_HEADERS"])

@@ -56,6 +56,28 @@ sealed interface StreamEvent {
      */
     data object Retract : StreamEvent
 
+    /**
+     * The chat model asked for a picture and the server started a job for it (`image_job`, sent
+     * only to a client that asked with `features: ["image_jobs"]`, before the reply's text). The
+     * app polls [id] like a Create image job, and the picture appears inside this reply. [prompt]
+     * is the description the model wrote; [size], [position] and [etaSeconds] are null when the
+     * server did not say.
+     */
+    data class ImageJob(
+        val id: String,
+        val prompt: String,
+        val size: String?,
+        val position: Int?,
+        val etaSeconds: Int?,
+    ) : StreamEvent
+
+    /**
+     * The picture was not started (`image_refused`: the term list, the free trial, the hourly cap,
+     * a full queue, the image engine being unavailable). [detail] is the server's own words and
+     * may be empty; [code] is the same code `POST /v1/app/images` would give, and may be empty.
+     */
+    data class ImageRefused(val code: String, val detail: String) : StreamEvent
+
     /** `data: [DONE]`: the answer is complete. */
     data object Done : StreamEvent
 }

@@ -170,9 +170,9 @@ def test_sysfs_cards_are_the_fallback_when_no_probe_tool_exists(monkeypatch, no_
 
     assert values_are_live is False
     assert len(gpus) == 2
-    assert sum(gpu["vram_total_gb"] for gpu in gpus) == 64.0
+    # The sysfs-only keys must not leak into the heartbeat; the PCI address stays, it is how ALLOWED_GPU_INDICES and MEDIA_GPU name a card.
     # The wire shape is fixed; the sysfs-only keys must not leak into the heartbeat.
-    assert set(gpus[0]) == {"id", "name", "vram_total_gb", "vram_free_gb", "load_percent"}
+    assert set(gpus[0]) == {"id", "name", "vram_total_gb", "vram_free_gb", "load_percent", "address"}
 
 
 def test_a_software_rasteriser_is_not_reported_as_a_gpu(monkeypatch, no_lspci):
@@ -318,3 +318,180 @@ def test_rejected_compute_cards_do_not_inflate_the_survivor(monkeypatch, no_lspc
 
     assert len(gpus) == 1
     assert gpus[0]["vram_total_gb"] == 0.5
+
+
+# --- The media card (2.6): cards named by PCI address, and one the engine never loads ---------
+
+def thewall_cards():
+    """TheWall as measured 2026-10-27: DLNE's ids follow the kernel's PCI order, Vulkan's order puts the iGPU first."""
+    def card(card_id, address, name, vram_gb, vk_index, integrated=False):
+        return {"id": card_id, "name": name, "address": address, "vram_total_gb": vram_gb, "vram_free_gb": vram_gb,
+                "load_percent": 0.0, "vk_index": vk_index, "integrated": integrated}
+
+    return [
+        card(0, "0000:03:00.0", "AMD Radeon Graphics (RADV NAVI12)", 8.0, 1),
+        card(1, "0000:09:00.0", "AMD Radeon Graphics (RADV NAVI12)", 8.0, 2),
+        card(2, "0000:0c:00.0", "AMD Radeon RX 580 Series (RADV POLARIS10)", 8.0, 3),
+        card(3, "0000:15:00.0", "AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO)", 0.5, 0, integrated=True),
+    ]
+
+
+@pytest.fixture
+def thewall_gpus(monkeypatch):
+    monkeypatch.setattr(hardware, "get_all_gpus", lambda: thewall_cards())
+    return thewall_cards()
+
+
+@pytest.mark.parametrize("spec, expected", [
+    ("1", 1), (" 2 ", 2), ("0000:03:00.0", 0), ("03:00.0", 0), ("0000:0C:00.0", 2), ("0c:00.0", 2),
+    ("9", None), ("0000:ff:00.0", None), ("00.0", None), ("", None), ("gpu", None),
+])
+def test_a_card_is_named_by_id_or_by_pci_address_with_or_without_the_domain(thewall_gpus, spec, expected):
+    found = hardware.find_gpu(spec, thewall_gpus)
+
+    assert (found["id"] if found else None) == expected
+
+
+def test_select_gpus_keeps_the_order_written_each_card_once_and_skips_unknown_entries(thewall_gpus):
+    chosen = hardware.select_gpus("1, 0000:03:00.0,0,7,03:00.0", thewall_gpus)
+
+    assert [g["id"] for g in chosen] == [1, 0]
+
+
+def test_without_a_media_card_the_engine_sees_what_was_allowed(thewall_gpus):
+    assert hardware.engine_gpu_devices("0,1") == ("0,1", "1,2", "")
+    assert hardware.engine_gpu_devices("0000:03:00.0,0000:09:00.0") == ("0,1", "1,2", "")
+    assert hardware.engine_gpu_devices("-1") == ("", "", "")        # no limit, no media card: left to Vulkan
+
+
+def test_the_media_card_comes_last_so_the_engine_cards_keep_their_names(thewall_gpus):
+    cuda, vulkan, media_device = hardware.engine_gpu_devices("0,1", "0000:0c:00.0")
+
+    assert (cuda, vulkan, media_device) == ("0,1", "1,2,3", "Vulkan2")
+
+
+def test_a_media_card_in_the_allowed_list_is_still_only_the_media_card(thewall_gpus):
+    assert hardware.engine_gpu_devices("0,1,2", "0c:00.0") == ("0,1", "1,2,3", "Vulkan2")
+    assert hardware.engine_gpu_devices("0,0000:0c:00.0,1", "2") == ("0,1", "1,2,3", "Vulkan2")
+
+
+def test_no_limit_with_a_media_card_writes_out_every_discrete_card_but_that_one(thewall_gpus):
+    # Vulkan's own default would take the RX 580 too; the iGPU is not a GPU contributor
+    assert hardware.engine_gpu_devices("-1", "0000:0c:00.0") == ("0,1", "1,2,3", "Vulkan2")
+
+
+def test_a_media_card_that_is_not_there_changes_nothing(thewall_gpus):
+    assert hardware.engine_gpu_devices("0,1", "0000:ff:00.0") == ("0,1", "1,2", "")
+    assert hardware.engine_gpu_devices("-1", "0000:ff:00.0") == ("", "", "")
+
+
+@pytest.fixture
+def warnings_logged(monkeypatch):
+    seen = []
+    monkeypatch.setattr(hardware, "log_warning", seen.append)
+    monkeypatch.setattr(hardware, "_dropped_warned", set())
+    return seen
+
+
+def test_a_card_named_twice_is_one_device_by_index_by_address_or_both(thewall_gpus, warnings_logged):
+    assert hardware.engine_gpu_devices("0,0000:03:00.0,1", "") == ("0,1", "1,2", "")
+    assert hardware.engine_gpu_devices("0000:03:00.0,0000:03:00.0", "") == ("0", "1", "")
+    assert hardware.engine_gpu_devices("0,0,0", "") == ("0", "1", "")
+    assert hardware.engine_gpu_devices("0,0000:0c:00.0", "0000:0c:00.0") == ("0", "1,3", "Vulkan1")
+    assert any("already listed" in line for line in warnings_logged)
+
+
+def test_a_card_the_probe_does_not_list_is_deduplicated_too(monkeypatch, warnings_logged):
+    monkeypatch.setattr(hardware, "get_all_gpus", lambda: [])
+
+    assert hardware.engine_gpu_devices("0,1,0,1", "") == ("0,1", "0,1", "")
+
+
+def test_every_entry_that_is_left_out_is_said_once_in_the_log(thewall_gpus, warnings_logged):
+    for _ in range(3):
+        assert hardware.engine_gpu_devices("0,typo,0000:ff:00.0,1,0000:0c:00.0", "0000:0c:00.0") == ("0,1", "1,2,3", "Vulkan2")
+
+    text = "\n".join(warnings_logged)
+    assert text.count("typo") == 1 and text.count("0000:ff:00.0") == 1 and text.count("media card") == 1
+    assert "names no card here" in text and "sysfs" in text and "use the id" in text
+    assert len(warnings_logged) == 3
+
+
+def test_nothing_is_said_when_nothing_is_left_out(thewall_gpus, warnings_logged):
+    hardware.engine_gpu_devices("0,1", "0000:0c:00.0")
+    hardware.engine_gpu_devices("-1", "0000:0c:00.0")
+
+    assert warnings_logged == []
+
+
+def test_an_entry_the_probe_does_not_list_is_passed_through_as_written(monkeypatch):
+    monkeypatch.setattr(hardware, "get_all_gpus", lambda: [])
+
+    assert hardware.engine_gpu_devices("0,1") == ("0,1", "0,1", "")
+    assert hardware.engine_gpu_devices("0000:03:00.0") == ("", "", "")      # an address cannot be passed through
+
+
+def test_a_probe_that_fails_does_not_stop_the_engine_starting(monkeypatch):
+    def broken():
+        raise OSError("no drm")
+
+    monkeypatch.setattr(hardware, "get_all_gpus", broken)
+
+    assert hardware.engine_gpu_devices("0,1", "0000:0c:00.0") == ("0,1", "0,1", "")
+
+
+@pytest.fixture
+def vulkan_install(tmp_path, monkeypatch):
+    """MEDIA_GPU applies on a Vulkan build; engine_build_is_vulkan reads <base>/bin, so a test that sets it points
+    that at a directory of its own instead of whatever the checkout or install holds."""
+    from engine import inference_manager
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "libggml-vulkan.so").write_bytes(b"")
+    monkeypatch.setattr(inference_manager, "get_base_dir", lambda: str(tmp_path))
+    return tmp_path
+
+
+def _limits(monkeypatch, **overrides):
+    limits = {"allowed_gpu_indices": "-1", "max_vram_gb": "-1", **overrides}
+    monkeypatch.setattr(hardware, "get_worker_limits", lambda: limits)
+
+
+def test_the_pool_a_node_advertises_leaves_the_media_card_out(thewall_gpus, monkeypatch, vulkan_install):
+    _limits(monkeypatch, allowed_gpu_indices="-1", media_gpu="0000:0c:00.0")
+    info = hardware.get_gpu_info()
+
+    assert info["count"] == 2 and info["vram_total_gb"] == 16.0
+    assert "RX 580" not in info["name"]
+
+
+def test_a_media_card_inside_an_explicit_list_is_left_out_too(thewall_gpus, monkeypatch, vulkan_install):
+    _limits(monkeypatch, allowed_gpu_indices="0,1,0000:0c:00.0", media_gpu="2")
+
+    assert hardware.get_gpu_info()["vram_total_gb"] == 16.0
+
+
+def test_on_a_cuda_build_the_pool_a_node_advertises_keeps_the_card_the_engine_uses(thewall_gpus, monkeypatch, tmp_path):
+    from engine import inference_manager
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "libggml-cuda.so").write_bytes(b"")
+    monkeypatch.setattr(inference_manager, "get_base_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(inference_manager, "_media_gpu_warned", True)       # said once already: no log line here
+    _limits(monkeypatch, allowed_gpu_indices="-1", media_gpu="0000:0c:00.0")
+
+    info = hardware.get_gpu_info()
+
+    assert info["count"] == 3 and info["vram_total_gb"] == 24.0 and "RX 580" in info["name"]
+
+
+def test_the_pool_is_what_it_was_without_a_media_card(thewall_gpus, monkeypatch):
+    _limits(monkeypatch, allowed_gpu_indices="0,1")
+    assert hardware.get_gpu_info()["vram_total_gb"] == 16.0
+
+    _limits(monkeypatch, allowed_gpu_indices="-1")
+    assert hardware.get_gpu_info()["vram_total_gb"] == 24.0       # the RX 580 counts when nothing says otherwise
+
+
+def test_the_pool_can_be_limited_by_pci_address(thewall_gpus, monkeypatch):
+    _limits(monkeypatch, allowed_gpu_indices="0000:03:00.0")
+
+    assert hardware.get_gpu_info()["vram_total_gb"] == 8.0

@@ -78,6 +78,28 @@ Everything here ships **off by default** (`CODING_MEMBERS_ENABLED=false`) until 
 Validation on the coordinator: strings ≤ 128 chars, numbers finite and in sane ranges,
 unknown keys refused, like the `app` block. A member below the speed floors is not routed to.
 
+**Docked (2.5.0).** Next to the block, at the top level of the signed profile, a GPU node says whether
+it is docked: `"link": "wired" | "wifi" | "cellular"`, `"power": "ac" | "battery"`, and
+`"docked": true | false` (wired and on mains). `engine/hardware.get_dock_state()` reads them from sysfs
+and `/proc/net/route` (Linux), `GetSystemPowerStatus` and the default route's adapter (Windows), or
+`pmset` and `networksetup` (macOS); a fact it cannot read is left out, `docked` is only said when both
+are known, a virtual machine never claims a link, and a change is reported only after it has held 60 s.
+A companion (the CPU half of a machine) sends none of them. The coordinator uses them in section 1:
+a near GPU shards only while docked; the worker's claim can demote it, never make it near.
+
+**Stepping aside and leaving (2.5.0).** A GPU node that is yielding, undocked, or says
+`"leaving": true` (a graceful stop: the worker sends it instead of vanishing) is left out of every new
+endpoint plan at once, but an engine still running on it is rebuilt without it only after the answers in
+flight finish, `SHARD_DRAIN_SECONDS` (60) at most; a node whose heartbeats stop is gone and restarts the
+engine at once, as before. An RPC node the engine runs on is told `"shard": true` in every heartbeat
+answer (only such a node leaves gracefully when its owner stops it); while the drain runs the answer also
+carries `"draining": true`, and the worker keeps its RPC server up until the key is gone or
+`LEAVE_GRACE_SECONDS` (90) pass; a yield that
+outlasts that restarts the worker's RPC server, which hands the weights' VRAM back to the owner. A GPU in
+the plan that the engine does not run on yet (answers in flight, or `REBALANCE_ON_JOIN=false`) keeps its
+owner's perks while it waits; a gain waits behind running answers for `TOPOLOGY_REJOIN_MAX_SECONDS` (600)
+at most.
+
 **Identity signature.** The signed bytes are the coding block
 without `sig`, as canonical JSON (`json.dumps(block, sort_keys=True, separators=(",", ":"),
 ensure_ascii=False).encode()`). The member makes its identity key once, stores it in its config folder
@@ -110,6 +132,13 @@ floors would be missed. Ladder order is quality order (smallest and least smart 
   pool, `vram_gb` what the GPU may use, the two are never added), `gpu_count`, and `gpu_bw_gbps`,
   `gpu_gflops`, `ram_bw_gbps` when known (otherwise conservative figures per card size; the hardware
   probe's `mem_bandwidth_gbs` is a measured `ram_bw_gbps`).
+- `choose_slots(tier, vram_gb, ram_gb, limits=None, **machine) -> int` (2.5.0) — how many requests at once
+  the member should open the chosen tier for: the largest n up to the tier's `server_slots` whose estimate at
+  n times the tier's context per request (`context ÷ server_slots`) clears the floors n times over, else 1
+  (the join test is the judge then); 1 for anything it cannot read, and it never raises. The context per
+  request is the invariant: a member with fewer slots gives each request the same context, not more. On the
+  shipped ladder, where `choose_tier` picks the smartest tier that just clears the margin at one stream, this
+  is one slot for the laptop and for the cards up to 24 GB, and both slots for a 48 GB card or a Mac's one pool.
 - `candidate_tiers(vram_gb, ram_gb, tiers, limits=None, **machine) -> list[dict]` — the tiers to try, best
   first (`choose_tier` is its first element). **Step-down protocol for the member runtime:** download and
   run the first, join-test it (`measure`, `meets_floor`); on a miss take the next (`next_tier_down(failed,
@@ -139,8 +168,12 @@ floors would be missed. Ladder order is quality order (smallest and least smart 
 
 `engine/coding_member.py` (worker side; modelled on `engine/app_member.py`):
 - downloads and verifies the chosen tier's files (sha256 + size; split models: every part, using the
-  downloader's API, section 9), starts llama-server on loopback with `--fit on`, the coding context, and
-  the no-trace arguments (section 8); restarts with backoff; low priority; stops cleanly.
+  downloader's API, section 9), starts llama-server on loopback with `--fit on`, `-c context ÷ server_slots × n
+  -np n` (n is the heartbeat answer's `coding_slots`, capped by the signed tier's `server_slots`, and all of them
+  when the answer names none; 2.5.0), the tier's `--ctx-checkpoints`, `-ub` and `--spec-type` when the **signed**
+  copy of the tier sets them (never from the answer), and the no-trace arguments (section 8); restarts with
+  backoff; low priority; stops cleanly. A change of n alone on the tier that runs is a restart, at most once
+  per `SLOT_SETTLE_SECONDS` (600) after any start.
 - starts it with `--alias <the model file's name>` (`engine/model_alias.py`, the same for the coordinator's
   engine and the phone-pool members), because llama-server otherwise puts the path it loaded the model from
   (`/home/<user>/...`) in the `model` field of every answer, which the requester opens. Nothing reads that
@@ -157,14 +190,23 @@ floors would be missed. Ladder order is quality order (smallest and least smart 
   only the RAM that is free when it starts). `MAX_RAM_GB` stays the limit of the GPU's other job (the RPC node)
   and of the phone pool, and a worker whose config lacks `CODING_MAX_RAM_GB` (an older extension) still reads
   `MAX_RAM_GB` for the coding job as well. The extension writes `-1` unless the user set `dlne.worker.maxRamGb`.
+  - The heartbeat's signed profile carries `coding_ram_gb` (2.4.9): the machine's total RAM, less what a "both"
+    machine lends the phone pool, under that cap. The coordinator chooses the tier on it (`ram_gb` is what the
+    RPC node lends, 4 GB by default, and fits no coding model). It is the total, not what is free right now,
+    so the assignment does not move with every browser tab; the member still checks what is free when it
+    starts and steps down a tier if it must (`CodingMember._fit`).
 
 ## 5. Routing
 
 `engine/coding_router.py` (coordinator side):
 - `CodingRouter.members(registry, relay_lookup) -> List[CodingMember]` (ready, tunnel up, floors met).
-- `pick(members, session_id, privacy, exclude) -> Optional[CodingMember]`: privacy filter first
-  (section 7), then **sticky**: the member that served this session in the last 30 minutes if it is
-  still eligible and not full; else the least busy (ties: higher `prefill_tps`, then `decode_tps`).
+- `pick(members, session_id, privacy, exclude, own=None, engine_tps=None) -> Optional[CodingMember]`: privacy
+  filter first (section 7), then **sticky**: the member that served this session in the last 30 minutes if it
+  is still eligible and not full; then (2.5.0) the requester's **own** machine, `own` being its trust id, if it
+  is among the eligible members and its `decode_tps` is at least `engine_tps`, what the coordinator's own
+  engine would write for them right now (its measured coding speed shared among the requests its gate has
+  in use; no measurement yet lets it through); else the least busy (ties: higher `prefill_tps`, then
+  `decode_tps`).
 - Forwarding: only the body goes to the member. No client IP, no API key, no user identity, no
   coordinator headers: a member learns nothing about who asked (anonymity).
 - Wiring in `engine/coordinator.py` (`chat_completions`, `completions`): when
@@ -172,11 +214,16 @@ floors would be missed. Ladder order is quality order (smallest and least smart 
   to that route's member; every plain request takes today's local engine path, unchanged. Queue order
   (GPU contributors, CPU contributors, trial) applies at the local engine's gate. The public model rule
   stays: callers cannot choose the model.
-- `GET /v1/coding/route?session=<id>&privacy=<mode>` → `{"route": "<opaque id>", "pubkey": "<b64>",
-  "alg": "x25519-hkdf-sha256-chacha20poly1305"}` for a member, or `{"route": null}` for the local engine.
-  The route id is opaque and short-lived (10 min); it is what the client sends back as `X-DLNE-Route`.
-- Status: `"coding_members": {"enabled": bool, "members": n, "ready": n, "slots": n, "busy": n}` in
-  `/v1/cluster/status` (counts only).
+- `GET /v1/coding/route?session=<id>&privacy=<mode>[&own=<trust id>]` → `{"route": "<opaque id>", "pubkey":
+  "<b64>", "alg": "x25519-hkdf-sha256-chacha20poly1305"}` for a member, or `{"route": null}` for the local
+  engine. The route id is opaque and short-lived (10 min); it is what the client sends back as
+  `X-DLNE-Route`. `own` (2.5.0) is the trust id of the requester's own coding member, which the extension
+  takes from the worker's `DLNE_ROLE` line while its job is `coding` (section 10); anything but 32 lower-case
+  hex characters is ignored.
+- Status: `"coding_members": {"enabled": bool, "members": n, "ready": n, "slots": n, "busy": n,
+  "decode_tps_median": x, "decode_tps_min": x, "prefill_tps_median": x, "prefill_tps_min": x}` in
+  `/v1/cluster/status` (counts and pool-wide figures only: the four speeds, 2.5.0, are the ready members'
+  join-test speeds to one decimal, `null` while none is ready; nothing names a member).
 
 As built:
 - **Sealed requests are never retried by the coordinator.** A missing, expired, gone, busy, failing or
@@ -196,15 +243,44 @@ As built:
 - **Restart grace:** a worker whose heartbeat already says `pool: coding` keeps its role after a
   coordinator restart; only an unknown machine waits out the 90 s probe grace.
 - A member-served 200 carries `X-DLNE-Served: member`.
-- **Roles:** a node is given `role: "coding"` only when it is a far GPU with at least 8 GB, has
-  `coding_ok: true` in its hardware profile, and has a tier from `choose_tier`.
+- **Roles:** a node is given `role: "coding"` only when it is a far GPU, or a near one that says it is off
+  its dock (`docked: false`, 2.5.0), with at least 8 GB, has `coding_ok: true` in its hardware profile, has
+  a tier from `choose_tier` (sized on `coding_ram_gb`, section 4), and is not measured farther than
+  `CODING_MEMBER_MAX_RTT_MS` (120 ms; one nobody has measured may still be). A near GPU that is docked, or
+  does not say, is told `"rpc"`. A GPU that is yielding to its owner is given no new job (`role: null`)
+  until it is quiet again: it keeps the job it has, and the shard or member logic drains it (section 2).
+  - With a tier the answer carries `coding_slots` (2.5.0): how many requests at once to open it for,
+    `choose_slots` (section 3) on the memory the tier was sized on. An answer without a tier has no
+    `coding_slots`. The member reports the slots it really opened; its context per request is the tier's
+    (`context ÷ server_slots`) whatever that count, which is what `policy.coding_context_tokens` counts.
   - A member stepping aside (its owner is gaming) reports `ready: false, slots: 0` and is not routable.
   - A member may serve a smaller tier than the one assigned; routing follows what it reports.
+- **Near and far (2.4.9, `engine/link_paths.py`):** a GPU is *near*, so `role: "rpc"` and part of the
+  shared model, when this coordinator's own round trip to it is fresh (15 min) and at most
+  `AUTO_SWAP_MAX_RTT_MS` (80 ms). The owner's grades: 40 ms and under best, 80 good, 120 usable, more
+  too far. What a worker reports about its own link (`/worker/link_report`) never makes it near.
+  - Every few minutes the coordinator times each volunteer GPU along the path the engine will use: a
+    household LAN address (below), else a TCP connect to the address its heartbeats come from, else a
+    `PING`/`PONG` frame through its reverse tunnel (frame types 4 and 5; a worker answers a ping the
+    moment it arrives). A tunnel busy with a bulk transfer (1 MB/s or more) is not timed, and the last
+    good figure stands.
+  - **A GPU in the coordinator's own household** joins through the public address and heartbeats from the
+    household's public IP, which cannot be dialled back. When a GPU worker's connections come from that
+    address (the coordinator resolves its own public names), the heartbeat answer carries
+    `"send_lan": true`, and the worker lists its private IPv4 addresses in its next signed profile
+    (`lan_ipv4`, at most 8). The coordinator keeps only those on the subnet of one of its own non-tunnel
+    interfaces, and dials one only after a TCP connection to it on the worker's RPC port succeeds. No
+    other worker is asked.
 - **Duplicate identities:** only the newest `signed_at` is believed, and neither on a tie.
 - **Pool figures for the website** (`/v1/cluster/status`, counts only; nothing names a machine or a user):
   `"gpu_pool": {"gpus", "vram_gb", "gpus_standing_by", "vram_standing_by_gb", "tokens_per_second",
-  "tokens_last_hour", "measured_tokens_per_second"}` and `"cpu_pool": {"machines", "machines_standing_by",
+  "tokens_last_hour", "measured_tokens_per_second", "reach"}` and `"cpu_pool": {"machines", "machines_standing_by",
   "cores", "ram_gb", "tokens_per_second", "tokens_last_hour"}`.
+  - `reach` (2.4.9) counts the same GPUs (serving and standing by) by how far they are:
+    `{"host", "best", "good", "usable", "too_far", "unmeasured"}`, `host` being the coordinator's own.
+    `coding_tiers[].unlocked` and `recommended_*` are judged on the near GPUs only, the pool automatic
+    switching uses; `total_vram_gb` still counts every GPU. `policy` carries both limits,
+    `shared_max_rtt_ms` and `coding_member_max_rtt_ms`.
   - A GPU is **serving** when it has a job: a node of the running engine's `--rpc` topology (this host's
     own GPUs are among them while its engine runs on them) or a ready coding member's. It is **standing
     by** when it is awake with none (or a verified member that is not ready). A node handed back to its
@@ -290,6 +366,14 @@ as `generate_keypair` returns it.
 7. *In the clear.* Error and busy answers (non-200) are not sealed; they carry no request content.
 8. *Canaries are sealed* exactly like real requests (same padding, same path), so a member cannot tell
    them apart (section 8).
+9. *What a member checks after opening (2.6.1).* The coordinator cannot inspect a sealed body, so the member
+   applies the coordinator's content rules itself (`engine/coding_member.py` `_media_refusal`, with
+   `engine/media.py`): a message part that is not `text` or `image_url`, and a `/v1/completions` prompt that is
+   an object, is a 400 `unsupported_content_type`; **any image part is a 400 `image_input_unavailable`** (a member
+   has no vision projector, and images are for the coordinator's own engine or a trusted machine, never a
+   volunteer's); a client's `id_slot` is dropped. The answer is `{"detail", "code", "error": {...}}` and quotes
+   nothing from the request. **Clients send a request that holds an image unsealed, to the coordinator** (do not
+   ask `/v1/coding/route` for it, or ignore the route).
 
 **What end-to-end encryption does and does not do.** The member has to read the request to run the
 model, so it sees the code it is sent; that is what privacy modes (section 7), redaction (section 11),
@@ -456,9 +540,12 @@ half-written. Used by coding members and by auto-swap for split models. It block
 
 ## 10. Extension integration
 
-- `X-DLNE-Session: <random uuid>` per agent conversation (and one per editor session for autocomplete),
-  sent on every chat, agent and autocomplete request. It is random, derived from nothing, and is the
-  coordinator's key for sticky routing (section 5).
+- `X-DLNE-Session: <random uuid>` per agent conversation (one per Chat thread for `@dlne`, one for the sidebar
+  chat; and one per editor session for autocomplete), sent on every chat, agent and autocomplete request. It is
+  random, derived from nothing, and is the coordinator's key for sticky routing (section 5). DLNE Swarm in VS Code's
+  model picker sends one per conversation that VS Code names (`modelOptions._conversationId`, an internal field of
+  VS Code's Chat view; without it, every request of the picker shares one id), always a fresh random value and never
+  made from the conversation's name or text.
 - Before each request: privacy mode (section 7), redaction (section 11), route lookup and sealing
   (sections 5 and 6) when the coordinator offers a member; plain request otherwise.
 - Adapter `vscode-extension/src/privacy/index.ts` is the only place the client imports the
@@ -530,9 +617,22 @@ through either of two channels, and works out an estimate itself from the third 
    CPU contributor 1, trial 2). If the swarm is not busy it says it is waiting for the first words, with the
    seconds elapsed.
 
+**Comment lines in the stream.** A streamed answer may carry `: keep-alive` lines (an SSE comment: a colon,
+then a blank line) whenever the engine has sent nothing for 15 s, such as while it reads a long prompt, and
+every 15 s a request that waited for a slot is still being prepared (a swap, the engine loading, a long
+history being summarised); skip them, and count them as bytes for a silence watchdog.
+
 Shown as: a banner above the sidebar's input ("All 2 coding slots are busy. You are #3 in line." with the
 count waiting and, for a non-contributor, that lending a GPU skips the line), the status bar item
-("#3 in line"), and a progress line in the `@dlne` chat. Never a silent wait.
+("#3 in line"), and a progress line in the `@dlne` chat. Never a silent wait. In DLNE Swarm in VS Code's model
+picker the place in line is the status bar's only: a wait is never put into the reply text, because VS Code stores
+that text as the model's answer and sends it back with the next step.
+
+**Keep-alive lines.** A streamed answer (`stream: true`) from the coordinator's own engine also carries an SSE comment
+line, `: keep-alive`, every `STREAM_KEEPALIVE_SECONDS` (15) in which the engine said nothing (it is reading a long
+prompt, say), and never inside an event. An SSE reader skips it, and a client's silence watchdog counts it as
+traffic (the extension ends a stream that stays silent too long and sends the step again). A request that waited for
+a slot gets them too. A sealed stream from a member, `/v1/completions` and the phone path do not.
 
 **Lending a GPU.** `dlne.worker.device` (auto / gpu / cpu) is unchanged. The first time a GPU owner clicks to
 contribute (a click or a command; never when a worker resumes by itself or restarts after a version change)
@@ -546,12 +646,22 @@ the way it reports `DLNE_REFUSAL`:
 ```
 DLNE_ROLE: rpc
 DLNE_ROLE: app
-DLNE_ROLE: coding {"model": "Qwen3.6-35B-A3B-UD-IQ3_S.gguf", "tier": "qwen36-a3b", "slots": 2, "trust_id": "<32 hex>"}
+DLNE_ROLE: coding {"model": "Qwen3.6-35B-A3B-UD-IQ3_S.gguf", "tier": "qwen36-a3b", "slots": 2, "context": 40960, "decode_tps": 32.5, "prefill_tps": 121.2, "trust_id": "<32 hex>"}
+```
+
+```
+DLNE_DOCK: {"link": "wired", "power": "ac", "docked": true}
+DLNE_YIELD: {"yielding": true, "why": "gpu"}
 ```
 
 (`rpc` = a share of the one big model run on many GPUs; `coding` = a whole coding model answering other
-people's requests; `app` = the phone app's CPU pool.) The JSON part is optional and each field is checked
-(`trust_id` is the 32 lower-case hex characters of section 1). The last line printed wins, and a new one is
+people's requests; `app` = the phone app's CPU pool. `DLNE_DOCK` (2.5.0) repeats the docked facts of
+section 2 once per change, with `docked` left out while a fact is unknown; `DLNE_YIELD` (2.5.0) says once
+per change whether the machine is stepping aside for its owner's own load and why: `fullscreen`, `gpu` or
+`cpu`, `""` when it is not.) The JSON part is optional and each field is checked
+(`trust_id` is the 32 lower-case hex characters of section 1). `context` (the tokens each request gets),
+`decode_tps` and `prefill_tps` (the join test's figures, once measured) are printed since 2.5.0; an
+extension that does not know them ignores them. The last line printed wins, and a new one is
 printed when the job changes. An engine that never prints one is a GPU pool member, as it always was.
 `engine/worker.py` prints this line when the coordinator assigns the job, with `trust_id` once the identity
 key exists. The sidebar card, the status bar tag ("Coding member"), the
@@ -579,5 +689,9 @@ As built:
 - Exclusion checks fail closed: `isExcludedFile()` in the adapter treats a check that throws as excluded,
   and so does the agent's `privacyRefusal`.
 - Known limits: shell output (for example `cat .env` that the user approves) is only pattern-redacted,
-  not excluded. A name and value on different lines (Terraform `variable` blocks) is not caught. VS
-  Code chat attachments arrive without a path, so they get pattern redaction only.
+  not excluded. A name and value on different lines (Terraform `variable` blocks) is not caught. A file
+  attached to an `@dlne` message is read by the extension, so the exclusion rules apply to it; text VS Code
+  attaches without a file (a terminal selection, say) gets pattern redaction only. On the model-picker path
+  (DLNE Swarm) VS Code's own tools read the files: the exclusion rules apply only to a tool result whose file
+  path DLNE can see, and everything else gets pattern redaction only (docs/privacy.md, "DLNE Swarm in VS Code's
+  model picker").

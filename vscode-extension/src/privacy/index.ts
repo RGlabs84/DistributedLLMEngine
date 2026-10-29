@@ -16,7 +16,7 @@ import { isExcluded, redactSecrets } from './redact';
 export { createPrivacyStatus, getPrivacyMode };
 export type { PrivacyMode };
 // The redaction hooks in the agent, autocomplete and chat (C2) import through here too.
-export { REDACTION_MARK, excludedNotice, excludedReason, isExcluded, redactSecrets, redactionNote } from './redact';
+export { REDACTION_MARK, excludedNotice, excludedReason, excludedReasonSkipping, filePathOf, isExcluded, redactSecrets, redactionNote } from './redact';
 
 /** The header values the coordinator reads (contract section 7). */
 const MODES: ReadonlySet<string> = new Set(['open', 'trusted', 'any']);

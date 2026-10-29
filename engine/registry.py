@@ -1,4 +1,5 @@
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import math
 import re
 import threading
 import time
@@ -87,6 +88,17 @@ _CLASS_RANK = {"local": 0, "lan": 1, "wan": 2, "unknown": 3}
 # actually reported a good number, and optimism here would place shards on the slowest link
 # in the cluster and call it a tie-break.
 _UNMEASURED_RTT_MS = 250.0
+
+
+def stepping_aside(hardware: Any) -> bool:
+    """
+    A GPU node that must not carry a shard right now, though it is still here: it is yielding to its
+    owner, it says it is leaving (a graceful stop, 2.5.0), or it is a laptop off its dock (2.5.0). It is
+    left out of every new endpoint plan, and an engine still running on it is rebuilt without it once the
+    answers in flight finish (coordinator._topology_change_is_settled).
+    """
+    profile = _as_profile(hardware)
+    return profile.get("is_yielding") is True or profile.get("leaving") is True or profile.get("docked") is False
 
 
 def _endpoint_class(ip: str) -> str:
@@ -199,6 +211,11 @@ class WorkerRegistry:
         # erased five seconds after it arrived. A node measures its link rarely and beats
         # constantly, which is exactly the pairing that needs two lifetimes.
         self.link_measurements: Dict[str, Dict[str, Any]] = {}
+        # What THIS Coordinator measured to each node (engine/link_paths.measure, every few
+        # minutes): {"rtt_ms", "via" ("lan", "direct" or "tunnel"), "measured_at"}. Kept apart
+        # from the node's own report above because a node chooses every number it reports:
+        # whether a GPU is near enough to share the coding model is decided by this alone.
+        self.link_probes: Dict[str, Dict[str, Any]] = {}
         # The llama.cpp RPC protocol major this Coordinator's engine speaks (from its signed
         # release), or None when unknown. llama-server ABORTS at startup if any --rpc backend
         # speaks another major, so a mismatched worker must never be routed to: it is left
@@ -345,6 +362,16 @@ class WorkerRegistry:
                 grace_expiry = prev_record.get("grace_expiry", 0.0)
 
             self.workers[worker_id] = {
+
+                # When this registration began: a node that left (pruned) and came back starts over, so the
+
+                # role grace (coordinator._coding_role_near) restarts with it.
+
+                "registered_at": (existing or {}).get("registered_at", current_time),
+                # When the current yield began (None while not yielding): a yield counts as a job for
+                # the owner's perks only for so long (coordinator._gpu_has_job, YIELD_PERKS_MAX_HOURS).
+                "yielding_since": (((existing or {}).get("yielding_since") or current_time)
+                                   if is_yielding is True else None),
                 "worker_id": worker_id,
                 "ip": ip,
                 "port": port,
@@ -449,6 +476,38 @@ class WorkerRegistry:
         with self._lock:
             return dict(self.link_measurements.get(worker_id, {}))
 
+    def record_probe(self, worker_id: str, rtt_ms: float, via: str) -> None:
+        """File this Coordinator's own round-trip measurement to a registered node."""
+        rtt = _as_float(rtt_ms, -1.0)
+        if not worker_id or rtt < 0 or not math.isfinite(rtt):
+            return
+        with self._lock:
+            if worker_id in self.workers:
+                self.link_probes[worker_id] = {"rtt_ms": rtt, "via": str(via), "measured_at": time.time()}
+
+    def endpoint_is_draining(self, endpoint: str) -> bool:
+        """
+        Whether ``endpoint`` is a registered GPU node that is stepping aside (yielding, leaving or undocked). It
+        is still here and still answering, so an engine running on it may finish its answers before it is
+        rebuilt without it; a node that is not registered any more is gone, and the engine is already broken.
+        """
+        with self._lock:
+            for data in self.workers.values():
+                if f"{data.get('ip')}:{data.get('port')}" == endpoint:
+                    return stepping_aside(data.get("hardware"))
+        return False
+
+    def registered_at(self, worker_id: str) -> float:
+        """When the current registration of ``worker_id`` began (epoch seconds), 0.0 for a node not registered."""
+        with self._lock:
+            data = self.workers.get(worker_id) or {}
+            return _as_float(data.get("registered_at"), 0.0)
+
+    def get_probe(self, worker_id: str) -> Dict[str, Any]:
+        """This Coordinator's last measurement of a node, or ``{}`` when it has none."""
+        with self._lock:
+            return dict(self.link_probes.get(worker_id, {}))
+
     def find_by_ip(self, ip: str) -> Any:
         """Returns the first worker heartbeating from ``ip``, or None. Locked."""
         if not ip:
@@ -481,23 +540,24 @@ class WorkerRegistry:
                 # it would let a stale figure go on influencing shard placement for a
                 # machine that has left the cluster.
                 self.link_measurements.pop(w_id, None)
+                self.link_probes.pop(w_id, None)
                 try:
                     log_error(f"Worker {ip} timed out (Sudden Disconnect). Removing from active pool.")
                 except Exception:
                     pass
 
     def get_active_rpc_endpoints(self) -> List[str]:
-        """Returns a list of 'IP:PORT' strings for all alive workers. Excludes yielding GPU workers."""
+        """Returns a list of 'IP:PORT' strings for all alive workers. Excludes GPU workers that are stepping aside
+        (yielding, leaving or undocked)."""
         with self._lock:
             self.prune_dead_workers()
             endpoints = []
             for w_id, data in self.workers.items():
                 hardware = data.get("hardware", {})
                 has_gpu = _gpu_section(hardware).get("has_gpu", False)
-                is_yielding = hardware.get("is_yielding", False)
 
-                # Exclude a yielding GPU worker, and one whose RPC protocol cannot serve.
-                if not (has_gpu and is_yielding) and self.rpc_compatible(hardware):
+                # Exclude a GPU worker that is stepping aside, and one whose RPC protocol cannot serve.
+                if not (has_gpu and stepping_aside(hardware)) and self.rpc_compatible(hardware):
                     endpoints.append(f"{data['ip']}:{data['port']}")
 
             # Sorted, not just deduped: callers compare this list against the
@@ -549,23 +609,27 @@ class WorkerRegistry:
                 hardware = data.get("hardware", {})
                 gpu_info = _gpu_section(hardware)
                 has_gpu = gpu_info.get("has_gpu", False)
-                if has_gpu and hardware.get("is_yielding", False):
-                    continue  # Handed back to its owner. Same rule as the endpoint getter.
+                if has_gpu and stepping_aside(hardware):
+                    continue  # Handed back to its owner, leaving, or off its dock. Same rule as the endpoint getter.
                 if not self.rpc_compatible(hardware):
                     continue  # Would abort llama-server at startup.
 
                 endpoint = f"{data['ip']}:{data['port']}"
                 vram = _as_float(gpu_info.get("vram_total_gb", 0.0)) if has_gpu else 0.0
                 link = self.link_measurements.get(w_id, {})
+                probe = self.link_probes.get(w_id, {})
                 candidates.append({
                     "endpoint": endpoint,
                     "vram": vram,
-                    "class": _endpoint_class(data.get("ip", "")),
-                    # A node that has never reported a measurement sorts as if it were on
-                    # the slow end of its own class rather than the fast end: assuming an
-                    # unmeasured link is quick is how a WAN node ends up preferred over a
-                    # LAN one that simply answered the question.
-                    "rtt": _as_float(link.get("rtt_min_ms"), _UNMEASURED_RTT_MS),
+                    # A node this Coordinator last reached over a confirmed LAN address is on the LAN,
+                    # whatever address it registered from (a household node arrives by its public IP).
+                    "class": "lan" if probe.get("via") == "lan" else _endpoint_class(data.get("ip", "")),
+                    # This Coordinator's own measurement first, the node's report only when
+                    # there is none. A node that has neither sorts as if it were on the slow
+                    # end of its own class rather than the fast end: assuming an unmeasured
+                    # link is quick is how a WAN node ends up preferred over a LAN one that
+                    # simply answered the question.
+                    "rtt": _as_float(probe.get("rtt_ms", link.get("rtt_min_ms")), _UNMEASURED_RTT_MS),
                 })
 
         if not candidates:

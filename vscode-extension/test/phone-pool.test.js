@@ -378,9 +378,25 @@ test('the version is the same in the manifest and the lockfile, and the CHANGELO
   const changelog = fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8');
   // (An "Unreleased" section above it is work waiting for its release; it is not a version.)
   const releases = [...changelog.matchAll(/^## \[([^\]]+)\]/gm)].map((m) => m[1]).filter((v) => v !== 'Unreleased');
-  assert.equal(releases[0], pkg.version, 'the newest released CHANGELOG entry is this version');
-  // 1.3.0's coding members, sealed requests and privacy modes need coordinator 2.4.0.
-  assert.match(changelog, new RegExp(`^## \\[${pkg.version.replace(/\./g, '\\.')}\\] - \\d{4}-\\d{2}-\\d{2}\\n\\nPairs with DLNE coordinator \\*\\*2\\.4\\.0\\*\\*`, 'm'));
+  assert.equal(releases[0], pkg.version, 'the newest CHANGELOG entry is this version');
+  // Dated once released; "Unreleased" while it is being finished on the branch (scripts/release-check.js refuses to
+  // package it like that). Every version since 1.3.0 names the coordinator it needs (1.3.0's coding members, sealed
+  // requests and privacy modes need 2.4.0; 1.4.0's working memory wants 2.4.9).
+  const entry = new RegExp(`^## \\[${pkg.version.replace(/\./g, '\\.')}\\] - (\\d{4}-\\d{2}-\\d{2}|Unreleased)\\n\\nPairs with DLNE coordinator \\*\\*(\\d+)\\.(\\d+)\\.(\\d+)\\*\\*`, 'm');
+  const match = changelog.match(entry);
+  assert.ok(match, `CHANGELOG.md: "## [${pkg.version}] - <date>" then "Pairs with DLNE coordinator **x.y.z**"`);
+  const coordinator = match.slice(2, 5).map(Number);
+  assert.ok(coordinator[0] > 2 || (coordinator[0] === 2 && coordinator[1] >= 4), 'at least coordinator 2.4.0');
+});
+
+test('packaging refuses a version whose CHANGELOG entry has no date', () => {
+  const { releaseProblem } = require('../scripts/release-check');
+  const entry = (when) => `# Change Log\n\n## [1.4.0] - ${when}\n\nPairs with DLNE coordinator **2.4.9**.\n\n## [1.3.5] - 2026-10-26\n`;
+  assert.equal(releaseProblem(entry('2026-10-28'), '1.4.0'), '');
+  assert.match(releaseProblem(entry('Unreleased'), '1.4.0'), /set the release date before packaging/);
+  assert.match(releaseProblem(entry('2026-10-28'), '1.4.1'), /newest CHANGELOG\.md entry is 1\.4\.0, but package\.json says 1\.4\.1/);
+  assert.match(releaseProblem('# Change Log\n\n## [Unreleased]\n\n## [1.3.5]\n', '1.3.5'), /set the release date/);
+  assert.match(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'), /"vscode:prepublish": "node scripts\/release-check\.js && /);
 });
 
 test('no text in the extension says contributors get unlimited chats or that a CPU runs the coding model', () => {

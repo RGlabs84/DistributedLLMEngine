@@ -1,19 +1,33 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { DlneClient, formatLoadingTelemetry } from '../client/dlneClient';
-import { SWARM_AUTO_LABEL } from '../client/modelChoice';
 import { WorkerManager } from '../worker/workerManager';
-import { newSessionId } from '../client/session';
-import { ALSO_CPU_LINE, CPU_POOL_HEADLINE, CPU_POOL_PERK, EXTERNAL_WORKER_LINE, EXTERNAL_WORKER_TEXT, MEMBER_PRIVACY_SUMMARY, ROLE_LABEL, TRUST_ID_HINT, roleMeaning } from '../worker/contribution';
-import { AgentLoop } from '../agent/agentLoop';
-import { ToolCallResult } from '../agent/tools';
-import { isExcludedFile, redactSecrets } from '../privacy';
+import {
+  ALSO_CPU_LINE, CPU_POOL_HEADLINE, CPU_POOL_PERK, EXTERNAL_WORKER_LINE, EXTERNAL_WORKER_TEXT, MEMBER_PRIVACY_SUMMARY, ROLE_LABEL,
+  TRAY_WORKER_LINE, TRAY_WORKER_TEXT, TRUST_ID_HINT, roleMeaning,
+} from '../worker/contribution';
+import { logError } from '../agent/agentLoop';
+import { ChatThreads, Thread, readTranscript } from '../agent/chatThreads';
+import { logLine } from '../log';
+import { IMAGE_TOOL_NAME } from '../agent/imageTool';
+import { ToolCallResult, ToolRegistry } from '../agent/tools';
+import { redactSecrets } from '../privacy';
+import { memoryMode } from '../agent/memory';
+import { AUTO_BUTTON, observeApprovals } from './chatAuto';
+import { fixRequest } from './chatEntry';
+import { attachedContext } from './chatReferences';
+import { ToolJsonFilter, diffBlock } from './chatText';
 
 /**
- * The one entry the swarm adds to VS Code's Chat model picker. It names no model: the coordinator
- * serves whichever one its ladder has active, so a request leaves `model` out (see modelChoice.ts).
+ * The Chat view's permission picker puts its level on each request (`permissionLevel`; it is not in the
+ * public typings, so it is read off the untyped request). These two are the levels that approve everything.
  */
-const SWARM_MODEL = { id: 'dlne-auto', label: SWARM_AUTO_LABEL };
+function chatApprovesAll(request: any): boolean {
+  return request?.permissionLevel === 'autoApprove' || request?.permissionLevel === 'autopilot';
+}
+
+/** The tools the agent loop runs when a model writes the call as text: the ones it offers, and the picture tool. */
+const TOOL_NAMES = new Set([...ToolRegistry.getToolDefinitions().map((tool) => tool.function.name), IMAGE_TOOL_NAME]);
 
 export function registerNativeChatParticipant(
   context: vscode.ExtensionContext,
@@ -25,15 +39,20 @@ export function registerNativeChatParticipant(
     return;
   }
 
-  const agentLoop = new AgentLoop(client);
-  // The language-model entry below has no conversation of its own to name: its requests share one session.
-  const modelSessionId = newSessionId();
+  // One conversation per Chat thread, each with its saved task: a VS Code restart does not end a task, Continue works
+  // after reopening, and a second thread no longer clears the first. (Persistent memory, AGENTS.md and the memory files,
+  // goes with every request: docs/agent-memory.md section 7.)
+  const threads = new ChatThreads(context, client);
+  context.subscriptions.push({ dispose: () => threads.dispose() });
 
-  const handler = async (
+  const respond = async (
     request: any,
-    _chatContext: any,
+    chatContext: any,
     stream: any,
-    token: vscode.CancellationToken
+    token: vscode.CancellationToken,
+    threadId: string,
+    /** Filled in once the request's thread is known: what the answer names if the request then ends in an exception. */
+    ran: { thread?: Thread }
   ) => {
     const cmd: string | undefined = request.command;
     const userPrompt: string = (request.prompt || '').trim();
@@ -72,7 +91,7 @@ export function registerNativeChatParticipant(
       const status = detailed.data;
 
       const contribBadge = worker.external && worker.state === 'contributing'
-        ? `🔌 **${EXTERNAL_WORKER_LINE}**`
+        ? `🔌 **${worker.trayApp ? TRAY_WORKER_LINE : EXTERNAL_WORKER_LINE}**`
         : worker.cpuPool
         ? worker.state === 'contributing'
           ? `✅ **CONTRIBUTING** (CPU pool, ${worker.vramContributedGb} GB of RAM: ${CPU_POOL_HEADLINE})`
@@ -118,7 +137,7 @@ export function registerNativeChatParticipant(
       await workerManager.toggle();
       const updated = workerManager.getStatus();
       if (updated.state === 'contributing' && updated.external) {
-        stream.markdown(`### 🔌 A worker is already running\n${EXTERNAL_WORKER_TEXT}`);
+        stream.markdown(`### 🔌 A worker is already running\n${updated.trayApp ? TRAY_WORKER_TEXT : EXTERNAL_WORKER_TEXT}`);
       } else if (updated.state === 'contributing' && updated.cpuPool) {
         stream.markdown(
           `### 📱 Compute Contribution Active!\n${CPU_POOL_HEADLINE}: **${updated.vramContributedGb} GB** of RAM lent, at low priority on half your cores. You get ${CPU_POOL_PERK}.`
@@ -143,7 +162,7 @@ export function registerNativeChatParticipant(
 
     // 3. /clear or /reset command
     if (cmd === 'clear' || cmd === 'reset') {
-      agentLoop.clearHistory();
+      threads.forget(threadId);
       stream.markdown('🧹 **Agent conversation history cleared.** DLNE Code Assistant context is fresh and ready for your next prompt.');
       return { metadata: { command: cmd } };
     }
@@ -180,24 +199,13 @@ export function registerNativeChatParticipant(
     // 4. Build final prompt (attach active editor / diagnostics for /fix or contextual references)
     let fullPrompt = userPrompt;
     if (cmd === 'fix') {
-      const editor = vscode.window.activeTextEditor;
-      if (editor && isExcludedFile(editor.document.uri)) {
-        stream.markdown(`\`${vscode.workspace.asRelativePath(editor.document.uri)}\` is excluded for privacy (a credentials file, or ignored by .gitignore or .dlneignore), so DLNE does not read it or send it anywhere.`);
+      // The same request DLNE: Fix Current File Problems sends to the sidebar chat (chatEntry.ts).
+      const fix = fixRequest(vscode.window.activeTextEditor, userPrompt);
+      if ('excluded' in fix) {
+        stream.markdown(fix.excluded);
         return { metadata: { command: 'fix' } };
       }
-      if (editor) {
-        const relPath = vscode.workspace.asRelativePath(editor.document.uri);
-        const diags = vscode.languages
-          .getDiagnostics(editor.document.uri)
-          .filter((d) => d.severity === vscode.DiagnosticSeverity.Error);
-        const diagText = diags.map((d) => `Line ${d.range.start.line + 1}: ${d.message}`).join('\n');
-        fullPrompt =
-          `Fix the issues in \`${relPath}\`.\n` +
-          (diagText ? `Diagnostics:\n${diagText}\n` : '') +
-          (userPrompt ? `Additional instructions: ${userPrompt}` : '');
-      } else if (!fullPrompt) {
-        fullPrompt = 'Inspect the workspace for issues and fix them.';
-      }
+      fullPrompt = fix.prompt;
     }
 
     if (!fullPrompt) {
@@ -207,39 +215,75 @@ export function registerNativeChatParticipant(
       return { metadata: { command: cmd || 'chat' } };
     }
 
-    token.onCancellationRequested(() => {
-      agentLoop.abort();
-    });
+    // What the user attached (`#file`, a selection, files dragged in) is read here, by the rules of the agent's read_file.
+    const attached = await attachedContext(request.references);
+    if (token.isCancellationRequested) return { metadata: { command: cmd || 'chat' } };
+    for (const note of attached.skipped) stream.markdown(`${note}\n\n`);
+    if (typeof stream.reference === 'function') {
+      for (const used of attached.used) stream.reference(used);
+    }
+    fullPrompt += attached.text;
+
+    // Each Chat thread has its own conversation (chatThreads.ts): a new thread is new memory, and /status, /model and
+    // /contribute never touch the agent, so the memory reset the old shared agent needed is gone. The thread is found
+    // below, by ChatThreads.run, once the transcript has been checked against it (a chat that was gone back in does not
+    // get the memory of the answers that were taken out).
 
     let isStreamingThought = false;
     stream.progress('Connecting to DLNE Distributed Vulkan Cluster...');
 
-    await agentLoop.run(fullPrompt, {
+    const maxTurns = vscode.workspace.getConfiguration('dlne').get<number>('agent.maxTurns');
+    const approves = chatApprovesAll(request);
+    // VS Code shows each progress message as a step ("Completed 1802 steps in 23m"). An update that only changes a
+    // number (a growing size, a token count) is not a new step: it is passed on at most every 15 seconds.
+    let lastShape = '';
+    let lastProgressAt = 0;
+    const progress = (text: string) => {
+      const shape = text.replace(/[\d.,]+/g, '#');
+      const now = Date.now();
+      if (shape === lastShape && now - lastProgressAt < 15000) return;
+      lastShape = shape;
+      lastProgressAt = now;
+      stream.progress(text);
+    };
+    // The model's answer, without the tool calls it writes as fenced JSON (the agent loop runs those: the chat shows each
+    // as a step). Its held text is let go at the end of each step and of the run.
+    const answer = new ToolJsonFilter((text) => stream.markdown(text), (name) => TOOL_NAMES.has(name));
+    // The first time the agent has to ask before it acts (Auto is off), the response offers the switch.
+    let autoOffered = false;
+    let lookingBack = false;
+    const approvals = observeApprovals(() => {
+      if (autoOffered || lookingBack || approves || typeof stream.button !== 'function') return;
+      autoOffered = true;
+      stream.button(AUTO_BUTTON);
+    });
+    // The thread saves its task itself (Thread.run) and then calls onStateChanged, where the held answer text goes out.
+    const run = await threads.run(threadId, chatContext?.history, fullPrompt, {
+      onStateChanged: () => answer.flush(),
       onLoadingProgress: (statusText: string) => {
-        stream.progress(statusText);
+        // A step sent again after the connection dropped says so here: what it had streamed so far is not to be joined
+        // to the new attempt's text.
+        answer.flush();
+        progress(statusText);
       },
-      onThinkingDelta: (delta: string) => {
-        if (!isStreamingThought) {
-          isStreamingThought = true;
-          stream.markdown(`\n> **Thought Process:**\n> `);
-        }
-        stream.markdown(delta.replace(/\n/g, '\n> '));
+      // After the answer: its questions (remember asks for a fact about the user) are not the run's, so no Auto button.
+      onReviewProgress: () => { lookingBack = true; },
+      // The model's thinking is not part of the answer. A line says it is thinking; its text stays out of the chat (the
+      // Chat view's own thinking block is an API proposal an extension in the stores cannot use).
+      onThinkingDelta: () => {
+        if (isStreamingThought) return;
+        isStreamingThought = true;
+        progress('Thinking...');
       },
       onContentDelta: (delta: string) => {
-        if (isStreamingThought) {
-          isStreamingThought = false;
-          stream.markdown(`\n\n---\n\n`);
-        }
-        // Hide raw inline JSON/XML tool call blocks from the user's visible chat stream
-        stream.markdown(delta);
+        isStreamingThought = false;
+        answer.push(delta);
       },
       onToolStart: (toolName: string, args: Record<string, any>) => {
-        if (isStreamingThought) {
-          isStreamingThought = false;
-          stream.markdown(`\n\n---\n\n`);
-        }
+        isStreamingThought = false;
+        answer.flush();
         const target = args.path || args.command || args.query || '';
-        stream.progress(`🔧 Executing ${toolName}${target ? ` (${target})` : ''}...`);
+        progress(`🔧 Executing ${toolName}${target ? ` (${target})` : ''}...`);
       },
       onToolEnd: (result: ToolCallResult) => {
         if (result.fileDiff) {
@@ -253,18 +297,7 @@ export function registerNativeChatParticipant(
             if (typeof stream.reference === 'function') {
               stream.reference(fileUri);
             }
-            const formattedLines = diff.lines
-              .slice(0, 60)
-              .map((l) => {
-                if (l.type === 'add') return `+ ${l.text}`;
-                if (l.type === 'del') return `- ${l.text}`;
-                if (l.type === 'header') return l.text;
-                return `  ${l.text}`;
-              })
-              .join('\n');
-            stream.markdown(
-              `\n\n📄 **Modified \`${diff.path}\`** (+${diff.additions} / -${diff.deletions})\n\`\`\`diff\n${formattedLines}\n\`\`\`\n`
-            );
+            stream.markdown(diffBlock(diff));
             if (typeof stream.button === 'function') {
               stream.button({
                 command: 'vscode.open',
@@ -273,25 +306,99 @@ export function registerNativeChatParticipant(
               });
             }
           }
+        } else if (result.imagePath) {
+          // A picture from generate_image: opened with the same button a changed file gets (VS Code shows a PNG itself).
+          const folders = vscode.workspace.workspaceFolders;
+          stream.markdown(`\n\n🎨 **${result.output}**\n`);
+          if (folders && folders.length > 0) {
+            const imageUri = vscode.Uri.file(path.join(folders[0].uri.fsPath, result.imagePath));
+            if (typeof stream.reference === 'function') stream.reference(imageUri);
+            if (typeof stream.button === 'function') {
+              stream.button({ command: 'vscode.open', arguments: [imageUri], title: `🖼 Open ${result.imagePath}` });
+            }
+          }
         } else if (result.terminalCommand) {
           stream.markdown(
             `\n\n💻 **Executed \`${result.terminalCommand}\`**:\n\`\`\`text\n${result.output.slice(0, 1000)}\n\`\`\`\n`
           );
         } else {
-          stream.markdown(`\n\n✅ **\`${result.name}\`**: ${result.output.slice(0, 200)}\n\n`);
+          stream.markdown(`\n\n${result.is_error ? '⚠️' : '✅'} **\`${result.name}\`**: ${result.output.slice(0, 200)}\n\n`);
+        }
+        // A change to the agent's memory is made at once, so it comes with a way back (docs/agent-memory.md 7.6).
+        if (result.memoryChange && typeof stream.button === 'function') {
+          stream.button({ command: 'dlne.memory.undo', arguments: [result.memoryChange], title: '↩ Undo' });
         }
       }
-    });
+    }, { maxTurns, reflect: memoryMode(vscode.workspace.getConfiguration('dlne').get('agent.memory', 'auto')) !== 'off',
+      approveAll: () => approves,
+      // Stop, and a message sent during the run ("steer": VS Code sets `yieldRequested` on this request and sends the
+      // message when this one has ended): the run ends after its current step and the message carries on from here.
+      token, yieldRequested: () => chatContext?.yieldRequested === true, onWait: (text: string) => stream.progress(text),
+      // A chat that cannot be followed starts a new conversation, and says so before anything else.
+      onNote: (text: string) => stream.markdown(text),
+      onThread: (found: Thread) => { ran.thread = found; } })
+      .finally(() => approvals.dispose());
+    const outcome = run.outcome;
+    try {
+      answer.flush();
+    } catch {
+      // The stream was closed under us (Stop): there is nobody left to show the held text to.
+    }
+    if (outcome === 'yielded') {
+      try {
+        stream.markdown('\n\n_(Stopped after this step to take your newer message.)_');
+      } catch {
+        // The stream was closed under us. An answer with errorDetails would keep VS Code from sending that message.
+      }
+    }
 
-    return { metadata: { command: cmd || 'chat' } };
+    // `paused`: the run stopped at its turn limit, or after a step to take a newer message; `failed`: it ended on an
+    // error. The follow-ups below offer to carry on from where it stopped. `threadId`, `turn` and `mark` say which
+    // conversation this answer belongs to, and where in the chat and the conversation it stands (see chatThreads.ts).
+    return {
+      metadata: {
+        command: cmd || 'chat', paused: outcome === 'paused' || outcome === 'yielded', failed: outcome === 'error',
+        threadId: run.thread.id, turn: run.turn, mark: run.mark,
+      },
+    };
+  };
+
+  // Every answer carries its thread's id in its result metadata, which VS Code hands back in `chatContext.history` with
+  // the next message of that thread: that is how the conversation is found again, after a reload too. An answer of the
+  // agent also carries its turn (its place among the chat's answers) and the mark of the conversation it left: that is
+  // how a chat that was gone back in, or forked, is told from one that was only continued.
+  const handler = async (request: any, chatContext: any, stream: any, token: vscode.CancellationToken) => {
+    const threadId = threads.idFor(chatContext?.history);
+    const ran: { thread?: Thread } = {};
+    try {
+      const result = await respond(request, chatContext, stream, token, threadId, ran);
+      return { ...result, metadata: { threadId, ...result?.metadata } };
+    } catch (err: any) {
+      // Whatever went wrong, the answer still names its thread (an answer without a result loses it) and offers Continue.
+      // It names the thread the request ran on, which is not the one its history named when the chat was cut back.
+      const message = redactSecrets(String(err?.message ?? err)).text;
+      const on = ran.thread;
+      logLine(`agent thread ${(on?.id ?? threadId).slice(0, 8)}: the request failed with an exception: ${logError(err?.message ?? err)}`);
+      return {
+        errorDetails: { message },
+        metadata: {
+          command: request?.command || 'chat', failed: true, threadId: on?.id ?? threadId,
+          ...(on ? { turn: readTranscript(chatContext?.history).answered + 1, mark: on.lastMark?.id } : {}),
+        },
+      };
+    }
   };
 
   const participant = chatNs.createChatParticipant('dlne.agent', handler);
   participant.iconPath = vscode.Uri.joinPath(context.extensionUri, 'media', 'dlne_logo.png');
 
   participant.followupProvider = {
-    provideFollowups(_result: any, _context: any, _token: vscode.CancellationToken) {
+    provideFollowups(result: any, _context: any, _token: vscode.CancellationToken) {
+      // A run that stopped (at its turn limit, to take a newer message, or on an error) carries on from where it stopped,
+      // with everything it has read.
+      const carryOn = result?.metadata?.paused || result?.metadata?.failed ? [{ prompt: 'continue', label: '▶ Continue' }] : [];
       return [
+        ...carryOn,
         {
           prompt: '',
           command: 'status',
@@ -312,65 +419,4 @@ export function registerNativeChatParticipant(
   };
 
   context.subscriptions.push(participant);
-
-  // Also register DLNE models into VS Code's Native Model Picker Dropdown (vscode.lm API)
-  const lmNs = (vscode as any).lm;
-  if (lmNs) {
-    const registerFn =
-      typeof lmNs.registerChatModelProvider === 'function'
-        ? lmNs.registerChatModelProvider.bind(lmNs)
-        : typeof lmNs.registerLanguageModelChatProvider === 'function'
-        ? lmNs.registerLanguageModelChatProvider.bind(lmNs)
-        : null;
-
-    if (registerFn) {
-      try {
-        const disp = registerFn(
-          SWARM_MODEL.id,
-          {
-            async provideLanguageModelResponse(
-              messages: any[],
-              _options: any,
-              _extensionId: string,
-              progress: any,
-              token: vscode.CancellationToken
-            ) {
-              const mapped = messages.map((m: any) => ({
-                role: (m.role === 1 || m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
-                // VS Code builds these messages (attached files, selections): secrets are removed before they leave.
-                content: redactSecrets(typeof m.content === 'string' ? m.content : JSON.stringify(m.content)).text
-              }));
-              await client.streamChat(
-                mapped,
-                [],
-                (delta: string) => {
-                  if (delta && progress && typeof progress.report === 'function') {
-                    progress.report({ index: 0, part: delta });
-                  }
-                },
-                undefined,
-                undefined,
-                undefined,
-                { sessionId: modelSessionId }
-              );
-            },
-            async provideTokenCount(_text: string) {
-              return Math.ceil((_text || '').length / 4);
-            }
-          },
-          {
-            vendor: 'dlne',
-            name: SWARM_MODEL.label,
-            family: 'dlne-swarm',
-            version: '1.0.3',
-            maxInputTokens: 32768,
-            maxOutputTokens: 4096,
-            isDefault: true,
-            isUserSelectable: true
-          }
-        );
-        if (disp) context.subscriptions.push(disp);
-      } catch {}
-    }
-  }
 }

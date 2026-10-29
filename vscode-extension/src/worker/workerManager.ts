@@ -6,7 +6,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as http from 'http';
 import * as https from 'https';
-import { EngineVerificationError, FetchResult, RELEASE_PUBKEY_HEX, fetchVerifiedEngine, fetchVerifiedRpcBin, hostRpcPlatform } from './engineRelease';
+import { EngineVerificationError, FetchResult, RELEASE_PUBKEY_HEX, fetchVerifiedEngine, fetchVerifiedRpcBin, hostRpcPlatform, checkEngineUpdate} from './engineRelease';
 import { resolveServerUrl } from '../serverUrl';
 import {
   CODING_MEMBER_ALLOWED_KEY, CODING_MEMBER_NOTICE, CPU_BELOW_MINIMUM_EXIT_CODE, CPU_MIN_RAM_GB, CPU_POOL_HEADLINE,
@@ -15,9 +15,11 @@ import {
   lendGpuPrompt, lendLabel, parseRefusal, parseRole, parseVulkanSummary, pickVulkanGpu, planContribution, ramChoices,
   ramOfferText, ramTooSmallText, setConfigValue, workerStartedNotice, powershellExpandCommand, quoteIfSpaced,
   isRpcExecutablePlatform, takeCompleteLines, EXTERNAL_WORKER_LINE, EXTERNAL_WORKER_TEXT, orphanRpcStopCommand,
-  MAX_CPU_THREADS_KEY, maxCpuThreadsConfigUpdate, parseClock, clockMessage,
-} from './contribution';
+  WORKER_STOP_GRACE_MS, LEAVING_TEXT, workerStopGraceMs,
+  MAX_CPU_THREADS_KEY, maxCpuThreadsConfigUpdate, parseClock, clockMessage, TRAY_WORKER_LINE, TRAY_WORKER_TEXT,
+  VCREDIST_MESSAGE, VCREDIST_URL, parseVcredistNeeded, parseDock, parseYield, DockState, YieldState} from './contribution';
 import { DonateChoice, DonateMachine, DonateSettings, readDonateSettings, settingsToWrite } from './donatePanel';
+import { trayWorkerRunning } from './trayApp';
 
 /** Remembered in the editor's global state: the GPU owner has been told what lending a GPU means. */
 const LEND_NOTICE_KEY = 'dlne.lendGpuNoticeSeen';
@@ -56,8 +58,41 @@ function downloadFile(urlStr: string, destPath: string): Promise<void> {
   });
 }
 
-// How long a stopped worker has to shut its coding model server down before it is killed (macOS and Linux).
-const WORKER_STOP_GRACE_MS = 8000;
+/** A worker that is leaving the swarm gets this long before the "Leaving the swarm" notice (a quick stop never shows it). */
+const LEAVING_NOTICE_DELAY_MS = 2000;
+/** After the kill, how long to wait for the process to be gone before giving up on it. */
+const WORKER_KILL_SETTLE_MS = 3000;
+/** The worker this editor started (its process id), so a window that opens after a reload knows it as its own. */
+const OWN_WORKER_KEY = 'dlne.worker.ownPid';
+/**
+ * After this editor's worker from another window (or from before a reload) ends, how long to wait for the window
+ * that started it to start the next one (an engine update ends a worker so that it is started again) before
+ * starting one here: two windows starting one each would fight over the port.
+ */
+const ADOPTED_RESTART_GRACE_MS = 30000;
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `pid` is alive and is a DLNE worker (its command line runs dlne_server.py worker), not a reused id. */
+function isDlneWorkerProcess(pid: number): boolean {
+  if (!processAlive(pid)) return false;
+  try {
+    const command = process.platform === 'win32'
+      ? child_process.execFileSync('powershell.exe', ['-NoProfile', '-Command',
+        `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`], { encoding: 'utf-8', timeout: 4000, windowsHide: true })
+      : child_process.execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf-8', timeout: 2000 });
+    return command.includes('dlne_server.py') && command.includes('worker');
+  } catch {
+    return false;
+  }
+}
 // The engine exits with this code when the coordinator runs a different version (engine/worker.py).
 const VERSION_MISMATCH_EXIT_CODE = 75;
 // Two automatic re-syncs within ten minutes; after that a mismatch is reported instead of looped on.
@@ -130,14 +165,35 @@ export interface WorkerStatus {
    * settings, so the status says so instead of describing it from the settings here. Undefined otherwise.
    */
   external?: boolean;
+  /**
+   * That outside worker is the one the DLNE Donate tray app runs (trayApp.ts trayWorkerRunning): the sidebar says so
+   * by name, and it is stopped from the app itself (its tray icon or its window). Undefined otherwise.
+   */
+  trayApp?: boolean;
   /** The settings this editor's running worker was started with, so the sidebar can tell when a change needs a restart. */
   startedWith?: DonateSettings;
+  /** Whether this machine is docked (wired and on mains), from the worker's last DLNE_DOCK line (2.5.0). */
+  dock?: DockState;
+  /** Whether this machine is stepping aside for its owner's own load, from the last DLNE_YIELD line (2.5.0). */
+  yielding?: YieldState;
+  /** The coordinator publishes a newer signed engine than the one installed here (2.5.0; checked every half hour). */
+  engineUpdate?: { installed: string | null; available: string };
 }
 
 export class WorkerManager {
   private workerProcess: child_process.ChildProcess | null = null;
   /** The worker that is running was started outside this editor (see WorkerStatus.external). */
   private externalWorker = false;
+  /**
+   * The worker an earlier window of this editor started, still running: VS Code keeps the worker across a window
+   * reload (see dispose), so it is this editor's own, not one "started outside VS Code". Its output went with the
+   * old window, so what it prints (its job, docked, stepping aside) is not shown until it is restarted here.
+   */
+  private adoptedPid: number | null = null;
+  /** When the adopted worker was last seen ending (see ADOPTED_RESTART_GRACE_MS); null otherwise. */
+  private adoptedGoneAt: number | null = null;
+  /** That outside worker is the DLNE Donate tray app's (see WorkerStatus.trayApp). Only meaningful with externalWorker. */
+  private trayWorker = false;
   /**
    * This machine has no user systemd to ask (a container, WSL, a desktop without a user session bus): every
    * `systemctl --user` fails there, so after the first failure the 5-second check stops asking.
@@ -163,10 +219,15 @@ export class WorkerManager {
     this.outputChannel = vscode.window.createOutputChannel('DLNE Compute Worker');
     // Synchronous immediate detection so initial UI render accurately reflects contributing state. A worker that is
     // already running was not started by this editor: it is described as such, never from the settings here.
-    if (this.isSystemdActive() || this.isProcessActive()) {
+    this.adoptedPid = this.ownWorkerFromBefore();
+    const trayActive = this.isTrayWorkerActive();
+    if (this.adoptedPid !== null) {
+      this.currentState = 'contributing';
+    } else if (this.isSystemdActive() || this.isProcessActive() || trayActive) {
       this.currentState = 'contributing';
       this.externalWorker = true;
-      this.statusMessage = EXTERNAL_WORKER_LINE;
+      this.trayWorker = trayActive;
+      this.statusMessage = trayActive ? TRAY_WORKER_LINE : EXTERNAL_WORKER_LINE;
     }
     // The owner's coding-member switch reaches a worker that is already running through the engine's
     // config.txt, which the worker re-reads: writing it when the setting changes needs no restart.
@@ -306,6 +367,45 @@ export class WorkerManager {
     this.pollInterval = setInterval(() => {
       this.refreshWorkerState();
     }, 5000);
+
+    // A worker that is not running never learns of a new engine (the sync runs at start): ask the
+    // coordinator now and every half hour, and let the sidebar's engine button say so.
+    void this.refreshEngineUpdate();
+    this.updateCheckInterval = setInterval(() => void this.refreshEngineUpdate(), 30 * 60 * 1000);
+  }
+
+  /** Where the extension installs the engine (the same folder ensureWorkerRuntime fills). */
+  private runtimeRoot(): string {
+    const localAppData = process.env.LOCALAPPDATA;
+    return process.platform === 'win32' && localAppData
+      ? path.join(localAppData, 'DLNE', 'runtime')
+      : path.join(os.homedir(), '.dlne', 'runtime');
+  }
+
+  /**
+   * Compare the installed engine with the coordinator's published release (engineRelease.checkEngineUpdate),
+   * without downloading anything. Nothing installed, no signed release, or any failure: no badge.
+   */
+  public async refreshEngineUpdate(): Promise<void> {
+    const before = JSON.stringify(this.engineUpdate);
+    try {
+      const root = this.runtimeRoot();
+      if (!fs.existsSync(path.join(root, 'dlne_server.py'))) {
+        this.engineUpdate = null;
+      } else {
+        const config = vscode.workspace.getConfiguration('dlne');
+        const installed = this.installedRelease(root);
+        const check = await checkEngineUpdate(resolveServerUrl(config), installed, {
+          publicKeyHex: this.options.releasePublicKeyHex ?? RELEASE_PUBKEY_HEX,
+          allowUnsigned: config.get<boolean>('worker.allowUnsignedEngine', false),
+          fetchJson: getJson,
+        });
+        this.engineUpdate = check.newer && check.available ? { installed: installed?.version ?? null, available: check.available } : null;
+      }
+    } catch {
+      // offline, or a release that does not verify: the installed engine is what it is; nothing to show
+    }
+    if (JSON.stringify(this.engineUpdate) !== before && !this.disposed) this.emitChange();
   }
 
   public getStatus(): WorkerStatus {
@@ -322,6 +422,7 @@ export class WorkerManager {
       // A worker started outside VS Code: nothing about it is read from the settings here (no CPU pool, no job).
       status.external = true;
       status.cpuPool = false;
+      if (this.trayWorker) status.trayApp = true;
       return status;
     }
     if (running && this.startedWith) {
@@ -338,6 +439,9 @@ export class WorkerManager {
     if (running && !cpuPool && this.alsoCpuRunning) {
       status.alsoCpu = true;
     }
+    if (running && this.dock) status.dock = this.dock;
+    if (running && this.yielding) status.yielding = this.yielding;
+    if (this.engineUpdate) status.engineUpdate = this.engineUpdate;
     return status;
   }
 
@@ -345,11 +449,19 @@ export class WorkerManager {
   private assignedRole: RoleAssignment | null = null;
   /** The running worker's last DLNE_ALSO line says the CPU serves the phone pool too; cleared when it stops. */
   private alsoCpuRunning = false;
+  /** The worker's last DLNE_DOCK and DLNE_YIELD lines (2.5.0); cleared with the job when the worker stops. */
+  private dock: DockState | null = null;
+  private yielding: YieldState | null = null;
+  /** A newer signed engine the coordinator publishes (refreshEngineUpdate), null when there is none or nothing is installed. */
+  private engineUpdate: { installed: string | null; available: string } | null = null;
+  private updateCheckInterval: NodeJS.Timeout | null = null;
   private codingNoticeShown = false;
   /** The settings the running worker was started with (null when none is running, or it is not this editor's). */
   private startedWith: DonateSettings | null = null;
   /** The clock offsets the owner has been told about during this worker run, so each is shown once. */
   private clockOffsetsShown = new Set<number>();
+  /** The missing-Visual-C++-Runtime notice was shown for this run of the worker. */
+  private vcredistShown = false;
 
   /** The unfinished last line of each stream of the running worker (a pipe may cut a line in two chunks). */
   private outputTail: { stdout: string; stderr: string } = { stdout: '', stderr: '' };
@@ -378,6 +490,26 @@ export class WorkerManager {
     if (also !== null && also !== this.alsoCpuRunning) {
       this.alsoCpuRunning = also;
       this.emitChange();
+    }
+    const dock = parseDock(text);
+    if (dock && JSON.stringify(dock) !== JSON.stringify(this.dock)) {
+      this.dock = dock;
+      this.emitChange();
+    }
+    const yielding = parseYield(text);
+    if (yielding && JSON.stringify(yielding) !== JSON.stringify(this.yielding)) {
+      this.yielding = yielding;
+      this.emitChange();
+    }
+    // A Windows PC without the Visual C++ Runtime cannot start the engine: say so once, with the installer.
+    if (parseVcredistNeeded(text) && !this.vcredistShown) {
+      this.vcredistShown = true;
+      this.currentState = 'error';
+      this.statusMessage = 'Install the Visual C++ Runtime to contribute';
+      this.emitChange();
+      void vscode.window.showErrorMessage(VCREDIST_MESSAGE, 'Download').then((choice) => {
+        if (choice === 'Download') void vscode.env.openExternal(vscode.Uri.parse(VCREDIST_URL));
+      });
     }
     // A wrong clock is worth one warning per offset: the worker corrects for it and prints a line only when it changes.
     for (const line of text.split(/\r?\n/)) {
@@ -547,22 +679,69 @@ export class WorkerManager {
     }
   }
 
+  /**
+   * The DLNE Donate tray app's worker is running (or the app is about to start it). The patterns above miss it: its
+   * command line is the app's own (`DLNE-Donate --run-worker ...`), not `dlne_server.py worker`, and as a coding member
+   * or a phone-app member it runs llama-server, not ggml-rpc-server, so nothing listens on 50052 either.
+   */
+  private isTrayWorkerActive(): boolean {
+    return trayWorkerRunning();
+  }
+
+  private ownWorkerFromBefore(): number | null {
+    const pid = this.context?.globalState?.get<number>(OWN_WORKER_KEY);
+    return typeof pid === 'number' && pid > 0 && isDlneWorkerProcess(pid) ? pid : null;
+  }
+
   public async refreshWorkerState(): Promise<WorkerStatus> {
-    if (this.workerProcess && !this.workerProcess.killed && this.currentState === 'contributing') {
+    // A worker being stopped (a leaving one takes up to 90 s) is still our own, not one "started outside VS Code".
+    if (this.stopping) {
       return this.getStatus();
+    }
+    // This editor's own worker, starting or running: what it says is the status. (Requiring 'contributing' here let a
+    // poll during its first seconds find its process and call it "started outside VS Code", for good.)
+    if (this.workerProcess && !this.workerProcess.killed) {
+      return this.getStatus();
+    }
+    if (this.adoptedPid !== null && !processAlive(this.adoptedPid)) {
+      this.adoptedPid = null;
+      this.currentState = 'idle';
+      this.adoptedGoneAt = Date.now();
+    }
+    if (this.adoptedPid === null) this.adoptedPid = this.ownWorkerFromBefore();
+    if (this.adoptedPid !== null) {
+      this.adoptedGoneAt = null;
+      if (this.currentState !== 'contributing' || this.externalWorker) {
+        this.externalWorker = false;
+        this.trayWorker = false;
+        this.markContributing();
+      }
+      return this.getStatus();
+    }
+    if (this.adoptedGoneAt !== null) {
+      // The window that started it may be starting the next one: wait, then start one here if none appeared.
+      if (Date.now() - this.adoptedGoneAt < ADOPTED_RESTART_GRACE_MS) return this.getStatus();
+      this.adoptedGoneAt = null;
+      if (vscode.workspace.getConfiguration('dlne').get<boolean>('worker.autoStart', false) && !this.isProcessActive()) {
+        void this.startWorker();
+        return this.getStatus();
+      }
     }
 
     const sysdActive = this.isSystemdActive();
     const processActive = this.isProcessActive();
     const portActive = await this.isPortListening(50052);
+    const trayActive = this.isTrayWorkerActive();
 
-    const isRunning = sysdActive || processActive || portActive;
+    const isRunning = sysdActive || processActive || portActive || trayActive;
 
     if (isRunning) {
       this.failedChecksCount = 0;
-      // Not this editor's own worker (that case returned above): one started outside VS Code.
-      if (this.currentState !== 'contributing' || !this.externalWorker) {
+      // Not this editor's own worker (that case returned above): one started outside VS Code. It is described again
+      // when it turns out to be (or no longer to be) the tray app's.
+      if (this.currentState !== 'contributing' || !this.externalWorker || this.trayWorker !== trayActive) {
         this.externalWorker = true;
+        this.trayWorker = trayActive;
         this.markContributing();
       }
     } else {
@@ -572,6 +751,7 @@ export class WorkerManager {
         if (this.currentState === 'contributing') {
           this.currentState = 'idle';
           this.externalWorker = false;
+          this.trayWorker = false;
           this.vramContributed = 0;
           this.statusMessage = 'Worker is idle.';
           this.emitChange();
@@ -1083,6 +1263,10 @@ export class WorkerManager {
   private async syncEngineSource(engineRoot: string, serverUrl: string): Promise<void> {
     const cleanServer = serverUrl.replace(/\/+$/, '');
     const srcZip = path.join(engineRoot, 'dlne_source_update.zip');
+    // Up to 2.5.0 every release's files were dated 1980-01-01, and Python trusts a cached .pyc while the
+    // source's mtime and size match, so a module that kept its size kept the old release's code. Drop the
+    // bytecode on every start: the code on disk is the code that runs.
+    try { fs.rmSync(path.join(engineRoot, 'engine', '__pycache__'), { recursive: true, force: true }); } catch {}
     try {
       const fetched = await this.fetchEngineArchive(cleanServer, srcZip, engineRoot);
       if (fetched.status === 'up-to-date') return;
@@ -1092,6 +1276,7 @@ export class WorkerManager {
         return;
       }
       this.recordInstalledRelease(engineRoot, fetched);
+      this.engineUpdate = null;                 // what was published is what is installed now
       this.outputChannel.appendLine(`[DLNE] Engine updated to ${fetched.manifest ? fetched.manifest.version : 'the coordinator\'s unsigned build'}.`);
     } catch (e: any) {
       if (e instanceof EngineVerificationError) {
@@ -1232,20 +1417,23 @@ export class WorkerManager {
       await vscode.workspace.getConfiguration('dlne').update('worker.autoStart', true, vscode.ConfigurationTarget.Global);
     } catch {}
 
-    // This editor's own worker is already running.
-    if (this.workerProcess && !this.workerProcess.killed) {
+    // This editor's own worker is already running (started here, or by this editor's window before a reload).
+    if ((this.workerProcess && !this.workerProcess.killed) || (this.adoptedPid !== null && processAlive(this.adoptedPid))) {
       this.markContributing();
       return true;
     }
-    // A worker started outside VS Code (a systemd service, a terminal) is running: a second one would fight it for
-    // the port, and that one does not use the settings here. Say so; Stop Contributing stops it.
+    // A worker started outside VS Code (a systemd service, a terminal, the DLNE Donate tray app) is running: a second
+    // one would fight it for the port or donate the same computer twice, and that one does not use the settings here.
+    // Say so; Stop Contributing stops it (the tray app's is stopped in the app).
     const portOpen = await this.isPortListening(50052);
     const sysdActive = this.isSystemdActive();
     const processActive = this.isProcessActive();
-    if (portOpen || sysdActive || processActive) {
+    const trayActive = this.isTrayWorkerActive();
+    if (portOpen || sysdActive || processActive || trayActive) {
       this.externalWorker = true;
+      this.trayWorker = trayActive;
       this.markContributing();
-      vscode.window.showInformationMessage(`DLNE: ${EXTERNAL_WORKER_TEXT}`);
+      vscode.window.showInformationMessage(`DLNE: ${trayActive ? TRAY_WORKER_TEXT : EXTERNAL_WORKER_TEXT}`);
       return true;
     }
 
@@ -1270,6 +1458,7 @@ export class WorkerManager {
     // if the machine has one, is never started from here: it runs with its own fixed arguments, and starting it
     // used to turn "lend my CPU, 16 GB" into whatever that service was set up to lend.)
     this.externalWorker = false;
+    this.trayWorker = false;
     const config = vscode.workspace.getConfiguration('dlne');
     const serverUrl: string = resolveServerUrl(config);
     const rootWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -1370,11 +1559,15 @@ export class WorkerManager {
         env: spawnEnv,
         windowsHide: true
       });
+      void this.context?.globalState?.update(OWN_WORKER_KEY, this.workerProcess.pid);
 
       this.lastRefusal = null;
       this.assignedRole = null;
+      this.dock = null;
+      this.yielding = null;
       this.alsoCpuRunning = false;
       this.clockOffsetsShown = new Set();
+      this.vcredistShown = false;
       this.outputTail = { stdout: '', stderr: '' };
       this.workerProcess.stdout?.on('data', (data) => {
         const text = data.toString();
@@ -1421,12 +1614,14 @@ export class WorkerManager {
    */
   private onWorkerExit(code: number | null): void {
     this.outputChannel.appendLine(`[DLNE] Worker process exited with code ${code}`);
-    this.currentState = 'idle';
+    this.currentState = this.vcredistShown ? 'error' : 'idle';
     this.assignedRole = null;
+    this.dock = null;
+    this.yielding = null;
     this.alsoCpuRunning = false;
     this.startedWith = null;
     this.vramContributed = 0;
-    this.statusMessage = `Worker stopped (code ${code})`;
+    this.statusMessage = this.vcredistShown ? 'Install the Visual C++ Runtime to contribute' : `Worker stopped (code ${code})`;
     this.workerProcess = null;
     this.emitChange();
 
@@ -1450,11 +1645,13 @@ export class WorkerManager {
   private contributionPlan: ContributionPlan | null = null;
 
   private markContributing(): void {
+    // A leaving worker still prints heartbeats: they must not turn "Leaving the swarm" back into "Actively contributing".
+    if (this.stopping) return;
     this.currentState = 'contributing';
     if (this.externalWorker) {
       // What it lends is its own settings' business, not these.
       this.vramContributed = 0;
-      this.statusMessage = EXTERNAL_WORKER_LINE;
+      this.statusMessage = this.trayWorker ? TRAY_WORKER_LINE : EXTERNAL_WORKER_LINE;
       this.emitChange();
       return;
     }
@@ -1563,7 +1760,33 @@ export class WorkerManager {
   }
 
   /** @param quiet no "paused" toast: the worker is about to start again (restartWorker). */
-  public async stopWorker(quiet: boolean = false): Promise<void> {
+  public stopWorker(quiet: boolean = false): Promise<void> {
+    // A stop already under way (a worker leaving the swarm): the second one forces it.
+    if (this.stopping) {
+      this.outputChannel.appendLine('[DLNE] Stop again: ending the worker now.');
+      this.forceStop?.();
+      return this.stopping;
+    }
+    const stopping = this.stopWorkerGracefully(quiet).finally(() => {
+      this.stopping = null;
+      this.forceStop = null;
+    });
+    this.stopping = stopping;
+    return stopping;
+  }
+
+  /** The stop under way (see stopWorker), and what a second Stop calls to end the worker at once. */
+  private stopping: Promise<void> | null = null;
+  private forceStop: (() => void) | null = null;
+
+  /**
+   * SIGTERM, then wait for the worker to be gone before anything else is touched. A worker that carries a shard
+   * of the model leaves the swarm first (engine/worker.py: it keeps its RPC server up while the answers running
+   * on it finish, 90 s at most), so it gets that long plus a margin before the kill; any other worker gets the
+   * few seconds it needs to stop its model server. The orphan clean-up runs only once the worker has exited:
+   * until then its RPC server is not an orphan but the worker's live child.
+   */
+  private async stopWorkerGracefully(quiet: boolean): Promise<void> {
     this.statusMessage = 'Stopping worker...';
     this.outputChannel.appendLine('[DLNE] Stopping compute worker...');
 
@@ -1578,30 +1801,93 @@ export class WorkerManager {
       } catch {}
     }
 
-    // Stop child process if active
-    if (this.workerProcess) {
-      // macOS and Linux: SIGTERM lets the worker stop its coding model server (that takes a few seconds), so
-      // the kill waits longer there. Windows has no such signal: kill() is TerminateProcess either way, and
-      // the model server is in a job object that dies with the worker (engine/coding_member.py).
-      const stopping = this.workerProcess;
-      stopping.kill('SIGTERM');
-      setTimeout(() => {
-        // Only this process: a worker started again in the meantime is not ours to kill.
-        if (this.workerProcess === stopping) {
-          stopping.kill('SIGKILL');
-          this.workerProcess = null;
+    // This editor's worker from before a window reload is SIGTERMed as well, so it leaves the swarm gracefully.
+    // Its output went with the old window, so its job is not known: it gets the leave in case it carries a shard.
+    const adopted = this.adoptedPid;
+    this.adoptedPid = null;
+    if (adopted !== null) {
+      try { process.kill(adopted, 'SIGTERM'); } catch {}
+    }
+    const child = this.workerProcess;
+    // Windows has no graceful SIGTERM: kill() is TerminateProcess either way, and the model server is in a job
+    // object that dies with the worker (engine/coding_member.py), so the quick stop stays there (workerStopGraceMs).
+    child?.kill('SIGTERM');
+
+    const graceMs = workerStopGraceMs(adopted !== null || this.assignedRole?.role === 'rpc', process.platform);
+    const leaving = graceMs > WORKER_STOP_GRACE_MS;
+    if (leaving) {
+      this.statusMessage = LEAVING_TEXT;
+      this.outputChannel.appendLine(`[DLNE] ${LEAVING_TEXT}`);
+      this.emitChange();
+    }
+
+    // Gone: the process has exited (the child's exit event, or the adopted pid no longer there).
+    const gone = Promise.all([
+      child
+        ? new Promise<void>((resolve) => {
+            if (child.exitCode !== null || child.signalCode !== null) resolve();
+            else child.once('exit', () => resolve());
+          })
+        : null,
+      adopted !== null
+        ? new Promise<void>((resolve) => {
+            const check = () => (processAlive(adopted) ? setTimeout(check, 250) : resolve());
+            check();
+          })
+        : null
+    ]).then(() => true);
+
+    let forceKill: () => void = () => {};
+    const killed = new Promise<void>((resolve) => {
+      forceKill = () => {
+        child?.kill('SIGKILL');
+        if (adopted !== null) {
+          try { process.kill(adopted, 'SIGKILL'); } catch {}
         }
-      }, process.platform === 'win32' ? 800 : WORKER_STOP_GRACE_MS);
+        resolve();
+      };
+    });
+    this.forceStop = forceKill;
+    const killTimer = setTimeout(forceKill, graceMs);
+    // Gone, or (when the kill did not take either) given up on: only a worker seen to exit is cleaned up after.
+    const exited = Promise.race([
+      gone,
+      killed.then(() => new Promise<boolean>((resolve) => setTimeout(() => resolve(false), WORKER_KILL_SETTLE_MS)))
+    ]);
+
+    // A worker that is still leaving after a moment is not stuck: say so, and let Cancel force it like a second Stop.
+    let noticeTimer: NodeJS.Timeout | undefined;
+    if (leaving) {
+      noticeTimer = setTimeout(() => {
+        void vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: `DLNE: ${LEAVING_TEXT}`, cancellable: true },
+          (_progress, token) => {
+            token?.onCancellationRequested(forceKill);
+            return exited;
+          }
+        );
+      }, LEAVING_NOTICE_DELAY_MS);
+    }
+
+    const workerExited = child || adopted !== null ? await exited : true;
+    clearTimeout(killTimer);
+    clearTimeout(noticeTimer);
+    if (this.workerProcess === child) {
+      this.workerProcess = null;
     }
 
     // An orphaned ggml-rpc-server of THIS install (its worker was killed before it could stop it) would keep port
     // 50052: it is stopped by its full path, never by name (another program's, or another install's, is not ours).
+    // Only after the worker has exited: while it lives, its RPC server is its own child, still draining answers.
     const engineScript = this.findEngineScript();
-    const orphanStop = engineScript
+    const orphanStop = engineScript && workerExited
       ? orphanRpcStopCommand(
           path.join(path.dirname(engineScript), 'bin', process.platform === 'win32' ? 'ggml-rpc-server.exe' : 'ggml-rpc-server'),
           process.platform)
       : null;
+    if (!workerExited) {
+      this.outputChannel.appendLine('[DLNE] The worker did not exit after being killed; its engine is left alone.');
+    }
     if (orphanStop) {
       try {
         child_process.execFileSync(orphanStop[0], orphanStop[1], { timeout: 4000, windowsHide: true, stdio: 'ignore' });
@@ -1610,7 +1896,10 @@ export class WorkerManager {
 
     this.currentState = 'idle';
     this.externalWorker = false;
+    this.trayWorker = false;
     this.assignedRole = null;
+    this.dock = null;
+    this.yielding = null;
     this.alsoCpuRunning = false;
     this.startedWith = null;
     this.vramContributed = 0;
@@ -1625,6 +1914,12 @@ export class WorkerManager {
   public async toggle(options: { fromPanel?: boolean } = {}): Promise<boolean> {
     await this.refreshWorkerState();
     if (this.currentState === 'contributing' || this.currentState === 'starting') {
+      // The tray app's worker is not this editor's to stop (its app would only report that it died): it keeps
+      // donating, and the owner is told where to stop it.
+      if (this.externalWorker && this.trayWorker) {
+        vscode.window.showInformationMessage(`DLNE: ${TRAY_WORKER_TEXT}`);
+        return true;
+      }
       await this.stopWorker();
       return false;
     } else {
@@ -1667,6 +1962,10 @@ export class WorkerManager {
     if (this.pollInterval) {
       clearInterval(this.pollInterval);
       this.pollInterval = null;
+    }
+    if (this.updateCheckInterval) {
+      clearInterval(this.updateCheckInterval);
+      this.updateCheckInterval = null;
     }
     this.settingListener?.dispose();
     this.settingListener = undefined;

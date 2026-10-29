@@ -8,11 +8,17 @@ import { PrivacyStatusGate } from './privacy';
 import { DlneFimProvider } from './completion/fimProvider';
 import { SidebarProvider } from './views/sidebarProvider';
 import { registerNativeChatParticipant } from './views/nativeChatParticipant';
+import { toggleAuto } from './views/chatAuto';
+import { fixDiagnostics, openChat, openChatPanel } from './views/chatEntry';
+import { registerDlneChatModel } from './client/modelProvider';
 import { ClusterStatusBar } from './statusbar/clusterStatusBar';
 import { WorkerManager } from './worker/workerManager';
+import { forgetSudoPassword } from './agent/askpass';
+import { SwarmDashboard } from './views/swarmDashboard';
 import { CPU_POOL_HEADLINE, CPU_POOL_PERK, EXTERNAL_WORKER_LINE, ROLE_LABEL, workerStartedNotice } from './worker/contribution';
 import { phoneChatUrl } from './serverUrl';
 import { ToolRegistry } from './agent/tools';
+import { undoMemoryChange } from './agent/memory';
 
 function isNewerVersion(current: string, remote: string): boolean {
   const cParts = current.split('.').map((n) => parseInt(n, 10) || 0);
@@ -137,6 +143,11 @@ export function activate(context: vscode.ExtensionContext) {
 
   const client = new DlneClient();
   const workerManager = new WorkerManager(context);
+
+  // The swarm's live state in an editor tab (the editor area is otherwise empty while the agent works).
+  context.subscriptions.push(
+    vscode.commands.registerCommand('dlne.openSwarmDashboard', () => SwarmDashboard.show(context, client, workerManager))
+  );
   client.setWorkerManager(workerManager);
   context.subscriptions.push(workerManager);
 
@@ -164,11 +175,20 @@ export function activate(context: vscode.ExtensionContext) {
   // 3a. DLNE Code Assistant sidebar webview (dedicated toolbar panel)
   const sidebarProvider = new SidebarProvider(context.extensionUri, client, workerManager, context);
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider('dlne.chatView', sidebarProvider)
+    // retainContextWhenHidden: without it VS Code throws the page away whenever the view is hidden (another side bar
+    // tab, Ctrl+B, a collapsed section) and makes a blank one when it is shown, while the task goes on unseen. The
+    // page is kept; what it missed while hidden is sent again on show (SidebarProvider.onShown).
+    vscode.window.registerWebviewViewProvider('dlne.chatView', sidebarProvider, {
+      webviewOptions: { retainContextWhenHidden: true },
+    })
   );
 
   // 3b. Native Built-in VS Code Chat Participant (@dlne in Ctrl+Alt+I Chat Panel)
   registerNativeChatParticipant(context, client, workerManager);
+
+  // 3c. DLNE Swarm in VS Code's Chat model picker (Ask, Edit and Agent run on the swarm; @dlne runs without a GitHub
+  // sign-in). On its own, not behind the participant: an editor can have the one and not the other.
+  registerDlneChatModel(context, client);
 
   // 4. Commands
   context.subscriptions.push(
@@ -178,10 +198,11 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // DLNE has two chats: `@dlne` in VS Code's Chat view, and our own in the sidebar (views/chatEntry.ts). Open Chat goes
+  // to the Chat view where there is one, and to the sidebar where there is not; Open Chat Panel is always the sidebar.
   context.subscriptions.push(
-    vscode.commands.registerCommand('dlne.openChat', () => {
-      vscode.commands.executeCommand('workbench.view.extension.dlne-sidebar');
-    })
+    vscode.commands.registerCommand('dlne.openChat', () => openChat()),
+    vscode.commands.registerCommand('dlne.openChatPanel', () => openChatPanel())
   );
 
   context.subscriptions.push(
@@ -249,7 +270,7 @@ export function activate(context: vscode.ExtensionContext) {
         {
           label: `$(server) Swarm Auto-Tiering: ${tier}`,
           description: `Serving ${activeModel}`,
-          detail: `Managed automatically by DLNE swarm (${totalVram} GB pooled VRAM across ${nodes} nodes)`
+          detail: `Managed automatically by DLNE swarm (${totalVram} GB pooled VRAM across ${nodes} nodes). Open the swarm dashboard.`
         },
         {
           label: '$(comment-discussion) Open DLNE Agent Chat',
@@ -276,9 +297,7 @@ export function activate(context: vscode.ExtensionContext) {
       if (!chosen) return;
 
       if (chosen.label.includes('Swarm Auto-Tiering')) {
-        vscode.window.showInformationMessage(
-          `🤖 DLNE Swarm Auto-Tiering: Currently running ${activeModel} (${tier}) across ${totalVram} GB VRAM. Tiers scale automatically as nodes join.`
-        );
+        vscode.commands.executeCommand('dlne.openSwarmDashboard');
       } else if (chosen.label.includes('Contributing')) {
         await workerManager.toggle();
       } else if (chosen.label.includes('Set Up Compute Engine')) {
@@ -293,16 +312,44 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // One click to let the agent run everything without asking, or to ask first again (ToolRegistry.autoApproveAllOn).
+  const autoItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
+  autoItem.command = 'dlne.toggleAutoApprove';
+  const showAuto = () => {
+    const on = ToolRegistry.autoApproveAllOn();
+    autoItem.text = on ? '$(unlock) DLNE: Auto' : '$(lock) DLNE: Ask';
+    autoItem.tooltip = on
+      ? 'DLNE agent: every action runs without asking (edits anywhere, every command). Click to have it ask first.'
+      : 'DLNE agent: asks before it edits files or runs a command. Click to let it run everything without asking.';
+    // DLNE blue while Auto is on. VS Code lets an extension colour a status bar item's background only red or
+    // yellow (statusBarItem.errorBackground / warningBackground), so the blue is the text and icon: the theme
+    // colour dlne.autoForeground (package.json "colors"), which a user can change in workbench.colorCustomizations.
+    autoItem.color = on ? new vscode.ThemeColor('dlne.autoForeground') : undefined;
+    autoItem.show();
+  };
+  showAuto();
+  context.subscriptions.push(
+    autoItem,
+    // The status bar item and the palette run it with nothing, which flips it; the chat's "Turn on Auto" button passes
+    // `true`, so clicking it twice leaves Auto on (views/chatAuto.ts).
+    vscode.commands.registerCommand('dlne.toggleAutoApprove', (on?: unknown) => toggleAuto(on)),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('dlne.autoApproveAll')) showAuto();
+    })
+  );
+
   // Shows what "Always allow" holds for this project and offers to forget it.
   context.subscriptions.push(
     vscode.commands.registerCommand('dlne.forgetApprovals', async () => {
-      const { edits, commands } = ToolRegistry.alwaysApprovals();
-      if (!edits && commands.length === 0) {
+      const { edits, commands, remember } = ToolRegistry.alwaysApprovals();
+      if (!edits && !remember && commands.length === 0) {
+        forgetSudoPassword();
         vscode.window.showInformationMessage('DLNE: The agent has no "Always allow" answers for this project.');
         return;
       }
       const held = [
         ...(edits ? ['edits inside this project'] : []),
+        ...(remember ? ['saving facts to this project\'s memory (.dlne/memory.md)'] : []),
         ...commands.map((command) => `the command "${command}"`),
       ];
       const choice = await vscode.window.showWarningMessage(
@@ -312,27 +359,24 @@ export function activate(context: vscode.ExtensionContext) {
       );
       if (choice === 'Forget them') {
         await ToolRegistry.forgetAlwaysApprovals();
-        vscode.window.showInformationMessage('DLNE: The agent will ask again before edits and commands in this project.');
+        vscode.window.showInformationMessage('DLNE: The agent will ask again before edits, commands and saving to memory in this project.');
       }
     })
   );
 
+  // The Undo button next to a memory change in VS Code's chat (docs/agent-memory.md 7.6). Not in the command
+  // palette: it only makes sense with the change the button carries, which undoMemoryChange checks.
   context.subscriptions.push(
-    vscode.commands.registerCommand('dlne.fixDiagnostics', async () => {
-      const activeEditor = vscode.window.activeTextEditor;
-      if (!activeEditor) {
-        vscode.window.showWarningMessage('No active editor open.');
-        return;
-      }
-      const diags = vscode.languages.getDiagnostics(activeEditor.document.uri);
-      const errors = diags.filter(d => d.severity === vscode.DiagnosticSeverity.Error);
-      if (errors.length === 0) {
-        vscode.window.showInformationMessage('No errors found in active file.');
-        return;
-      }
-      vscode.commands.executeCommand('workbench.view.extension.dlne-sidebar');
-      vscode.window.showInformationMessage(`Sending ${errors.length} error(s) to DLNE Agent...`);
+    vscode.commands.registerCommand('dlne.memory.undo', (change: unknown) => {
+      const undone = undoMemoryChange(change);
+      if (undone.ok) vscode.window.showInformationMessage(`DLNE: ${undone.message}`);
+      else vscode.window.showWarningMessage(`DLNE: ${undone.message}`);
     })
+  );
+
+  // Sends the active file's errors to `@dlne /fix` in the Chat view, or to the sidebar chat where there is no Chat view.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('dlne.fixDiagnostics', () => fixDiagnostics(sidebarProvider))
   );
 }
 

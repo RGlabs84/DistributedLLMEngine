@@ -1,8 +1,10 @@
 package io.dlne.chat.ui
 
+import io.dlne.chat.data.ReplyPicture
 import io.dlne.chat.data.Source
 import io.dlne.chat.markdown.Markdown
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -46,6 +48,56 @@ class PendingReplyTest {
     fun `retract on a reply that holds no sources or text changes nothing`() {
         val bare = PendingReply("chat-1")
         assertEquals(bare, bare.retracted())
+    }
+
+    @Test
+    fun `a reply that asked for a picture holds it, and a retract does not take it back`() {
+        val making = PendingReply("chat-1", text = "A fox is on its way.").withPictureJob("a red fox")
+        assertEquals(ReplyPicture("a red fox"), making.picture)
+        assertTrue(making.picture!!.pending)
+        // The server takes back the model's text, not the picture job it already started.
+        val after = making.retracted()
+        assertEquals("", after.text)
+        assertEquals(making.picture, after.picture)
+    }
+
+    @Test
+    fun `a reply makes one picture, so a second job in it is ignored`() {
+        val first = PendingReply("chat-1").withPictureJob("a red fox")
+        assertEquals(first, first.withPictureJob("a blue fox"))
+        assertEquals("a red fox", first.withPictureJob("a blue fox").picture?.prompt)
+    }
+
+    @Test
+    fun `a refusal keeps the server's words and starts nothing`() {
+        val refused = PendingReply("chat-1").withPictureRefused("Your free trial is used up.")
+        assertEquals(ReplyPicture.refusal("Your free trial is used up."), refused.picture)
+        assertFalse(refused.picture!!.created)
+        assertFalse(refused.picture!!.pending)
+        assertEquals("Your free trial is used up.", refused.picture!!.note)
+        // Saying it twice (or a retract) leaves it as it was.
+        assertEquals(refused, refused.withPictureRefused("Your free trial is used up."))
+        assertEquals(refused, refused.retracted())
+    }
+
+    @Test
+    fun `a job replaces a refusal that came first, but a refusal never replaces a job`() {
+        val refusedThenJob = PendingReply("chat-1").withPictureRefused("Not that one.").withPictureJob("a red fox")
+        assertEquals(ReplyPicture("a red fox"), refusedThenJob.picture)
+        val jobThenRefusal = PendingReply("chat-1").withPictureJob("a red fox").withPictureRefused("Not that one.")
+        assertEquals(ReplyPicture("a red fox"), jobThenRefusal.picture)
+    }
+
+    @Test
+    fun `a picture that ends while the reply is still streaming is kept for when it is saved`() {
+        val streaming = PendingReply("chat-1", text = "Here it comes").withPictureJob("a red fox")
+        val made = streaming.withPicture(streaming.picture!!.made("f.png", 768, 1024))
+        assertEquals(ReplyPicture("a red fox", "f.png", 768, 1024), made.picture)
+        assertEquals("Here it comes", made.text)
+        assertEquals(streaming.messageId, made.messageId)
+        val failed = streaming.withPicture(streaming.picture!!.failed("Image cancelled."))
+        assertEquals(ReplyPicture("a red fox", note = "Image cancelled."), failed.picture)
+        assertFalse(failed.picture!!.created)
     }
 
     @Test

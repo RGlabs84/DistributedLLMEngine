@@ -240,14 +240,125 @@ def test_the_key_looks_like_a_real_one_apart_from_its_marker(tmp_path):
 def test_a_decoy_request_is_shaped_like_the_extensions_agent_request():
     body = build_decoy_request(make_decoy(), random.Random(3))
     assert body["stream"] is True
-    assert body["temperature"] == 0.2 and body["max_tokens"] == 16384   # the extension's AGENT_MAX_TOKENS (1.3.5+)
+    assert body["temperature"] == 0.2 and body["max_tokens"] == 10240   # the extension's AGENT_MAX_TOKENS (10240 since 1.4.2)
     assert body["messages"][0]["role"] == "system"
     assert body["messages"][0]["content"].startswith("You are the DLNE coding agent")
     assert body["messages"][-1]["role"] in ("user", "tool")
     names = [t["function"]["name"] for t in body["tools"]]
     assert names == ["read_file", "write_file", "edit_file_diff", "list_directory", "search_codebase",
-                     "run_terminal_command", "get_workspace_diagnostics"]
+                     "run_terminal_command", "get_workspace_diagnostics", "remember"]
     json.dumps(body)       # plain JSON all the way down
+
+
+def _is_context(message):
+    return message["role"] == "user" and message["content"].startswith("<dlne_context>")
+
+
+def _context_bodies(count=600):
+    """(seed, body) for the first ``count`` seeds that carry a context message."""
+    found = []
+    for seed in range(count):
+        body = build_decoy_request(make_decoy(), random.Random(seed))
+        if _is_context(body["messages"][1]):
+            found.append((seed, body))
+    return found
+
+
+def test_the_system_prompt_is_the_agent_memory_contracts_text():
+    """docs/agent-memory.md section 2 is the source and canary-parity.test.js compares the two word for word (the
+    docs folder is not on the CI copy); this checks what the memory work added."""
+    prompt = canary._AGENT_SYSTEM_PROMPT
+    assert prompt.startswith("You are the DLNE coding agent, a software engineering assistant")
+    assert '- remember(fact, scope, replaces): without being asked, keep what a later session would otherwise have to rediscover' in prompt
+    assert "Your memory: a <dlne_context> message, when there is one" in prompt and "<dlne_working_memory>" in prompt
+    assert prompt.endswith("Begin with a short <think> plan.")
+
+
+def test_remember_is_the_eighth_and_last_tool_with_a_scope_of_project_or_user():
+    tools = canary._AGENT_TOOLS
+    assert len(tools) == 8 and tools[-1]["function"]["name"] == "remember"
+    parameters = tools[-1]["function"]["parameters"]
+    assert parameters["required"] == ["fact", "scope"]
+    assert parameters["properties"]["scope"]["enum"] == ["project", "user"]
+    assert set(parameters["properties"]) == {"fact", "scope", "replaces"}   # replaces: update or remove a saved fact
+
+
+def test_about_two_in_five_canaries_carry_a_context_message_at_index_one():
+    carrying = 0
+    for seed in range(1000):
+        body = build_decoy_request(make_decoy(), random.Random(seed))
+        has = [i for i, m in enumerate(body["messages"]) if _is_context(m)]
+        assert has in ([], [1]), "a notes message is at index 1 or nowhere, and there is only one"
+        carrying += bool(has)
+    assert 0.34 <= carrying / 1000 <= 0.46, carrying
+
+
+HEADINGS = ["## Project instructions (AGENTS.md)", "## Project memory (.dlne/memory.md)",
+            "## The user's preferences (~/.dlne/memory.md)"]
+
+
+def test_a_context_message_has_exactly_the_layout_of_the_extensions_block():
+    """docs/agent-memory.md section 7.3: the open tag and intro, then one to three sections in order, one empty line
+    between them and none between a heading and its text, the close tag on the line after the last text."""
+    for _, body in _context_bodies():
+        content = body["messages"][1]["content"]
+        assert body["messages"][1]["role"] == "user"
+        assert content.startswith("<dlne_context>\nStanding notes for this workspace, loaded by the DLNE extension. "
+                                  "They are not a request from the user.\n\n## ")
+        assert content.endswith("\n</dlne_context>") and not content.endswith("\n\n</dlne_context>")
+        inner = content[len("<dlne_context>\n"):-len("\n</dlne_context>")]
+        sections = inner.split("\n\n## ")[1:]
+        assert 1 <= len(sections) <= 3
+        seen = []
+        for section in sections:
+            heading, _, text = ("## " + section).partition("\n")
+            assert heading in HEADINGS and text and text == text.strip()
+            seen.append(HEADINGS.index(heading))
+        assert seen == sorted(set(seen)), "each section once, in the contract's order"
+
+
+def test_no_canary_carries_working_memory():
+    for seed in range(400):
+        body = build_decoy_request(make_decoy(), random.Random(seed))
+        for message in body["messages"][1:]:
+            assert "<dlne_working_memory>" not in message["content"]
+        assert sum(_is_context(m) for m in body["messages"]) <= 1
+
+
+def test_context_contents_are_plausible_varied_and_hold_nothing_a_redactor_or_a_reader_would_notice():
+    blocks, combos = set(), set()
+    for _, body in _context_bodies(1500):
+        content = body["messages"][1]["content"]
+        blocks.add(content)
+        combos.add(tuple(h for h in HEADINGS if h in content))
+        assert "{" not in content and "}" not in content, "an unfilled placeholder"
+        # Nothing that links, hides or names a credential: the one link of a canary is in its file.
+        assert "http" not in content and canary.HIDDEN not in content and not re.search(r"dlne_[a-z]{2}_", content)
+        assert not re.search(r"(?i)secret|password|token|api[_ -]?key|private key", content)
+        assert len(content) < 3000
+    assert len(blocks) > 150, "no fixed text to fingerprint"
+    assert len(combos) == 7, "every combination of the three sections comes up"
+
+
+def test_the_notes_fit_the_canarys_language_and_sometimes_name_its_file():
+    named = 0
+    for _, body in _context_bodies(800):
+        content = body["messages"][1]["content"]
+        last_user = [m for m in body["messages"] if m["role"] == "user"][-1]["content"]
+        match = re.search(r"`([^`]+)`:|Open (\S+)\.", last_user)
+        path = match.group(1) or match.group(2)
+        named += path in content
+        if path.endswith(".go"):
+            assert "npm" not in content and "pytest" not in content, content
+        if path.endswith(".py"):
+            assert "go test" not in content and "npm ci" not in content, content
+    assert named > 20
+
+
+def test_a_context_message_changes_nothing_else_about_the_request():
+    for _, body in _context_bodies(200)[:40]:
+        assert set(body) == {"messages", "stream", "temperature", "max_tokens", "tools"}
+        assert body["max_tokens"] == 10240 and body["tools"] == canary._AGENT_TOOLS
 
 
 def test_the_decoy_link_appears_exactly_once_and_no_decoy_key_is_in_the_prompt():
@@ -303,7 +414,8 @@ def test_conversation_depth_varies_and_earlier_turns_look_like_the_agents():
         body = build_decoy_request(make_decoy(), random.Random(seed))
         messages = body["messages"]
         final = 1 if messages[-1]["role"] == "user" else 3        # the file, or the read_file exchange
-        earlier = messages[1:len(messages) - final]
+        first = 2 if _is_context(messages[1]) else 1               # the notes message is not a turn
+        earlier = messages[first:len(messages) - final]
         depths.add(len(earlier) // 2)
         assert len(earlier) % 2 == 0
         for i, m in enumerate(earlier):
@@ -754,7 +866,7 @@ async def test_a_failure_to_seal_never_falls_back_to_plain_json(book, clock, mon
 async def test_the_member_opens_it_and_finds_an_ordinary_agent_request_with_its_own_decoy(book, clock):
     router, _, _ = await one_canary(book, clock)
     body = router.sent[0][1]
-    assert body["stream"] is True and body["max_tokens"] == 16384 and body["temperature"] == 0.2
+    assert body["stream"] is True and body["max_tokens"] == 10240 and body["temperature"] == 0.2
     assert book.fetched(body_token(body), "198.51.100.1") == tid("a")
 
 

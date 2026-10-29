@@ -229,13 +229,13 @@ private fun SourceRow(source: Source, onOpen: (String) -> Unit) {
     }
 }
 
-/** Copy and Report, under each finished answer. */
+/** Copy and Report, under each finished answer. [onReport] is null when a Report is offered elsewhere in the answer. */
 @Composable
-fun AnswerActions(onCopy: () -> Unit, onReport: () -> Unit) {
+fun AnswerActions(onCopy: () -> Unit, onReport: (() -> Unit)?) {
     // Pulled left so the icons line up with the text above despite the 48 dp touch targets.
     Row(Modifier.offset(x = (-12).dp)) {
         SmallAction(R.drawable.ic_copy, R.string.copy_message, onCopy)
-        SmallAction(R.drawable.ic_flag, R.string.report_answer, onReport)
+        if (onReport != null) SmallAction(R.drawable.ic_flag, R.string.report_answer, onReport)
     }
 }
 

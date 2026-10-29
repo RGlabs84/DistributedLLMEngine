@@ -49,6 +49,33 @@ async def test_cluster_status_endpoint(test_app):
 
 
 @pytest.mark.anyio
+async def test_the_public_status_names_no_address(test_app, monkeypatch):
+    """
+    Until 2.4.9 /v1/cluster/status, which anyone can read, listed every worker's ip:port
+    (``active_endpoints``: a volunteer's home address) and the IP address of every caller with a
+    request in flight (``in_flight_leases[].client_id``).
+    """
+    from engine.registry import WorkerRegistry
+    registry = WorkerRegistry()
+    registry.update_worker("home-gpu", "73.215.216.195", 50052, "tok-home",
+                           {"gpu": {"has_gpu": True, "vram_total_gb": 8.0}, "ram_gb": 30.0})
+    monkeypatch.setattr(coordinator, "registry", registry)
+    lease = lease_manager.acquire(task_type="chat", timeout=60.0, client_id="203.0.113.44")
+    try:
+        async with AsyncClient(transport=ASGITransport(app=test_app), base_url="http://test") as client:
+            data = (await client.get("/v1/cluster/status")).json()
+    finally:
+        lease.release()
+    assert data["active_workers_count"] == 1
+    assert "active_endpoints" not in data
+    assert data["in_flight_leases"] == [{"task_type": "chat", "elapsed_seconds": data["in_flight_leases"][0]["elapsed_seconds"],
+                                         "remaining_seconds": data["in_flight_leases"][0]["remaining_seconds"]}]
+    text = json.dumps(data)
+    for needle in ("73.215.216.195", "50052", "203.0.113.44", "tok-home", "home-gpu"):
+        assert needle not in text, needle
+
+
+@pytest.mark.anyio
 async def test_admin_api_keys_crud(test_app, monkeypatch):
     from engine.api_keys import hash_admin_key
 

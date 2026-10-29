@@ -22,6 +22,18 @@ def test_lease_acquire_and_release():
     assert mgr.active_count() == 0
 
 
+def test_the_public_summary_says_what_and_how_long_never_who():
+    mgr = InferenceLeaseManager()
+    lease = mgr.acquire(task_type="chat", timeout=10.0, client_id="198.51.100.7", metadata={"user": "x"})
+    try:
+        (item,) = mgr.public_summary()
+        assert set(item) == {"task_type", "elapsed_seconds", "remaining_seconds"}
+        assert item["task_type"] == "chat" and 0 < item["remaining_seconds"] <= 10.0
+    finally:
+        lease.release()
+    assert mgr.public_summary() == []
+
+
 def test_lease_context_managers():
     mgr = InferenceLeaseManager()
     with mgr.acquire(task_type="edit", timeout=5.0) as lease:

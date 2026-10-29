@@ -17,6 +17,7 @@ const {
   canonicalBytes,
   compareVersions,
   fetchVerifiedEngine,
+  checkEngineUpdate,
   fetchVerifiedRpcBin,
   hostRpcPlatform,
   RPC_PLATFORMS,
@@ -498,3 +499,28 @@ print(json.dumps({"manifest": m, "pubkey": release.public_key_hex(pem), "canonic
 });
 
 test.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+
+// ---- 2.5.0: the update check behind the sidebar's engine button --------------------------------
+
+test('a newer published release is reported without downloading anything', async () => {
+  const h = harness();
+  const check = await checkEngineUpdate('http://coordinator:11435/', { version: '1.9.0', sha256: 'old' }, h.options());
+  assert.deepEqual(check, { available: GOOD().version, newer: true });
+  assert.deepEqual(h.calls.downloaded, [], 'nothing is downloaded by a check');
+});
+
+test('the same or an older published release, or nothing installed, is not an update', async () => {
+  const h = harness();
+  assert.equal((await checkEngineUpdate('http://c', { version: GOOD().version, sha256: 'x' }, h.options())).newer, false);
+  assert.equal((await checkEngineUpdate('http://c', { version: '9.9.9', sha256: 'x' }, h.options())).newer, false);
+  assert.deepEqual(await checkEngineUpdate('http://c', null, h.options()), { available: GOOD().version, newer: false });
+});
+
+test('a coordinator with no signed release yields no update, and a forged one is refused', async () => {
+  const none = harness({ fetchError: Object.assign(new Error('HTTP 404'), { statusCode: 404 }) });
+  assert.deepEqual(await checkEngineUpdate('http://c', { version: '1.0.0', sha256: 'x' }, none.options({ allowUnsigned: true })),
+    { available: null, newer: false });
+  const forged = harness({ manifest: { ...GOOD(), version: '9.9.9' } });
+  await assert.rejects(checkEngineUpdate('http://c', { version: '1.0.0', sha256: 'x' }, forged.options()), EngineVerificationError);
+});

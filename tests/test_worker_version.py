@@ -117,8 +117,12 @@ def test_the_self_updater_is_really_gone_from_the_worker():
         assert not hasattr(worker, name) and not hasattr(worker.WorkerNode, name), name
 
 
-def test_the_heartbeat_wire_format_is_unchanged(node):
+def test_the_heartbeat_wire_format_is_unchanged(node, isolated_config, dlne_root, monkeypatch):
     """role and staged_version stay in the signed payload so older/newer ends still agree on the MAC."""
+    # The signature needs a NETWORK_KEY. The test brings its own, in a throwaway root: reading the real
+    # config/config.txt made this fail in every checkout that has none (a fresh worktree).
+    monkeypatch.setattr(worker, "get_base_dir", lambda: str(dlne_root))
+    isolated_config.write_text("NETWORK_KEY=throwaway-test-key\n", encoding="utf-8")
     payload = node._build_heartbeat_payload()
     assert payload["version"] == VERSION
     assert payload["role"] == "worker" and payload["staged_version"] == ""

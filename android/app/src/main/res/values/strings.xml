@@ -4,21 +4,21 @@
 
     <!-- First-run privacy notice (must be acknowledged before the first message) -->
     <string name="privacy_title">Before you start</string>
-    <string name="privacy_body">Answers are written by computers people lend to DLNE. Don\'t send passwords, private details or anything secret.</string>
+    <string name="privacy_body">Answers are written by AI on DLNE\'s own server. If it is restarting or down, a computer that someone lends to DLNE may answer instead. Photos you add go to DLNE\'s own server to write the answer and are never sent to a lent computer. Like every message, they are processed by the shared model, whose layers can run on lent graphics cards; those cards see only intermediate numbers, never the picture. DLNE doesn\'t keep them. Answers can be slow and can be wrong. Don\'t send passwords, private details or anything secret.</string>
     <string name="privacy_ack">I understand</string>
 
     <!-- Chat screen -->
     <string name="open_chats">Open chats</string>
     <string name="new_chat">New chat</string>
     <string name="input_placeholder">Message DLNE</string>
-    <string name="input_hint">Volunteer computers write the answers. Don\'t share anything secret.</string>
+    <string name="input_hint">DLNE\'s own server writes the answers; lent computers are the backup. Don\'t share anything secret.</string>
     <string name="send">Send</string>
     <string name="stop">Stop</string>
     <string name="wait_seconds">%1$ds</string>
     <string name="send_available_in">You can send again in %1$d seconds</string>
     <string name="empty_title">Ask DLNE anything</string>
-    <string name="empty_body">Your chats stay on this phone. Answers come from computers that volunteers lend to the DLNE network.</string>
-    <string name="waiting_for_machine">Waiting for a volunteer machine…</string>
+    <string name="empty_body">Your chats stay on this phone. Answers come from DLNE\'s own server, with computers that people lend to DLNE as the backup. They can be slow and can be wrong.</string>
+    <string name="waiting_for_machine">Waiting for a machine…</string>
     <string name="not_answered">Not answered yet</string>
     <string name="retry">Retry</string>
     <string name="dismiss">Dismiss</string>
@@ -28,6 +28,94 @@
     <string name="code">code</string>
     <string name="notice_stopped">Stopped.</string>
     <string name="no_browser">No app on this phone can open that link.</string>
+
+    <!-- Shown under an answer when a local question went without the phone\'s location -->
+    <string name="location_note_none">Your location couldn\'t be found in time, so this question went without it. Local results may not fit where you are.</string>
+    <string name="location_note_withdrawn">Location permission was turned off in Android\'s settings, so sharing is now off and this question went without your location.</string>
+    <string name="locating">Finding where you are…</string>
+    <!-- Shown under an answer when the person was asked to share their location and Android refused -->
+    <string name="location_note_refused">Location permission was refused, so this question went without your location. Local results may not fit where you are.</string>
+
+    <!-- The card above the message box, when a question needs the phone\'s location and sharing is off -->
+    <string name="location_ask_title">Use your location for this?</string>
+    <string name="location_ask_body">DLNE uses it only to look up the weather and places near you, and never keeps it. Use my location keeps sharing on until you turn it off in Settings.</string>
+    <string name="location_ask_use">Use my location</string>
+    <string name="location_ask_not_now">Not now</string>
+    <string name="location_ask_settings">Open settings</string>
+
+    <!-- Create image (shown only when the server offers it) -->
+    <string name="create_image">Create image</string>
+    <string name="create_image_prompt_label">Describe the image</string>
+    <string name="create_image_count">%1$d/%2$d</string>
+    <string name="create_image_size">Size</string>
+    <string name="create_image_note">Takes a minute or two. Requests and pictures are checked, and some things are refused. Your description goes to the DLNE server; the picture is kept on this phone with the chat.</string>
+    <string name="create_image_start">Create</string>
+    <string name="image_size_label">%1$s (%2$s)</string>
+    <string name="image_shape_square">square</string>
+    <string name="image_shape_portrait">portrait</string>
+    <string name="image_shape_landscape">landscape</string>
+    <string name="image_size_eta">%1$s, about %2$d s</string>
+    <string name="image_status_queued">Waiting in line…</string>
+    <string name="image_status_position">Waiting in line, place %1$d</string>
+    <string name="image_status_checking">Checking your request…</string>
+    <string name="image_status_generating">Creating your image… about %1$d s</string>
+    <string name="image_status_generating_noeta">Creating your image…</string>
+    <string name="image_status_reviewing">Checking the picture…</string>
+    <string name="image_status_cancelling">Cancelling…</string>
+    <string name="image_elapsed">%1$d s so far</string>
+    <string name="image_taking_longer">%1$d s so far. Taking longer than expected, still working.</string>
+    <string name="image_job_description">Making an image: %1$s</string>
+    <string name="image_cancelled">Image cancelled.</string>
+    <string name="image_expired">The picture wasn\'t collected in time and has been removed from the server. Please try again.</string>
+    <string name="image_refused">That image can\'t be made.</string>
+    <string name="image_failed">The image couldn\'t be made. Please try again.</string>
+    <string name="image_lost_contact">Lost contact with DLNE while your image was being made. Please try again.</string>
+    <string name="image_save_failed">The image was made, but this phone couldn\'t store it.</string>
+    <!-- Inside a reply whose picture was started but the app has neither a job nor a picture for it (the app was closed meanwhile) -->
+    <string name="picture_unfinished">This picture wasn\'t finished. Ask again to get a new one.</string>
+    <plurals name="image_try_again">
+        <item quantity="one">Try again in %1$d second.</item>
+        <item quantity="other">Try again in %1$d seconds.</item>
+    </plurals>
+    <string name="image_description">Image: %1$s</string>
+    <string name="image_missing">This image is no longer stored on this phone.</string>
+    <string name="image_save">Save</string>
+    <string name="image_share">Share</string>
+    <string name="image_saved">Saved to Pictures/DLNE</string>
+    <string name="image_save_error">Couldn\'t save the image</string>
+    <string name="image_share_title">Share image</string>
+
+    <!-- The "+" next to the message box: Photos and Camera (only when the server can look at photos), Create image -->
+    <string name="attach">Add a photo or create an image</string>
+    <string name="attach_photos">Photos</string>
+    <string name="attach_camera">Camera</string>
+    <plurals name="attach_limit">
+        <item quantity="one">You can add up to %1$d photo to one message.</item>
+        <item quantity="other">You can add up to %1$d photos to one message.</item>
+    </plurals>
+    <string name="attach_privacy">Photos you add go to DLNE\'s own server to write the answer and are never sent to a lent computer. Like every message, they are processed by the shared model, whose layers can run on lent graphics cards; those cards see only intermediate numbers, never the picture. DLNE doesn\'t keep them. They stay on this phone with the chat.</string>
+    <string name="camera_unavailable">Couldn\'t open the camera on this phone.</string>
+    <string name="photo_unreadable">Couldn\'t use that photo. Try a different one.</string>
+    <string name="photo_too_slow">That photo took too long to get ready. Try a different one.</string>
+    <string name="photo_save_failed">This phone couldn\'t store your photo, so the message wasn\'t sent.</string>
+    <string name="photo_preparing">Getting your photo ready…</string>
+    <string name="photo_one">Photo</string>
+    <string name="photo_n_of">Photo %1$d of %2$d</string>
+    <string name="photo_remove">Remove photo</string>
+    <string name="photo_remove_n">Remove photo %1$d</string>
+    <string name="photo_open">View photo</string>
+    <string name="photo_close">Close photo</string>
+    <string name="photo_missing">This photo is no longer stored on this phone.</string>
+    <!-- The name of a chat that starts with photos and no words -->
+    <plurals name="photo_chat_title">
+        <item quantity="one">Photo</item>
+        <item quantity="other">Photos</item>
+    </plurals>
+    <!-- The message box once photos are added -->
+    <plurals name="input_placeholder_photos">
+        <item quantity="one">Ask about your photo</item>
+        <item quantity="other">Ask about your photos</item>
+    </plurals>
 
     <!-- Lookups the DLNE server makes for the model, by tool (weather, wikipedia, news, web_search) -->
     <string name="lookup_weather">Checking the weather for “%1$s”</string>
@@ -103,10 +191,16 @@
     <string name="settings_server_saved">Server address saved</string>
     <string name="settings_save">Save</string>
     <string name="settings_use_default">Use default</string>
+    <string name="settings_location_title">Location</string>
+    <string name="settings_location_label">Share location</string>
+    <string name="settings_location_help">Off unless you turn it on, here or by saying yes when DLNE asks in a chat. When you ask something local (near me, nearby, the weather), your phone\'s precise location goes with that message to DLNE\'s own server, only for lookups that need it: local weather (rounded to about 100 m, sent to Open-Meteo) and local searches (only a nearby place name). Other questions never use it. The AI model never gets your coordinates, only the town named in those lookups\' results. Nothing is logged or stored. If your phone can\'t find its position within a few seconds, the message goes without it and the app tells you.</string>
+    <string name="settings_location_refused">Location permission was refused, so sharing stays off. You can allow it in Android\'s app settings.</string>
     <string name="settings_privacy_title">Privacy</string>
-    <string name="settings_privacy_body_1">DLNE has no accounts, and this app collects nothing about you: no analytics, no ads, no tracking.</string>
-    <string name="settings_privacy_body_2">Your chats are stored only on this phone. When you send a message, the conversation so far travels over an encrypted connection to the DLNE service, which passes it to one of the computers people lend to DLNE to write the answer.</string>
-    <string name="settings_privacy_body_3">Those computers belong to other people, so don\'t send passwords, private details or anything secret. The service sees your network (IP) address, which it uses to limit how often each network can ask.</string>
+    <string name="settings_privacy_body_1">DLNE has no accounts, and this app collects nothing about you: no analytics, no ads, no tracking. The one exception is location, which is off unless you turn it on. If you do, your phone\'s precise location is sent with a local question (near me, nearby, the weather) to DLNE\'s own server and is used only for lookups that need it. For local weather, the coordinates, rounded to about 100 m, go to the weather service (Open-Meteo). For local searches, only a nearby place name is added to the search, which DLNE\'s search sends to web search engines. The AI model that answers never gets your coordinates; when it looks something up near you, the results it reads name the nearby town. Your location is never logged or stored.</string>
+    <string name="settings_privacy_body_2">Your chats are stored only on this phone. When you send a message, the conversation so far travels over an encrypted connection to the DLNE service, which passes it to DLNE\'s own server to write the answer. Only if that server is restarting or down, it may pass it to a computer that someone lends to DLNE instead.</string>
+    <string name="settings_privacy_body_photos">Photos you add go to DLNE\'s own server to write the answer and are never sent to a lent computer. Like every message, they are processed by the shared model, whose layers can run on lent graphics cards; those cards see only intermediate numbers, never the picture. DLNE doesn\'t keep them. Your newest photos go again with the messages after them, so the AI can still see them. They stay on this phone with the chat, so deleting the chat deletes them. The phone takes the camera details and location out of a photo before it sends it.</string>
+    <string name="settings_privacy_body_pictures">When you ask for a picture, the description the AI writes for it goes to DLNE\'s own server, which checks it, draws the picture on its own computer and keeps it in memory for up to 30 minutes after it is made, so your phone can collect it. The picture is kept on this phone with the chat.</string>
+    <string name="settings_privacy_body_3">A lent computer belongs to someone else, so don\'t send passwords, private details or anything secret, in case yours is answered by one. The service sees your network (IP) address, which it uses to limit how often each network can ask.</string>
     <string name="settings_privacy_body_4">Lookups (weather, Wikipedia, news, web search) are made by the DLNE server, not your phone; reported answers are kept on the server for review.</string>
     <string name="settings_delete_all">Delete all chats</string>
     <string name="settings_delete_all_title">Delete all chats?</string>

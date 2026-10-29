@@ -36,6 +36,7 @@ from fastapi.responses import StreamingResponse
 
 import engine.coordinator as coordinator
 from engine.authn import NonceCache, sign_heartbeat
+from engine.priority import UsageWindow
 from engine.version import VERSION
 
 
@@ -392,6 +393,9 @@ def test_counter_returns_to_baseline_after_the_maxed_out_nudge(counter_env, monk
     the slot, and it has to give it back once the client has read the nudge.
     """
     set_start_result(monkeypatch, (False, 0, "Network Maxed Out"))
+    # Pinned (2.6.2 review): the swarm's own model not fitting is an engine between restarts, not "maxed out", so
+    # which model is the swarm's must not be left to whatever an earlier test file set it to.
+    monkeypatch.setattr(coordinator, "global_active_model", "some-other-model.gguf")
     baseline = coordinator.active_inference_requests
 
     async def scenario():
@@ -403,11 +407,89 @@ def test_counter_returns_to_baseline_after_the_maxed_out_nudge(counter_env, monk
         assert coordinator.active_inference_requests == baseline + 1
 
         chunks = await drain(response)
-        assert b"maxed out" in b"".join(chunks)
+        assert b"maxed out" in b"".join(chunks) and b"dlne_error" not in b"".join(chunks)
 
     asyncio.run(scenario())
 
     assert coordinator.active_inference_requests == baseline
+
+
+def test_the_swarms_own_model_not_fitting_asks_for_the_step_again_and_gives_the_trial_chat_back(counter_env,
+                                                                                                monkeypatch):
+    """2026-10-28 10:11: with the laptop's shard gone the swarm's own IQ4_XS could not start, and "maxed out ... switch
+    your chat" ended a 330-step task. It is the engine between restarts: "engine_unavailable", and the free-trial chat
+    the request spent comes back (the agent sends the step again)."""
+    set_start_result(monkeypatch, (False, 0, "Network Maxed Out"))
+    monkeypatch.setattr(coordinator, "global_active_model", "phi3-mini.gguf")
+    refunds = []
+    monkeypatch.setattr(coordinator.starter_quota_mgr, "refund", lambda client_id, count=1: refunds.append(client_id))
+    request = FakeRequest({"model": "phi3-mini", "messages": [{"role": "user", "content": "hi"}]})
+    request.state.starter_quota_remaining = 41
+    request.url = types.SimpleNamespace(path="/v1/chat/completions")
+
+    async def scenario():
+        response = await coordinator.chat_completions(request)
+        body = b"".join(await drain(response))
+        assert b"reorganising" in body and b'"dlne_error": "engine_unavailable"' in body
+        assert b"switch your chat" not in body
+
+    asyncio.run(scenario())
+    assert refunds == [coordinator.trial_identity("203.0.113.7")], "given back once"
+
+
+def test_a_cpu_contributor_gets_its_window_chat_back_and_no_trial_chat_is_touched(counter_env, monkeypatch):
+    """2.6.2 review: a CPU contributor's step that met an engine restart spent one of its window's chats (50 per 5 h by
+    default) each time the agent sent it again, and none came back."""
+    set_start_result(monkeypatch, (False, 0, "Network Maxed Out"))
+    monkeypatch.setattr(coordinator, "global_active_model", "phi3-mini.gguf")
+    window = UsageWindow()
+    monkeypatch.setattr(coordinator, "cpu_coding_window", window)
+    trial_refunds = []
+    monkeypatch.setattr(coordinator.starter_quota_mgr, "refund", lambda client_id, count=1: trial_refunds.append(client_id))
+    for _ in range(3):
+        window.check_and_record("worker-cpu", 50, 5 * 3600)       # the middleware spent this request's chat, and two before
+    request = FakeRequest({"model": "phi3-mini", "messages": [{"role": "user", "content": "hi"}]})
+    request.state.dlne_tier = "cpu"
+    request.state.cpu_window_key = "worker-cpu"
+    request.url = types.SimpleNamespace(path="/v1/chat/completions")
+
+    async def scenario():
+        response = await coordinator.chat_completions(request)
+        body = b"".join(await drain(response))
+        assert b'"dlne_error": "engine_unavailable"' in body
+
+    asyncio.run(scenario())
+    assert window.peek("worker-cpu", 50, 5 * 3600)[0] == 48, "this request's one chat is back, the two before are not"
+    assert trial_refunds == []
+
+
+@pytest.mark.parametrize("status, tagged", [(504, True), (500, True), (503, True), (400, False), (403, False)])
+def test_a_queued_chat_whose_engine_fails_or_is_loading_is_told_to_send_the_step_again(monkeypatch, status, tagged):
+    """2.6.2 review: a queued request that reached its slot and then met the engine failing or still loading (a
+    5xx) is marked "engine_unavailable" as a plain string, the form the extension's agent retries; it used to be
+    "[System Alert] ..." text alone, which ended the agent's task. A refusal (4xx) is left as it was."""
+    async def nothing(*args, **kwargs):
+        return None
+
+    async def granted(self, deadline):
+        self.winner = "engine"
+        return
+        yield
+
+    async def failing(request, slot_held=False):
+        raise HTTPException(status_code=status, detail="Inference engine timed out while loading the model.")
+
+    monkeypatch.setattr(coordinator, "_change_inference_count", nothing)
+    monkeypatch.setattr(coordinator._QueuedChat, "_wait", granted)
+    monkeypatch.setattr(coordinator, "_chat_completions_impl", failing)
+    queued = coordinator._QueuedChat(FakeRequest({"messages": [{"role": "user", "content": "hi"}]}), {}, {})
+
+    async def run():
+        return b"".join([chunk async for chunk in queued._run()])
+
+    body = asyncio.run(run())
+    assert b"timed out while loading" in body
+    assert (b'"dlne_error": "engine_unavailable"' in body) is tagged
 
 
 # ======================================================================================
@@ -1492,16 +1574,24 @@ def test_a_crashed_engine_is_reaped_through_the_async_wrapper(counter_env, monke
     baseline = coordinator.active_inference_requests
 
     async def scenario():
+        response = await coordinator.chat_completions(
+            FakeRequest({"model": "phi3-mini", "stream": True,
+                         "messages": [{"role": "user", "content": "hi"}]})
+        )
+        # 2.6.2: a start that dies is the coordinator's own rebuild after a GPU left (2026-10-28 10:11), so the
+        # client is told to send the step again ("engine_unavailable"), not handed a 500 that ends an agent's task.
+        assert isinstance(response, StreamingResponse)
+        body = b"".join(await drain(response))
+        assert b"reorganising" in body and b'"dlne_error": "engine_unavailable"' in body
+        # A caller that did not ask for a stream (an OpenAI client) gets a 503 with Retry-After, which it retries.
         with pytest.raises(HTTPException) as excinfo:
             await coordinator.chat_completions(
-                FakeRequest({"model": "phi3-mini",
-                             "messages": [{"role": "user", "content": "hi"}]})
-            )
-        assert excinfo.value.status_code == 500
+                FakeRequest({"model": "phi3-mini", "messages": [{"role": "user", "content": "hi"}]}))
+        assert excinfo.value.status_code == 503 and excinfo.value.headers == {"Retry-After": "5"}
 
     asyncio.run(scenario())
 
-    assert reaped == ["phi3-mini.gguf"]
+    assert reaped == ["phi3-mini.gguf", "phi3-mini.gguf"]
     assert coordinator.active_inference_requests == baseline
 
 
@@ -1538,11 +1628,11 @@ def test_the_event_loop_keeps_running_while_a_crashed_engine_is_reaped(counter_e
     async def scenario():
         beat = asyncio.create_task(ticker())
         try:
-            with pytest.raises(HTTPException):
-                await coordinator.chat_completions(
-                    FakeRequest({"model": "phi3-mini",
-                                 "messages": [{"role": "user", "content": "hi"}]})
-                )
+            response = await coordinator.chat_completions(
+                FakeRequest({"model": "phi3-mini", "stream": True,
+                             "messages": [{"role": "user", "content": "hi"}]})
+            )
+            await drain(response)
         finally:
             beat.cancel()
             await asyncio.gather(beat, return_exceptions=True)

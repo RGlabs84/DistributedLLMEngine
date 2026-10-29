@@ -698,6 +698,29 @@ def test_generous_but_real_hardware_still_passes(profile):
     assert authn.validate_hardware_profile(profile) == (True, "ok")
 
 
+# --- 2.4.9: the coding job's RAM and a household node's LAN addresses -------------------------------------
+
+def test_the_coding_ram_is_bounded_like_the_ram():
+    assert authn.validate_hardware_profile({"coding_ram_gb": 30.0}) == (True, "ok")
+    for bad in (-1.0, 4096.0, "lots", True):
+        assert authn.validate_hardware_profile({"coding_ram_gb": bad})[0] is False
+
+
+@pytest.mark.parametrize("lan, ok", [
+    (["192.168.40.50"], True),
+    (["192.168.40.50", "172.17.0.1", "10.13.13.2"], True),
+    ([], True),
+    ("192.168.40.50", False),                                   # not a list
+    (["192.168.40.50/24"], False),
+    (["fe80::1"], False),                                       # dotted quads only
+    (["192.168.40.50", 7], False),
+    (["x" * 300], False),
+    ([f"10.0.0.{i}" for i in range(9)], False),                 # at most eight
+])
+def test_lan_addresses_are_a_short_list_of_ipv4_addresses(lan, ok):
+    assert authn.validate_hardware_profile({"lan_ipv4": lan})[0] is ok
+
+
 @pytest.mark.parametrize(
     "profile, expected_fragment",
     [

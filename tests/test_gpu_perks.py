@@ -333,3 +333,26 @@ def test_the_coordinator_loads_the_clocks_at_start_and_saves_them_at_shutdown():
 def test_the_real_book_keeps_its_file_in_the_installation_config_folder(monkeypatch, tmp_path):
     monkeypatch.setattr(coordinator, "get_base_dir", lambda: str(tmp_path))
     assert coordinator.gpu_standby.path_fn() == os.path.join(str(tmp_path), "config", "gpu_standby.json")
+
+
+def test_a_gpu_waiting_in_reserve_is_not_idling(perks, monkeypatch):
+    """Planned but not yet run on (answers in flight, or REBALANCE_ON_JOIN off): the node is ready and waiting on
+    this coordinator, so its owner keeps the GPU tier meanwhile (2.5.0)."""
+    endpoint = perks.add_worker("g1", gpu_hw())
+    monkeypatch.setattr(coordinator, "_last_planned_endpoints", {endpoint})
+    perks.standby.t += 2 * 60 * MINUTE
+    assert tier_of(perks.tier("g1")) == "gpu"
+    monkeypatch.setattr(coordinator, "_last_planned_endpoints", set())
+    assert tier_of(perks.tier("g1")) == "gpu", "out of the plan: the grace starts now"
+    perks.standby.t += 31 * MINUTE
+    assert tier_of(perks.tier("g1")) == "cpu"
+
+
+def test_a_yield_counts_as_a_job_for_six_hours_not_for_ever(perks):
+    endpoint = perks.add_worker("g1", gpu_hw(is_yielding=True))
+    perks.standby.t += 2 * 60 * MINUTE
+    assert tier_of(perks.tier("g1")) == "gpu", "a long gaming session costs nothing"
+    perks.registry.workers["g1"]["yielding_since"] -= 7 * 3600
+    assert tier_of(perks.tier("g1")) == "gpu", "past the cap the yield is no longer a job: the grace starts now"
+    perks.standby.t += 31 * MINUTE
+    assert tier_of(perks.tier("g1")) == "cpu", "a node that only ever claims to yield earns nothing"

@@ -12,7 +12,7 @@ DLNE: Community AI Chat
 ## Short description (max 80 characters)
 
 ```
-Free AI chat answered by computers volunteers lend. No account, no tracking.
+Free AI chat from DLNE's own server, lent computers as backup. No account.
 ```
 (76 characters)
 
@@ -21,7 +21,7 @@ Free AI chat answered by computers volunteers lend. No account, no tracking.
 ```
 DLNE is a free AI chat assistant run by a community, not by a data company.
 
-Every answer is written by an open-source language model running on computers that volunteers lend to the DLNE network. Your phone only asks the question: it never does any of the work and never runs anything in the background.
+Every answer is written by an open-source language model running on DLNE's own server. If that server is restarting or down, computers that people lend to the DLNE network can answer as the backup. Your phone only asks the question: it never does any of the work and never runs anything in the background.
 
 WHAT YOU GET
 • Answers that appear word by word as they are written, with a Stop button
@@ -37,13 +37,15 @@ WHAT YOU GET
 PRIVATE BY DESIGN
 • No account, no sign-in, no email address
 • No ads, no analytics, no tracking, no Google Play Services
-• One permission only: internet access
+• Internet access, plus location only if you turn it on, in Settings or when the app asks in a chat (off by default): used for local weather and "near me" searches, and never read in the background
+• Photos you add go to DLNE's own server to write the answer and are never sent to a lent computer. Like every message, they are processed by the shared model, whose layers can run on lent graphics cards, which see only intermediate numbers, never the picture. DLNE doesn't keep them, and they stay on your phone with the chat
+• The AI model never receives your coordinates. A local lookup names the nearby town in the text the answering computer reads (DLNE's own server, or a lent computer as the backup)
 • Chats are left out of cloud backups
 • Lookups (weather, Wikipedia, news, web search) are made by the DLNE server, not your phone; reported answers are kept on the server for review
 
-Because answers are written on computers that belong to other people, please don't send passwords, private details or anything secret. The app reminds you before your first message.
+Because a computer lent by someone else can sometimes answer, please don't send passwords, private details or anything secret. The app reminds you before your first message.
 
-Answers come from AI and can be wrong. Check anything important.
+Answers come from AI, can be slow and can be wrong. Check anything important.
 
 FAIR USE
 DLNE is shared by everyone, so each network can have one answer in progress at a time and a few questions per minute. If you ask too quickly, the app tells you how long to wait.
@@ -52,7 +54,7 @@ RUN YOUR OWN
 DLNE uses the public DLNE server at https://dlne.rossgilsonlabs.dev unless you say otherwise. DLNE is open source under the MIT license. If you run your own DLNE server, enter its address in Settings.
 
 HELP DLNE GROW
-The more computers people lend, the bigger and faster the models DLNE can offer. Anyone with a PC can donate spare computing power with the free DLNE extension for VS Code and VSCodium. You can also support the project with a coffee from the app's Settings, which also links to the DLNE website and the DLNE Discord for news and help.
+Computers that people lend are DLNE's backup when its own server is restarting or down. Anyone with a PC can donate spare computing power with the free DLNE extension for VS Code and VSCodium. You can also support the project with a coffee from the app's Settings, which also links to the DLNE website and the DLNE Discord for news and help.
 
 Source code: https://github.com/RGlabs84/DistributedLLMEngine
 ```

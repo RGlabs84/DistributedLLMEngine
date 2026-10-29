@@ -23,7 +23,9 @@ signed block) only the block with the newest ``signed_at`` is believed, and neit
 WHICH MEMBER. ``pick`` (for GET /v1/coding/route): members the privacy mode allows (engine/privacy_policy.py), then the
 member that served this session in the last 30 minutes if it still qualifies and has a free
 slot (its model has the session's prompt cached, and a laptop reads prompts at a quarter of
-the speed of the coordinator's own GPUs), else the least busy, ties to the faster reader.
+the speed of the coordinator's own GPUs), then the requester's own machine (``own``, its trust
+id; 2.5.0) if it is among them and writes at least as fast as the coordinator's engine would
+for them right now, else the least busy, ties to the faster reader.
 Load is what the member reported, or what this coordinator has in flight there, whichever is
 higher, plus the routes issued but not yet used (a burst of route lookups is spread out
 instead of all landing on the same member).
@@ -69,6 +71,7 @@ import itertools
 import json
 import os
 import secrets
+import statistics
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -223,6 +226,8 @@ class _Want:
     reserve: int = 0
     model: Optional[str] = None
     need_pubkey: bool = False
+    own: Optional[str] = None          # the requester's own member's trust id (2.5.0)
+    engine_tps: Optional[float] = None # what the coordinator's engine would write for them now; None: unmeasured
 
 
 class MemberLease:
@@ -542,17 +547,20 @@ class CodingRouter:
     def pick(self, members: List[CodingMember], session_id: Optional[str], privacy: Optional[str],
              exclude: Iterable[str] = (), *, trusted_ids: Optional[Iterable[str]] = None, reserve: int = 0,
              model: Optional[str] = None, need_pubkey: bool = False,
-             commit: bool = True) -> Optional[CodingMember]:
+             commit: bool = True, own: Optional[str] = None,
+             engine_tps: Optional[float] = None) -> Optional[CodingMember]:
         """
         The member for a request: privacy first, then the session's sticky member if it still
-        qualifies and has a free slot, else the least busy (load as a share of its slots; ties to
-        the faster prompt reader, then the faster writer). None when no member qualifies.
-        ``reserve`` free slots are left alone (autocomplete leaves one for agents); ``commit``
-        remembers the choice as the session's sticky member.
+        qualifies and has a free slot, then the requester's own machine (``own``, a trust id; 2.5.0)
+        if it qualifies and its ``decode_tps`` is at least ``engine_tps``, what the coordinator's own
+        engine would write for them right now (None, no measurement yet, lets it through), else the
+        least busy (load as a share of its slots; ties to the faster prompt reader, then the faster
+        writer). None when no member qualifies. ``reserve`` free slots are left alone (autocomplete
+        leaves one for agents); ``commit`` remembers the choice as the session's sticky member.
         """
         want = _Want(lambda: members, _session_key(session_id), normalize_privacy(privacy),
                      normalize_trust_ids(self.trusted_ids if trusted_ids is None else trusted_ids),
-                     frozenset(exclude), reserve, model, need_pubkey)
+                     frozenset(exclude), reserve, model, need_pubkey, own, engine_tps)
         chosen = self._choose(want, self._eligible(want))
         if chosen is not None and commit:
             self._remember(want.session_id, chosen)
@@ -565,6 +573,10 @@ class CodingRouter:
         if sticky is not None:
             for member in candidates:
                 if member.key == sticky:
+                    return member
+        if want.own:
+            for member in candidates:
+                if member.trust_id == want.own and (want.engine_tps is None or member.decode_tps >= want.engine_tps):
                     return member
         return min(candidates, key=lambda m: (self.load(m) / m.slots, -m.prefill_tps, -m.decode_tps, m.key))
 
@@ -957,15 +969,21 @@ class CodingRouter:
 
     # ------------------------------------------------------------------ status
     def status(self, registry, relay_lookup, limits: Optional[Dict[str, Any]], enabled: bool) -> Dict[str, Any]:
-        """Counts only, for /v1/cluster/status."""
+        """Counts and pool-wide speeds only, for /v1/cluster/status: nothing here names a member."""
         everyone = self.all_members(registry, relay_lookup, limits)
         ready = [m for m in everyone if m.routable and not self.is_blocked(m)]
+        decode, prefill = [m.decode_tps for m in ready], [m.prefill_tps for m in ready]
         return {
             "enabled": bool(enabled),
             "members": len(everyone),
             "ready": len(ready),
             "slots": sum(m.slots for m in ready),
             "busy": sum(min(m.slots, max(m.busy, self._inflight.get(m.key, 0))) for m in ready),
+            # The ready members' join-test speeds as a pool (2.5.0), one decimal; null while none is ready.
+            "decode_tps_median": round(statistics.median(decode), 1) if ready else None,
+            "decode_tps_min": round(min(decode), 1) if ready else None,
+            "prefill_tps_median": round(statistics.median(prefill), 1) if ready else None,
+            "prefill_tps_min": round(min(prefill), 1) if ready else None,
         }
 
     # ------------------------------------------------------------------ roles
@@ -1018,30 +1036,51 @@ def _dropped_notice() -> bytes:
 # Roles (the heartbeat answer)
 # ======================================================================================
 
-def assign_role(hardware: Any, near: Optional[bool], tiers: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+def assign_role(hardware: Any, near: Optional[bool], tiers: List[Dict[str, Any]], rtt_ms: Optional[float] = None,
+                max_member_rtt_ms: Optional[float] = None
+                ) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[int]]:
     """
-    What a worker should be, as ``(role, coding_tier)``:
+    What a worker should be, as ``(role, coding_tier, coding_slots)``:
 
     * no GPU (or already a CPU pool member): ``"app"``, today's behaviour;
-    * a GPU close to the coordinator (``near``): ``"rpc"``, part of the sharded engine;
+    * a GPU close to the coordinator (``near``) that is docked, or does not say (2.5.0, ``docked``):
+      ``"rpc"``, part of the sharded engine; one that says it is off its dock is judged like a far GPU;
+    * a GPU that is yielding to its owner right now: ``None``, no new job (it keeps the one it has);
     * a far GPU with at least 8 GB: ``"coding"``, with the biggest tier it can hold whole
-      (engine/coding_member_select.choose_tier);
-    * anything else, a far GPU too small or too short of memory for a tier, or one nobody has
-      measured yet (``near`` None): ``None``, no assignment, so it does what it did before.
+      (engine/coding_member_select.choose_tier) and how many requests at once to open it for
+      (choose_slots: up to the tier's server_slots, as many as it is estimated to run fast
+      enough; 2.5.0), unless its measured round trip ``rtt_ms`` is over ``max_member_rtt_ms``
+      (CODING_MEMBER_MAX_RTT_MS). One nobody has measured may still;
+    * anything else, a far GPU too small, too short of memory for a tier, or too far away, or one
+      nobody has measured yet (``near`` None): ``None``, no assignment, so it does what it did before.
+
+    ``coding_slots`` is None whenever there is no tier. The tier is sized on ``coding_ram_gb``, the
+    RAM the worker's coding job may use (2.4.9), and on ``ram_gb`` only for a worker that does not
+    say: ``ram_gb`` is what its RPC node lends, capped by MAX_RAM_GB (4 GB by default), which fits
+    no coding model.
     """
     hardware = hardware if isinstance(hardware, dict) else {}
     gpu = hardware.get("gpu") if isinstance(hardware.get("gpu"), dict) else {}
     vram = _number(gpu.get("vram_total_gb"))
     if hardware.get("pool") == "app" or gpu.get("has_gpu") is False or vram <= 0:
-        return "app", None
+        return "app", None, None
     if near is None:
-        return None, None
-    if near:
-        return "rpc", None
+        return None, None, None
+    if hardware.get("is_yielding") is True:
+        return None, None, None      # stepping aside for its owner (2.5.0): no new job now; what it has, it keeps
+    if near and hardware.get("docked") is not False:
+        return "rpc", None, None     # a LAN GPU that is docked (or cannot say) shares the big model
+    # Near but off its dock (Wi-Fi or battery, 2.5.0): a shard that may leave any minute would take every
+    # user's answer with it, so it is treated like a far GPU below: a whole model of its own, or nothing.
     if vram < MIN_CODING_VRAM_GB or hardware.get("coding_ok", True) is not True:
-        return None, None            # too small, or the worker says it cannot run a coding member (coding_ok)
-    tier = coding_member_select.choose_tier(vram, _number(hardware.get("ram_gb")), tiers)
-    return ("coding", tier) if tier else (None, None)
+        return None, None, None      # too small, or the worker says it cannot run a coding member (coding_ok)
+    if rtt_ms is not None and max_member_rtt_ms is not None and _number(rtt_ms) > max_member_rtt_ms:
+        return None, None, None      # too far even for a whole model of its own
+    ram = _number(hardware.get("coding_ram_gb", hardware.get("ram_gb")))
+    tier = coding_member_select.choose_tier(vram, ram, tiers)
+    if not tier:
+        return None, None, None
+    return "coding", tier, coding_member_select.choose_slots(tier, vram, ram)
 
 
 coding_router = CodingRouter()

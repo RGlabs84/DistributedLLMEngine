@@ -18,10 +18,15 @@ import kotlinx.coroutines.launch
 fun DlneApp(viewModel: ChatViewModel) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
 
-    // The status line is refreshed only while the app is on screen.
+    // The status line is refreshed only while the app is on screen: each start (also coming back from
+    // another app) fetches at once, so the header shows the live model, then every minute.
     LifecycleStartEffect(viewModel) {
         viewModel.startStatusUpdates()
-        onStopOrDispose { viewModel.stopStatusUpdates() }
+        viewModel.onForeground() // image jobs are polled only while the app is shown
+        onStopOrDispose {
+            viewModel.stopStatusUpdates()
+            viewModel.onBackground()
+        }
     }
 
     when (viewModel.screen) {
@@ -35,6 +40,8 @@ fun DlneApp(viewModel: ChatViewModel) {
                         onSaveServerUrl = viewModel::setServerUrl,
                         onResetServerUrl = viewModel::resetServerUrl,
                         onDeleteAllChats = viewModel::deleteAllConversations,
+                        onShareLocationChange = viewModel::setShareLocation,
+                        locationPermitted = viewModel::locationPermitted,
                     )
                 },
             )
@@ -73,6 +80,12 @@ private fun ChatWithDrawer(state: ChatUiState, viewModel: ChatViewModel) {
             onSendReport = viewModel::sendReport,
             onCloseReport = viewModel::closeReport,
             onReportThanksShown = viewModel::reportThanksShown,
+            onCreateImage = viewModel::createImage,
+            onCancelImage = viewModel::cancelImage,
+            onAnswerLocationAsk = viewModel::answerLocationAsk,
+            locationPermitted = viewModel::locationPermitted,
+            onAddPhotos = viewModel::addPhotos,
+            onRemovePhoto = viewModel::removePhoto,
         )
     }
 
@@ -101,6 +114,7 @@ private fun ChatWithDrawer(state: ChatUiState, viewModel: ChatViewModel) {
         ChatScreen(
             state = state,
             draft = viewModel.draft,
+            photos = viewModel.photoDraft,
             report = viewModel.report,
             reportThanksPending = viewModel.reportThanksPending,
             actions = actions,

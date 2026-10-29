@@ -1,5 +1,6 @@
 package io.dlne.chat.net
 
+import io.dlne.chat.data.PhoneLocation
 import io.dlne.chat.data.ReportRequest
 import java.io.IOException
 import java.io.InputStream
@@ -27,15 +28,25 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 
-/** One turn of the conversation as the server receives it. */
-@Serializable
-data class WireMessage(val role: String, val content: String)
+/**
+ * One turn of the conversation as the server receives it. [content] is the turn's text and goes on
+ * the wire as a plain string. A user turn with photos carries them in [images], each the
+ * `data:image/jpeg;base64,...` URL of one photo, and then goes as a list of parts instead (see
+ * [WireMessageSerializer]).
+ */
+@Serializable(with = WireMessageSerializer::class)
+data class WireMessage(val role: String, val content: String, val images: List<String> = emptyList())
 
 @Serializable
 private data class ChatRequest(
+    @SerialName("chat_id") val chatId: String,
     val messages: List<WireMessage>,
     @SerialName("max_tokens") val maxTokens: Int,
     val stream: Boolean,
+    // Left out of the request when null (defaults are not encoded), which is the usual case.
+    val location: PhoneLocation? = null,
+    // What this app can show beyond text (see CHAT_FEATURES). It has no default on purpose: a default is not encoded.
+    val features: List<String>,
 )
 
 /** The parts of `GET /v1/cluster/status` the app shows. Unknown fields are ignored. */
@@ -43,7 +54,16 @@ private data class ChatRequest(
 data class ClusterStatus(
     @SerialName("app_pool") val appPool: AppPool? = null,
     @SerialName("server_version") val serverVersion: String? = null,
-)
+    /** What this server can do beyond chat; missing (an older server) means nothing extra. */
+    val capabilities: Capabilities? = null,
+    @SerialName("image_generation") val imageGenerationInfo: ImageGenerationInfo? = null,
+) {
+    /** True only when the server says so: the "Create image" button is shown for nothing else. */
+    val imageGeneration: Boolean get() = capabilities?.imageGeneration == true
+
+    /** True only when the server says the phone chat can look at photos: Photos and Camera are shown for nothing else. */
+    val appVision: Boolean get() = capabilities?.appVision == true
+}
 
 /** The CPU pool that answers the phone app: how many machines and which model. */
 @Serializable
@@ -59,9 +79,10 @@ sealed class ApiException(message: String, cause: Throwable? = null) : Exception
     /**
      * The server refused the request: 400 for a bad request, 429 when this network is
      * already waiting for an answer or asked too often. [detail] is the server's own
-     * explanation; [retryAfterSeconds] comes from the Retry-After header when present.
+     * explanation; [retryAfterSeconds] comes from the Retry-After header when present;
+     * [errorCode] is the JSON `code` (for example `image_quota`) when there is one.
      */
-    class Http(val code: Int, val detail: String, val retryAfterSeconds: Long?) :
+    class Http(val code: Int, val detail: String, val retryAfterSeconds: Long?, val errorCode: String? = null) :
         ApiException("HTTP $code: $detail")
 
     /** No usable answer at all: offline, DNS, TLS, a timeout or a dropped connection. */
@@ -70,7 +91,8 @@ sealed class ApiException(message: String, cause: Throwable? = null) : Exception
 
 /**
  * The DLNE service client. Plain OkHttp with no interceptors, cookies, cache or tracking
- * headers: each call sends exactly the conversation and nothing else.
+ * headers: each call sends exactly the conversation, its random chat id and, only if the
+ * person turned that on, their location.
  */
 class DlneApi(private val http: OkHttpClient = defaultHttpClient()) {
 
@@ -81,13 +103,22 @@ class DlneApi(private val http: OkHttpClient = defaultHttpClient()) {
      * `data: [DONE]` (or when the server closes the stream). It fails with [ApiException].
      * Cancelling the collector (the Stop button) cancels the HTTP call, which unblocks the
      * read immediately and tells the server to stop generating.
+     *
+     * [chatId] is the conversation's random id: the server keeps a private prompt cache per
+     * chat with it. [location] is sent only when given (see [io.dlne.chat.data.DeviceLocation]).
+     * Every request also says which extra events this app can show ([CHAT_FEATURES]).
      */
     fun streamChat(
         baseUrl: String,
+        chatId: String,
         messages: List<WireMessage>,
+        location: PhoneLocation? = null,
         maxTokens: Int = DEFAULT_MAX_TOKENS,
     ): Flow<StreamEvent> = callbackFlow {
-        val body = json.encodeToString(ChatRequest.serializer(), ChatRequest(messages, maxTokens, stream = true))
+        val body = json.encodeToString(
+            ChatRequest.serializer(),
+            ChatRequest(chatId, messages, maxTokens, stream = true, location = location, features = CHAT_FEATURES),
+        )
         val request = Request.Builder()
             .url(endpoint(baseUrl, CHAT_PATH))
             .header("Accept", "text/event-stream")
@@ -158,6 +189,59 @@ class DlneApi(private val http: OkHttpClient = defaultHttpClient()) {
         }
     }
 
+    /**
+     * Asks for an image: `POST {baseUrl}/v1/app/images`. [chatId] is the conversation's random
+     * id (the free trial counts one image as one chat). Fails with [ApiException.Http] (400
+     * prompt_empty / prompt_too_long / bad_size / prompt_refused, 429 image_quota / image_busy
+     * with Retry-After, 503 image_generation_unavailable) or [ApiException.Network].
+     */
+    suspend fun createImage(baseUrl: String, prompt: String, size: String?, chatId: String?): ImageTicket =
+        withContext(Dispatchers.IO) {
+            val body = json.encodeToString(ImageRequestBody.serializer(), ImageRequestBody(prompt, size, chatId))
+            val request = Request.Builder().url(endpoint(baseUrl, IMAGES_PATH)).post(body.toRequestBody(JSON)).build()
+            imageCall(request) { text ->
+                json.decodeFromString(WireTicket.serializer(), text).toTicket().also {
+                    if (it.id.isBlank()) throw SerializationException("no job id")
+                }
+            }
+        }
+
+    /** One poll of `GET {baseUrl}/v1/app/images/{id}`; the picture arrives with `completed`. */
+    suspend fun imageProgress(baseUrl: String, id: String): ImageProgress = withContext(Dispatchers.IO) {
+        val request = Request.Builder().url(imageEndpoint(baseUrl, id)).get().build()
+        imageCall(request, MAX_IMAGE_RESPONSE_BYTES) { text ->
+            json.decodeFromString(WireProgress.serializer(), text).toProgress()
+        }
+    }
+
+    /** `POST {baseUrl}/v1/app/images/{id}/cancel`; returns the job's status afterwards. */
+    suspend fun cancelImage(baseUrl: String, id: String): ImageStatus = withContext(Dispatchers.IO) {
+        val request = Request.Builder().url(imageEndpoint(baseUrl, id, "cancel"))
+            .post(ByteArray(0).toRequestBody(null)).build()
+        imageCall(request) { text -> json.decodeFromString(WireProgress.serializer(), text).let { ImageStatus.of(it.status) } }
+    }
+
+    // A picture comes back base64 in the answer, so these calls get a longer limit than a status check.
+    private val imageClient: OkHttpClient by lazy {
+        http.newBuilder().callTimeout(60, TimeUnit.SECONDS).build()
+    }
+
+    private fun <T> imageCall(request: Request, maxBytes: Long = 64L * 1024, parse: (String) -> T): T = try {
+        imageClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw httpError(response)
+            val text = response.peekBody(maxBytes).string()
+            try {
+                parse(text)
+            } catch (e: SerializationException) {
+                throw ApiException.Network(IOException("Unreadable answer", e))
+            } catch (e: IllegalArgumentException) {
+                throw ApiException.Network(IOException("Unreadable answer", e))
+            }
+        }
+    } catch (e: IOException) {
+        throw ApiException.Network(e)
+    }
+
     /** Reads SSE bytes as they arrive and forwards each event, stopping at [StreamEvent.Done]. */
     private suspend fun ProducerScope<StreamEvent>.pump(stream: InputStream) {
         val lines = SseLineBuffer()
@@ -185,9 +269,20 @@ class DlneApi(private val http: OkHttpClient = defaultHttpClient()) {
         /** The server caps answers at 1024 tokens; asking for that much is the most useful. */
         const val DEFAULT_MAX_TOKENS = 1024
 
+        /**
+         * Sent with every chat request: `image_jobs` says this app shows the `image_job` and
+         * `image_refused` events, so the server lets the model create pictures in a reply. A server
+         * that does not know it ignores it (and a request without it gets no picture tool).
+         */
+        internal val CHAT_FEATURES = listOf("image_jobs")
+
         private const val CHAT_PATH = "v1/app/chat/completions"
         private const val STATUS_PATH = "v1/cluster/status"
         private const val REPORT_PATH = "v1/app/report"
+        private const val IMAGES_PATH = "v1/app/images"
+
+        /** A 1024x1024 PNG is about 2 MB, 3 MB as base64; anything past this is not a picture. */
+        private const val MAX_IMAGE_RESPONSE_BYTES = 16L * 1024 * 1024
         private val JSON = "application/json; charset=utf-8".toMediaType()
         private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
 
@@ -210,6 +305,12 @@ class DlneApi(private val http: OkHttpClient = defaultHttpClient()) {
             return base.newBuilder().addPathSegments(path).build()
         }
 
+        private fun imageEndpoint(baseUrl: String, id: String, vararg more: String): HttpUrl {
+            val builder = endpoint(baseUrl, IMAGES_PATH).newBuilder().addPathSegment(id)
+            more.forEach { builder.addPathSegment(it) }
+            return builder.build()
+        }
+
         /** Builds the exception for a non-2xx answer from its JSON `detail` and Retry-After. */
         internal fun httpError(response: Response): ApiException.Http {
             val text = try {
@@ -219,7 +320,19 @@ class DlneApi(private val http: OkHttpClient = defaultHttpClient()) {
             }
             val detail = extractDetail(text) ?: "The server answered ${response.code}."
             val retryAfter = response.header("Retry-After")?.trim()?.toLongOrNull()?.coerceIn(1, 3600)
-            return ApiException.Http(response.code, detail, retryAfter)
+            return ApiException.Http(response.code, detail, retryAfter, extractCode(text))
+        }
+
+        /** The JSON `code` of an error body (`{"detail": "...", "code": "image_quota"}`), if any. */
+        internal fun extractCode(body: String): String? {
+            val root = try {
+                json.parseToJsonElement(body) as? JsonObject
+            } catch (_: SerializationException) {
+                null
+            } catch (_: IllegalArgumentException) {
+                null
+            } ?: return null
+            return (root["code"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() && it.length <= 64 }
         }
 
         /**

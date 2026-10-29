@@ -45,6 +45,10 @@ RPC_PLATFORMS = ("win-x64", "linux-x64", "macos-arm64", "win-arm64", "linux-arm6
 SERVER_LLAMA_UPLOAD = "server-llama.tar.gz"
 LLAMA_DIR = "llama"      # root/llama/<build>/ holds each installed server build
 BIN_LINK = "bin"         # root/bin -> the server build in use (llama-server, ggml-rpc-server)
+# The image engine (2.6.1): sd-server and its libraries, unpacked flat into root/bin-sd/. A folder of its own, never
+# bin/: its libggml has llama.cpp's names. Only the coordinator uses it; a worker neither downloads nor needs it.
+SERVER_SD_UPLOAD = "server-sd.tar.gz"
+SD_DIR = "bin-sd"
 
 
 def rpc_zip_name(platform: str) -> str:
@@ -239,6 +243,16 @@ def check_assets(root: str, manifest: Dict, assets_dir: Optional[str]) -> Dict[s
                              "but it was not uploaded and is not installed.")
     elif assets_dir and os.path.exists(os.path.join(assets_dir, SERVER_LLAMA_UPLOAD)):
         raise ApplyError("A server llama.cpp build was supplied but the manifest does not sign it.")
+    if "server_sd_sha256" in manifest:
+        if assets_dir and os.path.exists(os.path.join(assets_dir, SERVER_SD_UPLOAD)):
+            path = os.path.join(assets_dir, SERVER_SD_UPLOAD)
+            _check_file(path, manifest.get("server_sd_size"), manifest["server_sd_sha256"], "image engine archive")
+            found[SERVER_SD_UPLOAD] = path
+        elif _installed_sd_sha(root) != manifest["server_sd_sha256"]:
+            raise ApplyError(f"The release signs the image engine {manifest.get('sd_build')}, "
+                             "but it was not uploaded and is not installed.")
+    elif assets_dir and os.path.exists(os.path.join(assets_dir, SERVER_SD_UPLOAD)):
+        raise ApplyError("An image engine archive was supplied but the manifest does not sign it.")
     return found
 
 
@@ -286,6 +300,50 @@ def install_server_llama(root: str, build: str, tarball: str, sha256: str) -> st
         if "llama-server" in files:
             return dirpath
     raise ApplyError(f"llama.cpp {build} has no llama-server.")
+
+
+def _installed_sd_sha(root: str) -> Optional[str]:
+    try:
+        with open(os.path.join(root, SD_DIR, ".installed-from"), "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def install_server_sd(root: str, tarball: str, sha256: str) -> str:
+    """
+    Unpack the image engine into root/bin-sd/ (once per build) and return that directory. The archive is flat: every
+    entry a regular file named without a path, so nothing can land outside bin-sd. It is unpacked beside the old
+    folder and swapped in, so a failed unpack leaves the installed engine as it was.
+    """
+    target = os.path.join(root, SD_DIR)
+    if _installed_sd_sha(root) != sha256:
+        staging = f"{target}.partial-{os.getpid()}"
+        if os.path.isdir(staging):
+            shutil.rmtree(staging)
+        os.makedirs(staging)
+        try:
+            with tarfile.open(tarball, "r:gz") as tar:
+                members = tar.getmembers()
+                for member in members:
+                    if not member.isfile() or "/" in member.name or "\\" in member.name or member.name in ("", ".", "..") \
+                            or member.name.startswith("."):
+                        raise ApplyError(f"The image engine archive contains an unsafe entry: {member.name!r}")
+                if not any(m.name == "sd-server" for m in members):
+                    raise ApplyError("The image engine archive has no sd-server.")
+                tar.extractall(staging, filter="data")
+            with open(os.path.join(staging, ".installed-from"), "w", encoding="utf-8") as handle:
+                handle.write(sha256 + "\n")
+            old = f"{target}.old-{os.getpid()}"
+            if os.path.isdir(target):
+                os.replace(target, old)
+            os.replace(staging, target)
+            if os.path.isdir(old):
+                shutil.rmtree(old)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+    return target
 
 
 def current_bin_target(root: str) -> Optional[str]:
@@ -358,12 +416,14 @@ def _install(root: str, members: Dict[str, bytes], archive_path: str, manifest: 
         _write_atomic(os.path.join(root, *name.split("/")), data)
     _write_atomic(os.path.join(root, ARCHIVE_NAME), open(archive_path, "rb").read())
     for name, path in assets.items():
-        if name != SERVER_LLAMA_UPLOAD and os.path.abspath(path) != os.path.abspath(os.path.join(root, name)):
+        if name not in (SERVER_LLAMA_UPLOAD, SERVER_SD_UPLOAD) and os.path.abspath(path) != os.path.abspath(os.path.join(root, name)):
             _write_atomic(os.path.join(root, name), open(path, "rb").read())
     if "server_llama_sha256" in manifest:
         server_dir = install_server_llama(root, manifest["llama_build"], assets.get(SERVER_LLAMA_UPLOAD, ""),
                                           manifest["server_llama_sha256"])
         point_bin_at(root, server_dir)
+    if "server_sd_sha256" in manifest:
+        install_server_sd(root, assets.get(SERVER_SD_UPLOAD, ""), manifest["server_sd_sha256"])
     _write_atomic(os.path.join(root, MANIFEST_NAME), (json.dumps(manifest, indent=2) + "\n").encode())
     pruned: List[str] = []
     if prune:

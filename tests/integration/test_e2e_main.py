@@ -274,6 +274,8 @@ def test_a_member_with_a_damaged_identity_signature_is_never_routed_to(main):
     assert hits(w)["c"] == before["c"] == 0, "a member whose identity signature does not verify was sent work"
     status = w.coding_status()
     assert status["ready"] == 2, status          # A and B are usable; C is not counted as ready
+    # (two slots each: choose_slots gives an 8 GB card one slot only for a model that is slow on it, and this run's
+    # 0.5B model clears the speed floors for both. A real 8 GB member with a coding-sized model has one.)
     assert status["slots"] == 4, status
     # (each route lookup holds a slot for 30 s, so only a few are made)
     for _ in range(3):

@@ -30,16 +30,17 @@ outright RPC hijacking.
 
 import json
 import re
+import socket
 import time
 import httpx
 import subprocess
 import threading
 import sys
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from engine.logger import log_worker, log_error, log_system, log_warning
-from engine.hardware import get_hardware_profile, _hidden_process_kwargs
-from engine.downloader import download_and_extract_engine
+from engine.hardware import get_hardware_profile, _hidden_process_kwargs, yield_reason as hardware_yield_reason
+from engine.downloader import download_and_extract_engine, explain_dll_not_found, is_dll_not_found
 from engine.version import VERSION
 from engine.config import get_base_dir, get_worker_limits
 from engine.authn import sign_heartbeat
@@ -123,10 +124,22 @@ REFUSAL_MARKER = "DLNE_REFUSAL: "
 # 'DLNE_ROLE: coding {"model": ..., "tier": ..., "slots": 2, "trust_id": "<32 hex>"}'. One line of compact
 # JSON with names and counts only; the last line printed wins, and a new one follows every change.
 ROLE_MARKER = "DLNE_ROLE: "
+# Whether this machine is docked (a wired link and mains power, engine/hardware.get_dock_state), printed
+# once per change for the editor and the tray app: 'DLNE_DOCK: {"link": "wired", "power": "ac", "docked": true}'.
+# "docked" is left out while either fact is unknown. A companion stays quiet: the GPU half says it.
+DOCK_MARKER = "DLNE_DOCK: "
+# Whether this machine is yielding to its owner's own load, printed once per change for the editor and the
+# tray app: 'DLNE_YIELD: {"yielding": true, "why": "gpu"}' (why: fullscreen, gpu or cpu; "" when not).
+YIELD_MARKER = "DLNE_YIELD: "
 
 # How long a node that is AHEAD of its coordinator waits between heartbeats. The coordinator
 # is probably mid-restart onto the same version; hammering it helps nobody.
 AHEAD_OF_COORDINATOR_RETRY_SECONDS = 30.0
+
+# A graceful stop of an RPC node, and a yield that outlasts the coordinator's drain (2.5.0): how long the
+# node keeps its RPC server up for the answers running on its shard (the coordinator rebuilds the engine
+# without it within SHARD_DRAIN_SECONDS, 60 by default) before it stops, or frees its VRAM for its owner.
+LEAVE_GRACE_SECONDS = 90.0
 
 # A heartbeat refused for a "stale timestamp" means this computer's clock and the coordinator's disagree by more
 # than its 30 s window (engine/swarm_clock.py). The refusal itself carries the coordinator's time, so the beat is
@@ -169,6 +182,58 @@ def _coding_ram_cap_gib(limits: Dict[str, Any]) -> Optional[float]:
     coding = limits.get("coding_max_ram_gb")
     cap = coding if number(coding) else limits.get("max_ram_gb", -1.0)
     return float(cap) if number(cap) and cap >= 0 else None
+
+
+# At most this many addresses go in a heartbeat (authn allows eight).
+MAX_LAN_ADDRESSES = 8
+
+
+def _lan_tunnel_url(value: Any) -> Optional[str]:
+    """
+    The coordinator's LAN address for the reverse tunnel ("lan_tunnel" in a heartbeat answer, 2.5.2), or None.
+    Only a plain ws:// URL to a private IPv4 address is taken: the tunnel carries this node's token, and a
+    coordinator must not be able to send it anywhere but its own LAN.
+    """
+    import ipaddress
+    from urllib.parse import urlsplit
+    if not isinstance(value, str):
+        return None
+    try:
+        parts = urlsplit(value)
+        address = ipaddress.IPv4Address(parts.hostname or "")
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme != "ws" or not port or parts.path not in ("", "/") or parts.query or parts.username \
+            or not address.is_private or address.is_loopback or address.is_link_local:
+        return None
+    return f"ws://{address}:{port}"
+
+
+def _lan_ipv4_addresses() -> List[str]:
+    """
+    This machine's private IPv4 addresses (loopback and link-local left out), for a coordinator in
+    the same household that asked for them ("send_lan"): it dials the one on its own subnet.
+    """
+    import ipaddress
+    found: List[str] = []
+    try:
+        import psutil
+        interfaces = psutil.net_if_addrs()
+    except Exception:  # noqa: BLE001 - no psutil: nothing to offer
+        return found
+    for addresses in interfaces.values():
+        for entry in addresses:
+            if entry.family != socket.AF_INET:
+                continue
+            try:
+                address = ipaddress.IPv4Address(entry.address)
+            except ValueError:
+                continue
+            if address.is_private and not address.is_loopback and not address.is_link_local \
+                    and entry.address not in found:
+                found.append(entry.address)
+    return found[:MAX_LAN_ADDRESSES]
 
 
 def _response_detail(response: httpx.Response) -> str:
@@ -275,6 +340,13 @@ class WorkerNode:
         self._companion_started = time.monotonic()
         self.hardware_profile = self._probe_hardware()
         self.rpc_process = None
+        # A graceful stop under way (``leaving`` in the profile; request_shutdown), and a yield's age, for
+        # handing the GPU back to its owner when the coordinator has moved off this shard (_after_answer).
+        self._leaving = False
+        self._leave_done = False
+        self._leave_deadline = 0.0
+        self._yield_since: Optional[float] = None
+        self._vram_freed_for_owner = False
         # The RPC protocol the running ggml-rpc-server announced, e.g. "8.0.1" ("" = unknown).
         self.rpc_proto = ""
         # Set when this node serves the CPU pool (no usable GPU) instead of running an RPC
@@ -294,6 +366,13 @@ class WorkerNode:
         self._role_target: Optional[str] = None
         self._role_hold: Dict[str, float] = {}
         self._latest_answer: Dict[str, Any] = {}
+        # Set when the coordinator says this machine is in its own household ("send_lan" in the heartbeat
+        # answer): the heartbeats then list this machine's private IPv4 addresses, so the coordinator can
+        # reach its GPU over the LAN (engine/link_paths.py). Never set by any other coordinator.
+        self._send_lan = False
+        # The coordinator's own LAN address for the reverse tunnel ("lan_tunnel", 2.5.2), from the same household
+        # answers: an outbound connection no host firewall drops, without the router's hairpin.
+        self._lan_tunnel: Optional[str] = None
         self._announced = ""        # the last DLNE_ROLE line printed
         self._coding_refused_logged = False
         self.is_running = False
@@ -353,11 +432,14 @@ class WorkerNode:
         profile = get_hardware_profile()
         if not self.companion_of or not isinstance(profile, dict):
             return profile
-        from engine.hardware import get_memory_bandwidth_gbs
+        from engine.hardware import get_memory_bandwidth_gbs, is_yielding_now
 
         profile = dict(profile)
         profile["gpu"] = {"has_gpu": False, "vram_total_gb": 0, "vram_free_gb": 0, "name": None, "load_percent": 0.0}
         profile["gpu_type"] = "cpu"
+        # The CPU half steps aside for any load of the owner's, the CPU's included (2.6.2: the profile's own verdict
+        # is the GPU node's, which CPU load alone no longer trips when the GPU can be read).
+        profile["is_yielding"] = profile.get("is_yielding") is True or is_yielding_now(cpu_node=True)
         profile["ram_gb"] = round(self.companion_ram_gb, 1)
         profile["companion_of"] = self.companion_of
         bandwidth = get_memory_bandwidth_gbs()
@@ -369,7 +451,7 @@ class WorkerNode:
     # Shutdown coordination
     # ----------------------------------------------------------------------------------
 
-    def request_shutdown(self, exit_code: int = 0, reason: str = "") -> None:
+    def request_shutdown(self, exit_code: int = 0, reason: str = "", leave_first: bool = True) -> None:
         """
         Ask the node to shut down, from any thread.
 
@@ -383,21 +465,78 @@ class WorkerNode:
                 requested shutdown". The first caller wins: a later graceful request must
                 not overwrite the failure code of whatever went wrong first.
             reason: Short human-readable cause, logged once.
+            leave_first: False when the heartbeat loop itself has ended: a leave is finished by that loop, so
+                deferring to it would wait forever (2.5.3).
         """
         with self._shutdown_lock:
-            first_request = not self._shutdown_event.is_set()
-            if first_request:
-                self.exit_code = int(exit_code)
+            if leave_first and self._may_leave_first(exit_code):
+                # A graceful stop of an RPC node: the coordinator is told first (``leaving`` in the next
+                # heartbeat) and the RPC server stays up while the answers running on this shard finish,
+                # LEAVE_GRACE_SECONDS at most; the heartbeat loop ends the node once the coordinator no
+                # longer says it is draining this shard (_after_answer). A second request stops at once.
+                self._leaving = True
+                self._leave_deadline = time.monotonic() + LEAVE_GRACE_SECONDS
+                deferred, first_request = True, False
+            else:
+                deferred = False
+                first_request = not self._shutdown_event.is_set()
+                if first_request:
+                    self.exit_code = int(exit_code)
 
-            # Order matters: clear the run flag *before* setting the Event, so the
-            # heartbeat loop can never observe "shutdown signalled but still running".
-            self.is_running = False
-            self._shutdown_event.set()
+                # Order matters: clear the run flag *before* setting the Event, so the
+                # heartbeat loop can never observe "shutdown signalled but still running".
+                self.is_running = False
+                self._shutdown_event.set()
 
         # Logged outside the lock - the logger writes to a rotating file, and holding a
         # lock across file I/O is how a shutdown path turns into a deadlock.
-        if first_request and reason:
+        if deferred:
+            log_worker(f"Shutdown requested: {reason}. Leaving the swarm first: the answers running on this "
+                       f"GPU finish, {LEAVE_GRACE_SECONDS:.0f}s at most.")
+        elif first_request and reason:
             log_worker(f"Shutdown requested: {reason}")
+
+    def _may_leave_first(self, exit_code: int) -> bool:
+        """A normal stop of a running RPC node the engine runs on (the last answer said ``shard``), not asked
+        before (under _shutdown_lock). A node in reserve, a member and a companion stop at once."""
+        latest = getattr(self, "_latest_answer", None)
+        return (int(exit_code) == 0 and self.is_running and not self._shutdown_event.is_set()
+                and not self._leaving and not self._leave_done
+                and self.rpc_process is not None and not self.companion_of
+                and isinstance(latest, dict) and latest.get("shard") is True)
+
+    def _after_answer(self, answer: Any) -> None:
+        """
+        Leaving and yielding, after each heartbeat answer (2.5.0): a deferred stop ends once the coordinator
+        no longer runs the engine on this shard (no ``draining`` in the answer) or the grace is over; and a
+        yield that has outlasted the drain hands the GPU back to its owner by restarting the RPC server, which
+        frees the weights the engine had loaded into it (the port stays, for the return).
+        """
+        draining = isinstance(answer, dict) and answer.get("draining") is True
+        now = time.monotonic()
+        if self._leaving and (not draining or now >= self._leave_deadline):
+            self._leaving, self._leave_done = False, True
+            self.request_shutdown(0, "left the swarm" if not draining else "leaving: the grace is over")
+            return
+        profile = self.hardware_profile if isinstance(self.hardware_profile, dict) else {}
+        if profile.get("is_yielding") is not True:
+            self._yield_since, self._vram_freed_for_owner = None, False
+            return
+        if self._yield_since is None:
+            self._yield_since = now
+        elif (not draining and not self._vram_freed_for_owner and self.rpc_process is not None
+              and now - self._yield_since >= LEAVE_GRACE_SECONDS):
+            self._vram_freed_for_owner = True
+            self._restart_rpc_server_for_owner()
+
+    def _restart_rpc_server_for_owner(self) -> None:
+        """Stop and start ggml-rpc-server so the owner gets the VRAM back; nothing else about the node changes."""
+        log_worker("Yielding for a while: the GPU's memory is handed back to its owner (the RPC server is restarted).")
+        try:
+            self._stop_rpc_server()
+            self.start_rpc_server()
+        except Exception as exc:  # noqa: BLE001 - the node keeps heartbeating either way
+            log_error(f"Could not restart the RPC server for the owner: {type(exc).__name__}: {exc}")
 
     # ----------------------------------------------------------------------------------
     # Cluster authentication
@@ -482,6 +621,17 @@ class WorkerNode:
             # Whether this machine may be a coding member (the owner allows it, CODING_MEMBER_ALLOWED, and it
             # has a GPU): the coordinator assigns the job only to nodes that say yes.
             hardware = {**hardware, "coding_ok": not self._coding_refusal()}
+            # The RAM a coding model may use, which is not ram_gb (that is what the RPC node lends, MAX_RAM_GB).
+            coding_ram = self._coding_ram_gb()
+            if coding_ram is not None:
+                hardware["coding_ram_gb"] = coding_ram
+            if getattr(self, "_send_lan", False) and not getattr(self, "companion_of", None):
+                hardware["lan_ipv4"] = _lan_ipv4_addresses()
+            if getattr(self, "companion_of", None):
+                # The GPU half of this machine says whether it is docked; the CPU half never shards.
+                hardware = {k: v for k, v in hardware.items() if k not in ("link", "power", "docked")}
+            elif getattr(self, "_leaving", False):
+                hardware["leaving"] = True
         if coding_member is not None:
             # The owner's own load (a game, a render) makes the member stop at once; see CodingMember.set_yielding.
             set_yielding = getattr(coding_member, "set_yielding", None)
@@ -682,6 +832,30 @@ class WorkerNode:
             info["limited"] = True
         return info
 
+    def _coding_ram_gb(self) -> Optional[float]:
+        """
+        The RAM this node's coding job may use, as the coordinator should size a coding model for it
+        (``coding_ram_gb`` in the heartbeat): the machine's total, less what the phone pool is lent on a
+        "both" machine, under the owner's coding cap (_coding_ram_cap_gib; none by default). The total, not
+        what is free this second, so the coordinator's choice does not move with every browser tab; the
+        member measures what is really free when it starts and steps down a tier if it must
+        (CodingMember._fit). None for a node without a GPU, and for the CPU half of a "both" machine.
+        """
+        gpu = self.hardware_profile.get("gpu") if isinstance(self.hardware_profile, dict) else None
+        if getattr(self, "companion_of", None) or not isinstance(gpu, dict) or not gpu.get("has_gpu"):
+            return None
+        try:
+            import psutil
+            ram = psutil.virtual_memory().total / 2 ** 30
+        except Exception:  # noqa: BLE001 - no figure: the coordinator falls back to ram_gb
+            return None
+        if getattr(self, "_companion_gate", None) is not None:
+            ram = max(0.0, ram - getattr(self, "_companion_lent", 0.0))
+        cap = _coding_ram_cap_gib(get_worker_limits())
+        if cap is not None:
+            ram = min(ram, cap)
+        return round(ram, 1)
+
     def _coding_resources(self) -> Dict[str, Any]:
         """
         The owner's limits as llama-server launch settings, read at every start of the coding model so an
@@ -726,8 +900,11 @@ class WorkerNode:
             return []
         cards = list(hardware.get_all_gpus() or [])
         if allowed != "-1":
-            by_id = {card.get("id"): card for card in cards}
-            cards = [by_id[int(x)] for x in allowed.split(",") if x.strip().isdigit() and int(x) in by_id]
+            cards = hardware.select_gpus(allowed, cards)
+        from engine.inference_manager import media_gpu_spec
+
+        media = hardware.find_gpu(media_gpu_spec(limits), cards)     # the engine's cards only; none on a non-Vulkan build
+        cards = [c for c in cards if media is None or c.get("id") != media.get("id")]
         cards = [c for c in cards if hardware.counts_as_gpu(c.get("name") or "", c.get("integrated"))]
         return [c.get("vram_total_gb", 0) for c in cards]
 
@@ -856,6 +1033,29 @@ class WorkerNode:
         log_warning(message)
         print(CLOCK_MARKER + json.dumps({"offset_seconds": int(round(swarm_clock.offset))}), flush=True)
 
+    def _report_dock(self) -> None:
+        """Print DOCK_MARKER once per change of the docked facts in the profile (a companion stays quiet)."""
+        if self.companion_of:
+            return
+        profile = self.hardware_profile if isinstance(self.hardware_profile, dict) else {}
+        facts = {k: profile[k] for k in ("link", "power", "docked") if k in profile}
+        if not facts or facts == getattr(self, "_dock_announced", None):
+            return
+        self._dock_announced = facts
+        print(DOCK_MARKER + json.dumps(facts), flush=True)
+
+    def _report_yield(self) -> None:
+        """Print YIELD_MARKER once per change of the profile's ``is_yielding`` (a companion stays quiet)."""
+        if self.companion_of:
+            return
+        profile = self.hardware_profile if isinstance(self.hardware_profile, dict) else {}
+        yielding = profile.get("is_yielding") is True
+        facts = {"yielding": yielding, "why": hardware_yield_reason() if yielding else ""}
+        if facts == getattr(self, "_yield_announced", None):
+            return
+        self._yield_announced = facts
+        print(YIELD_MARKER + json.dumps(facts), flush=True)
+
     def _follow_assignment(self, answer: Any) -> None:
         """
         What a heartbeat answer asks of this node. ``role`` ("rpc", "coding", "app" or null for
@@ -865,6 +1065,8 @@ class WorkerNode:
         if not isinstance(answer, dict):
             return
         self._latest_answer = answer
+        self._send_lan = answer.get("send_lan") is True
+        self._lan_tunnel = _lan_tunnel_url(answer.get("lan_tunnel"))
         if self.companion_of:
             # The CPU half of a "both" machine has one job, the phone pool's: it takes its model and nothing else
             # (the GPU node's role is the GPU node's business), and tells the GPU node's coding model when it is up.
@@ -892,12 +1094,12 @@ class WorkerNode:
         if (role in POOL_ROLES and self.role != "hybrid" and role != self._current_pool()
                 and time.monotonic() >= self._role_hold.get(role, 0.0)):
             self._switch_role(role)
-        # A coding tier moves the member; an answer without one ("no assignment", which a coordinator that
-        # has just restarted sends for a while) leaves it serving what it serves. Stopping a coding member is
-        # a role change.
+        # A coding tier moves the member, and coding_slots (2.5.0) says how many requests at once to open it
+        # for; an answer without a tier ("no assignment", which a coordinator that has just restarted sends
+        # for a while) leaves it serving what it serves. Stopping a coding member is a role change.
         tier = answer.get("coding_tier")
         if self.coding_member is not None and tier is not None:
-            self.coding_member.assign(tier)
+            self.coding_member.assign(tier, answer.get("coding_slots"))
         if self.app_member is not None:
             self.app_member.assign(answer.get("app_model"))
 
@@ -1017,8 +1219,19 @@ class WorkerNode:
         """
         # Inject GPU isolation environment variables
         env = os.environ.copy()
-        allowed_gpu = get_worker_limits().get('allowed_gpu_indices', '-1').lower()
-        if allowed_gpu != '-1' and allowed_gpu != 'none':
+        limits = get_worker_limits()
+        allowed_gpu = limits.get('allowed_gpu_indices', '-1').lower()
+        from engine.inference_manager import media_gpu_spec
+        media_gpu = media_gpu_spec(limits)          # '' on an engine build that is not Vulkan
+        if allowed_gpu != 'none' and (media_gpu or ':' in allowed_gpu):
+            # Cards named by PCI address, or a media card to keep out: the node's own process never sees it.
+            from engine import hardware
+            cuda, vulkan, media_device = hardware.engine_gpu_devices(allowed_gpu, media_gpu)
+            if media_device:
+                vulkan = vulkan.rpartition(",")[0]
+            env['CUDA_VISIBLE_DEVICES'], env['GGML_VK_VISIBLE_DEVICES'] = cuda, vulkan
+            log_worker(f"Hardware Isolated to GPU(s): {cuda or 'none'} (Vulkan {vulkan or 'none'})")
+        elif allowed_gpu != '-1' and allowed_gpu != 'none':
             env['CUDA_VISIBLE_DEVICES'] = str(allowed_gpu)
             env['GGML_VK_VISIBLE_DEVICES'] = str(allowed_gpu)
             log_worker(f"Hardware Isolated to GPU ID(s): {allowed_gpu}")
@@ -1175,6 +1388,12 @@ class WorkerNode:
                         self.last_token_rotation = current_time
                         token_rotated = True
 
+                    # A graceful stop whose grace is over (the coordinator could not be asked): stop now.
+                    if self._leaving and time.monotonic() >= self._leave_deadline:
+                        self._leaving, self._leave_done = False, True
+                        self.request_shutdown(0, "leaving: the grace is over")
+                        break
+
                     # Refresh hardware profile to check for yielding (Gaming Mode)
                     self.hardware_profile = self._probe_hardware()
 
@@ -1186,6 +1405,10 @@ class WorkerNode:
                     if rpc_process and rpc_process.poll() is not None and self.rpc_process is rpc_process:
                         err_code = rpc_process.returncode
                         log_error(f"CRITICAL: Engine subprocess crashed unexpectedly with error code {err_code}!")
+                        if is_dll_not_found(err_code):
+                            args = getattr(rpc_process, "args", None)
+                            exe = str(args[0] if isinstance(args, (list, tuple)) and args else args or "ggml-rpc-server")
+                            log_error(explain_dll_not_found(exe, err_code))
                         log_error("CRITICAL: This node cannot continue processing. Stopping worker...")
                         # A crashed engine must never report success to a supervisor, so a
                         # 0/None return code is promoted to a generic failure code. A
@@ -1210,6 +1433,8 @@ class WorkerNode:
                         # timestamp follows it (engine/swarm_clock.py).
                         swarm_clock.learn_from(response, sent_at, swarm_clock.local())
                         self._report_clock()
+                        self._report_dock()
+                        self._report_yield()
                         response.raise_for_status()
                         stale_refusals = 0
                         if token_rotated and not self.companion_of:
@@ -1223,6 +1448,7 @@ class WorkerNode:
                         except ValueError:
                             answer = {}
                         self._follow_assignment(answer)
+                        self._after_answer(answer)
                         self._announce_role()
                         if self.verbose_heartbeats:
                             log_worker(f"Heartbeat OK | Status: {status_msg}")
@@ -1308,8 +1534,10 @@ class WorkerNode:
             # If the loop ever ends without an explicit request - is_running cleared by an
             # external stop(), or an unrecoverable error escaping the guards above - wake
             # start() anyway. A silently dead heartbeat thread under a still-running
-            # process is the exact failure this rewrite exists to eliminate.
-            self.request_shutdown(0, "heartbeat loop ended")
+            # process is the exact failure this rewrite exists to eliminate. Never "leave first" from here: the
+            # leave is finished by this loop, which has just ended (2026-10-27: a window reload broke stdout, the
+            # loop ended, and the node waited on itself for minutes with its RPC server already gone).
+            self.request_shutdown(0, "heartbeat loop ended", leave_first=False)
 
     # ----------------------------------------------------------------------------------
     # Lifecycle
@@ -1383,6 +1611,7 @@ class WorkerNode:
                         self._shutdown_event,
                         # Read at each connect: the token rotates every minute.
                         token_provider=lambda: self.access_token,
+                        lan_url_provider=lambda: self._lan_tunnel,
                     )
                 except Exception:
                     pass

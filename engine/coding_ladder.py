@@ -25,6 +25,12 @@ A TIER, as load_coding_tiers() returns it
                  when the model is one file)
     min_vram_gb  int, the pooled VRAM the tier needs
     context      int, the total engine context the tier is meant to run with
+    server_slots int, the most requests at once a coding member opens it for (2 unless the tier
+                 says otherwise); context / server_slots is the context per request, which a
+                 member keeps whatever slot count the coordinator gives it
+    server_ctx_checkpoints, server_ubatch, server_spec_type
+                 the member's llama-server knobs (--ctx-checkpoints, -ub, --spec-type), each
+                 None unless the tier sets it (release.py has the ranges)
     enabled      bool, the owner's switch
     blocked      None, or why the tier is held back (an enabled tier is never blocked)
     files        [{file, url, sha256, size}, ...] every part in order; one entry for a
@@ -44,13 +50,15 @@ from engine import release
 CODING_MODELS_FILE = os.path.join("scripts", "coding_models.json")
 
 # The model the public swarm has served since 2026-10-25. Identical to the first tier of
-# scripts/coding_models.json (a test pins that), and to the CPU pool's "qwen36-a3b".
+# scripts/coding_models.json (a test pins that), and to the CPU pool's "qwen36-a3b" (which
+# has no server_* fields: the member's slots and context are the coding pool's business).
 BUILTIN_TIERS: List[Dict[str, Any]] = [
     {
         "id": "qwen36-a3b",
         "name": "Qwen3.6 35B-A3B",
         "min_vram_gb": 15,
-        "context": 65536,
+        "context": 81920,
+        "server_slots": 2,
         "enabled": True,
         "file": "Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
         "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",

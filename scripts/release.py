@@ -11,7 +11,10 @@ The llama.cpp binaries are not built from this repository: scripts/package_llama
 pinned upstream build into release_dist/assets/llama/ (an RPC zip per platform, the server's
 own build, build.json). Every release signs that folder into the manifest (or --binaries DIR),
 and deploy refuses to ship a release without it unless told --no-binaries.
-    scripts/release.py backups                   releases that can be rolled back to
+The image engine (stable-diffusion.cpp's sd-server, 2.6.1) is packaged the same way by scripts/package_sd.py into
+release_dist/assets/sd/ (or --sd-assets DIR). It is optional: a release is signed with it when that folder holds a
+build, and without it everything else is unchanged. --no-binaries leaves it out too.
+    scripts/release.py backups                  releases that can be rolled back to
     scripts/release.py rollback [--backup NAME]
 
 One rule runs through all of it: a version number names exactly one archive. `deploy` refuses
@@ -42,6 +45,28 @@ OUT_DIR = "release_dist"
 DEFAULT_BINARIES = os.path.join(REPO_ROOT, OUT_DIR, "assets", "llama")
 # The name the server's llama.cpp build is uploaded under (release_apply.py expects it).
 SERVER_LLAMA_UPLOAD = "server-llama.tar.gz"
+DEFAULT_SD_ASSETS = os.path.join(REPO_ROOT, OUT_DIR, "assets", "sd")
+# The name the image engine is uploaded under (release_apply.py expects it).
+SERVER_SD_UPLOAD = "server-sd.tar.gz"
+
+
+def load_sd_assets(directory: str, required: bool = False) -> Optional[Dict]:
+    """
+    The packaged image engine in ``directory`` (see scripts/package_sd.py): {"sd_build", "server_sd": path}, or None
+    when there is no build there and none was asked for by name (``required``: the operator pointed at this folder).
+    """
+    try:
+        with open(os.path.join(directory, "build.json"), "r", encoding="utf-8") as handle:
+            info = json.load(handle)
+    except (OSError, ValueError) as exc:
+        if required:
+            raise CliError(f"No packaged image engine in {directory} ({type(exc).__name__}). "
+                           "Run scripts/package_sd.py first.") from exc
+        return None
+    archive = os.path.join(directory, str(info.get("server_sd", "")))
+    if not info.get("server_sd") or not os.path.isfile(archive) or not info.get("sd_build"):
+        raise CliError(f"{directory} is incomplete; missing: {info.get('server_sd') or SERVER_SD_UPLOAD}.")
+    return {"sd_build": info["sd_build"], "server_sd": archive}
 
 
 def load_binaries(directory: str) -> Dict:
@@ -176,7 +201,8 @@ def build_release(repo: str, out_dir: str, key_pem: bytes, notes: str, allow_dir
                                          rpc_zips=b.get("rpc_zips"), llama_build=b.get("llama_build"),
                                          rpc_proto=b.get("rpc_proto"), server_llama=b.get("server_llama"),
                                          app_models=load_app_models(repo),
-                                         coding_models=load_coding_models(repo))
+                                         coding_models=load_coding_models(repo),
+                                         sd_build=b.get("sd_build"), server_sd=b.get("server_sd"))
     except release.ReleaseError as exc:
         raise CliError(str(exc)) from exc
     signed = release.sign_manifest(manifest, key_pem)
@@ -195,6 +221,10 @@ def build_release(repo: str, out_dir: str, key_pem: bytes, notes: str, allow_dir
         ok, reason = release.verify_server_llama(signed, binaries["server_llama"])
         if not ok:
             raise CliError(f"The server llama.cpp build does not match the manifest just built ({reason}).")
+        if binaries.get("server_sd"):
+            ok, reason = release.verify_server_sd(signed, binaries["server_sd"])
+            if not ok:
+                raise CliError(f"The image engine archive does not match the manifest just built ({reason}).")
 
     with open(manifest_path, "w", encoding="utf-8") as handle:
         json.dump(signed, handle, indent=2)
@@ -265,6 +295,9 @@ def deploy(repo: str, remote, key_pem: bytes, notes: str, allow_dirty: bool = Fa
             expected[release.rpc_zip_name(platform)] = manifest[release.rpc_field(platform, "sha256")]
         remote.put(binaries["server_llama"], f"{incoming}/{SERVER_LLAMA_UPLOAD}")
         expected[SERVER_LLAMA_UPLOAD] = manifest["server_llama_sha256"]
+        if binaries.get("server_sd"):
+            remote.put(binaries["server_sd"], f"{incoming}/{SERVER_SD_UPLOAD}")
+            expected[SERVER_SD_UPLOAD] = manifest["server_sd_sha256"]
 
     for name, digest in expected.items():
         code, out = remote.run(f"sha256sum {incoming}/{name}")
@@ -320,7 +353,10 @@ def _args_binaries(args) -> Optional[Dict]:
     """The packaged llama.cpp binaries to sign into this release, or None when left out."""
     if args.no_binaries:
         return None
-    return load_binaries(args.binaries or DEFAULT_BINARIES)
+    binaries = load_binaries(args.binaries or DEFAULT_BINARIES)
+    named = getattr(args, "sd_assets", None)
+    sd = load_sd_assets(named or DEFAULT_SD_ASSETS, required=bool(named))
+    return {**binaries, **sd} if sd else binaries
 
 
 def _remote(args) -> Remote:
@@ -370,6 +406,8 @@ def cmd_build(args) -> int:
         for platform in release.RPC_PLATFORMS:
             print(f"    {release.rpc_zip_name(platform)}  sha256 {m[release.rpc_field(platform, 'sha256')]}")
         print(f"    server build  sha256 {m['server_llama_sha256']}")
+        if "sd_build" in m:
+            print(f"  image engine {m['sd_build']}  sha256 {m['server_sd_sha256']}")
     print(f"  signed manifest {built['manifest_path']}")
     return 0
 
@@ -415,6 +453,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--allow-dirty", action="store_true", help="build even with uncommitted changes (throwaway builds only)")
         p.add_argument("--binaries", help=f"packaged llama.cpp build to sign (default {os.path.relpath(DEFAULT_BINARIES, REPO_ROOT)})")
         p.add_argument("--no-binaries", action="store_true", help="release without llama.cpp binaries (workers cannot install one)")
+        p.add_argument("--sd-assets", help=f"packaged image engine to sign (default {os.path.relpath(DEFAULT_SD_ASSETS, REPO_ROOT)} "
+                       "when it holds a build; a release without one is built as before)")
         if name == "deploy":
             p.add_argument("--allow-downgrade", action="store_true")
         p.set_defaults(func=func)

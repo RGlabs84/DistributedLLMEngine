@@ -1,5 +1,6 @@
 package io.dlne.chat.ui
 
+import android.net.Uri
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.combinedClickable
@@ -76,6 +77,7 @@ import io.dlne.chat.data.ReportReason
 import io.dlne.chat.data.Role
 import io.dlne.chat.net.ClusterStatus
 import io.dlne.chat.update.UpdateBanner
+import java.io.File
 import kotlinx.coroutines.delay
 
 /** What the chat screen can ask the view model to do. */
@@ -91,6 +93,16 @@ class ChatActions(
     val onSendReport: (ReportReason, String) -> Unit,
     val onCloseReport: () -> Unit,
     val onReportThanksShown: () -> Unit,
+    val onCreateImage: (prompt: String, size: String) -> Unit,
+    /** Cancels the picture being made under this job id (several can run at once). */
+    val onCancelImage: (jobId: String) -> Unit,
+    /** The person answered the "Use your location for this?" card. */
+    val onAnswerLocationAsk: (LocationAnswer) -> Unit,
+    /** True when Android's location permission is already given. */
+    val locationPermitted: () -> Boolean,
+    /** Photos chosen with the "+" menu (and the camera's temporary file, when it came from the camera). */
+    val onAddPhotos: (uris: List<Uri>, cameraFile: File?) -> Unit,
+    val onRemovePhoto: (id: String) -> Unit,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -98,6 +110,7 @@ class ChatActions(
 fun ChatScreen(
     state: ChatUiState,
     draft: String,
+    photos: DraftPhotos,
     report: ReportUiState?,
     reportThanksPending: Boolean,
     actions: ChatActions,
@@ -150,6 +163,7 @@ fun ChatScreen(
         bottomBar = {
             InputBar(
                 draft = draft,
+                photos = photos,
                 state = state,
                 actions = actions,
             )
@@ -157,12 +171,15 @@ fun ChatScreen(
     ) { padding ->
         val messages = state.current?.messages.orEmpty()
         val pending = state.pendingForCurrent
-        if (messages.isEmpty() && pending == null) {
+        val imageJobs = state.imageJobsForCurrent
+        if (messages.isEmpty() && pending == null && imageJobs.isEmpty()) {
             EmptyState(Modifier.fillMaxSize().padding(padding))
         } else {
             MessageList(
                 messages = messages,
                 pending = pending,
+                imageJobs = imageJobs,
+                onCancelImage = actions.onCancelImage,
                 canRetry = !state.isStreaming && state.error == null,
                 onRetry = actions.onRetry,
                 onReport = actions.onReport,
@@ -175,11 +192,12 @@ fun ChatScreen(
 /** "Qwen3 4B Instruct · 3 machines serving", from the service status, when available. */
 @Composable
 private fun statusLine(status: ClusterStatus?): String? {
-    val pool = status?.appPool ?: return null
-    val ready = pool.membersReady ?: 0
-    if (ready <= 0) return stringResource(R.string.status_no_machines)
-    val machines = pluralStringResource(R.plurals.status_machines, ready, ready)
-    return listOfNotNull(pool.activeModel?.takeIf { it.isNotBlank() }, machines).joinToString(" · ")
+    val ready = status?.appPool?.membersReady ?: 0
+    return statusLineOf(
+        status,
+        noMachines = stringResource(R.string.status_no_machines),
+        machines = if (ready > 0) pluralStringResource(R.plurals.status_machines, ready, ready) else "",
+    )
 }
 
 @Composable
@@ -211,17 +229,19 @@ private fun EmptyState(modifier: Modifier) {
 private fun MessageList(
     messages: List<ChatMessage>,
     pending: PendingReply?,
+    imageJobs: List<ImageJobUi>,
+    onCancelImage: (String) -> Unit,
     canRetry: Boolean,
     onRetry: () -> Unit,
     onReport: (String) -> Unit,
     contentPadding: PaddingValues,
 ) {
     val listState = rememberLazyListState()
-    // Jump to the newest message whenever one is added (sent, or an answer saved).
-    LaunchedEffect(messages.size, pending != null) { listState.scrollToItem(0) }
+    // Jump to the newest message whenever one is added (sent, or an answer saved), or a picture starts or ends.
+    LaunchedEffect(messages.size, pending != null, imageJobs.size) { listState.scrollToItem(0) }
 
     val last = messages.lastOrNull()
-    val unanswered = canRetry && pending == null && last?.role == Role.USER
+    val unanswered = canRetry && pending == null && last?.role == Role.USER && last.image == null
     val direction = LocalLayoutDirection.current
 
     // Answers whose sources the reader unfolded, by message id. Held here rather than in each
@@ -246,12 +266,20 @@ private fun MessageList(
         if (unanswered) {
             item(key = "unanswered") { NoticeRow(stringResource(R.string.not_answered), onRetry) }
         }
+        // A Create image request or picture in progress is a card of its own; the pictures the chat makes
+        // sit inside the reply that asked for them (below).
+        for (job in imageJobs) {
+            if (job.replyId != null) continue
+            item(key = "image-job-${job.jobId ?: "request"}") { ImageJobCard(job, onCancel = { job.jobId?.let(onCancelImage) }) }
+        }
         if (pending != null) {
             item(key = "pending") {
                 PendingMessage(
                     pending,
                     sourcesOpen = pending.messageId in openSources,
                     onToggleSources = { toggleSources(pending.messageId) },
+                    job = imageJobs.forReply(pending.messageId),
+                    onCancelImage = onCancelImage,
                 )
             }
         }
@@ -260,12 +288,17 @@ private fun MessageList(
             val isLast = index == 0
             when (message.role) {
                 Role.USER -> UserMessage(message)
-                Role.ASSISTANT -> AssistantMessage(
+                Role.ASSISTANT -> if (message.image != null) {
+                    ImageResult(message, onReport = if (message.image.file != null) ({ onReport(message.id) }) else null)
+                } else AssistantMessage(
                     message,
-                    onRetry = if (isLast && canRetry && pending == null && message.notice != null) onRetry else null,
+                    // A reply that made (or was refused) a picture is answered: asking again would make another.
+                    onRetry = if (isLast && canRetry && pending == null && message.notice != null && message.picture == null) onRetry else null,
                     onReport = { onReport(message.id) },
                     sourcesOpen = message.id in openSources,
                     onToggleSources = { toggleSources(message.id) },
+                    job = imageJobs.forReply(message.id),
+                    onCancelImage = onCancelImage,
                 )
             }
         }
@@ -288,23 +321,29 @@ private fun UserMessage(message: ChatMessage) {
                     interactionSource = null,
                     indication = null,
                     onLongClickLabel = copyLabel,
-                    onLongClick = { copyToClipboard(context, message.content) },
+                    // A message of photos alone has no words to copy.
+                    onLongClick = { if (message.content.isNotBlank()) copyToClipboard(context, message.content) },
                     onClick = {},
                 ),
         ) {
-            Text(
-                message.content,
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-            )
+            Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (message.photos.isNotEmpty()) MessagePhotos(message.photos)
+                if (message.content.isNotBlank()) {
+                    Text(
+                        message.content,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                }
+            }
         }
     }
 }
 
 /**
  * A saved answer: the text (with `[n]` citations), its sources (folded unless [sourcesOpen]),
- * the service's lookup notes, any notice, then Copy and Report. Long-press anywhere also copies.
+ * the service's lookup notes, any notice, the picture it made (its card while [job] runs, then the
+ * picture with Save, Share and Report), then Copy and Report. Long-press anywhere also copies.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -314,6 +353,8 @@ private fun AssistantMessage(
     onReport: () -> Unit,
     sourcesOpen: Boolean,
     onToggleSources: () -> Unit,
+    job: ImageJobUi?,
+    onCancelImage: (String) -> Unit,
 ) {
     val context = LocalContext.current
     val copyLabel = stringResource(R.string.copy_message)
@@ -333,20 +374,41 @@ private fun AssistantMessage(
         if (message.sources.isNotEmpty()) SourceList(message.sources, sourcesOpen, onToggleSources)
         if (message.searchNotes.isNotEmpty()) SearchNotes(message.searchNotes)
         message.notice?.let { NoticeRow(it, onRetry) }
+        // A finished picture carries its own Report next to Save and Share; the flag below would repeat it.
+        val reportInPicture = message.picture?.file != null
+        message.picture?.let { ReplyPictureView(it, job, onCancelImage, onReport = onReport.takeIf { reportInPicture }) }
         if (message.content.isNotBlank()) {
-            AnswerActions(onCopy = { copyToClipboard(context, message.content) }, onReport = onReport)
+            AnswerActions(onCopy = { copyToClipboard(context, message.content) }, onReport = onReport.takeUnless { reportInPicture })
         }
     }
 }
 
-/** The answer while it streams: lookup status until text arrives, then text, sources and notes. */
+/**
+ * The answer while it streams: lookup status until text arrives, then text, sources and notes,
+ * and the card of the picture it is making ([job]) or why none was made.
+ */
 @Composable
-private fun PendingMessage(pending: PendingReply, sourcesOpen: Boolean, onToggleSources: () -> Unit) {
+private fun PendingMessage(
+    pending: PendingReply,
+    sourcesOpen: Boolean,
+    onToggleSources: () -> Unit,
+    job: ImageJobUi?,
+    onCancelImage: (String) -> Unit,
+) {
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (pending.text.isEmpty() && pending.notice == null) {
-            if (pending.lookup != null) {
+            if (pending.locating) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text(
+                        stringResource(R.string.locating),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else if (pending.lookup != null) {
                 LookupStatusRow(pending.lookup)
-            } else {
+            } else if (pending.picture == null) { // with a picture on its way its card says what is happening
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                     Text(
@@ -361,12 +423,13 @@ private fun PendingMessage(pending: PendingReply, sourcesOpen: Boolean, onToggle
         if (pending.sources.isNotEmpty()) SourceList(pending.sources, sourcesOpen, onToggleSources)
         if (pending.searchNotes.isNotEmpty()) SearchNotes(pending.searchNotes)
         pending.notice?.let { NoticeRow(it, onRetry = null) }
+        pending.picture?.let { ReplyPictureView(it, job, onCancelImage, onReport = null) }
     }
 }
 
 /** A line from the service (not the model), in a quieter style, with an optional Retry. */
 @Composable
-private fun NoticeRow(text: String, onRetry: (() -> Unit)?) {
+internal fun NoticeRow(text: String, onRetry: (() -> Unit)?) {
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Text(
             text,
@@ -387,7 +450,7 @@ private fun NoticeRow(text: String, onRetry: (() -> Unit)?) {
  * navigation bar and the keyboard, whichever is taller, so it always sits just above both.
  */
 @Composable
-private fun InputBar(draft: String, state: ChatUiState, actions: ChatActions) {
+private fun InputBar(draft: String, photos: DraftPhotos, state: ChatUiState, actions: ChatActions) {
     Surface(color = MaterialTheme.colorScheme.surface) {
         Column(
             Modifier
@@ -406,11 +469,44 @@ private fun InputBar(draft: String, state: ChatUiState, actions: ChatActions) {
                 )
                 Spacer(Modifier.size(8.dp))
             }
+            // A message about where the person is waits here, with the text still in the box, until they answer.
+            state.locationAsk?.let { ask ->
+                LocationAskCard(ask, permitted = actions.locationPermitted, onAnswer = actions.onAnswerLocationAsk)
+                Spacer(Modifier.size(8.dp))
+            }
+            var imageDialog by rememberSaveable { mutableStateOf(false) }
+            if (imageDialog) {
+                CreateImageDialog(
+                    initialPrompt = draft,
+                    status = state.status,
+                    onCreate = { prompt, size ->
+                        imageDialog = false
+                        actions.onCreateImage(prompt, size)
+                    },
+                    onDismiss = { imageDialog = false },
+                )
+            }
+            if (!photos.isEmpty) DraftPhotoStrip(photos, onRemove = actions.onRemovePhoto)
             Row(verticalAlignment = Alignment.Bottom) {
+                // The "+": Photos and Camera when the server can look at photos, Create image when it can make
+                // them; nothing at all on an older server.
+                AttachButton(
+                    menu = AttachMenu.of(state.status),
+                    photoRoom = photos.room,
+                    enabled = state.privacyAcknowledged,
+                    createImageEnabled = state.imageJob == null,
+                    onAddPhotos = actions.onAddPhotos,
+                    onCreateImage = { imageDialog = true },
+                )
                 TextField(
                     value = draft,
                     onValueChange = actions.onDraftChange,
-                    placeholder = { Text(stringResource(R.string.input_placeholder)) },
+                    placeholder = {
+                        Text(
+                            if (photos.isEmpty) stringResource(R.string.input_placeholder)
+                            else pluralStringResource(R.plurals.input_placeholder_photos, photos.count),
+                        )
+                    },
                     maxLines = 6,
                     shape = RoundedCornerShape(26.dp),
                     keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
@@ -425,7 +521,7 @@ private fun InputBar(draft: String, state: ChatUiState, actions: ChatActions) {
                     modifier = Modifier.weight(1f).heightIn(min = 52.dp),
                 )
                 Spacer(Modifier.size(8.dp))
-                SendButton(draft, state, actions)
+                SendButton(draft, photos, state, actions)
             }
             Text(
                 stringResource(R.string.input_hint),
@@ -439,7 +535,7 @@ private fun InputBar(draft: String, state: ChatUiState, actions: ChatActions) {
 
 /** Send; Stop while an answer streams; a countdown while the service asks us to wait. */
 @Composable
-private fun SendButton(draft: String, state: ChatUiState, actions: ChatActions) {
+private fun SendButton(draft: String, photos: DraftPhotos, state: ChatUiState, actions: ChatActions) {
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(state.rateLimitedUntil) {
         while (System.currentTimeMillis() < state.rateLimitedUntil) {
@@ -469,7 +565,8 @@ private fun SendButton(draft: String, state: ChatUiState, actions: ChatActions) 
 
         else -> FilledIconButton(
             onClick = actions.onSend,
-            enabled = draft.isNotBlank() && state.privacyAcknowledged,
+            // Photos alone can be sent; photos still being prepared are waited for.
+            enabled = photos.canSend(draft.isNotBlank()) && state.privacyAcknowledged,
             modifier = buttonModifier,
         ) {
             Icon(painterResource(R.drawable.ic_send), contentDescription = stringResource(R.string.send))
@@ -499,4 +596,15 @@ private fun ErrorBanner(error: ChatError, onRetry: (() -> Unit)?, onDismiss: () 
             }
         }
     }
+}
+
+/**
+ * The status line's text: the model name and the machine count, "No machines online right now"
+ * when none is ready, nothing without a status. The server counts the engine's own phone lanes
+ * as a serving machine, so `members_ready >= 1` reads as "1 machine serving".
+ */
+internal fun statusLineOf(status: ClusterStatus?, noMachines: String, machines: String): String? {
+    val pool = status?.appPool ?: return null
+    if ((pool.membersReady ?: 0) <= 0) return noMachines
+    return listOfNotNull(pool.activeModel?.takeIf { it.isNotBlank() }, machines).joinToString(" · ")
 }

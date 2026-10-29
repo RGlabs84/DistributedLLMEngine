@@ -1,7 +1,8 @@
 /**
  * Asks the coordinator whether a coding member should serve a request (docs/coding-members.md section 5):
- * `GET /v1/coding/route?session=<id>&privacy=<mode>` answers `{route, pubkey, alg}` for a member or
- * `{route: null}` for the coordinator's own engine. A coordinator from before coding members answers 404,
+ * `GET /v1/coding/route?session=<id>&privacy=<mode>[&own=<trust id>]` answers `{route, pubkey, alg}` for a
+ * member or `{route: null}` for the coordinator's own engine (`own` names this machine's own coding member,
+ * which the coordinator prefers while it is fast enough). A coordinator from before coding members answers 404,
  * which is remembered for ten minutes so an old server is asked once, not before every request. No
  * vscode import, so tests load it straight from dist/.
  */
@@ -103,6 +104,8 @@ export class RouteLookup {
   /**
    * @param ttlMs how long this answer may be reused for the same session (0: ask every time, which is
    *   right for chat, where the router should see each turn; autocomplete passes a few seconds)
+   * @param own the trust id of this machine's own coding member, when the worker is one (32 hex characters;
+   *   anything else is not sent)
    */
   async lookup(
     base: string,
@@ -110,13 +113,15 @@ export class RouteLookup {
     session: string,
     privacy: string,
     ttlMs: number,
-    agent?: http.Agent
+    agent?: http.Agent,
+    own?: string
   ): Promise<RouteOffer | null> {
     const now = Date.now();
     if ((this.unsupportedUntil.get(base) ?? 0) > now) {
       return null;
     }
-    const key = `${base}|${session}|${privacy}`;
+    const mine = own && /^[0-9a-f]{32}$/.test(own) ? own : '';
+    const key = `${base}|${session}|${privacy}|${mine}`;
     if (ttlMs > 0) {
       const hit = this.cache.get(key);
       if (hit && hit.until > now) {
@@ -125,7 +130,8 @@ export class RouteLookup {
     }
     let reply: { status: number; body: unknown };
     try {
-      const url = new URL(`${base}/v1/coding/route?session=${encodeURIComponent(session)}&privacy=${encodeURIComponent(privacy)}`);
+      const url = new URL(`${base}/v1/coding/route?session=${encodeURIComponent(session)}&privacy=${encodeURIComponent(privacy)}` +
+        (mine ? `&own=${mine}` : ''));
       reply = await getJson(url, headers, LOOKUP_TIMEOUT_MS, agent);
     } catch {
       return null; // the network is struggling: the plain path now, and ask again next time

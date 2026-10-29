@@ -185,6 +185,91 @@ def test_the_context_is_split_evenly_between_the_slots(build):
     assert arg_after(recorded_starts(env.record)[0], "-c") == "65536"
 
 
+# ======================================================================================
+# The tier's server settings and the coordinator's slot count (2.5.0)
+# ======================================================================================
+
+def test_the_tiers_server_settings_reach_llama_server_from_the_signed_tier_only(build):
+    env = build()
+    env.tier.update(server_slots=4, server_ctx_checkpoints=8, server_ubatch=256, server_spec_type="ngram-mod")
+    # The coordinator's copy of the tier may say anything: the knobs come from this node's signed release.
+    serve(env, {**env.tier, "server_slots": 64, "server_ubatch": 4096, "server_spec_type": "ngram-cache"})
+    argv = recorded_starts(env.record)[0]
+    assert arg_after(argv, "-c") == "65536" and arg_after(argv, "-np") == "4", "four slots of 16,384"
+    assert arg_after(argv, "--ctx-checkpoints") == "8" and arg_after(argv, "-ub") == "256"
+    assert arg_after(argv, "--spec-type") == "ngram-mod"
+    assert argv.index("--spec-type") < argv.index(no_trace.LLAMA_NO_TRACE_ARGS[0]), "before the no-trace arguments"
+    block = env.member.status()
+    assert (block["slots"], block["no_trace"]) == (4, True)
+    check_coding_block(block)
+    assert env.member.role_detail()["context"] == 16384
+
+
+def test_the_coordinator_may_ask_for_fewer_slots_and_each_request_keeps_its_context(build):
+    env = build()
+    env.member.assign(env.tier, 1)
+    settle(env.member)
+    argv = recorded_starts(env.record)[0]
+    assert arg_after(argv, "-c") == "32768" and arg_after(argv, "-np") == "1", "one slot of the tier's 65,536 / 2"
+    block = env.member.status()
+    assert (block["ready"], block["slots"], block["busy"]) == (True, 1, 0)
+    check_coding_block(block)
+    detail = env.member.role_detail()
+    assert (detail["slots"], detail["context"], detail["decode_tps"], detail["prefill_tps"]) == (1, 32768, 31.5, 118.0)
+    refused = [httpx.post(f"http://127.0.0.1:{env.member.port}/v1/chat/completions", json=CHAT, trust_env=False)]
+    assert refused[0].status_code == 200, "the one slot serves"
+
+
+@pytest.mark.parametrize("asked", [None, 0, 3, 65, "1", True, 1.0, -1])
+def test_an_ask_outside_the_tier_or_not_a_count_means_every_slot_the_tier_has(build, asked):
+    env = build()
+    env.member.assign(env.tier, asked)
+    settle(env.member)
+    argv = recorded_starts(env.record)[0]
+    assert arg_after(argv, "-c") == "65536" and arg_after(argv, "-np") == "2"
+    assert env.member.status()["slots"] == 2
+
+
+def test_a_change_of_slot_count_alone_is_a_restart_at_most_once_per_settle_period(build, clock):
+    env = build()
+    serve(env)                                                      # both slots, nothing asked
+    env.member.assign(env.tier, 1)
+    settle(env.member)
+    assert len(recorded_starts(env.record)) == 1, "not within the settle period of the last start"
+    assert env.member.status()["slots"] == 2, "what runs is what is reported"
+    clock.now += cm.SLOT_SETTLE_SECONDS + 1
+    env.member.assign(env.tier, 1)
+    settle(env.member)
+    starts = recorded_starts(env.record)
+    assert len(starts) == 2 and (arg_after(starts[1], "-c"), arg_after(starts[1], "-np")) == ("32768", "1")
+    block = env.member.status()
+    assert (block["ready"], block["slots"]) == (True, 1)
+    assert len(env.measured) == 2, "measured again on the new slot count"
+    env.member.assign(env.tier, 2)
+    settle(env.member)
+    assert len(recorded_starts(env.record)) == 2, "and not again until the next period"
+    env.member.assign(env.tier, 1)
+    clock.now += cm.SLOT_SETTLE_SECONDS + 1
+    env.member.assign(env.tier, 1)
+    settle(env.member)
+    assert len(recorded_starts(env.record)) == 2, "the count that runs is no change"
+    env.member.assign(env.tier, None)
+    settle(env.member)
+    assert len(recorded_starts(env.record)) == 3 and arg_after(recorded_starts(env.record)[2], "-np") == "2", \
+        "no preference means every slot again"
+
+
+def test_role_detail_names_the_context_and_the_speeds_once_known(build):
+    env = build()
+    assert set(env.member.role_detail()) == {"slots", "trust_id"}, "nothing is claimed before a server runs"
+    serve(env)
+    assert env.member.role_detail() == {"model": env.tier["file"], "tier": "coder-a", "slots": 2, "context": 32768,
+                                        "decode_tps": 31.5, "prefill_tps": 118.0, "trust_id": env.member.trust_id}
+    env.member.assign(None)
+    settle(env.member)
+    assert set(env.member.role_detail()) == {"slots", "trust_id"}, "forgotten with the server"
+
+
 def test_a_split_model_downloads_every_part_and_loads_the_first(build):
     parts = [b"part one " * 40, b"part two " * 50, b"part three " * 30]
     env = build(parts=parts)
@@ -1167,6 +1252,13 @@ def test_server_arguments(tmp_path):
     assert "-ngl" not in args and "-t" not in args
     assert args[-len(no_trace.LLAMA_NO_TRACE_ARGS):] == no_trace.LLAMA_NO_TRACE_ARGS
     assert arg_after(coding_server_args("b", "m", 1, threads=4), "-t") == "4"
+    assert not {"--ctx-checkpoints", "-ub", "--spec-type"} & set(args), "unset knobs leave llama-server's defaults"
+    knobs = coding_server_args("b", "m", 1, extra=["--fit-target", "1024"], ctx_checkpoints=0, ubatch=512,
+                               spec_type="ngram-simple")
+    assert arg_after(knobs, "--ctx-checkpoints") == "0" and arg_after(knobs, "-ub") == "512"
+    assert arg_after(knobs, "--spec-type") == "ngram-simple"
+    assert knobs.index("--spec-type") < knobs.index("--fit-target") < knobs.index(no_trace.LLAMA_NO_TRACE_ARGS[0])
+    assert not no_trace.no_trace_violations(knobs)
 
 
 # ======================================================================================
@@ -1437,6 +1529,81 @@ def test_a_streamed_ghost_text_request_is_warmed_up_with_a_plain_request(proxy):
         raw = b"".join(response.iter_raw())
     assert raw == b"".join(proxy.up.chunks)
     assert _bodies(proxy)[0]["stream"] is False and _bodies(proxy)[1]["stream"] is True
+
+
+# ------------------------------------------------------------------ 2.6.1: the coordinator cannot see a sealed body
+
+IMAGE_PART = {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+REMOTE_PART = {"type": "image_url", "image_url": {"url": "http://192.168.1.1/x.png"}}
+
+
+def _post(proxy, path, body, sealed):
+    if sealed:
+        envelope, _key = seal_request(body, proxy.member.pubkey)
+        return proxy.client.post(path, json=envelope)
+    return proxy.client.post(path, json=body)
+
+
+@pytest.mark.parametrize("sealed", [True, False])
+@pytest.mark.parametrize("part", [
+    IMAGE_PART, REMOTE_PART,
+    {"type": "video_url", "video_url": {"url": "http://192.168.1.1/clip.mp4"}},
+    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+])
+def test_a_member_refuses_an_image_or_an_unknown_part_whether_the_request_was_sealed_or_not(proxy, sealed, part):
+    body = {"messages": [{"role": "user", "content": "hi"}, {"role": "user", "content": [{"type": "text", "text": "x"}, part]}]}
+
+    response = _post(proxy, "/v1/chat/completions", body, sealed)
+
+    answer = response.json()
+    expected = "unsupported_content_type" if part["type"] in ("video_url", "input_audio") else "image_input_unavailable"
+    assert response.status_code == 400 and answer["code"] == expected
+    assert answer["detail"] and answer["error"]["code"] == 400
+    assert "192.168" not in response.text and "iVBOR" not in response.text           # nothing of the request comes back
+    assert proxy.up.received == [] and proxy.member.status()["busy"] == 0            # llama-server never saw it, no slot held
+
+
+@pytest.mark.parametrize("sealed", [True, False])
+def test_a_member_takes_text_and_text_parts(proxy, sealed):
+    body = {"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}
+
+    assert _post(proxy, "/v1/chat/completions", body, sealed).status_code == 200
+    assert len(proxy.up.received) == 1
+
+
+@pytest.mark.parametrize("sealed", [True, False])
+@pytest.mark.parametrize("prompt", [{"prompt_string": "x <__media__>", "multimodal_data": ["AAAA"]}, ["a", {"prompt_string": "b"}], [True]])
+def test_a_member_refuses_a_completion_prompt_that_is_not_text_or_tokens(proxy, sealed, prompt):
+    response = _post(proxy, "/v1/completions", {"prompt": prompt, "max_tokens": 4}, sealed)
+
+    assert response.status_code == 400 and response.json()["code"] == "unsupported_content_type"
+    assert proxy.up.received == []
+
+
+@pytest.mark.parametrize("prompt", ["def f(", [1, 2, 3], ["a", 5], [[1, 2], [3]], [["a"]]])
+def test_a_member_takes_a_text_token_or_batch_prompt(proxy, prompt):
+    assert _post(proxy, "/v1/completions", {"prompt": prompt, "max_tokens": 4}, True).status_code == 200
+
+
+@pytest.mark.parametrize("sealed", [True, False])
+@pytest.mark.parametrize("path, body", [
+    ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "id_slot": 3}),
+    ("/v1/completions", {"prompt": "def f(", "max_tokens": 4, "id_slot": 0}),
+])
+def test_a_clients_id_slot_never_reaches_a_members_llama_server(proxy, sealed, path, body):
+    response = _post(proxy, path, body, sealed)
+
+    assert response.status_code == 200
+    assert all("id_slot" not in b for b in _bodies(proxy))
+    assert _bodies(proxy)[-1]["messages" if "messages" in body else "prompt"] == (
+        body["messages"] if "messages" in body else body["prompt"])        # and the rest of the body is untouched
+
+
+def test_a_body_without_an_id_slot_goes_through_byte_for_byte_still(proxy):
+    sent = json.dumps(CHAT, separators=(",", ":")).encode()
+    proxy.client.post("/v1/chat/completions", content=sent, headers={"content-type": "application/json"})
+
+    assert proxy.up.received[0]["body"] == sent
 
 
 def test_a_plain_stream_is_relayed_unchanged(proxy):

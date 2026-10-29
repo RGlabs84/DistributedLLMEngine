@@ -207,12 +207,18 @@ def test_the_page_keeps_its_csp_and_loads_its_icons_only_from_itself():
         if tag == "img" or (tag == "link" and attrs.get("rel") in ("icon", "apple-touch-icon")):
             url = attrs.get("src") or attrs.get("href")
             assert url.startswith("/chat/") and not url.startswith("//"), url
-    assert "data:image" not in chat_page.CHAT_HTML and "data:image" not in landing.LANDING_HTML
+    assert "data:image" not in landing.LANDING_HTML
+    # The page embeds no picture. Its data: URLs are made at run time: from a generated image's bytes (an image card:
+    # the one literal below) and, since 2.6.2, from the reader's own photos, which the canvas hands over as JPEG data:
+    # URLs (the one pattern that checks them). That is what the CSP's data: is for.
+    assert chat_page.CHAT_HTML.count("data:image") == 2
+    assert "'data:image/png;base64,' + data" in chat_page.CHAT_HTML
+    assert r"/^data:image\/jpeg;base64,[A-Za-z0-9+/]+={0,2}$/" in chat_page.CHAT_HTML
 
 
 # The page's own button glyphs: plain controls, not marks. Anything else drawn inline is a new logo.
 BUTTON_GLYPH_PATHS = {
-    "M12 5v14M5 12h14",                       # new chat
+    "M12 5v14M5 12h14",                       # new chat, and the composer's "+"
     "M4 7h16M4 12h16M4 17h16",                # menu
     "M6 6l12 12M18 6L6 18",                   # close (menu and report sheets)
     "M12 19V5M5.5 11.5L12 5l6.5 6.5",         # send
@@ -225,13 +231,13 @@ def test_the_page_has_no_inline_logo_only_its_button_glyphs():
     assert not [e for e in elements if e[0] in ("symbol", "use", "image", "text", "g", "defs", "circle", "ellipse")]
     assert "<symbol" not in chat_page.CHAT_HTML and "dlne-mark" not in chat_page.CHAT_HTML
     svgs = [e for e in elements if e[0] == "svg"]
-    assert len(svgs) == 6
+    assert len(svgs) == 8   # + the image sheet's close button + the composer's "+" (the same glyph as new chat)
     for _tag, attrs, parents in svgs:
         assert "class" not in attrs and attrs.get("aria-hidden") == "true", attrs
         assert any(t == "button" for t, _a in parents), "an inline <svg> outside a button is a drawn mark"
         assert attrs["viewbox"] == "0 0 24 24"   # HTMLParser lower-cases attribute names
     shapes = [(t, a) for t, a, parents in elements if t in ("path", "rect") and any(p[0] == "svg" for p in parents)]
-    assert len(shapes) == 6
+    assert len(shapes) == 8
     for tag, attrs in shapes:
         if tag == "path":
             assert attrs["d"] in BUTTON_GLYPH_PATHS, f"a new drawn shape: {attrs['d']}"

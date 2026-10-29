@@ -373,6 +373,7 @@ def test_status_with_no_tiers_and_no_members():
     assert AppPool().status([], 2) == {
         "members": 0, "members_ready": 0, "active_tier": None, "active_model": None,
         "tiers": [], "requests_in_flight": 0, "median_answer_seconds": None,
+        "serving": None, "engine_requests_in_flight": 0,
     }
 
 
@@ -403,6 +404,48 @@ def test_status_counts_requests_in_flight_and_the_recent_median():
     assert status["requests_in_flight"] == 3
     assert 1.9 <= status["median_answer_seconds"] <= 2.2
     json.dumps(status)  # what /v1/cluster/status serves must serialise
+
+
+ENGINE = {"model": "Qwen3.6 35B-A3B", "tier": "qwen36-35b"}
+
+
+def test_status_with_the_engine_answering_phones_counts_it_as_a_serving_machine_and_names_its_model():
+    """The 2.6.0 bug: lanes on, the CPU copy off, and the status said no machine was online and "Qwen3 4B"."""
+    pool = pool_with(T0, T1, T2)
+    status = pool.status([], 2, engine=ENGINE)
+
+    assert status["members"] == 1 and status["members_ready"] == 1
+    assert status["active_model"] == "Qwen3.6 35B-A3B" and status["active_tier"] == "qwen36-35b"
+    assert status["serving"] == "engine"
+    assert [t["unlocked"] for t in status["tiers"]] == [True, True, True], "the CPU tiers are all below the engine's model"
+    assert [t["members_able"] for t in status["tiers"]] == [0, 0, 0], "and they are still counted as CPU machines"
+    json.dumps(status)
+
+
+def test_status_with_the_engine_and_cpu_members_adds_one_machine_and_keeps_the_ladder():
+    pool = pool_with(T0, T1, T2)
+    status = pool.status([member("a", 32), member("b", 32, ready=False)], 2, engine=ENGINE)
+
+    assert status["members"] == 3 and status["members_ready"] == 2
+    assert status["active_model"] == "Qwen3.6 35B-A3B"
+
+
+def test_status_without_the_engine_is_the_cpu_pools_alone_and_says_who_serves():
+    pool = pool_with(T0, T1)
+    assert pool.status([member("a", 8)], 2)["serving"] == "cpu"
+    idle = pool.status([member("a", 8, ready=False)], 2)
+    assert idle["serving"] is None and idle["members_ready"] == 0
+    assert pool.status([member("a", 8)], 2, engine=None)["active_model"] == "Small 4B"
+
+
+def test_status_says_what_in_flight_and_the_median_count():
+    pool = pool_with(T0)
+    pool._inflight.update({"worker:1": 1, ap.ENGINE_KEY: 2})
+    status = pool.status([], 2, engine=ENGINE)
+
+    assert status["requests_in_flight"] == 3, "model requests running now on any machine, the engine's lanes included"
+    assert status["engine_requests_in_flight"] == 2
+    assert "requests_in_flight" in AppPool.status.__doc__ and "median_answer_seconds" in AppPool.status.__doc__
 
 
 # ======================================================================================

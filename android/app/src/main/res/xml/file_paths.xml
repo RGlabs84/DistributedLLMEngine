@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Two folders can be handed to another app, one file at a time:
+    - images: a generated image, to the share sheet (Share);
+    - camera: the cache folder where the camera app writes the photo the person takes (the "+" menu's
+      Camera). The app reads the photo from there at once and deletes it. The name must match
+      PhotoFiles.CAMERA_DIR; a unit test checks it.
+-->
+<paths>
+    <files-path name="images" path="images/" />
+    <cache-path name="camera" path="camera/" />
+</paths>

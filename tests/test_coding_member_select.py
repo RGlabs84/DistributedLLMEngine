@@ -111,13 +111,46 @@ def test_unified_memory_is_one_pool_not_two(ladder):
 
 
 def test_the_os_reserve_comes_off_the_ram(ladder):
-    # 8 + 13.4 GiB: 7.4 usable, 15.4 in all against the 15.5 the IQ3_S tier needs.
+    # 8 + 13.6 GiB: 7.6 usable, 15.6 in all against the 15.7 the IQ3_S tier needs (its 81,920-token KV cache included).
     assert sel.choose_tier(8, 13.4, ladder, LIMITS) is None
-    assert sel.choose_tier(8, 13.6, ladder, LIMITS)["id"] == IQ3
+    assert sel.choose_tier(8, 13.6, ladder, LIMITS) is None
+    assert sel.choose_tier(8, 13.8, ladder, LIMITS)["id"] == IQ3
     # An operator who knows better can leave the OS less.
     assert sel.choose_tier(8, 13.4, ladder, {"coding_member_ram_reserve_gb": 3.0})["id"] == IQ3
     # ...and the config spelling works too.
     assert sel.choose_tier(8, 13.4, ladder, {"CODING_MEMBER_RAM_RESERVE_GB": 3.0})["id"] == IQ3
+
+
+# ======================================================================================
+# How many requests at once (2.5.0)
+# ======================================================================================
+
+def test_choose_slots_opens_as_many_slots_as_the_machine_runs_fast_enough(ladder):
+    """n slots are n answers at once: the estimate runs at n times the context per request against floors n times
+    higher. choose_tier picks the smartest tier that just clears the margin at one stream, so on the shipped ladder
+    that is one slot for the laptop and the cards up to 24 GB, and both for a 48 GB card or a Mac's one pool."""
+    for vram, ram, facts, expected in [(*LAPTOP, {}, 1), (8, 16, {}, 1), (12, 32, {}, 1), (24, 64, {}, 1),
+                                       (48, 64, {}, 2), (24, 32, {"unified": True}, 2), (96, 128, {"unified": True}, 2)]:
+        tier = sel.choose_tier(vram, ram, ladder, LIMITS, **facts)
+        assert sel.choose_slots(tier, vram, ram, LIMITS, **facts) == expected, (vram, ram, facts)
+
+
+def test_choose_slots_never_exceeds_the_tiers_server_slots_and_the_floors_scale_with_the_count(ladder):
+    wide = dict(by_id(ladder, Q6), server_slots=8, context=8 * 40960)
+    easy = {"coding_member_min_decode_tps": 0.01, "coding_member_min_prefill_tps": 0.01}
+    assert sel.choose_slots(wide, 500, 1024, easy) == 8, "every slot when the floors are nothing"
+    assert sel.choose_slots(dict(wide, server_slots=1, context=40960), 500, 1024, easy) == 1
+    assert sel.choose_slots(wide, 500, 1024, {"coding_member_min_decode_tps": 90.0}) == 1, "90 tok/s a user: one"
+    assert 1 < sel.choose_slots(wide, 500, 1024, LIMITS) < 8, "the shipped floors: some, not all"
+    assert sel.choose_slots(wide, 500, 1024, {"CODING_MEMBER_MIN_DECODE_TPS": 90.0}) == 1, "the config spelling too"
+
+
+def test_choose_slots_answers_one_for_anything_it_cannot_judge(ladder):
+    assert sel.choose_slots({"id": "x"}, 24, 32, LIMITS) == 1, "no context"
+    assert sel.choose_slots({"id": "x", "context": 65536}, 24, 32, LIMITS) == 1, "no size"
+    assert sel.choose_slots(None, 24, 32, LIMITS) == 1
+    assert sel.choose_slots(by_id(ladder, Q6), "many", None, LIMITS) == 1
+    assert sel.choose_slots(by_id(ladder, Q6), 4, 8, LIMITS) == 1, "a machine the tier does not fit"
 
 
 def test_eight_gb_means_cards_that_report_just_under_eight(ladder):

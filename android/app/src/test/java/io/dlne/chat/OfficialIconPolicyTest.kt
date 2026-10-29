@@ -31,8 +31,10 @@ class OfficialIconPolicyTest {
 
     /** The only drawables that are not icons of DLNE: plain functional glyphs (send, back...). */
     private val actionGlyphs = setOf(
-        "ic_add", "ic_back", "ic_copy", "ic_delete", "ic_flag", "ic_info",
+        "ic_add", "ic_back", "ic_copy", "ic_delete", "ic_flag", "ic_image", "ic_info",
         "ic_menu", "ic_open_in_new", "ic_send", "ic_settings", "ic_stop",
+        // The "+" menu and the photo thumbnails: camera, create image, remove (x).
+        "ic_camera", "ic_sparkle", "ic_close",
     )
 
     /** Files generated from the official logo, relative to src/main/res. */

@@ -2,8 +2,8 @@
 /**
  * The swarm serves one coding model, the one its coordinator has active, and the coordinator reads a
  * request's `model` as `body.model or <active model>`. So the extension names no model (naming one
- * can make the coordinator swap), offers a single "DLNE Swarm (auto)" entry in VS Code's model
- * picker, and shows the live model as a read-only line in the sidebar.
+ * can make the coordinator swap), offers a single "DLNE Swarm" entry in VS Code's model picker
+ * (model-provider.test.js), and shows the live model as a read-only line in the sidebar.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -14,20 +14,8 @@ const path = require('node:path');
 
 const stub = require('./helpers/vscode-stub');
 
-// The compiled code copies the `vscode` module's members when it is first loaded, so the Chat and
-// language-model namespaces the picker test needs are added before anything from dist/ is required.
-const registered = [];
-stub.vscode.chat = { createChatParticipant: () => ({ dispose() {} }) };
-stub.vscode.lm = {
-  registerChatModelProvider(id, provider, meta) {
-    registered.push({ id, provider, meta });
-    return { dispose() {} };
-  },
-};
-
 const { DlneClient } = require('../dist/client/dlneClient');
 const { SidebarProvider } = require('../dist/views/sidebarProvider');
-const { registerNativeChatParticipant } = require('../dist/views/nativeChatParticipant');
 const choice = require('../dist/client/modelChoice');
 
 process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'dlne-model-home-'));
@@ -266,22 +254,7 @@ test('the status listener hears every good answer, and can be removed', async ()
   }
 });
 
-// ---- VS Code's Chat model picker ---------------------------------------------------------
-
-test('VS Code\'s model picker gets one entry, "DLNE Swarm (auto)", and choosing it writes no setting', async () => {
-  stub.reset();
-  registered.length = 0;
-  const streamed = [];
-  const client = { streamChat: async (messages) => { streamed.push(messages); return { content: '', toolCalls: [] }; } };
-  registerNativeChatParticipant({ extensionUri: { fsPath: ROOT }, subscriptions: [] }, client, workerManager);
-  assert.equal(registered.length, 1);
-  assert.equal(registered[0].id, 'dlne-auto');
-  assert.equal(registered[0].meta.name, 'DLNE Swarm (auto)');
-  assert.equal(registered[0].meta.isDefault, true);
-  await registered[0].provider.provideLanguageModelResponse([{ role: 1, content: 'hi' }], {}, 'x', { report() {} }, {});
-  assert.equal(streamed.length, 1);
-  assert.deepEqual(stub.state.updates, [], 'picking the entry must not write dlne.chatModel');
-});
+// (VS Code's Chat model picker, and that choosing its entry writes no setting: model-provider.test.js)
 
 // ---- the words ---------------------------------------------------------------------------
 

@@ -517,3 +517,26 @@ def test_the_real_qwen36_header_matches_the_hand_numbers():
     # TheWall's placement (--n-cpu-moe 5): 11.0 GiB on the cards, 1.7 GiB in RAM
     assert shape.gpu_bytes(5) == 11_822_996_448
     assert shape.cpu_bytes(5) == 1_853_726_720
+
+
+# --------------------------------------------------------------------------------------
+# A vision projector must match its model (2.6.1)
+# --------------------------------------------------------------------------------------
+
+def test_a_models_embedding_length_and_a_projectors_projection_dim_are_read(tmp_path):
+    model = write_model(tmp_path, build_gguf(architecture_entries("qwen35moe", 40, 2, 2048, 16)))
+    projector = write_model(tmp_path, build_gguf([
+        ("general.architecture", T_STRING, _string("clip")),
+        ("clip.vision.embedding_length", T_UINT32, struct.pack("<I", 1152)),
+        ("clip.vision.projection_dim", T_UINT32, struct.pack("<I", 2048))]), name="mmproj.gguf")
+
+    assert gguf.embedding_length(model) == 2048 and gguf.projection_dim(projector) == 2048
+    assert gguf.projection_dim(model) is None                  # a text model names no projection
+    assert gguf.embedding_length(projector) is None            # the projector's arch is "clip": no <arch>.embedding_length
+
+
+def test_unreadable_files_give_no_dimension(tmp_path):
+    junk = write_model(tmp_path, b"not gguf at all", name="junk.gguf")
+
+    for path in (junk, str(tmp_path / "missing.gguf"), ""):
+        assert gguf.embedding_length(path) is None and gguf.projection_dim(path) is None

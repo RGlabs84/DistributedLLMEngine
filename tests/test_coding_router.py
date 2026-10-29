@@ -276,6 +276,32 @@ def test_a_sticky_member_that_is_full_gone_or_not_allowed_is_not_used(router):
     assert pick(router, [a, b], "s2", privacy="trusted", trusted_ids={OTHER}).worker_id == "b"
 
 
+# ======================================================================================
+# pick: the requester's own machine (2.5.0)
+# ======================================================================================
+
+def test_the_requesters_own_member_comes_before_the_least_busy_while_it_is_fast_enough(router):
+    mine, other = member("mine", busy=1, decode=25.0, trust=TRUSTED), member("other", decode=40.0, prefill=300.0)
+    assert pick(router, [mine, other]).worker_id == "other", "nothing said: the least busy"
+    assert pick(router, [mine, other], own=TRUSTED).worker_id == "mine", "no engine speed measured yet: own"
+    assert pick(router, [mine, other], own=TRUSTED, engine_tps=25.0).worker_id == "mine", "as fast as the engine: own"
+    assert pick(router, [mine, other], own=TRUSTED, engine_tps=25.1).worker_id == "other", "slower than the engine: not own"
+    assert pick(router, [mine, other], own=OTHER).worker_id == "other", "own names a member that is not here"
+    assert pick(router, [member("mine", busy=2, trust=TRUSTED), other], own=TRUSTED).worker_id == "other", "own is full"
+    assert pick(router, [mine, other], own=TRUSTED, privacy="trusted", trusted_ids={OTHER}).worker_id == "other", \
+        "own may not have this code"
+    assert pick(router, [mine], own=TRUSTED, engine_tps=99.0).worker_id == "mine", "too slow, but the only one there is"
+    assert pick(router, [mine, other], own=TRUSTED.upper()).worker_id == "other", "a trust id is compared as given"
+
+
+def test_the_sessions_sticky_member_still_comes_before_the_requesters_own(router):
+    mine, other = member("mine", trust=TRUSTED), member("other", prefill=300.0)
+    assert pick(router, [mine, other], "s").worker_id == "other"
+    assert pick(router, [mine, other], "s", own=TRUSTED).worker_id == "other", "the session's prompt is cached there"
+    assert pick(router, [mine, other], "s2", own=TRUSTED).worker_id == "mine"
+    assert pick(router, [mine, other], "s2").worker_id == "mine", "and own is sticky in its turn"
+
+
 def test_commit_false_leaves_no_memory(router):
     a, b = member("a", prefill=200), member("b", prefill=100)
     assert pick(router, [a, b], "s", commit=False).worker_id == "a"
@@ -627,8 +653,25 @@ def test_status_counts_only(router):
     registered(registry, "w4", ip="10.0.0.4", decode_tps=1.0)
     relay = lambda ip, port: 7001
     router._reserve(router.members(registry, relay)[1])
-    assert router.status(registry, relay, {}, True) == {"enabled": True, "members": 4, "ready": 2, "slots": 6, "busy": 2}
+    assert router.status(registry, relay, {}, True) == {
+        "enabled": True, "members": 4, "ready": 2, "slots": 6, "busy": 2,
+        "decode_tps_median": 30.0, "decode_tps_min": 30.0, "prefill_tps_median": 100.0, "prefill_tps_min": 100.0}
     assert router.status(registry, relay, {}, False)["enabled"] is False
+
+
+def test_the_status_speeds_are_the_ready_pools_median_and_minimum(router):
+    registry = WorkerRegistry()
+    registered(registry, "w1", ip="10.0.0.1", decode_tps=25.25, prefill_tps=90.0)
+    registered(registry, "w2", ip="10.0.0.2", decode_tps=40.0, prefill_tps=300.0)
+    registered(registry, "w3", ip="10.0.0.3", decode_tps=33.0, prefill_tps=121.0)
+    registered(registry, "w4", ip="10.0.0.4", decode_tps=999.0, prefill_tps=9999.0, ready=False)    # not ready: not counted
+    status = router.status(registry, lambda ip, port: 7001, {}, True)
+    assert (status["decode_tps_median"], status["decode_tps_min"]) == (33.0, 25.2)
+    assert (status["prefill_tps_median"], status["prefill_tps_min"]) == (121.0, 90.0)
+    none = router.status(WorkerRegistry(), lambda ip, port: 7001, {}, True)
+    assert [none[k] for k in ("decode_tps_median", "decode_tps_min", "prefill_tps_median", "prefill_tps_min")] == [None] * 4
+    text = json.dumps(status)
+    assert "w1" not in text and "10.0.0" not in text, "aggregates only"
 
 
 # ======================================================================================
@@ -696,15 +739,26 @@ def gpu(vram, ram=32.0, **extra):
     return {"gpu": {"has_gpu": True, "vram_total_gb": vram}, "ram_gb": ram, **extra}
 
 
+class Calls(list):
+    """choose_tier's (vram, ram) calls; ``.slots`` holds choose_slots' (tier id, vram, ram) calls."""
+    slots: list
+
+
 @pytest.fixture
 def chooser(monkeypatch):
-    calls = []
+    calls = Calls()
+    calls.slots = []
 
     def choose(vram, ram, tiers):
         calls.append((vram, ram))
         return tiers[0] if vram >= 8 and vram + ram >= 24 else None
 
+    def slots(tier, vram, ram):
+        calls.slots.append((tier["id"], vram, ram))
+        return 2 if vram >= 12 else 1
+
     monkeypatch.setattr(coding_member_select, "choose_tier", choose)
+    monkeypatch.setattr(coding_member_select, "choose_slots", slots)
     return calls
 
 
@@ -730,16 +784,42 @@ def chooser(monkeypatch):
     (None, False, "app", False),
 ])
 def test_assign_role(chooser, hardware, near, role, tiered):
-    got_role, tier = assign_role(hardware, near, TIERS)
+    got_role, tier, slots = assign_role(hardware, near, TIERS)
     assert got_role == role and (tier is not None) is tiered
     if tiered:
-        assert tier is TIERS[0]
+        assert tier is TIERS[0] and slots == (2 if hardware["gpu"]["vram_total_gb"] >= 12 else 1)
+    else:
+        assert slots is None, "no tier, no slot count"
 
 
 def test_a_gpu_that_is_not_near_is_only_sized_with_its_own_memory(chooser):
     assign_role(gpu(12.0, ram=20.0), False, TIERS)
     assign_role(gpu(24.0), True, TIERS)
-    assert chooser == [(12.0, 20.0)]
+    assert chooser == [(12.0, 20.0)] and chooser.slots == [("qwen36-a3b", 12.0, 20.0)]
+
+
+def test_the_coding_model_is_sized_on_the_ram_the_coding_job_may_use(chooser):
+    """ram_gb is the RPC node's lend (MAX_RAM_GB, 4 GB by default); coding_ram_gb is the coding job's (2.4.9)."""
+    assert assign_role(gpu(8.0, ram=4.0), False, TIERS) == (None, None, None)
+    role, tier, slots = assign_role({**gpu(8.0, ram=4.0), "coding_ram_gb": 30.0}, False, TIERS)
+    assert role == "coding" and tier is TIERS[0] and slots == 1
+    assert chooser[-1] == (8.0, 30.0) and chooser.slots[-1] == ("qwen36-a3b", 8.0, 30.0), "the slots are sized on the same memory"
+
+
+def test_a_tier_the_slot_estimate_cannot_read_still_gets_one_slot(monkeypatch):
+    """TIERS here has no context or size; choose_slots never raises and answers 1, the join test's figure."""
+    monkeypatch.setattr(coding_member_select, "choose_tier", lambda vram, ram, tiers: tiers[0])
+    assert assign_role(gpu(24), False, TIERS) == ("coding", TIERS[0], 1)
+
+
+@pytest.mark.parametrize("rtt, role", [(None, "coding"), (0.0, "coding"), (119.9, "coding"), (120.0, "coding"),
+                                       (120.1, None), (900.0, None)])
+def test_a_far_gpu_gets_a_model_of_its_own_only_within_the_member_limit(chooser, rtt, role):
+    assert assign_role(gpu(24), False, TIERS, rtt_ms=rtt, max_member_rtt_ms=120.0)[0] == role
+
+
+def test_without_a_member_limit_any_far_gpu_may_be_a_member(chooser):
+    assert assign_role(gpu(24), False, TIERS, rtt_ms=900.0)[0] == "coding"
 
 
 def test_first_seen_is_kept_and_bounded(router, monkeypatch):
@@ -882,3 +962,20 @@ def test_the_floors_in_config_reach_the_join_test_check(monkeypatch):
     limits = limits_for(monkeypatch, {"CODING_MEMBER_MIN_DECODE_TPS": "25"})
     assert not coding_member_select.meets_floor(20.0, 200.0, limits)
     assert coding_member_select.meets_floor(25.0, 80.0, limits)
+
+
+# ---- 2.5.0: docked laptops shard; a yielding GPU is given no new job --------------------------------------------
+
+@pytest.mark.parametrize("hardware, near, role, tiered", [
+    (gpu(24, docked=True), True, "rpc", False),
+    (gpu(24), True, "rpc", False),                              # cannot say: as before
+    (gpu(24, docked=False), True, "coding", True),              # near but off its dock: a whole model of its own
+    (gpu(8, ram=4, docked=False), True, None, False),           # ... or nothing, when it cannot hold one
+    (gpu(24, docked=False), False, "coding", True),
+    (gpu(24, is_yielding=True), True, None, False),             # stepping aside: no new job, it keeps the one it has
+    (gpu(24, is_yielding=True), False, None, False),
+    (gpu(24, is_yielding=False, docked=True), True, "rpc", False),
+])
+def test_docked_and_yielding_decide_a_near_gpus_job(chooser, hardware, near, role, tiered):
+    got_role, tier, slots = assign_role(hardware, near, TIERS)
+    assert got_role == role and (tier is not None) is tiered and (slots is not None) is tiered

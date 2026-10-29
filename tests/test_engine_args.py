@@ -78,3 +78,52 @@ def test_across_volunteers_gpus_only_the_card_placement_is_left_out():
         "--threads", "4", "--threads-batch", "4", "--cpu-mask", "0xc3", "--cpu-strict", "1",
         "--chat-template-kwargs", '{"enable_thinking":false}']
     assert engine_config.engine_args_without_placement(["-ot", "exps=CPU", "--no-mmap", "-sm", "row"]) == ["--no-mmap"]
+
+
+# --- 2.6: the media card and the vision projector -----------------------------------------------
+
+def test_media_and_vision_are_off_by_default(monkeypatch):
+    limits = _limits(monkeypatch, {})
+    assert (limits["media_gpu"], limits["engine_mmproj"], limits["engine_image_max_tokens"]) == ("", "", 1024)
+
+
+def test_media_card_and_projector_are_read_as_written_without_the_spaces(monkeypatch):
+    limits = _limits(monkeypatch, {"MEDIA_GPU": " 0000:0c:00.0 ", "ENGINE_MMPROJ": " ~/models/mmproj-F16.gguf "})
+    assert limits["media_gpu"] == "0000:0c:00.0" and limits["engine_mmproj"] == "~/models/mmproj-F16.gguf"
+
+
+@pytest.mark.parametrize("raw, expected", [("768", 768), ("1", 1), ("8192", 8192), ("0", 1024), ("8193", 1024),
+                                           ("-5", 1024), ("many", 1024), ("", 1024)])
+def test_the_image_budget_keeps_its_default_on_a_typo(monkeypatch, raw, expected):
+    assert _limits(monkeypatch, {"ENGINE_IMAGE_MAX_TOKENS": raw})["engine_image_max_tokens"] == expected
+
+
+@pytest.mark.parametrize("raw, expected", [("30", 30), ("0", 0), ("600", 600), (" 5 ", 5),
+                                           ("601", 30), ("-1", 30), ("lots", 30), ("1.5", 30), ("", 30)])
+def test_the_image_input_budget_is_bounded_and_a_typo_keeps_the_default(monkeypatch, raw, expected):
+    assert _limits(monkeypatch, {"IMAGE_INPUT_PER_HOUR": raw})["image_input_per_hour"] == expected
+
+
+def test_the_image_input_budget_defaults_to_30_an_hour(monkeypatch):
+    assert _limits(monkeypatch, {})["image_input_per_hour"] == 30
+
+
+def test_phone_lanes_are_off_by_default(monkeypatch):
+    limits = _limits(monkeypatch, {})
+    assert (limits["engine_phone_slots"], limits["engine_phone_context"]) == (0, 8192)
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("2", 2), ("0", 0), ("8", 8), (" 3 ", 3),
+    ("9", 0), ("-1", 0), ("some", 0), ("1.5", 0), ("", 0),   # a typo keeps the phones off the engine
+])
+def test_engine_phone_slots_are_bounded(monkeypatch, raw, expected):
+    assert _limits(monkeypatch, {"ENGINE_PHONE_SLOTS": raw})["engine_phone_slots"] == expected
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("8192", 8192), ("4096", 4096), ("65536", 65536),
+    ("4095", 8192), ("65537", 8192), ("big", 8192), ("0", 8192),
+])
+def test_engine_phone_context_is_bounded(monkeypatch, raw, expected):
+    assert _limits(monkeypatch, {"ENGINE_PHONE_CONTEXT": raw})["engine_phone_context"] == expected

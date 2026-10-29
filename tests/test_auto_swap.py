@@ -11,6 +11,7 @@ alias on the chat and completion paths. Engines there are fakes too.
 import asyncio
 import os
 import threading
+from types import SimpleNamespace
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -54,6 +55,7 @@ class Rig:
                          "auto_swap_down_stable_seconds": 120, "auto_swap_cooldown_seconds": 1800}
         self.settings.update(settings or {})
         self.swaps = []          # (tier id, abort_if_busy, time)
+        self.speed_checked = []  # (tier id, check_speed)
         self.result = "swapped"
         self.in_progress = False
         self.busy = False
@@ -61,6 +63,7 @@ class Rig:
         self.gate = None         # an asyncio.Event holds downloads until set
         self.download_ok = True
         self.logs = []
+        self.engine_short = False   # the engine already runs without the GPUs that left
         self.controller = AutoSwapController(
             tiers_provider=lambda: [dict(t) for t in self.tiers],
             pool_provider=lambda: {"vram_gb": self.vram, "far_vram_gb": self.far, "sysram_gb": 12.0},
@@ -73,10 +76,12 @@ class Rig:
             queue_busy=lambda: self.busy,
             clock=lambda: self.now,
             log=self.logs.append,
+            engine_short=lambda: self.engine_short,
         )
 
-    async def _swap(self, tier, *, drain_seconds, abort_if_busy):
+    async def _swap(self, tier, *, drain_seconds, abort_if_busy, check_speed=False):
         self.swaps.append((tier["id"], abort_if_busy, self.now))
+        self.speed_checked.append((tier["id"], check_speed))
         if self.result == "swapped":
             self.current = tier["file"]
         return SwapResult(self.result, "from the test")
@@ -164,6 +169,18 @@ async def test_a_down_swap_ignores_the_cooldown():
     await rig.at(T0 + 750)                                # 120 s short, long before the cooldown ends
     assert rig.swaps[-1] == ("t16", False, T0 + 750)      # down-switches never abort on a busy queue
     assert rig.current == "t16.gguf"
+
+
+@pytest.mark.anyio
+async def test_an_engine_already_rebuilt_without_the_gpu_steps_down_at_once():
+    """2026-10-27: the laptop's shard went, the engine was rebuilt on 16 GB at once, and IQ4_XS spilled for the
+    two-minute grace that could no longer save anything."""
+    rig = Rig(vram=24)
+    await rig.every(T0, T0 + 600)                         # up to t24
+    rig.vram = 16
+    rig.engine_short = True
+    await rig.at(T0 + 630)
+    assert rig.swaps[-1] == ("t16", False, T0 + 630) and rig.current == "t16.gguf"
 
 
 @pytest.mark.anyio
@@ -604,19 +621,21 @@ async def test_the_link_probe_measures_each_volunteer_every_interval_and_files_o
 
 @pytest.fixture
 def lan_and_wan(monkeypatch):
-    """A registry with this machine's 16 GB, a measured LAN volunteer, and three that do not count."""
+    """A registry with this machine's 16 GB, a measured LAN volunteer, and four that do not count."""
     from engine.registry import WorkerRegistry
 
     registry = WorkerRegistry()
     for worker_id, ip, vram in (("local", "127.0.0.1", 16.0), ("lan", "192.168.1.20", 8.0),
                                 ("wan", "203.0.113.7", 8.0), ("stale", "192.168.1.30", 8.0),
-                                ("slow", "192.168.1.40", 8.0)):
+                                ("slow", "192.168.1.40", 8.0), ("liar", "198.51.100.9", 8.0)):
         registry.update_worker(worker_id=worker_id, ip=ip, port=50052, token=f"t-{worker_id}",
                                hardware_profile={"gpu": {"has_gpu": True, "vram_total_gb": vram}})
+    registry.record_probe("lan", 0.6, "lan")
     registry.record_link_measurement("lan", {"rtt_min_ms": 0.6, "download_mbps": 900})
-    registry.record_link_measurement("stale", {"rtt_min_ms": 0.5})
-    registry.link_measurements["stale"]["reported_at"] -= 3600          # an hour old
-    registry.record_link_measurement("slow", {"rtt_min_ms": 40.0})     # a LAN address, but 40 ms away
+    registry.record_probe("stale", 0.5, "direct")
+    registry.link_probes["stale"]["measured_at"] -= 3600                # an hour old
+    registry.record_probe("slow", 100.0, "tunnel")                     # usable for a member, too far to share
+    registry.record_link_measurement("liar", {"rtt_min_ms": 0.5})      # says it is close; nobody measured it
     monkeypatch.setattr(coordinator, "registry", registry)
     return registry
 
@@ -624,15 +643,33 @@ def lan_and_wan(monkeypatch):
 def test_the_coordinator_pool_counts_this_machine_and_near_volunteers_only(lan_and_wan):
     pool = coordinator._coding_pool()
     assert pool["vram_gb"] == 24.0                        # 16 local + 8 on the LAN
-    assert pool["far_vram_gb"] == 24.0                    # unmeasured, stale and slow
+    assert pool["far_vram_gb"] == 32.0                    # unmeasured, stale, slow, and one that only says it is near
 
 
-def test_a_probe_result_is_filed_beside_what_the_worker_reported(lan_and_wan):
+def test_a_probe_result_is_filed_as_the_coordinators_own_measurement(lan_and_wan):
+    coordinator._probe_paths["192.168.1.20:50052"] = "lan"
     coordinator._record_probed_rtt("192.168.1.20:50052", 0.9)
-    measurement = lan_and_wan.get_link_measurement("lan")
-    assert measurement["rtt_min_ms"] == 0.9 and measurement["download_mbps"] == 900
-    coordinator._record_probed_rtt("203.0.113.7:50052", 3.0)            # a WAN address that answers fast
+    probe = lan_and_wan.get_probe("lan")
+    assert probe["rtt_ms"] == 0.9 and probe["via"] == "lan"
+    measurement = lan_and_wan.get_link_measurement("lan")               # what the worker said is left alone
+    assert measurement["rtt_min_ms"] == 0.6 and measurement["download_mbps"] == 900
+    coordinator._record_probed_rtt("203.0.113.7:50052", 70.0)           # a WAN volunteer within 80 ms
     assert coordinator._coding_pool()["vram_gb"] == 32.0
+
+
+def test_the_shared_pool_limit_is_80_ms_by_default(lan_and_wan):
+    coordinator._record_probed_rtt("203.0.113.7:50052", 80.0)
+    coordinator._record_probed_rtt("192.168.1.40:50052", 80.1)
+    assert coordinator._max_shared_rtt() == 80.0
+    assert coordinator._coding_pool()["vram_gb"] == 32.0                # 16 + LAN 8 + the 80 ms one
+
+
+@pytest.mark.parametrize("rtt, grade", [
+    (0.4, "best"), (40.0, "best"), (40.1, "good"), (80.0, "good"), (80.1, "usable"), (120.0, "usable"),
+    (120.1, "too_far"), (900.0, "too_far"), (None, "unmeasured"), ("fast", "unmeasured"), (-1, "unmeasured"),
+])
+def test_the_owners_link_grades(rtt, grade):
+    assert auto_swap.rtt_grade(rtt) == grade
 
 
 def test_the_probe_skips_this_machine(lan_and_wan):
@@ -688,10 +725,21 @@ def test_auto_swap_timings_are_range_checked(isolated_config):
     assert limits["auto_swap_cooldown_seconds"] == 1800
 
 
-@pytest.mark.parametrize("raw, expected", [("5", 5.0), ("2.5", 2.5), ("15", 15.0), ("0", 15.0),
-                                           ("2000", 15.0), ("near", 15.0), ("nan", 15.0)])
+@pytest.mark.parametrize("raw, expected", [("5", 5.0), ("2.5", 2.5), ("15", 15.0), ("0", 80.0),
+                                           ("2000", 80.0), ("near", 80.0), ("nan", 80.0)])
 def test_the_rtt_limit_is_range_checked(isolated_config, raw, expected):
     assert _limits_from(isolated_config, f"AUTO_SWAP_MAX_RTT_MS={raw}\n")["auto_swap_max_rtt_ms"] == expected
+
+
+@pytest.mark.parametrize("raw, expected", [("200", 200.0), ("60", 60.0), ("0", 120.0),
+                                           ("9000", 120.0), ("far", 120.0), ("nan", 120.0)])
+def test_the_member_rtt_limit_is_range_checked(isolated_config, raw, expected):
+    assert _limits_from(isolated_config, f"CODING_MEMBER_MAX_RTT_MS={raw}\n")["coding_member_max_rtt_ms"] == expected
+
+
+def test_the_rtt_limits_default_to_the_owners_choice(isolated_config):
+    limits = engine_config.get_worker_limits()
+    assert limits["auto_swap_max_rtt_ms"] == 80.0 and limits["coding_member_max_rtt_ms"] == 120.0
 
 
 @pytest.mark.parametrize("raw, expected", [("300", 300), ("30", 30), ("5", 180), ("99999", 180), ("soon", 180)])
@@ -995,6 +1043,100 @@ def test_the_load_limit_defaults_to_three_minutes(isolated_config):
     assert engine_config.get_worker_limits()["auto_swap_load_timeout_seconds"] == 180
 
 
+# --- the speed check after a move up (2.4.9) -------------------------------------------------------------
+
+@pytest.fixture
+def measured_speed(monkeypatch):
+    """The engine's speed as llama.cpp would time it: set ``.rate`` (or ``.result``) per test."""
+    probe = SimpleNamespace(rate=30.0, result=None, runs=[], delay=0.0)
+
+    async def run(manager, model_path, prompt=None, max_tokens=128, source="api"):
+        probe.runs.append((model_path, max_tokens, source))
+        if probe.delay:
+            await asyncio.sleep(probe.delay)
+        return probe.result if probe.result is not None else {"ok": True, "tokens_per_second": probe.rate}
+
+    monkeypatch.setattr(coordinator.benchmark, "run_inference_benchmark", run)
+    return probe
+
+
+@pytest.mark.anyio
+async def test_a_move_up_that_is_fast_enough_stays(engines, measured_speed):
+    result = await coordinator._auto_swap_to(tier("t24", 24), drain_seconds=1.0, abort_if_busy=True, check_speed=True)
+    assert result.status == "swapped"
+    assert engines.calls == ["stop", ("start", "t24.gguf")]
+    # A warm-up, then the timed run, both on the new model while requests still wait.
+    assert [(m, n) for m, n, _ in measured_speed.runs] == [("t24.gguf", 8), ("t24.gguf", 64)]
+
+
+@pytest.mark.anyio
+async def test_a_move_up_that_crawls_is_rolled_back(engines, measured_speed):
+    measured_speed.rate = 6.2
+    result = await coordinator._auto_swap_to(tier("t24", 24), drain_seconds=1.0, abort_if_busy=True, check_speed=True)
+    assert result.status == "failed" and "6.2 tokens a second" in result.detail and "10" in result.detail
+    assert engines.calls == ["stop", ("start", "t24.gguf"), "stop", ("start", "old.gguf")]
+    assert coordinator.global_active_model == "old.gguf"
+    assert coordinator.is_swapping_models is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("result", [{"ok": False, "detail": "The engine answered HTTP 500."},
+                                    {"ok": True, "tokens_per_second": None}, {"ok": True, "tokens_per_second": True}])
+async def test_a_speed_that_cannot_be_measured_counts_as_too_slow(engines, measured_speed, result):
+    measured_speed.result = result
+    out = await coordinator._auto_swap_to(tier("t24", 24), drain_seconds=1.0, abort_if_busy=True, check_speed=True)
+    assert out.status == "failed" and "could not be measured" in out.detail
+    assert coordinator.global_active_model == "old.gguf"
+
+
+@pytest.mark.anyio
+async def test_a_speed_check_that_hangs_is_cut_short(engines, measured_speed, monkeypatch):
+    monkeypatch.setattr(coordinator, "SPEED_CHECK_TIMEOUT_SECONDS", 0.2)
+    measured_speed.delay = 5.0
+    started = asyncio.get_running_loop().time()
+    out = await coordinator._auto_swap_to(tier("t24", 24), drain_seconds=1.0, abort_if_busy=True, check_speed=True)
+    assert out.status == "failed" and "did not finish" in out.detail
+    assert asyncio.get_running_loop().time() - started < 3.0
+    assert coordinator.global_active_model == "old.gguf"
+
+
+@pytest.mark.anyio
+async def test_a_floor_of_zero_and_a_move_down_are_not_speed_checked(engines, measured_speed, monkeypatch):
+    out = await coordinator._auto_swap_to(tier("t16", 16), drain_seconds=1.0, abort_if_busy=False)
+    assert out.status == "swapped" and measured_speed.runs == []
+    limits = coordinator.get_worker_limits
+    monkeypatch.setattr(coordinator, "get_worker_limits", lambda: {**limits(), "auto_swap_min_decode_tps": 0.0})
+    out = await coordinator._auto_swap_to(tier("t24", 24), drain_seconds=1.0, abort_if_busy=True, check_speed=True)
+    assert out.status == "swapped" and measured_speed.runs == []
+
+
+@pytest.mark.anyio
+async def test_the_controller_speed_checks_moves_up_only():
+    rig = Rig(vram=24)
+    await rig.every(T0, T0 + 600)                         # up to t24
+    rig.vram = 16
+    await rig.every(T0 + 630, T0 + 750)                   # back down to t16
+    assert rig.speed_checked == [("t24", True), ("t16", False)]
+
+
+@pytest.mark.anyio
+async def test_a_tier_that_was_too_slow_is_held_off_like_any_failed_switch():
+    rig = Rig(vram=24)
+    rig.result = "failed"
+    await rig.every(T0, T0 + 600)
+    assert [s[0] for s in rig.swaps] == ["t24"]
+    status = rig.controller.status()
+    assert "not trying it again" in status["detail"]
+    await rig.every(T0 + 630, T0 + 4 * 3600)             # well inside the 6 h hold
+    assert [s[0] for s in rig.swaps] == ["t24"]
+
+
+def test_the_speed_floor_defaults_to_ten_and_is_range_checked(isolated_config):
+    assert engine_config.get_worker_limits()["auto_swap_min_decode_tps"] == 10.0
+    for raw, expected in (("15", 15.0), ("0", 0.0), ("-1", 10.0), ("fast", 10.0), ("5000", 10.0)):
+        assert _limits_from(isolated_config, f"AUTO_SWAP_MIN_DECODE_TPS={raw}\n")["auto_swap_min_decode_tps"] == expected
+
+
 @pytest.mark.anyio
 async def test_a_manual_switch_during_an_automatic_one_wins(engines, monkeypatch):
     engines.healthy = False
@@ -1215,7 +1357,7 @@ async def test_the_controller_fetches_a_split_tier_with_the_real_downloader_and_
     served = {"model": "t32.gguf"}
     logs = []
 
-    async def swap(chosen, *, drain_seconds, abort_if_busy):
+    async def swap(chosen, *, drain_seconds, abort_if_busy, check_speed=False):
         swaps.append(chosen["id"])
         served["model"] = chosen["file"]
         return SwapResult("swapped", "from the test")

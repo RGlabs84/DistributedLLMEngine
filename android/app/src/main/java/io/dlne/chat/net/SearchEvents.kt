@@ -26,10 +26,21 @@ import kotlinx.serialization.json.contentOrNull
  * being shown, keeps its bubble, and drops any sources it already holds for it (normally
  * none); see [io.dlne.chat.ui.PendingReply.retracted].
  *
+ * Two more events belong to the chat's own picture tool (server 2.6.2). They are sent only to
+ * a client that asked with `"features": ["image_jobs"]` in the request, before the reply's text:
+ *
+ *     {"dlne":{"event":"image_job","id":"abc_DEF-1","prompt":"a red fox","size":"768x768","position":1,"eta_seconds":80}}
+ *     {"dlne":{"event":"image_refused","code":"image_quota","detail":"Your free trial is used up. ..."}}
+ *
+ * `image_job` starts a job the app polls like a Create image job (a job id of another shape is
+ * not trusted and the event is dropped); `image_refused` carries the server's words for why no
+ * picture was started.
+ *
  * Titles, hosts and URLs come from arbitrary web pages, so everything is treated as
  * hostile: text is flattened to one plain line without control or bidi-override
  * characters and capped in length, only http(s) URLs survive, and the host shown for a
- * link is always the one the link really goes to. An event this version does not know is
+ * link is always the one the link really goes to. A picture description comes from the model
+ * and is flattened and capped the same way. An event this version does not know is
  * dropped, never shown as text.
  */
 internal object SearchEvents {
@@ -42,6 +53,17 @@ internal object SearchEvents {
     private const val MAX_QUERY = 200
     private const val MAX_NOTE = 300
     private const val MAX_URL = 2048
+    private const val MAX_CODE = 64
+    private const val MAX_REFUSAL = 400
+
+    /** Seconds or places in line: more than a day is not a real figure. */
+    private const val MAX_COUNT = 86_400
+
+    /** The job ids the server makes (`secrets.token_urlsafe`): the alphabet is URL-safe and has no dots or slashes. */
+    private val JOB_ID = Regex("[A-Za-z0-9_-]{1,64}")
+
+    /** Shown when a job arrives with no description at all (the server always sends one). */
+    private const val UNNAMED_PICTURE = "a picture"
 
     fun parse(event: JsonObject): StreamEvent? = when (string(event["event"])) {
         "searching" -> StreamEvent.Searching(
@@ -53,7 +75,24 @@ internal object SearchEvents {
             ?.let { StreamEvent.SearchNote(it) }
         "search_unavailable" -> StreamEvent.SearchUnavailable(cleanText(string(event["reason"]).orEmpty(), MAX_NOTE))
         "retract" -> StreamEvent.Retract
+        "image_job" -> parseImageJob(event)
+        "image_refused" -> StreamEvent.ImageRefused(
+            code = cleanText(string(event["code"]).orEmpty(), MAX_CODE),
+            detail = cleanText(string(event["detail"]).orEmpty(), MAX_REFUSAL),
+        )
         else -> null
+    }
+
+    /** A job needs an id of the shape the server makes; everything else about it is optional. */
+    private fun parseImageJob(event: JsonObject): StreamEvent.ImageJob? {
+        val id = string(event["id"])?.takeIf { JOB_ID.matches(it) } ?: return null
+        return StreamEvent.ImageJob(
+            id = id,
+            prompt = cleanText(string(event["prompt"]).orEmpty(), MAX_IMAGE_PROMPT_CHARS).ifEmpty { UNNAMED_PICTURE },
+            size = string(event["size"])?.takeIf { IMAGE_SIZE.matches(it) },
+            position = count(event["position"]),
+            etaSeconds = count(event["eta_seconds"]),
+        )
     }
 
     /**
@@ -128,5 +167,12 @@ internal object SearchEvents {
     private fun number(element: JsonElement?): Int? {
         val primitive = element as? JsonPrimitive ?: return null
         return primitive.contentOrNull?.trim()?.toIntOrNull()
+    }
+
+    /** A figure of seconds or places: a number from 0 to [MAX_COUNT] (80 and 80.0 both read), else null. */
+    private fun count(element: JsonElement?): Int? {
+        val primitive = element as? JsonPrimitive ?: return null
+        val value = primitive.contentOrNull?.trim()?.toDoubleOrNull() ?: return null
+        return if (value.isFinite() && value in 0.0..MAX_COUNT.toDouble()) Math.round(value).toInt() else null
     }
 }

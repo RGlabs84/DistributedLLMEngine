@@ -93,6 +93,7 @@ import hashlib
 import hmac
 import json
 import math
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -719,7 +720,15 @@ HARDWARE_BOUNDS = {
     # Measured by CPU-only nodes (engine/hardware.measure_memory_bandwidth_gbs). A 12-channel
     # DDR5 server reaches ~460 GB/s; anything near the cap is a lie, not a machine.
     "mem_bandwidth_gbs": (0.0, 2048.0),
+    # The RAM the node's coding job may use (2.4.9): its total under CODING_MAX_RAM_GB. A coding
+    # model is chosen to fit it, so it is held to the same bound as ram_gb.
+    "coding_ram_gb": (0.0, 2048.0),
 }
+
+# A node in the coordinator's own household lists its private IPv4 addresses when asked
+# (engine/link_paths.py); dotted quads only, and only a few.
+_MAX_LAN_ADDRESSES = 8
+_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 
 # cpu_features is a list of instruction-set names (engine/hardware.CPU_FEATURE_NAMES); a
 # node gets to say which it has, not to send arbitrary data along with it.
@@ -744,6 +753,8 @@ _BOOLEAN_FIELDS = (
     ("gpu", "has_gpu"),
     (None, "has_gpu"),      # tolerated at the top level too; older probes put it there
     (None, "coding_ok"),    # the volunteer allows the coding-member job (CODING_MEMBER_ALLOWED)
+    (None, "docked"),       # a wired link and mains power (2.5.0): a near GPU shards only while this is true
+    (None, "leaving"),      # a graceful stop under way (2.5.0): the engine is rebuilt without this shard, after a drain
 )
 
 
@@ -878,6 +889,18 @@ def validate_hardware_profile(hw: dict) -> Tuple[bool, str]:
     arch = hw.get("cpu_arch")
     if arch is not None and not (isinstance(arch, str) and len(arch) <= _MAX_NAME_LENGTH):
         return (False, "cpu_arch must be a short name")
+    lan = hw.get("lan_ipv4")
+    if lan is not None and (not isinstance(lan, list) or len(lan) > _MAX_LAN_ADDRESSES
+                            or not all(isinstance(a, str) and _IPV4_RE.match(a) for a in lan)):
+        return (False, f"lan_ipv4 must be a list of at most {_MAX_LAN_ADDRESSES} IPv4 addresses")
+    # Docked (2.5.0): the link and power facts behind "docked". A worker leaves out what it could not
+    # read rather than sending "unknown", so only the known values are accepted.
+    link = hw.get("link")
+    if link is not None and link not in ("wired", "wifi", "cellular"):
+        return (False, "link must be \"wired\", \"wifi\" or \"cellular\" when present")
+    power = hw.get("power")
+    if power is not None and power not in ("ac", "battery"):
+        return (False, "power must be \"ac\" or \"battery\" when present")
 
     # A CPU pool member (2.3.0) says so, and reports what it serves. A coding member (see
     # docs/coding-members.md) says "coding" and reports its model and speeds in a "coding" block.

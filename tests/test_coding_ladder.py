@@ -94,7 +94,9 @@ def test_the_shipped_ladder_is_the_approved_one():
     approved = ["qwen36-a3b", "qwen36-a3b-iq4xs", "qwen36-a3b-q4", "qwen36-a3b-q6"]
     assert [tiers[i]["min_vram_gb"] for i in approved] == [15, 24, 29, 39]
     assert all(tiers[i]["enabled"] and tiers[i]["blocked"] is None for i in approved)
-    assert all(tiers[i]["context"] == 65536 for i in approved)
+    # 2.5.0: two slots of 40,960 tokens each, TheWall's own per-request context (docs/coding-members.md section 4).
+    assert all((tiers[i]["context"], tiers[i]["server_slots"]) == (81920, 2) for i in approved)
+    assert all(tiers[i][knob] is None for i in approved for knob in release._CODING_SERVER_KNOBS)
     # Qwen3-Coder-Next sits above them, pinned but off (see the test below). Everything else bigger is a placeholder:
     # off, and saying so.
     rest = [t for i, t in tiers.items() if i not in approved and i != CODER_NEXT["id"]]
@@ -162,7 +164,20 @@ def test_a_single_file_tier_is_normalised():
     assert t["files"] == [{"file": "Tiny-8B-Q4_K_M.gguf", "url": _url("Tiny-8B-Q4_K_M.gguf"),
                            "sha256": "ab" * 32, "size": 5_000_000_000}]
     assert (t["file"], t["size"], t["enabled"], t["blocked"]) == ("Tiny-8B-Q4_K_M.gguf", 5_000_000_000, True, None)
-    assert set(t) == {"id", "name", "file", "url", "sha256", "size", "min_vram_gb", "context", "enabled", "blocked", "files"}
+    assert set(t) == {"id", "name", "file", "url", "sha256", "size", "min_vram_gb", "context", "enabled", "blocked", "files",
+                      "server_slots", "server_ctx_checkpoints", "server_ubatch", "server_spec_type"}
+    assert (t["server_slots"], t["server_ctx_checkpoints"], t["server_ubatch"], t["server_spec_type"]) == (2, None, None, None)
+
+
+def test_the_server_settings_are_read_and_none_means_unset():
+    t = release.coding_tier(tier(context=32768, server_slots=4, server_ctx_checkpoints=8, server_ubatch=256,
+                                 server_spec_type="ngram-mod"))
+    assert (t["server_slots"], t["server_ctx_checkpoints"], t["server_ubatch"], t["server_spec_type"]) == (4, 8, 256, "ngram-mod")
+    assert release.coding_tier(tier(server_spec_type="none"))["server_spec_type"] is None, '"none" is no setting'
+    assert release.coding_tier(tier(server_ctx_checkpoints=0))["server_ctx_checkpoints"] == 0, "0 switches checkpoints off"
+    nulls = release.coding_tier(tier(server_slots=None, server_ctx_checkpoints=None, server_ubatch=None, server_spec_type=None))
+    assert (nulls["server_slots"], nulls["server_ctx_checkpoints"], nulls["server_ubatch"], nulls["server_spec_type"]) == (2, None, None, None)
+    assert release.coding_tier(tier(context=65536, server_slots=64))["server_slots"] == 64
 
 
 def test_a_split_tier_names_part_one_and_totals_the_size():
@@ -202,6 +217,22 @@ BAD_TIERS = {
     "context too big": tier(context=(1 << 21) + 1),
     "enabled as text": tier(enabled="true"),
     "enabled as 1": tier(enabled=1),
+    "server_slots zero": tier(server_slots=0),
+    "server_slots over 64": tier(server_slots=65),
+    "server_slots bool": tier(server_slots=True),
+    "server_slots float": tier(server_slots=2.0),
+    "server_slots text": tier(server_slots="2"),
+    "context not a multiple of server_slots": tier(context=32768, server_slots=3),
+    "checkpoints negative": tier(server_ctx_checkpoints=-1),
+    "checkpoints over 64": tier(server_ctx_checkpoints=65),
+    "checkpoints bool": tier(server_ctx_checkpoints=False),
+    "ubatch zero": tier(server_ubatch=0),
+    "ubatch over 8192": tier(server_ubatch=8193),
+    "ubatch float": tier(server_ubatch=512.0),
+    "spec type with a draft model": tier(server_spec_type="draft-simple"),
+    "spec type ngram-cache": tier(server_spec_type="ngram-cache"),
+    "spec type not text": tier(server_spec_type=1),
+    "spec type a list": tier(server_spec_type=["ngram-mod"]),
     "enabled but blocked": tier(blocked="licence"),
     "blocked empty": tier(enabled=False, blocked=""),
     "blocked non-ASCII": tier(enabled=False, blocked="licen\u00e7e"),
@@ -262,8 +293,27 @@ def test_make_manifest_flattens_the_ladder_into_text_and_integers_only(archive):
     assert m[release.coding_field("qwen38-flash-next-q2", "enabled")] == 0
     assert m[release.coding_field("qwen38-flash-next-q2", "parts")] == 3
     assert m[release.coding_field("qwen36-a3b", "part1_file")] == LIVE_FILE
+    assert m[release.coding_field("qwen36-a3b", "server_slots")] == 2
+    assert m[release.coding_field("qwen38-flash-next-q2", "server_slots")] == 2, "the default is signed too"
+    assert not any(key.endswith(release._CODING_SERVER_KNOBS) for key in m), "an unset knob is left out, never null"
     for key, value in m.items():
         # The extension's verifier throws on anything else, rejecting the whole release.
+        assert isinstance(value, (str, int)) and not isinstance(value, (bool, float)), key
+
+
+KNOBS = dict(context=32768, server_slots=4, server_ctx_checkpoints=8, server_ubatch=256, server_spec_type="ngram-mod")
+
+
+def test_the_server_knobs_are_signed_as_integers_and_text_only_when_set(archive):
+    m = manifest(archive, [tier(**KNOBS), tier(tid="plain-8", file="Plain.gguf", url=_url("Plain.gguf"),
+                                               server_spec_type="none")])
+    f = release.coding_field
+    assert [m[f("tiny-8", k)] for k in ("server_slots", "server_ctx_checkpoints", "server_ubatch", "server_spec_type")] == \
+        [4, 8, 256, "ngram-mod"]
+    assert m[f("plain-8", "server_slots")] == 2
+    assert not any(k.startswith(f("plain-8", "server_")) and k != f("plain-8", "server_slots") for k in m), \
+        '"none" and the unset knobs are left out'
+    for key, value in m.items():
         assert isinstance(value, (str, int)) and not isinstance(value, (bool, float)), key
 
 
@@ -274,6 +324,28 @@ def test_sign_verify_and_read_back(archive, keypair):
     wire = json.loads(json.dumps(signed))
     assert release.verify_manifest(wire, keypair[1]) == (True, "ok")
     assert release.coding_tiers(wire) == release.check_coding_tiers(SHIPPED)
+
+
+def test_the_server_knobs_survive_the_round_trip(archive, keypair):
+    ladder = [tier(**KNOBS), split_tier()]
+    signed = release.sign_manifest(manifest(archive, ladder), keypair[0])
+    assert release.verify_manifest(signed, keypair[1]) == (True, "ok")
+    back = release.coding_tiers(json.loads(json.dumps(signed)))
+    assert back == release.check_coding_tiers(ladder)
+    assert (back[0]["server_slots"], back[0]["server_ctx_checkpoints"], back[0]["server_ubatch"], back[0]["server_spec_type"]) == \
+        (4, 8, 256, "ngram-mod")
+    assert (back[1]["server_slots"], back[1]["server_ctx_checkpoints"], back[1]["server_ubatch"], back[1]["server_spec_type"]) == \
+        (2, None, None, None)
+
+
+def test_a_release_from_before_the_server_fields_reads_as_two_slots(archive, keypair):
+    """A 2.4.9 manifest signs no server_slots: its tiers are read exactly as the members of that release ran them."""
+    m = manifest(archive, [tier()])
+    del m[release.coding_field("tiny-8", "server_slots")]
+    signed = release.sign_manifest(m, keypair[0])
+    assert release.verify_manifest(signed, keypair[1]) == (True, "ok")
+    (t,) = release.coding_tiers(signed)
+    assert (t["server_slots"], t["server_ctx_checkpoints"], t["server_ubatch"], t["server_spec_type"]) == (2, None, None, None)
 
 
 def test_the_ladder_sits_beside_the_cpu_pools_tiers(archive, keypair):
@@ -338,6 +410,13 @@ def _signed_by_hand(archive, keypair, mutate):
     ("blocked not text", lambda m: m.__setitem__(release.coding_field("huge-100", "blocked"), 0)),
     ("bad host", lambda m: m.__setitem__(release.coding_field("tiny-8", "part1_url"),
                                          _url("Tiny-8B-Q4_K_M.gguf", host="evil.example"))),
+    ("server_slots as 0", lambda m: m.__setitem__(release.coding_field("tiny-8", "server_slots"), 0)),
+    ("server_slots as text", lambda m: m.__setitem__(release.coding_field("tiny-8", "server_slots"), "2")),
+    ("server_slots not dividing the context", lambda m: m.__setitem__(release.coding_field("tiny-8", "server_slots"), 3)),
+    ("checkpoints over the limit", lambda m: m.__setitem__(release.coding_field("tiny-8", "server_ctx_checkpoints"), 65)),
+    ("ubatch as a bool", lambda m: m.__setitem__(release.coding_field("tiny-8", "server_ubatch"), True)),
+    ("spec type with a draft model", lambda m: m.__setitem__(release.coding_field("tiny-8", "server_spec_type"), "draft-simple")),
+    ("spec type not text", lambda m: m.__setitem__(release.coding_field("tiny-8", "server_spec_type"), 1)),
 ])
 def test_verify_refuses_a_signed_manifest_with_a_malformed_ladder(archive, keypair, label, mutate):
     ok, reason = release.verify_manifest(_signed_by_hand(archive, keypair, mutate), keypair[1])

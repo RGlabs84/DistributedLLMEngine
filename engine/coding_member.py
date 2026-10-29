@@ -1,7 +1,8 @@
 """
 A worker's side of the coding members (docs/coding-members.md section 4): this machine's GPU
-runs a whole coding model and answers coding requests on its own, about two agent slots per
-volunteer. It works like the CPU pool's member (engine/app_member.py): it downloads and
+runs a whole coding model and answers coding requests on its own, one or two agent slots per
+volunteer (the coordinator says how many; each gets the tier's context per request). It works
+like the CPU pool's member (engine/app_member.py): it downloads and
 verifies the model, runs llama-server at low priority, backs off after failures, stops
 cleanly, and reports itself in the signed heartbeat. Two things differ:
 
@@ -56,7 +57,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from engine import coding_member_select as select
-from engine import member_identity, no_trace
+from engine import media, member_identity, no_trace, release
 from engine.app_pool import sha256_ok
 from engine.model_alias import alias_args
 from engine.swarm_clock import swarm_clock
@@ -64,8 +65,10 @@ from engine.e2e import KeyRing, ResponseSealer
 from engine.fim_warm import fim_warm_body
 from engine.logger import log_error, log_success, log_system, log_warning
 
-# Parallel requests the member accepts. The coding context is split evenly between them.
-CODING_SLOTS = 2
+# Parallel requests the member accepts when its tier does not say (every signed tier does: ``server_slots``).
+# The tier's context is split evenly between its server_slots, and that share, the context per request, is
+# what a member keeps however many slots the coordinator asks it to open (see _start).
+CODING_SLOTS = release.CODING_DEFAULT_SERVER_SLOTS
 DEFAULT_CONTEXT = 65536
 # Host RAM llama-server may keep old prompts in, so a session coming back finds its prefix
 # (the member reads prompts slowly, so that matters). Its own default, 8 GiB, is too much to
@@ -75,7 +78,9 @@ LIMITED_PROMPT_CACHE_MIB = 512       # the same, while the volunteer has put a c
 FIT_MARGIN_MIB = 1024                # what --fit leaves free on a card by default (llama.cpp's own figure)
 # While the owner's own load makes the worker yield (a game, a render), the member stops answering at once,
 # lets the requests in flight finish for this long, then stops llama-server to give the GPU memory back.
-YIELD_DRAIN_SECONDS = 10.0
+# 30 s (2.5.0; 10 before): the yield itself is debounced now, so the owner has already been busy for a
+# while, and a cut answer is not retried by the client once text has been shown.
+YIELD_DRAIN_SECONDS = 30.0
 # After the yielding ends, the member waits this long before it restarts and reports ready again, unless the
 # worker's limits say otherwise: the coordinator waits the same TOPOLOGY_SETTLE_SECONDS before it rebuilds
 # the RPC engine for a node that comes back, so a flapping load costs one restart per this period at most.
@@ -89,6 +94,10 @@ BACKOFF_MAX_SECONDS = 3600.0
 STABLE_SECONDS = 120.0
 # A model change waits this long for the requests in flight before the old server is stopped.
 DRAIN_SECONDS = 60.0
+# A change of slot count alone (the coordinator asks for more or fewer requests at once on the tier that is
+# running) is a restart too, applied at most once per this period after any start: a figure that wavers must
+# not reload the model every few minutes.
+SLOT_SETTLE_SECONDS = 600.0
 
 # How long the first load of the coding model waits for the phone-pool model of the same machine (engine/companion.py).
 GATE_WAIT_SECONDS = 25 * 60.0
@@ -127,14 +136,17 @@ IDENTITY_FILE = os.path.join("config", "coding_identity.key")
 
 def coding_server_args(binary: str, model_path: str, port: int, ctx: int = DEFAULT_CONTEXT,
                        slots: int = CODING_SLOTS, threads: int = 0, extra: Sequence[str] = (),
-                       cache_ram_mib: int = PROMPT_CACHE_MIB) -> List[str]:
+                       cache_ram_mib: int = PROMPT_CACHE_MIB, ctx_checkpoints: Optional[int] = None,
+                       ubatch: Optional[int] = None, spec_type: Optional[str] = None) -> List[str]:
     """
     llama-server for a coding member: loopback only, the whole model fitted to this machine's own
     memory (``--fit on`` places layers and experts between the GPU and system RAM; ``-ngl`` is
     left unset on purpose, it would switch that off), the coding context, the settings of the
-    live coding engine, the owner's limits (``threads``, and ``extra`` such as ``--fit-target``), the
-    no-trace arguments, and the model file's name as its ``--alias`` (without it every answer would
-    carry the path of the owner's model folder, home directory and user name included).
+    live coding engine, the tier's own knobs when the signed tier sets them (``ctx_checkpoints``,
+    ``ubatch``, ``spec_type``: ``--ctx-checkpoints``, ``-ub``, ``--spec-type``; 2.5.0), the owner's
+    limits (``threads``, and ``extra`` such as ``--fit-target``), the no-trace arguments, and the model
+    file's name as its ``--alias`` (without it every answer would carry the path of the owner's model
+    folder, home directory and user name included).
     """
     args = [binary, "-m", model_path, *alias_args(model_path), "--host", "127.0.0.1", "--port", str(port),
             "-c", str(ctx), "-np", str(slots), "--fit", "on",
@@ -143,6 +155,12 @@ def coding_server_args(binary: str, model_path: str, port: int, ctx: int = DEFAU
             "--jinja"]
     if threads > 0:
         args += ["-t", str(threads), "-tb", str(threads)]
+    if ctx_checkpoints is not None:
+        args += ["--ctx-checkpoints", str(ctx_checkpoints)]
+    if ubatch is not None:
+        args += ["-ub", str(ubatch)]
+    if spec_type is not None:
+        args += ["--spec-type", str(spec_type)]
     return args + list(extra) + list(no_trace.LLAMA_NO_TRACE_ARGS)
 
 
@@ -487,6 +505,9 @@ class CodingMember:
         self._step_downs = 0
         self.serving: Optional[str] = None               # tier id the running server was started for
         self.model: Optional[str] = None                 # its file name
+        self.context: Optional[int] = None               # its context per request (the tier's, see _start)
+        self._slots_asked: Optional[int] = None          # the coordinator's coding_slots, as assign() sanitised it
+        self._slots_not_before = 0.0                     # monotonic time before which a slots-only restart waits
         self.ready = False
         self.decode_tps = 0.0
         self.prefill_tps = 0.0
@@ -600,9 +621,11 @@ class CodingMember:
 
     def role_detail(self) -> Dict[str, Any]:
         """What the worker prints for the extension on its DLNE_ROLE line (contract section 10): the model
-        file, the tier, the slots and this member's trust id; names and counts only, a field left out
-        while it is not known."""
-        detail = {"model": self.model, "tier": self.serving, "slots": self.slots, "trust_id": self.trust_id}
+        file, the tier, the slots, the context per request, the join test's speeds and this member's trust
+        id; names and counts only, a field left out while it is not known."""
+        detail = {"model": self.model, "tier": self.serving, "slots": self.slots, "context": self.context,
+                  "decode_tps": _speed(self.decode_tps) or None, "prefill_tps": _speed(self.prefill_tps) or None,
+                  "trust_id": self.trust_id}
         return {key: value for key, value in detail.items()
                 if value is not None and not (isinstance(value, str) and len(value) > 128)}
 
@@ -669,17 +692,21 @@ class CodingMember:
             log_warning(f"Coding member: a request could not be served ({kind}).")
 
     # --------------------------------------------------------------------- control
-    def assign(self, tier: Any) -> None:
+    def assign(self, tier: Any, slots: Any = None) -> None:
         """
-        Called with each heartbeat answer's ``coding_tier``; converges in the background and
-        never blocks. ``None`` means this member should not serve. Each call retries whatever is
-        not done yet, except a tier that is backing off.
+        Called with each heartbeat answer's ``coding_tier`` and ``coding_slots``; converges in the
+        background and never blocks. A ``tier`` of ``None`` means this member should not serve.
+        ``slots`` is how many requests at once the coordinator would have the tier opened for (a whole
+        number from 1 to 64; anything else is no preference), never more than the signed tier allows
+        (see _start); a different count on the tier that is running is a restart, at most once per
+        SLOT_SETTLE_SECONDS. Each call retries whatever is not done yet, except a tier that is backing off.
         """
         wanted = self._effective(_wanted(tier))
+        asked = slots if _int(slots) is not None and 1 <= slots <= release.CODING_MAX_SERVER_SLOTS else None
         with self._lock:
             if self._stopped.is_set():
                 return
-            self.target = wanted
+            self.target, self._slots_asked = wanted, asked
             if self._busy or not self._available():
                 return          # busy, or yielding / settling: nothing is started until it is over
             alive = self._alive()
@@ -689,7 +716,8 @@ class CodingMember:
                     and time.monotonic() - self._ready_since >= STABLE_SECONDS:
                 self._backoff.pop(self.serving, None)      # it has proved itself: forget earlier failures
             if wanted is not None:
-                if wanted["id"] == self.serving and alive and self.ready and not self._needs_measure():
+                if wanted["id"] == self.serving and alive and self.ready and not self._needs_measure() \
+                        and not self._slots_due():
                     return
                 if self._held_back(wanted["id"]):
                     return
@@ -765,7 +793,7 @@ class CodingMember:
                 self._note_exit()
                 if self._held_back(tier_id):
                     return
-            if self._alive() and tier_id == self.serving:
+            if self._alive() and tier_id == self.serving and not self._slots_due():
                 if not self.ready:
                     if self._wait_ready() is None:
                         self._note_exit()
@@ -782,7 +810,7 @@ class CodingMember:
             if tier["id"] != tier_id:
                 # Smaller than what was asked: the next heartbeat's assignment resolves to it as well.
                 tier_id = tier["id"]
-                if self._alive() and tier_id == self.serving:
+                if self._alive() and tier_id == self.serving and not self._slots_due():
                     return
             # The running server, if any, keeps answering until the new model is in place.
             path = self._ensure_model(tier)
@@ -795,8 +823,20 @@ class CodingMember:
                 self._busy = False
 
     def _forget_server(self) -> None:
-        self.serving = self.model = None
+        self.serving = self.model = self.context = None
         self.decode_tps = self.prefill_tps = 0.0
+
+    def _slots_for(self, tier: Dict[str, Any]) -> int:
+        """How many requests at once to open ``tier`` for: what the coordinator asked, never more than the signed
+        tier's ``server_slots`` (CODING_SLOTS when it says nothing), and all of them when it asked nothing."""
+        most = _server_slots(tier)
+        return min(most, self._slots_asked) if self._slots_asked else most
+
+    def _slots_due(self) -> bool:
+        """The coordinator asks for a different slot count on the tier that is running, and the last start is
+        SLOT_SETTLE_SECONDS behind: a slots-only restart is due."""
+        return (self._tier is not None and self._slots_for(self._tier) != self.slots
+                and time.monotonic() >= self._slots_not_before)
 
     def _note_exit(self) -> None:
         """llama-server died on its own: count it against its tier unless it had been serving for a while."""
@@ -996,15 +1036,21 @@ class CodingMember:
                 return          # stopped, or the owner's load began while this was being prepared
             self._stop_engine()
             self.llama_port = self._fixed_llama_port or _free_port()
+            # The context per request is the tier's, its context over its server_slots, whatever the slot
+            # count: the coordinator's coding_slots only says how many such requests to open at once. The
+            # tier here is the signed release's (see _resolve), so its knobs are the release's too.
             ctx = tier.get("context")
             ctx = ctx if isinstance(ctx, int) and ctx >= 2048 else DEFAULT_CONTEXT
-            ctx -= ctx % self.slots
+            per_request, slots = ctx // _server_slots(tier), self._slots_for(tier)
             model_arg, workdir = _model_argument(model_path)
             threads = resources.get("threads", self.threads)
-            args = coding_server_args(binary, model_arg, self.llama_port, ctx, self.slots,
+            args = coding_server_args(binary, model_arg, self.llama_port, per_request * slots, slots,
                                       threads if isinstance(threads, int) and threads > 0 else 0,
                                       extra=[str(a) for a in resources.get("extra_args", [])],
-                                      cache_ram_mib=int(resources.get("cache_ram_mib", PROMPT_CACHE_MIB)))
+                                      cache_ram_mib=int(resources.get("cache_ram_mib", PROMPT_CACHE_MIB)),
+                                      ctx_checkpoints=_int(tier.get("server_ctx_checkpoints")),
+                                      ubatch=_int(tier.get("server_ubatch")),
+                                      spec_type=tier.get("server_spec_type") or None)
             problems = no_trace.no_trace_violations(args)
             if problems:
                 # Never run, and never claim "no_trace", with settings that would keep a prompt.
@@ -1030,6 +1076,8 @@ class CodingMember:
                 with contextlib.suppress(OSError):
                     os.setpriority(os.PRIO_PROCESS, self.process.pid, 10)
             self.serving, self.model, self._tier = tier["id"], tier["file"], tier
+            self.slots, self.context = slots, per_request
+            self._slots_not_before = time.monotonic() + SLOT_SETTLE_SECONDS
             self.decode_tps = self.prefill_tps = 0.0
             self._measure_after, self._measure_failures = 0.0, 0
         if self._wait_ready() is None:
@@ -1138,6 +1186,12 @@ def _same_files(wanted: Dict[str, Any], signed: Dict[str, Any]) -> bool:
 
 def _int(value: Any) -> Optional[int]:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _server_slots(tier: Dict[str, Any]) -> int:
+    """The most requests at once a tier is opened for: its signed ``server_slots``, CODING_SLOTS when it says nothing."""
+    most = _int(tier.get("server_slots"))
+    return most if most and most >= 1 else CODING_SLOTS
 
 
 class _Slot:
@@ -1301,6 +1355,30 @@ async def _relay_sealed(response: httpx.Response, sealer: Any, cleanup: _Cleanup
         await cleanup.run()
 
 
+def _media_refusal(body: Dict[str, Any], path: str) -> Optional[JSONResponse]:
+    """
+    The same content-part rule the coordinator applies to a plain request (engine/media.py), applied to the
+    body once it is open: only text and image parts, and a completion prompt that is text or tokens. A sealed
+    request is never seen by the coordinator, so this is where one can be checked. A member has no vision
+    projector, so an image is refused outright (400 ``image_input_unavailable``): the bytes are not read, let
+    alone forwarded. The body is ``{"detail", "code"}`` as the coordinator's 400s are, with the proxy's usual
+    ``error`` object beside it. Fixed sentences only.
+    """
+    try:
+        if path == "/v1/completions":
+            if "prompt" in body and not media.is_plain_prompt(body["prompt"]):
+                raise media.ImageError(media.UNSUPPORTED_CONTENT_TYPE, "A completion prompt must be text or tokens.")
+            return None
+        messages = body.get("messages")
+        media.check_content_types(messages if isinstance(messages, list) else None)
+        if media.has_images(messages):
+            raise media.ImageError(media.IMAGE_INPUT_UNAVAILABLE, "This machine cannot read images.")
+    except media.ImageError as exc:
+        return JSONResponse({"detail": exc.message, "code": exc.code,
+                             "error": {"message": exc.message, "type": "invalid_request", "code": 400}}, status_code=400)
+    return None
+
+
 async def _proxy_request(member: CodingMember, request: Request, path: str) -> Response:
     if not member.is_ready():
         return _error(503, "not_ready", "this member's model is not ready yet", retry_after=5)
@@ -1327,6 +1405,14 @@ async def _proxy_request(member: CodingMember, request: Request, path: str) -> R
             request_body = opened
         except Exception:  # noqa: BLE001 - any failure to open is the same answer; the reason could hint at the content
             return _error(400, "invalid_envelope", "the encrypted request could not be opened")
+
+    refusal = _media_refusal(request_body, path)
+    if refusal is not None:
+        return refusal
+    if "id_slot" in request_body:
+        # The slot a request runs on is this member's to choose, never the client's.
+        del request_body["id_slot"]
+        payload = json.dumps(request_body).encode("utf-8")
 
     slot = member._reserve()
     if slot is None:

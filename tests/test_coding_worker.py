@@ -8,6 +8,8 @@ The members and the RPC process are fakes; what is tested is the worker's own bo
 """
 
 import io
+import os
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -29,15 +31,17 @@ CPU_HW = {**GPU_HW, "gpu": {"has_gpu": False, "vram_total_gb": 0}}
 class RecordingMember:
     def __init__(self, status=None):
         self.assigned = []
+        self.slots_asked = []
         self.stopped = False
         self._status = status or {"model": None, "ready": False}
 
     def status(self):
         return dict(self._status)
 
-    def assign(self, tier):
+    def assign(self, tier, slots=None):
         if not self.stopped:
             self.assigned.append(tier)
+            self.slots_asked.append(slots)
 
     def stop(self):
         self.stopped = True
@@ -196,9 +200,10 @@ def _run(node, monkeypatch, replies):
 def test_the_coding_tier_in_the_answer_reaches_the_coding_member_only(node, monkeypatch):
     node.coding_member = RecordingMember()
     tier = {"id": "qwen36-a3b", "file": "x.gguf"}
-    _run(node, monkeypatch, [{"status": "ok", "role": "coding", "coding_tier": tier, "app_model": "ignored"},
+    _run(node, monkeypatch, [{"status": "ok", "role": "coding", "coding_tier": tier, "coding_slots": 1, "app_model": "ignored"},
                              {"status": "ok", "role": "coding", "coding_tier": tier}])
     assert node.coding_member.assigned == [tier, tier]
+    assert node.coding_member.slots_asked == [1, None], "coding_slots goes with the tier; an answer without it asks nothing"
 
 
 @pytest.mark.parametrize("answer", [
@@ -788,6 +793,52 @@ def test_the_cards_are_listed_in_the_order_llama_server_numbers_them(monkeypatch
     assert totals({"allowed_gpu_indices": "9"}) == []
 
 
+@pytest.fixture
+def vulkan_install(tmp_path, monkeypatch):
+    """An install whose bin/ holds a Vulkan build, so MEDIA_GPU applies. engine_build_is_vulkan reads <base>/bin:
+    without this the test reads whatever the checkout or install it runs from holds."""
+    from engine import inference_manager
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "libggml-vulkan.so").write_bytes(b"")
+    monkeypatch.setattr(inference_manager, "get_base_dir", lambda: str(tmp_path))
+    return tmp_path
+
+
+@pytest.fixture
+def cuda_install(tmp_path, monkeypatch):
+    from engine import inference_manager
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "libggml-cuda.so").write_bytes(b"")
+    monkeypatch.setattr(inference_manager, "get_base_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(inference_manager, "_media_gpu_warned", False)
+    monkeypatch.setattr(inference_manager, "log_warning", lambda *a, **k: None)
+    return tmp_path
+
+
+def test_on_a_cuda_build_the_coding_members_cards_include_the_media_card(cuda_install, monkeypatch):
+    from engine import hardware
+    cards = [{"id": 0, "name": "RTX A", "address": "0000:03:00.0", "vram_total_gb": 8.0},
+             {"id": 1, "name": "RTX B", "address": "0000:0c:00.0", "vram_total_gb": 12.0}]
+    monkeypatch.setattr(hardware, "get_all_gpus", lambda: cards)
+    monkeypatch.setattr(hardware, "counts_as_gpu", lambda name, integrated=None: True)
+
+    # the engine ignores MEDIA_GPU on this build (the card is the model's), so the totals must count it
+    assert worker.WorkerNode._gpu_totals_gib({"allowed_gpu_indices": "-1", "media_gpu": "0000:0c:00.0"}) == [8.0, 12.0]
+
+
+def test_the_media_card_is_no_part_of_the_cards_the_coding_model_may_see(vulkan_install, monkeypatch):
+    from engine import hardware
+    cards = [{"id": 0, "name": "RTX A", "address": "0000:03:00.0", "vram_total_gb": 8.0},
+             {"id": 1, "name": "RX 580", "address": "0000:0c:00.0", "vram_total_gb": 8.0},
+             {"id": 2, "name": "RTX B", "address": "0000:09:00.0", "vram_total_gb": 12.0}]
+    monkeypatch.setattr(hardware, "get_all_gpus", lambda: cards)
+    monkeypatch.setattr(hardware, "counts_as_gpu", lambda name, integrated=None: True)
+    totals = worker.WorkerNode._gpu_totals_gib
+    assert totals({"allowed_gpu_indices": "-1", "media_gpu": "0000:0c:00.0"}) == [8.0, 12.0]
+    assert totals({"allowed_gpu_indices": "1,2,0", "media_gpu": "1"}) == [12.0, 8.0]
+    assert totals({"allowed_gpu_indices": "0000:09:00.0,0000:03:00.0"}) == [12.0, 8.0], "PCI addresses name cards too"
+
+
 def test_the_coding_member_is_given_the_limits_reader(node, monkeypatch):
     made = []
     monkeypatch.setattr(worker, "download_and_extract_engine", lambda *a, **k: "x")
@@ -883,6 +934,87 @@ def test_the_heartbeat_says_whether_the_owner_allows_it_inside_the_signature(nod
 def test_a_node_without_the_key_in_its_config_allows_it(node, monkeypatch):
     _limits(monkeypatch)
     assert node._build_heartbeat_payload()["hardware"]["coding_ok"] is True
+
+
+# --- 2.4.9: the RAM a coding model may use, and the LAN addresses a household coordinator asks for --------
+
+@pytest.mark.parametrize("limits, expected", [
+    ({"max_ram_gb": 4.0, "coding_max_ram_gb": -1.0}, 30.0),     # the extension's defaults: 4 GB lent to RPC, coding uncapped
+    ({"max_ram_gb": 4.0}, 4.0),                                 # an old config with only MAX_RAM_GB: it caps both
+    ({"max_ram_gb": 4.0, "coding_max_ram_gb": 12.0}, 12.0),
+    ({}, 30.0),
+])
+def test_the_heartbeat_reports_the_ram_the_coding_job_may_use(node, monkeypatch, limits, expected):
+    _memory(monkeypatch, 30, 9)              # the total, not what is free this second
+    _limits(monkeypatch, **limits)
+    payload = node._build_heartbeat_payload()
+    assert payload["hardware"]["coding_ram_gb"] == expected
+    assert _verify(payload)[0] is True
+    assert _verify(payload, {**payload["hardware"], "coding_ram_gb": 512.0})[0] is False, "signed"
+
+
+def test_a_node_without_a_gpu_reports_no_coding_ram(node, monkeypatch):
+    _memory(monkeypatch, 30, 9)
+    _limits(monkeypatch)
+    node.hardware_profile = {"gpu": {"has_gpu": False, "vram_total_gb": 0}, "ram_gb": 30.0}
+    assert "coding_ram_gb" not in node._build_heartbeat_payload()["hardware"]
+
+
+def test_the_lan_addresses_are_sent_only_after_the_coordinator_asks(node, monkeypatch):
+    _limits(monkeypatch)
+    monkeypatch.setattr(worker, "_lan_ipv4_addresses", lambda: ["192.168.40.50"])
+    assert "lan_ipv4" not in node._build_heartbeat_payload()["hardware"]
+    node._follow_assignment({"status": "ok", "send_lan": True})
+    payload = node._build_heartbeat_payload()
+    assert payload["hardware"]["lan_ipv4"] == ["192.168.40.50"]
+    assert _verify(payload)[0] is True
+    assert "lan_ipv4" not in node.hardware_profile
+    node._follow_assignment({"status": "ok"})                  # a coordinator that stops asking
+    assert "lan_ipv4" not in node._build_heartbeat_payload()["hardware"]
+    node._follow_assignment({"status": "ok", "send_lan": "yes"})
+    assert "lan_ipv4" not in node._build_heartbeat_payload()["hardware"]
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("ws://192.168.40.23:11435", "ws://192.168.40.23:11435"),
+    ("ws://10.0.0.5:8080/", "ws://10.0.0.5:8080"),
+    ("wss://192.168.40.23:11435", None),              # plain ws only: nothing else on the LAN speaks TLS here
+    ("ws://8.8.8.8:11435", None),                     # never a public address: the tunnel carries the token
+    ("ws://127.0.0.1:11435", None),
+    ("ws://169.254.1.1:11435", None),
+    ("ws://192.168.40.23", None),
+    ("ws://192.168.40.23:11435/elsewhere", None),
+    ("ws://user@192.168.40.23:11435", None),
+    ("ws://dlne.example:11435", None),
+    ("ws://192.168.40.23:99999", None),
+    (None, None), (42, None), ("", None),
+])
+def test_only_a_plain_ws_url_to_a_private_address_is_taken_for_the_lan_tunnel(value, expected):
+    assert worker._lan_tunnel_url(value) == expected
+
+
+def test_the_lan_tunnel_follows_the_coordinators_answers(node, monkeypatch):
+    _limits(monkeypatch)
+    assert node._lan_tunnel is None
+    node._follow_assignment({"status": "ok", "send_lan": True, "lan_tunnel": "ws://192.168.40.23:11435"})
+    assert node._lan_tunnel == "ws://192.168.40.23:11435"
+    node._follow_assignment({"status": "ok"})
+    assert node._lan_tunnel is None
+
+
+def test_the_lan_addresses_are_private_ipv4_only(monkeypatch):
+    import socket as socket_module
+    import psutil
+
+    def entry(address, family=socket_module.AF_INET):
+        return SimpleNamespace(family=family, address=address, netmask="255.255.255.0")
+
+    monkeypatch.setattr(psutil, "net_if_addrs", lambda: {
+        "lo": [entry("127.0.0.1")], "wlan0": [entry("192.168.40.50"), entry("fe80::1", socket_module.AF_INET6)],
+        "docker0": [entry("172.17.0.1")], "tun0": [entry("100.64.0.2")], "eth9": [entry("73.215.216.195")],
+        "x": [entry("169.254.9.9")],
+    })
+    assert worker._lan_ipv4_addresses() == ["192.168.40.50", "172.17.0.1"]
 
 
 def test_the_coding_job_is_refused_quietly_when_the_owner_says_no(node, monkeypatch):
@@ -1025,6 +1157,48 @@ def test_vulkan_is_kept_off_an_integrated_gpu_when_a_discrete_one_is_present(nod
     assert env["GGML_VK_VISIBLE_DEVICES"] == "1"
 
 
+def test_cards_named_by_pci_address_reach_the_process_as_ids(node, monkeypatch, clean_env):
+    from engine import hardware
+    monkeypatch.setattr(hardware, "get_all_gpus", lambda: [
+        {"id": 0, "name": "A", "address": "0000:03:00.0", "vram_total_gb": 8.0, "vk_index": 1},
+        {"id": 1, "name": "B", "address": "0000:09:00.0", "vram_total_gb": 8.0, "vk_index": 2}])
+    monkeypatch.setattr(worker, "get_worker_limits", lambda: {"allowed_gpu_indices": "0000:09:00.0,0000:03:00.0"})
+    env, allowed = node._gpu_environment()
+    assert allowed == "0000:09:00.0,0000:03:00.0"
+    assert env["CUDA_VISIBLE_DEVICES"] == "1,0" and env["GGML_VK_VISIBLE_DEVICES"] == "2,1"
+
+
+def test_the_media_card_is_hidden_from_the_nodes_own_process(node, monkeypatch, clean_env, vulkan_install):
+    from engine import hardware
+    monkeypatch.setattr(hardware, "get_all_gpus", lambda: [
+        {"id": 0, "name": "A", "address": "0000:03:00.0", "vram_total_gb": 8.0, "vk_index": 1},
+        {"id": 1, "name": "B", "address": "0000:0c:00.0", "vram_total_gb": 8.0, "vk_index": 3}])
+    monkeypatch.setattr(hardware, "counts_as_gpu", lambda name, integrated=None: True)
+    monkeypatch.setattr(worker, "get_worker_limits", lambda: {"allowed_gpu_indices": "-1", "media_gpu": "0000:0c:00.0"})
+    env, _ = node._gpu_environment()
+    assert env["CUDA_VISIBLE_DEVICES"] == "0" and env["GGML_VK_VISIBLE_DEVICES"] == "1"
+
+
+def test_on_a_cuda_build_the_media_card_stays_in_the_nodes_environment(node, monkeypatch, tmp_path, clean_env):
+    from engine import hardware, inference_manager
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "ggml-cuda.dll").write_bytes(b"")
+    monkeypatch.setattr(inference_manager, "get_base_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(inference_manager, "_media_gpu_warned", False)
+    warnings = []
+    monkeypatch.setattr(inference_manager, "log_warning", warnings.append)
+    monkeypatch.setattr(hardware, "get_all_gpus", lambda: [
+        {"id": 0, "name": "A", "address": "0000:03:00.0", "vram_total_gb": 8.0, "vk_index": 1},
+        {"id": 1, "name": "B", "address": "0000:0c:00.0", "vram_total_gb": 8.0, "vk_index": 3}])
+    monkeypatch.setattr(hardware, "counts_as_gpu", lambda name, integrated=None: True)
+    monkeypatch.setattr(worker, "get_worker_limits", lambda: {"allowed_gpu_indices": "-1", "media_gpu": "0000:0c:00.0"})
+    monkeypatch.setattr(worker.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1, stdout=""))
+    env, _ = node._gpu_environment()
+    node._gpu_environment()
+    assert "CUDA_VISIBLE_DEVICES" not in env and "GGML_VK_VISIBLE_DEVICES" not in env     # nothing hidden, nothing named
+    assert len(warnings) == 1 and "not a Vulkan build" in warnings[0]
+
+
 def test_start_rpc_server_still_uses_that_environment(node, monkeypatch, tmp_path, clean_env):
     seen = {}
     monkeypatch.setattr(worker, "download_and_extract_engine", lambda *a, **k: "/bin/ggml-rpc-server")
@@ -1041,3 +1215,123 @@ def test_start_rpc_server_still_uses_that_environment(node, monkeypatch, tmp_pat
     assert seen["env"] == {"MARK": "1"} and seen["args"][:3] == ["/bin/ggml-rpc-server", "--host", node.rpc_ip]
     assert node.rpc_proto == "8.0.1"
     node.rpc_log_file.close()
+
+
+# ---- 2.5.0: leaving the swarm gracefully, and handing the GPU back after a long yield ------------------------
+
+class _Alive:
+    def poll(self):
+        return None
+
+
+def test_a_normal_stop_of_an_rpc_node_tells_the_coordinator_first(node, monkeypatch):
+    _limits(monkeypatch)
+    node.rpc_process = _Alive()
+    node._latest_answer = {"status": "ok", "shard": True}                 # the engine runs on this node
+    node.request_shutdown(0, "the owner clicked Stop")
+    assert node.is_running and not node._shutdown_event.is_set(), "not stopped yet"
+    payload = node._build_heartbeat_payload()
+    assert payload["hardware"]["leaving"] is True and _verify(payload)[0] is True
+    node._after_answer({"status": "ok", "draining": True})
+    assert node.is_running, "the engine still runs on this shard: wait"
+    node._after_answer({"status": "ok"})
+    assert not node.is_running and node._shutdown_event.is_set() and node.exit_code == 0
+
+
+def test_a_heartbeat_loop_that_ends_does_not_wait_on_itself(node, monkeypatch):
+    """2026-10-27: a window reload broke the worker's stdout, Rich answered with SystemExit, the loop ended, and its
+    own stop was deferred to the loop that had just ended: the node hung for minutes with its RPC server gone."""
+    _limits(monkeypatch)
+    node.rpc_process = _Alive()
+    node._latest_answer = {"status": "ok", "shard": True}
+
+    def broken_pipe():
+        raise SystemExit(1)
+
+    monkeypatch.setattr(node, "_probe_hardware", broken_pipe)
+    with pytest.raises(SystemExit):
+        node.heartbeat_loop()
+    assert not node.is_running and node._shutdown_event.is_set() and not node._leaving
+
+
+def test_a_closed_stdout_does_not_stop_the_node(monkeypatch):
+    """The editor that started a worker can go away (a window reload) while the worker runs on, by design."""
+    from engine import logger
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    stream = logger._StdoutThatSurvives(os.fdopen(write_end, "w"))
+    monkeypatch.setattr(sys, "stdout", stream)
+    print("DLNE_DOCK: {}", flush=True)
+    logger.log_error("still here")          # Rich used to answer the broken pipe with SystemExit
+    logger.log_worker("and here")
+    print("DLNE_YIELD: {}", flush=True)
+
+
+def test_the_leave_ends_when_the_grace_is_over_or_on_a_second_request(node, monkeypatch):
+    _limits(monkeypatch)
+    clock = [1000.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    node.rpc_process = _Alive()
+    node._latest_answer = {"status": "ok", "shard": True}
+    node.request_shutdown(0, "stop")
+    clock[0] += worker.LEAVE_GRACE_SECONDS + 1
+    node._after_answer({"status": "ok", "draining": True})
+    assert not node.is_running, "the grace is over"
+    other = worker.WorkerNode("http://coordinator:11435")
+    other.is_running = True
+    other.rpc_process = _Alive()
+    other._latest_answer = {"status": "ok", "shard": True}
+    other.request_shutdown(0, "stop")
+    assert other.is_running
+    other.request_shutdown(0, "stop again")
+    assert not other.is_running, "a second request stops at once"
+    other._stopped = True
+    reserve = worker.WorkerNode("http://coordinator:11435")
+    reserve.is_running = True
+    reserve.rpc_process = _Alive()
+    reserve._latest_answer = {"status": "ok", "role": "rpc"}
+    reserve.request_shutdown(0, "stop")
+    assert not reserve.is_running, "the engine does not run on it: nothing to drain, stop at once"
+    reserve._stopped = True
+    member = worker.WorkerNode("http://coordinator:11435")
+    member.is_running = True
+    member.request_shutdown(0, "stop")
+    assert not member.is_running, "a node without an RPC server (a member) stops at once"
+    member._stopped = True
+
+
+def test_a_yield_that_outlasts_the_drain_hands_the_vram_back_once(node, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    restarts = []
+    monkeypatch.setattr(node, "_restart_rpc_server_for_owner", lambda: restarts.append(1))
+    node.rpc_process = _Alive()
+    node.hardware_profile = {**GPU_HW, "is_yielding": True}
+    node._after_answer({"status": "ok", "draining": True})
+    clock[0] += worker.LEAVE_GRACE_SECONDS + 1
+    node._after_answer({"status": "ok", "draining": True})
+    assert restarts == [], "the engine still runs on it: the coordinator is draining"
+    node._after_answer({"status": "ok"})
+    assert restarts == [1]
+    node._after_answer({"status": "ok"})
+    assert restarts == [1], "once"
+    node.hardware_profile = dict(GPU_HW)
+    node._after_answer({"status": "ok"})
+    node.hardware_profile = {**GPU_HW, "is_yielding": True}
+    node._after_answer({"status": "ok"})
+    clock[0] += worker.LEAVE_GRACE_SECONDS + 1
+    node._after_answer({"status": "ok"})
+    assert restarts == [1, 1], "a new yield, a new grace"
+
+
+def test_the_worker_prints_the_yield_marker_once_per_change(node, monkeypatch, capsys):
+    import json
+    monkeypatch.setattr(worker, "hardware_yield_reason", lambda: "gpu")
+    node.hardware_profile = {**GPU_HW, "is_yielding": True}
+    node._report_yield()
+    node._report_yield()
+    node.hardware_profile = dict(GPU_HW)
+    node._report_yield()
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith(worker.YIELD_MARKER)]
+    assert [json.loads(l[len(worker.YIELD_MARKER):]) for l in lines] == [
+        {"yielding": True, "why": "gpu"}, {"yielding": False, "why": ""}]

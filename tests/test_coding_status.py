@@ -399,6 +399,7 @@ def cluster(monkeypatch, tmp_path):
     monkeypatch.setattr(coordinator, "global_active_model", LIVE_FILE)
     monkeypatch.setattr(coordinator.manager, "running_models", {LIVE_FILE: engine_entry(65536)})
     monkeypatch.setattr(coordinator.registry, "get_total_vram_gb", lambda: 16.0)
+    monkeypatch.setattr(coordinator, "_near_vram_gb", lambda: 16.0)      # all of it near enough to share a model
 
     async def no_telemetry(model_path):
         return {}
@@ -467,10 +468,25 @@ async def test_the_stale_14b_recommendation_is_gone(cluster):
 ])
 async def test_the_recommendation_follows_the_pool(cluster, vram, file):
     cluster.monkeypatch.setattr(coordinator.registry, "get_total_vram_gb", lambda: vram)
+    cluster.monkeypatch.setattr(coordinator, "_near_vram_gb", lambda: vram)
     data = await get_json("/v1/cluster/status")
     assert data["recommended_model"] == file
     tiers = await get_json("/v1/cluster/tiers")
     assert tiers["recommended_model"] == file
+
+
+@pytest.mark.anyio
+async def test_a_gpu_too_far_to_share_the_model_unlocks_nothing(cluster):
+    """24 GB lent, but 8 of it too far away to share a model: the 24 GB tier is not unlocked, because
+    automatic switching would never move to it (the site said "unlocked" and nothing happened)."""
+    cluster.monkeypatch.setattr(coordinator.registry, "get_total_vram_gb", lambda: 24.0)
+    data = await get_json("/v1/cluster/status")
+    assert data["total_vram_gb"] == 24.0
+    assert {t["id"]: t["unlocked"] for t in data["coding_tiers"]}["qwen36-a3b-iq4xs"] is False
+    assert data["recommended_model"] == LIVE_FILE
+    tiers = await get_json("/v1/cluster/tiers")
+    assert {t["id"]: t["unlocked"] for t in tiers["tiers"]}["qwen36-a3b-iq4xs"] is False
+    assert tiers["total_vram_gb"] == 24.0
 
 
 @pytest.mark.anyio
@@ -567,6 +583,8 @@ async def test_cluster_tiers_lists_the_ladder_with_the_old_field_names(cluster, 
     first, split = rows[0], {r["id"]: r for r in rows}["qwen38-flash-next-q2"]
     assert (first["model"], first["tier"], first["cached_on_disk"], first["parts"]) == \
         (LIVE_FILE, "Qwen3.6 35B-A3B (15 GB+ VRAM)", True, 1)
+    assert (first["context"], first["server_slots"], first["context_per_request"]) == (81920, 2, 40960)
+    assert (split["context"], split["server_slots"], split["context_per_request"]) == (65536, 2, 32768)
     assert split["parts"] == 3 and split["enabled"] is False and split["blocked"].startswith("placeholder")
     assert split["cached_on_disk"] is False
     assert "qwen2.5" not in json.dumps(data).lower()

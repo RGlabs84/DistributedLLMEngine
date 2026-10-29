@@ -63,6 +63,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from engine import config as _config
+from engine import release
 
 GIB = 1024 ** 3
 GB = 1_000_000_000
@@ -442,6 +443,33 @@ def choose_tier(vram_gb: Any, ram_gb: Any, tiers: Sequence[Dict[str, Any]], limi
     """
     found = candidate_tiers(vram_gb, ram_gb, tiers, limits, **machine)
     return found[0] if found else None
+
+
+def choose_slots(tier: Dict[str, Any], vram_gb: Any, ram_gb: Any, limits: Optional[Dict[str, Any]] = None,
+                 **machine: Any) -> int:
+    """
+    How many requests at once this machine should open ``tier`` for (2.5.0): the most, up to the
+    tier's ``server_slots``, that it is estimated to run fast enough with every slot answering. The
+    context per request is the tier's (``context // server_slots``) whatever the count, so n slots
+    cost n times the KV cache and n answers at once share the machine: the estimate runs at n times
+    the per-request context against floors n times higher. 1 when no count clears them (the join
+    test is the judge then) and 1 for a tier or machine the estimate cannot read; never raises.
+    """
+    try:
+        most = tier.get("server_slots")
+        if not isinstance(most, int) or isinstance(most, bool) or most < 1:
+            most = release.CODING_DEFAULT_SERVER_SLOTS
+        per_request = int(tier["context"]) // most
+        limits = _limits(limits)
+        min_decode, min_prefill = floors(limits)
+        rig = make_machine(vram_gb, ram_gb, **machine)
+        for n in range(most, 1, -1):
+            scaled = {**limits, "coding_member_min_decode_tps": min_decode * n, "coding_member_min_prefill_tps": min_prefill * n}
+            if estimate_tier({**tier, "context": per_request * n}, rig, scaled).verdict == "good":
+                return n
+    except Exception:  # noqa: BLE001 - no context, no size, odd figures: one slot
+        pass
+    return 1
 
 
 def next_tier_down(failed: Dict[str, Any], vram_gb: Any, ram_gb: Any, tiers: Sequence[Dict[str, Any]],

@@ -555,7 +555,7 @@ function governingFolders(file: string, roots: string[]): DirRules[] {
  * The file that ignores `file` (".gitignore", ".dlneignore", ".git/info/exclude"), or null. Parent
  * folders are considered one by one, as git does: an ignored folder hides everything under it.
  */
-function ignoredBy(chain: DirRules[], file: string, fileIsDir: boolean): string | null {
+function ignoredBy(chain: DirRules[], file: string, fileIsDir: boolean, skip: ReadonlySet<string> = NO_SKIP): string | null {
   if (chain.length === 0) return null;
   const top = chain[0].dir;
   const target = forwardSlashes(file);
@@ -572,6 +572,7 @@ function ignoredBy(chain: DirRules[], file: string, fileIsDir: boolean): string 
       if (!norm(current).startsWith(norm(entry.dir) + '/')) continue;
       const rel = current.slice(entry.dir.length + 1);
       for (const rule of entry.rules) {
+        if (skip.has(rule.source)) continue;
         if (rule.dirOnly && !isDir) continue;
         if (rule.re.test(rel)) source = rule.negate ? null : rule.source;
       }
@@ -592,18 +593,66 @@ function toFsPath(uri: UriLike): string {
   return (typeof uri.fsPath === 'string' && uri.fsPath) || (typeof uri.path === 'string' ? uri.path : '');
 }
 
-function reasonFor(file: string, scheme: string | undefined): string | null {
+/**
+ * The path of the file a URI stands for, or undefined when no file does. A `file` URI is its own path. Any other URI that
+ * carries an absolute path (a cell of a notebook, a `git:` copy, a remote or virtual file) stands for the file at that
+ * path: a cell of nb.ipynb is that notebook. One with no such path (an unsaved `untitled:Untitled-1` buffer, an output
+ * channel) has no file behind it. The places that name a file to the model use this too (views/chatPaths.ts).
+ */
+export function filePathOf(uri: { fsPath?: string } | null | undefined): string | undefined {
+  return typeof uri?.fsPath === 'string' && path.isAbsolute(uri.fsPath) ? uri.fsPath : undefined;
+}
+
+/**
+ * The scheme the rules judge a URI by. The rules look at the files of a project, and used to skip every URI that was not a
+ * `file` one as if it were an output panel, so a cell of a notebook in .gitignore (or a `git:` copy of a private file)
+ * was let through. A URI with a file behind it is judged as that file; one with none (an untitled buffer, an output
+ * channel) has nothing to exclude, and the rules leave it alone.
+ */
+function judgedScheme(uri: UriLike): string | undefined {
+  if (typeof uri === 'string') return undefined;
+  return uri.scheme && uri.scheme !== 'file' && filePathOf(uri) !== undefined ? 'file' : uri.scheme;
+}
+
+/** No ignore file is skipped (the normal check). */
+const NO_SKIP: ReadonlySet<string> = new Set();
+
+function reasonFor(file: string, scheme: string | undefined, skip: ReadonlySet<string> = NO_SKIP): string | null {
   const named = credentialReason(file);
   if (named) return named;
-  if (scheme && scheme !== 'file') return null; // untitled buffers, output panels, virtual file systems
+  if (scheme && scheme !== 'file') return null; // no file behind it: an untitled buffer, an output panel (see judgedScheme)
   let isDir = false;
   try {
     isDir = fs.statSync(file).isDirectory();
   } catch {
     // does not exist (yet): treat it as a file
   }
-  const source = ignoredBy(governingFolders(file, workspaceRoots()), file, isDir);
+  const source = ignoredBy(governingFolders(file, workspaceRoots()), file, isDir, skip);
   return source ? `ignored by ${source}` : null;
+}
+
+/**
+ * Like excludedReason, but the rules of the ignore files named in `skip` (".gitignore", ".git/info/exclude",
+ * ".dlneignore") do not count. The agent's memory files use it: people git-ignore tool folders such as `.dlne/`,
+ * which must not switch memory off, while `.dlneignore` and the credential rules still apply. Every other rule is
+ * evaluated as usual, so a `.dlneignore` entry is found even where a `.gitignore` entry would have matched first.
+ * Not cached: it is called for a handful of files per request.
+ */
+export function excludedReasonSkipping(uri: UriLike, skip: readonly string[]): string | null {
+  const file = toFsPath(uri);
+  if (!file) return null;
+  const scheme = judgedScheme(uri);
+  const skipped = new Set(skip);
+  let reason = reasonFor(file, scheme, skipped);
+  if (!reason) {
+    try {
+      const real = fs.realpathSync(file);
+      if (real !== file) reason = reasonFor(real, scheme, skipped);
+    } catch {
+      // not an existing file: nothing to resolve
+    }
+  }
+  return reason;
 }
 
 /**
@@ -613,7 +662,7 @@ function reasonFor(file: string, scheme: string | undefined): string | null {
 export function excludedReason(uri: UriLike): string | null {
   const file = toFsPath(uri);
   if (!file) return null;
-  const scheme = typeof uri === 'string' ? undefined : uri.scheme;
+  const scheme = judgedScheme(uri);
 
   const now = Date.now();
   const cacheKey = `${scheme ?? ''}\0${file}`;

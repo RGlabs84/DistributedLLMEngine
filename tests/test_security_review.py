@@ -50,8 +50,9 @@ def b64(raw: bytes) -> str:
 
 def _extension_system_prompt() -> str:
     source = (EXTENSION / "agent" / "agentLoop.ts").read_text(encoding="utf-8")
-    at = source.index("private initSystemPrompt()")
-    start = source.index("content: `", at) + len("content: `")
+    # The prompt is the exported AGENT_SYSTEM_PROMPT (docs/agent-memory.md section 2); initSystemPrompt only uses it.
+    at = source.index("export const AGENT_SYSTEM_PROMPT")
+    start = source.index("`", at) + 1
     end = start
     while not (source[end] == "`" and source[end - 1] != "\\"):
         end += 1
@@ -82,7 +83,7 @@ def test_sr02_a_canary_has_no_field_the_extension_does_not_send():
     assert set(body) <= real, f"only a canary has: {sorted(set(body) - real)}"
     # the coordinator adds penalties to a PLAIN request; a sealed one reaches the member as the editor made it
     assert "frequency_penalty" not in body and "presence_penalty" not in body
-    assert body["temperature"] == 0.2 and body["max_tokens"] == 16384 and body["stream"] is True   # AGENT_MAX_TOKENS
+    assert body["temperature"] == 0.2 and body["max_tokens"] == 10240 and body["stream"] is True   # AGENT_MAX_TOKENS
 
 
 def test_sr03_a_canary_prompt_holds_the_decoy_link_and_no_decoy_key():
@@ -123,7 +124,7 @@ class _RecordingMember:
     def status(self):
         return {"model": None, "ready": False}
 
-    def assign(self, tier):
+    def assign(self, tier, slots=None):
         self.assigned.append(tier)
 
     def stop(self):

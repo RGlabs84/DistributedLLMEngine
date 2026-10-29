@@ -7,7 +7,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** The two settings the app keeps: the server address and whether the privacy notice was read. */
+/** The settings the app keeps: the server address, whether the privacy notice was read, and whether to share the location. */
 class SettingsStore(private val prefs: SharedPreferences) {
     constructor(context: Context) : this(context.getSharedPreferences("dlne_settings", Context.MODE_PRIVATE))
 
@@ -16,6 +16,10 @@ class SettingsStore(private val prefs: SharedPreferences) {
 
     private val _privacyAcknowledged = MutableStateFlow(prefs.getBoolean(PREF_PRIVACY_ACK, false))
     val privacyAcknowledged: StateFlow<Boolean> = _privacyAcknowledged.asStateFlow()
+
+    // Off until the person turns it on (and allows the permission it needs).
+    private val _shareLocation = MutableStateFlow(prefs.getBoolean(PREF_SHARE_LOCATION, false))
+    val shareLocation: StateFlow<Boolean> = _shareLocation.asStateFlow()
 
     /**
      * The saved address, with the old public address upgraded to the current default without
@@ -46,8 +50,14 @@ class SettingsStore(private val prefs: SharedPreferences) {
         _privacyAcknowledged.value = true
     }
 
+    fun setShareLocation(on: Boolean) {
+        prefs.edit().putBoolean(PREF_SHARE_LOCATION, on).apply()
+        _shareLocation.value = on
+    }
+
     private companion object {
         const val PREF_SERVER_URL = "server_url"
         const val PREF_PRIVACY_ACK = "privacy_acknowledged_v1"
+        const val PREF_SHARE_LOCATION = "share_location"
     }
 }

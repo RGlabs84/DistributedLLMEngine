@@ -401,3 +401,54 @@ test('the wording the extension reads is the wording the contract documents', ()
   assert.ok(doc.includes('dlne_queue'), 'section 10 documents the busy answer');
   assert.equal(c.ROLE_MARKER, 'DLNE_ROLE: ');
 });
+
+// ---- 2.5.0: docked, stepping aside, the member's own figures, and the engine button ----------------------------
+
+test('DLNE_DOCK: wired and plugged in, or not, with unknown facts left out', () => {
+  assert.deepEqual(c.parseDock('DLNE_DOCK: {"link": "wired", "power": "ac", "docked": true}'), { link: 'wired', power: 'ac', docked: true });
+  assert.deepEqual(c.parseDock('x\nDLNE_DOCK: {"link": "wifi", "power": "battery", "docked": false}\ny'), { link: 'wifi', power: 'battery', docked: false });
+  assert.deepEqual(c.parseDock('DLNE_DOCK: {"power": "ac"}'), { power: 'ac' }, 'the link could not be read');
+  assert.deepEqual(c.parseDock('DLNE_DOCK: {"link": "ethernet", "power": "solar", "docked": "yes"}'), {}, 'checked, not trusted');
+  assert.equal(c.parseDock('DLNE_DOCK: junk'), null);
+  assert.deepEqual(c.parseDock('DLNE_DOCK: {"docked": true}\nDLNE_DOCK: {"docked": false}'), { docked: false }, 'the last one wins');
+});
+
+test('DLNE_YIELD: stepping aside and why', () => {
+  assert.deepEqual(c.parseYield('DLNE_YIELD: {"yielding": true, "why": "gpu"}'), { yielding: true, why: 'gpu' });
+  assert.deepEqual(c.parseYield('DLNE_YIELD: {"yielding": false, "why": ""}'), { yielding: false, why: '' });
+  assert.deepEqual(c.parseYield('DLNE_YIELD: {"yielding": true, "why": "aliens"}'), { yielding: true, why: '' });
+  assert.equal(c.parseYield('DLNE_YIELD: {"yielding": "yes"}'), null);
+});
+
+test('DLNE_ROLE carries the member\'s own figures (2.5.0), checked like the rest', () => {
+  const parsed = c.parseRole(`DLNE_ROLE: coding {"model":"m.gguf","tier":"t","slots":1,"trust_id":"${TRUST}","context":40960,"decode_tps":24.26,"prefill_tps":310}`);
+  assert.deepEqual(parsed, { role: 'coding', model: 'm.gguf', tier: 't', slots: 1, trustId: TRUST, context: 40960, decodeTps: 24.3, prefillTps: 310 });
+  assert.deepEqual(c.parseRole('DLNE_ROLE: coding {"context": 12, "decode_tps": -1, "prefill_tps": "fast"}'), { role: 'coding' });
+  assert.match(c.roleMeaning('coding', { slots: 1, context: 40960, decodeTps: 24.3 }), /about 1 at a time \(40,960 tokens each, 24.3 tok\/s\)/);
+  assert.match(c.roleMeaning('coding', { slots: 2 }), /about 2 at a time\.$/, 'nothing said, nothing shown');
+});
+
+test('the card says whether the machine is docked and when it steps aside', () => {
+  const docked = c.roleCopy(view('contributing', 'rpc', undefined, { dock: { link: 'wired', power: 'ac', docked: true } }));
+  assert.match(docked.roleHtml, /Docked \(wired and plugged in\): your GPU may share the swarm's big model/);
+  const undocked = c.roleCopy(view('contributing', 'coding', { slots: 1 }, { dock: { link: 'wifi', power: 'battery', docked: false } }));
+  assert.match(undocked.roleHtml, /Not docked \(on Wi-Fi and battery\): your GPU runs a whole model by itself/);
+  const unknown = c.roleCopy(view('contributing', 'rpc', undefined, { dock: { power: 'ac' } }));
+  assert.doesNotMatch(unknown.roleHtml, /docked/i, 'nothing claimed while a fact is unknown');
+  const yielding = c.roleCopy(view('contributing', 'rpc', undefined, { yielding: { yielding: true, why: 'fullscreen' } }));
+  assert.match(yielding.roleHtml, /<strong>Stepping aside for a full-screen app: the swarm gets the GPU back once you are done\.<\/strong>/);
+  assert.doesNotMatch(c.roleCopy(view('contributing', 'rpc', undefined, { yielding: { yielding: false, why: '' } })).roleHtml, /Stepping aside/);
+  assert.equal(c.dockLine(undefined), '');
+  assert.equal(c.yieldLine({ yielding: true, why: 'cpu' }), 'Stepping aside for your own CPU use: the swarm gets the GPU back once you are done.');
+});
+
+test('the engine button says when a newer signed engine is published', () => {
+  const plain = c.contributionCopy(view('idle'));
+  assert.deepEqual(plain.engineButton, { text: 'Set Up Engine', title: 'Install the signed DLNE compute engine' });
+  const update = c.contributionCopy(view('contributing', 'rpc', undefined, { engineUpdate: { installed: '2.4.9', available: '2.5.0' } }));
+  assert.equal(update.engineButton.text, 'Update Engine → 2.5.0');
+  assert.match(update.engineButton.title, /newer signed DLNE compute engine \(2\.5\.0\).*installed one is 2\.4\.9/);
+  const cpu = c.contributionCopy({ ...view('idle'), cpuPool: true, engineUpdate: { installed: null, available: '2.5.0' } });
+  assert.equal(cpu.engineButton.text, 'Update Engine → 2.5.0');
+  assert.match(cpu.engineButton.title, /no version record/);
+});

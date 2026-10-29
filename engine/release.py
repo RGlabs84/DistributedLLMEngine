@@ -16,6 +16,7 @@ the same manifest in TypeScript, which is why the signed text is restricted to p
 Python's ``json.dumps`` and JavaScript's ``JSON.stringify`` only agree byte for byte there.
 """
 
+import datetime
 import hashlib
 import io
 import json
@@ -48,10 +49,20 @@ _RPC_MEMBER_RE = re.compile(
     r"^bin/(ggml-rpc-server(\.exe)?|llama-server(\.exe)?"
     r"|(lib)?ggml[A-Za-z0-9_.-]*\.(dll|so(\.[0-9.]+)?|dylib)"
     r"|(lib)?(llama|llama-common|llama-server-impl|mtmd)(\.[0-9]+)*\.(dll|dylib|so(\.[0-9]+)*)"
-    r"|libomp\.dll|LICENSE)$"
+    r"|libomp\.dll|LICENSE"
+    # The Visual C++ runtime, app-local, in the Windows zips only (scripts/package_llama.py): a clean
+    # Windows has none of it and every Windows llama.cpp program imports it.
+    r"|vcruntime140(_1)?\.dll|msvcp140\.dll)$"
 )
 _PROTO_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _BUILD_RE = re.compile(r"^b\d+$")
+
+# The image engine (2.6.1): stable-diffusion.cpp's sd-server, which only the coordinator runs, on its media card. A
+# release that ships it signs ``sd_build`` (the upstream build, like "master-1017-be48649") and the size and SHA-256 of
+# ``server-sd.tar.gz`` (server_sd_sha256 / server_sd_size), and scripts/release_apply.py unpacks it into <root>/bin-sd/.
+# Workers never download it and nothing serves it. A release without these fields is exactly what it was before.
+_SD_BUILD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SD_FIELDS = ("sd_build", "server_sd_sha256", "server_sd_size")
 
 
 def rpc_zip_name(platform: str) -> str:
@@ -79,9 +90,14 @@ SHIPPED_PACKAGES = ("engine",)
 # rolled back at deploy. Never extend this to a directory that can hold secrets or scratch files.
 SHIPPED_ASSET_DIRS = {"engine/static": ".png"}
 
-# Every archive entry gets the same timestamp and permissions, so the output depends only on
-# names and contents.
-_FIXED_DATE_TIME = (1980, 1, 1, 0, 0, 0)
+# Every archive entry gets the same date and permissions, so the output depends only on names
+# and contents. The date itself is derived from the contents, so each release has its own (always
+# in the past): unzip and tar give the files they extract the archive's dates, and Python trusts a
+# cached .pyc while the source's mtime and size are unchanged. With one fixed date for every
+# release, a module whose size did not change (engine/version.py, 2.4.9 -> 2.5.0) kept running the
+# previous release's bytecode.
+_DATE_BASE = datetime.datetime(1980, 1, 2)
+_DATE_SPAN_SECONDS = 40 * 365 * 24 * 3600
 _FILE_MODE = 0o100644 << 16
 
 _VERSION_RE = re.compile(r'^VERSION[ \t]*=[ \t]*"([^"]+)"[ \t]*$', re.MULTILINE)
@@ -178,21 +194,33 @@ def shipped_files(repo_root: str) -> List[str]:
     return sorted(found)
 
 
+def _archive_date_time(contents: List[Tuple[str, bytes]]) -> Tuple[int, int, int, int, int, int]:
+    """The date every entry gets: a pure function of the names and contents, in even seconds (zip's resolution)."""
+    digest = hashlib.sha256()
+    for name, data in contents:
+        digest.update(name.encode("utf-8") + b"\0" + hashlib.sha256(data).digest())
+    seconds = 2 * (int.from_bytes(digest.digest()[:8], "big") % (_DATE_SPAN_SECONDS // 2))
+    return (_DATE_BASE + datetime.timedelta(seconds=seconds)).timetuple()[:6]
+
+
 def build_source_archive(repo_root: str, out_path: str) -> Dict[str, Any]:
     """
     Write the release archive and return ``{"sha256", "size", "files"}``.
 
-    Deterministic: entries are sorted, every timestamp and permission is fixed, and nothing
-    about the machine or the moment of the build is recorded. Building twice from the same
-    tree yields identical bytes.
+    Deterministic: entries are sorted, every permission is fixed, the one date all entries share
+    comes from the contents, and nothing about the machine or the moment of the build is
+    recorded. Building twice from the same tree yields identical bytes.
     """
     files = shipped_files(repo_root)
+    contents = []
+    for relative in files:
+        with open(os.path.join(repo_root, *relative.split("/")), "rb") as handle:
+            contents.append((relative, handle.read()))
+    date_time = _archive_date_time(contents)
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        for relative in files:
-            with open(os.path.join(repo_root, *relative.split("/")), "rb") as handle:
-                data = handle.read()
-            info = zipfile.ZipInfo(relative, date_time=_FIXED_DATE_TIME)
+        for relative, data in contents:
+            info = zipfile.ZipInfo(relative, date_time=date_time)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = _FILE_MODE
             info.create_system = 3
@@ -330,8 +358,16 @@ def app_tiers(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
 # scripts/coding_models.json lists the tiers smallest first; engine/coding_ladder.py is what
 # the coordinator reads them through. Signed the same way as the CPU pool's tiers, as flat
 # text and integer fields only: "coding_tiers" lists the ids, and each id has
-# coding_<id>_{name,min_vram_gb,context,enabled,blocked,parts} plus
-# coding_<id>_part<k>_{file,url,sha256,size} for k = 1..parts.
+# coding_<id>_{name,min_vram_gb,context,server_slots,enabled,blocked,parts} plus
+# coding_<id>_part<k>_{file,url,sha256,size} for k = 1..parts, and
+# coding_<id>_{server_ctx_checkpoints,server_ubatch,server_spec_type} only when the tier sets
+# them (an unset knob is left out, never signed as null).
+#
+# The server_* fields say how a coding member runs the tier's llama-server (docs/coding-members.md
+# section 4): server_slots is the most requests it opens at once (-np), and the context per request,
+# which a member keeps whatever its slot count, is context / server_slots (so context must divide
+# evenly); the knobs are --ctx-checkpoints, -ub and --spec-type (ngram types only: a member has no
+# draft model, and ngram-cache keeps prompts).
 #
 # NEVER A BOOLEAN IN THE MANIFEST. The VS Code extension's verifier (engineRelease.ts
 # canonicalBytes) throws on any value that is not a string or an integer, so one `true` here
@@ -347,10 +383,17 @@ _CODING_URL_RE = re.compile(
 )
 _SPLIT_PART_RE = re.compile(r"^(?P<stem>.+)-(?P<part>\d{5})-of-(?P<count>\d{5})\.gguf$")
 _CODING_PART_KEYS = ("file", "url", "sha256", "size")
-_CODING_KEYS = {"id", "name", "min_vram_gb", "context", "enabled", "blocked", "files", *_CODING_PART_KEYS}
+_CODING_SERVER_KNOBS = ("server_ctx_checkpoints", "server_ubatch", "server_spec_type")
+_CODING_KEYS = {"id", "name", "min_vram_gb", "context", "enabled", "blocked", "files", "server_slots",
+                *_CODING_SERVER_KNOBS, *_CODING_PART_KEYS}
 CODING_MAX_PARTS = 16
 CODING_MAX_CONTEXT = 1 << 21          # 2M tokens: room for the 1M-context models being researched
 CODING_MAX_VRAM_GB = 4096
+CODING_DEFAULT_SERVER_SLOTS = 2
+CODING_MAX_SERVER_SLOTS = 64          # the heartbeat's coding.slots limit (engine/authn.py)
+CODING_MAX_CTX_CHECKPOINTS = 64
+CODING_MAX_UBATCH = 8192
+CODING_SPEC_TYPES = ("none", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod")
 
 
 def coding_field(tier_id: str, what: str) -> str:
@@ -392,7 +435,9 @@ def coding_tier(entry: Any) -> Dict[str, Any]:
     An entry names its model either with file/url/sha256/size (one file) or with "files", a
     list of such objects (a split set, in part order). Keys starting with "_" are comments.
     The result always has both: "files" lists every part, "file"/"url"/"sha256" are part 1
-    (the file llama-server is pointed at) and "size" is the total of all parts.
+    (the file llama-server is pointed at) and "size" is the total of all parts. The server_*
+    fields are optional: a missing or null server_slots is CODING_DEFAULT_SERVER_SLOTS, a missing
+    or null knob is None (unset), and a server_spec_type of "none" is None as well.
     """
     if not isinstance(entry, dict):
         raise ReleaseError("each tier must be an object")
@@ -415,6 +460,19 @@ def coding_tier(entry: Any) -> Dict[str, Any]:
         raise ReleaseError(f"tier {tier_id}: blocked must be printable ASCII, 1 to 200 characters")
     if entry["enabled"] and blocked:
         raise ReleaseError(f"tier {tier_id}: enabled but still marked blocked ({blocked}); clear one of them")
+    slots = entry.get("server_slots")
+    slots = CODING_DEFAULT_SERVER_SLOTS if slots is None else slots
+    if not _is_int(slots, 1, CODING_MAX_SERVER_SLOTS):
+        raise ReleaseError(f"tier {tier_id}: bad server_slots (a whole number from 1 to {CODING_MAX_SERVER_SLOTS})")
+    if entry["context"] % slots:
+        raise ReleaseError(f"tier {tier_id}: context must be a multiple of server_slots")
+    checkpoints, ubatch, spec_type = (entry.get(knob) for knob in _CODING_SERVER_KNOBS)
+    if checkpoints is not None and not _is_int(checkpoints, 0, CODING_MAX_CTX_CHECKPOINTS):
+        raise ReleaseError(f"tier {tier_id}: bad server_ctx_checkpoints (a whole number from 0 to {CODING_MAX_CTX_CHECKPOINTS})")
+    if ubatch is not None and not _is_int(ubatch, 1, CODING_MAX_UBATCH):
+        raise ReleaseError(f"tier {tier_id}: bad server_ubatch (a whole number from 1 to {CODING_MAX_UBATCH})")
+    if spec_type is not None and spec_type not in CODING_SPEC_TYPES:
+        raise ReleaseError(f"tier {tier_id}: server_spec_type must be one of {', '.join(CODING_SPEC_TYPES)}")
 
     has_single = any(key in entry for key in _CODING_PART_KEYS)
     if "files" in entry:
@@ -446,6 +504,10 @@ def coding_tier(entry: Any) -> Dict[str, Any]:
         "size": sum(part["size"] for part in parts),
         "min_vram_gb": entry["min_vram_gb"],
         "context": entry["context"],
+        "server_slots": slots,
+        "server_ctx_checkpoints": checkpoints,
+        "server_ubatch": ubatch,
+        "server_spec_type": None if spec_type == "none" else spec_type,
         "enabled": entry["enabled"],
         "blocked": blocked or None,
         "files": parts,
@@ -474,10 +536,14 @@ def _flatten_coding_tier(tier: Dict[str, Any]) -> Dict[str, Any]:
         coding_field(tier["id"], "name"): tier["name"],
         coding_field(tier["id"], "min_vram_gb"): tier["min_vram_gb"],
         coding_field(tier["id"], "context"): tier["context"],
+        coding_field(tier["id"], "server_slots"): tier["server_slots"],
         coding_field(tier["id"], "enabled"): 1 if tier["enabled"] else 0,   # never a bool, see above
         coding_field(tier["id"], "blocked"): tier["blocked"] or "",
         coding_field(tier["id"], "parts"): len(tier["files"]),
     }
+    for knob in _CODING_SERVER_KNOBS:
+        if tier.get(knob) is not None:          # an unset knob is left out: never null in the manifest
+            fields[coding_field(tier["id"], knob)] = tier[knob]
     for number, part in enumerate(tier["files"], start=1):
         for what in _CODING_PART_KEYS:
             fields[coding_field(tier["id"], f"part{number}_{what}")] = part[what]
@@ -508,6 +574,9 @@ def coding_tiers(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
             "name": manifest.get(coding_field(tier_id, "name")),
             "min_vram_gb": manifest.get(coding_field(tier_id, "min_vram_gb")),
             "context": manifest.get(coding_field(tier_id, "context")),
+            # Absent in a release before 2.5.0, and for every knob a tier leaves unset: coding_tier() defaults them.
+            "server_slots": manifest.get(coding_field(tier_id, "server_slots")),
+            **{knob: manifest.get(coding_field(tier_id, knob)) for knob in _CODING_SERVER_KNOBS},
             "enabled": enabled == 1,
             "blocked": blocked or None,
             "files": [{what: manifest.get(coding_field(tier_id, f"part{number}_{what}")) for what in _CODING_PART_KEYS}
@@ -520,9 +589,13 @@ def make_manifest(version: str, archive_path: str, git_commit: str, built_at: st
                   rpc_zips: Optional[Dict[str, str]] = None, llama_build: Optional[str] = None,
                   rpc_proto: Optional[str] = None, server_llama: Optional[str] = None,
                   app_models: Optional[List[Dict[str, Any]]] = None,
-                  coding_models: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                  coding_models: Optional[List[Dict[str, Any]]] = None,
+                  sd_build: Optional[str] = None, server_sd: Optional[str] = None) -> Dict[str, Any]:
     """
     The unsigned manifest for ``archive_path``. Every string is validated as printable ASCII.
+
+    ``server_sd`` is the image engine's archive (server-sd.tar.gz) and ``sd_build`` the upstream build it is made from;
+    both or neither.
 
     ``rpc_zips`` maps platform -> RPC zip; with it come ``llama_build`` (the upstream tag, e.g.
     "b11838") and ``rpc_proto`` (its RPC protocol, e.g. "8.0.1"). ``server_llama`` is the
@@ -557,6 +630,12 @@ def make_manifest(version: str, archive_path: str, git_commit: str, built_at: st
     if server_llama is not None:
         manifest["server_llama_sha256"] = sha256_file(server_llama)
         manifest["server_llama_size"] = os.path.getsize(server_llama)
+    if sd_build is not None or server_sd is not None:
+        if not (isinstance(sd_build, str) and _SD_BUILD_RE.fullmatch(sd_build) and server_sd):
+            raise ReleaseError("The image engine needs the sd build it comes from (like master-1017-be48649) and its archive.")
+        manifest["sd_build"] = sd_build
+        manifest["server_sd_sha256"] = sha256_file(server_sd)
+        manifest["server_sd_size"] = os.path.getsize(server_sd)
     if app_models:
         ids = []
         for model in app_models:
@@ -655,6 +734,14 @@ def verify_manifest(manifest: Any, pubkey_hex: Optional[str] = None) -> Tuple[bo
             return (False, "the manifest has no valid llama_build")
         if proto_major(manifest.get("rpc_proto")) is None:
             return (False, "the manifest has no valid rpc_proto")
+    if any(key in manifest for key in SD_FIELDS):
+        if not (isinstance(manifest.get("sd_build"), str) and _SD_BUILD_RE.fullmatch(manifest["sd_build"])):
+            return (False, "the manifest has no valid sd_build")
+        sd_sha, sd_size = manifest.get("server_sd_sha256"), manifest.get("server_sd_size")
+        if not isinstance(sd_sha, str) or not _SHA256_RE.fullmatch(sd_sha):
+            return (False, "the manifest has no valid server_sd_sha256")
+        if not isinstance(sd_size, int) or isinstance(sd_size, bool) or sd_size <= 0:
+            return (False, "the manifest has no valid server_sd_size")
     if "app_tiers" in manifest:
         tiers = app_tiers(manifest)
         if not tiers:
@@ -717,6 +804,12 @@ def verify_server_llama(manifest: Dict[str, Any], path: str) -> Tuple[bool, str]
     """The coordinator's llama.cpp build on disk is the one the (verified) manifest names."""
     return _verify_asset(manifest, "server_llama_sha256", "server_llama_size", path,
                          "the release does not sign a server llama.cpp build", "llama.cpp build")
+
+
+def verify_server_sd(manifest: Dict[str, Any], path: str) -> Tuple[bool, str]:
+    """The image engine's archive on disk is the one the (verified) manifest names."""
+    return _verify_asset(manifest, "server_sd_sha256", "server_sd_size", path,
+                         "the release does not sign an image engine", "image engine archive")
 
 
 def _verify_asset(manifest: Dict[str, Any], sha_key: str, size_key: str, path: str,

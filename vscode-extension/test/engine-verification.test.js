@@ -122,6 +122,17 @@ test('syncing when already on the current release downloads nothing', () =>
     assert.equal(downloads(sb), before, 'no second download of the same release');
   }));
 
+test('the engine bytecode is dropped on every sync, even when the release is already current', () =>
+  withSandbox({}, async (sb, wm) => {
+    assert.ok(await install(wm));
+    // 2.4.9 -> 2.5.0: version.py kept its size and its 1980 date, so Python kept running 2.4.9's .pyc.
+    const cache = path.join(sb.runtimeDir, 'engine', '__pycache__');
+    fs.mkdirSync(cache, { recursive: true });
+    fs.writeFileSync(path.join(cache, 'version.cpython-314.pyc'), 'stale');
+    await sync(wm, sb);
+    assert.equal(fs.existsSync(cache), false);
+  }));
+
 test('a newer signed release is installed over the old one and recorded', () =>
   withSandbox({}, async (sb, wm) => {
     assert.ok(await install(wm));

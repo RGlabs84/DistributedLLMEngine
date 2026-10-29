@@ -122,6 +122,32 @@ def save_state(state: Dict[str, Any]) -> None:
         json.dump(state, f, indent=2)
 
 
+# gpu_pool.reach grades (2.4.9) as the tile words them, best first.
+REACH_WORDS = (("best", "best link"), ("good", "good link"), ("usable", "usable link"),
+               ("too_far", "too far away"), ("unmeasured", "not measured yet"))
+
+
+def volunteer_gpus(status: Dict[str, Any]) -> "tuple[int, str]":
+    """
+    How many volunteer GPUs there are and how far away, as ``(count, "1 best link, 1 usable link")``, from
+    the status's ``gpu_pool.reach``. A coordinator from before 2.4.9 has no reach: every worker but TheWall's
+    own counts, ungraded.
+    """
+    reach = (status.get("gpu_pool") or {}).get("reach")
+    if not isinstance(reach, dict):
+        try:
+            return max(0, int(status.get("active_workers_count", 0)) - 1), ""
+        except (TypeError, ValueError):
+            return 0, ""
+
+    def count(key: str) -> int:
+        value = reach.get(key, 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+    graded = ", ".join(f"{count(key)} {words}" for key, words in REACH_WORDS if count(key))
+    return sum(count(key) for key, _ in REACH_WORDS), graded
+
+
 def build_tile_fields(status: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Construct embed title, color, and fields according to live cluster metrics."""
     if not status:
@@ -140,7 +166,6 @@ def build_tile_fields(status: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     loading = status.get("model_loading") or {}
     is_loading = loading.get("is_loading", False)
     workers_cnt = status.get("active_workers_count", 0)
-    endpoints = status.get("active_endpoints") or []
     vram = status.get("total_vram_gb", 0.0)
     sysram = status.get("total_sysram_gb", 0.0)
     mem_total = status.get("total_memory_gb", vram + sysram)
@@ -163,16 +188,14 @@ def build_tile_fields(status: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         state_str = "🟡 Standby (Waiting for Workers)"
         color = "#FEE75C"  # Yellow
 
-    # Format nodes
+    # Format nodes: counts only, never an address. Until 2.4.9 this listed every remote worker's
+    # ip:port, which put a volunteer's home address in a public channel.
     rig_lines = []
-    has_local = any("127.0.0.1" in ep for ep in endpoints)
-    if has_local or workers_cnt > 0:
+    if workers_cnt > 0:
         rig_lines.append("• **TheWall** (Primary): Dual AMD BC-160 Navi 12 (16 GB HBM2) [Vulkan]")
-    
-    remote_nodes = [ep for ep in endpoints if "127.0.0.1" not in ep]
-    if remote_nodes:
-        for ep in remote_nodes:
-            rig_lines.append(f"• **Remote Worker** (`{ep}`): Active GPU Compute Node")
+    volunteers, graded = volunteer_gpus(status)
+    if volunteers:
+        rig_lines.append(f"• **{volunteers} volunteer GPU(s)**" + (f": {graded}" if graded else ""))
     elif workers_cnt <= 1:
         rig_lines.append("• *Connect your worker node to contribute GPU VRAM!*")
 

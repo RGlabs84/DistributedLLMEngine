@@ -154,7 +154,7 @@ def test_a_missing_key_file_says_where_it_looked(tmp_path):
         cli.load_key(str(tmp_path / "nope.pem"))
 
 
-@pytest.mark.skipif(not os.path.isdir(os.path.join(REPO_ROOT, ".git")),
+@pytest.mark.skipif(not os.path.exists(os.path.join(REPO_ROOT, ".git")),     # a file, not a folder, in a linked worktree
                     reason="needs a git checkout (the TheWall test copy has none)")
 def test_the_real_repository_builds_a_valid_release(tmp_path, key):
     built = cli.build_release(REPO_ROOT, str(tmp_path / "out"), key[0], "smoke", allow_dirty=True, expected_pubkey=key[1])

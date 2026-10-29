@@ -250,6 +250,68 @@ def test_an_unrecognised_failure_names_its_type_rather_than_guessing():
     assert is_error is True
 
 
+class _FakeEngineStreams:
+    """``client.stream()`` stand-in: each outcome is an exception raised on opening, or the response handed out."""
+
+    def __init__(self, outcomes):
+        self.outcomes, self.opened = list(outcomes), 0
+
+    def stream(self, method, url, **kwargs):
+        outcome, fake = self.outcomes.pop(0), self
+
+        class _Opening:
+            async def __aenter__(self):
+                fake.opened += 1
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Opening()
+
+
+def test_a_connection_the_engine_closed_before_answering_is_opened_again_once():
+    """2026-10-27: "Server disconnected without sending a response" ended an agent's task as "Node disconnected
+    mid-response". Nothing had reached the engine and nothing came back, so the request goes again, once."""
+    import asyncio
+
+    async def open_with(outcomes):
+        fake = _FakeEngineStreams(outcomes)
+        async with coordinator._open_engine_stream(fake, "http://127.0.0.1:8081/v1/chat/completions") as response:
+            return response, fake.opened
+
+    dropped = httpx.RemoteProtocolError("Server disconnected without sending a response.")
+    assert asyncio.run(open_with([dropped, "the response"])) == ("the response", 2)
+    with pytest.raises(httpx.RemoteProtocolError):
+        asyncio.run(open_with([dropped, httpx.RemoteProtocolError("again")]))
+
+
+def test_a_drop_after_the_answer_began_is_not_sent_again():
+    """Part of the answer is already with the client: the coordinator reports it, and the agent retries the step."""
+    import asyncio
+    fake = _FakeEngineStreams(["the response", "never opened"])
+
+    async def stream_then_drop():
+        async with coordinator._open_engine_stream(fake, "http://127.0.0.1:8081/v1/chat/completions"):
+            raise httpx.ReadError("mid-stream")
+
+    with pytest.raises(httpx.ReadError):
+        asyncio.run(stream_then_drop())
+    assert fake.opened == 1
+
+
+@pytest.mark.parametrize("exc, kind", [
+    (httpx.RemoteProtocolError("x"), "engine_dropped"), (httpx.ReadError("x"), "engine_dropped"),
+    (ConnectionResetError("x"), "engine_dropped"), (httpx.ConnectError("x"), "engine_unavailable"),
+    (httpx.ReadTimeout("x"), "engine_timeout"), (ValueError("x"), "engine_failed"),
+])
+def test_an_engine_failure_says_what_a_client_may_do_about_it(exc, kind):
+    """``dlne_error`` beside the message: the agent sends a dropped or unavailable step again instead of stopping."""
+    assert coordinator._engine_failure_kind(exc) == kind
+
+
 # --------------------------------------------------------------------------------------
 # Phase A3 — the two-ended speed test
 # --------------------------------------------------------------------------------------
@@ -679,3 +741,50 @@ def test_an_unanswerable_probe_assumes_no_cache(monkeypatch):
 
     monkeypatch.setattr(worker_module.subprocess, "run", explode)
     assert worker_module._rpc_server_supports_cache("ggml-rpc-server") is False
+
+
+# --- 2.5.0: a shard that steps aside is drained, not killed -----------------------------
+
+@pytest.fixture
+def draining_env(settle_env, monkeypatch):
+    """The engine runs on this machine and on a volunteer that is still registered but yielding."""
+    from engine.registry import WorkerRegistry
+    registry = WorkerRegistry()
+    registry.update_worker("vol", "10.8.0.4", 50052, "t-vol",
+                           {"gpu": {"has_gpu": True, "vram_total_gb": 8.0}, "is_yielding": True})
+    monkeypatch.setattr(coordinator, "registry", registry)
+    monkeypatch.setattr(coordinator, "_pending_drain", None)
+    monkeypatch.setattr(coordinator, "_pending_drain_since", 0.0)
+    monkeypatch.setattr(coordinator, "get_worker_limits",
+                        lambda: {"topology_settle_seconds": 0, "shard_policy": "auto", "rebalance_on_join": True,
+                                 "shard_drain_seconds": 60, "topology_rejoin_max_seconds": 600})
+    _set_live_endpoints(monkeypatch, ["127.0.0.1:50052", "10.8.0.4:50052"])
+    return registry
+
+
+def test_a_shard_that_steps_aside_waits_for_the_running_answers(draining_env):
+    from engine.lease import lease_manager
+    with lease_manager.acquire(task_type="chat"):
+        assert coordinator._topology_change_is_settled(["127.0.0.1:50052"]) is False, "an answer is running on it"
+        coordinator._pending_drain_since -= 61
+        assert coordinator._topology_change_is_settled(["127.0.0.1:50052"]) is True, "the drain is over"
+
+
+def test_a_shard_that_steps_aside_is_dropped_at_once_when_nothing_runs(draining_env):
+    assert coordinator._topology_change_is_settled(["127.0.0.1:50052"]) is True
+
+
+def test_a_shard_that_is_gone_still_restarts_at_once_under_running_answers(draining_env):
+    from engine.lease import lease_manager
+    draining_env.workers.clear()                                 # its heartbeats stopped: pruned
+    with lease_manager.acquire(task_type="chat"):
+        assert coordinator._topology_change_is_settled(["127.0.0.1:50052"]) is True
+
+
+def test_a_gained_gpu_is_taken_back_once_the_rejoin_wait_is_over(draining_env, monkeypatch):
+    from engine.lease import lease_manager
+    _set_live_endpoints(monkeypatch, ["127.0.0.1:50052"])
+    with lease_manager.acquire(task_type="chat"):
+        assert coordinator._topology_change_is_settled(["127.0.0.1:50052", "10.8.0.9:50052"]) is False
+        coordinator._pending_topology_since -= 601
+        assert coordinator._topology_change_is_settled(["127.0.0.1:50052", "10.8.0.9:50052"]) is True

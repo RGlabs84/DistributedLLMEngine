@@ -27,3 +27,23 @@ export function logOnce(key: string, line: string, everyMs = 60_000, now = Date.
   channel.appendLine(`[${new Date(now).toISOString()}] ${line}`);
   return true;
 }
+
+/**
+ * Writes `line` to the DLNE log as it is: the agent's run log, where every start, step, retry and end is wanted
+ * (a long task that ended by itself left no trace before). Callers keep prompts, file contents and secrets out of
+ * `line`. Never throws: a log that cannot be written must not stop a task.
+ */
+export function logLine(line: string, now = Date.now()): void {
+  try {
+    channel ??= vscode.window.createOutputChannel('DLNE');
+    channel.appendLine(`[${new Date(now).toISOString()}] ${line}`);
+  } catch {
+    // nothing else to do with it
+  }
+}
+
+/** Forgets the channel and the once-a-minute memory, so the next line opens a new one (the tests' editor stand-in resets this). */
+export function forgetLogChannel(): void {
+  channel = null;
+  lastWritten.clear();
+}

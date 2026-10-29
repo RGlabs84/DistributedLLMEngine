@@ -120,3 +120,14 @@ test('the sidebar loads the logo through the webview, from inside the extension 
   assert.match(source, /this\._view\.webview\.asWebviewUri\(logo\)/);
   assert.match(source, /localResourceRoots: \[this\._extensionUri\]/);
 });
+
+test('buttons keep a background, text colour and border when the theme leaves the VS Code button colours out', () => {
+  const source = fs.readFileSync(path.join(ROOT, 'src', 'views', 'sidebarProvider.ts'), 'utf8');
+  const css = (selector) => source.match(new RegExp(`\\n    ${selector.replace(/[.:]/g, '\\$&')} \\{([^}]*)\\}`))[1];
+  assert.match(css('button'), /--vscode-button-background, #[0-9a-f]{6}\)/);
+  assert.match(css('button'), /--vscode-button-foreground, #[0-9a-f]+\)/);
+  assert.match(css('button.secondary'), /--vscode-button-secondaryBackground, #[0-9a-f]{6}\)/);
+  assert.match(css('button.secondary'), /--vscode-button-secondaryForeground, #[0-9a-f]+\)/);
+  assert.match(css('button.secondary'), /border-color:/);
+  assert.match(css('button.secondary:hover'), /--vscode-button-secondaryHoverBackground, #[0-9a-f]{6}\)/);
+});

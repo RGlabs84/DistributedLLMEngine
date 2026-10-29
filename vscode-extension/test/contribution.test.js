@@ -212,6 +212,7 @@ test('the sidebar card for a GPU contributor reads as it always did', () => {
     deviceHtml: '<strong>VULKAN GPU:</strong> RTX 4060 (8 GB)',
     ruleHtml: '<strong>Core Rule:</strong> You must give compute to receive compute.',
     buttonText: '⚡ Contribute Local GPU',
+    engineButton: { text: 'Set Up Engine', title: 'Install the signed DLNE compute engine' },
   });
   assert.equal(contributionCopy(view('starting', false)).buttonText, '⏳ Initializing...');
   assert.equal(contributionCopy(view('starting', false)).ruleHtml, '⏳ Connecting local worker to cluster coordinator...');
@@ -227,6 +228,7 @@ test('the sidebar card for a CPU contributor says the computer powers the phone 
     deviceHtml: '<strong>CPU pool:</strong> Your computer powers the DLNE phone app',
     ruleHtml: '<strong>You get:</strong> the coding agent 2nd in line, with 300 chats every 5 hours.',
     buttonText: '⚡ Power the DLNE Phone App',
+    engineButton: { text: 'Set Up Engine', title: 'Install the signed DLNE compute engine' },
   });
   assert.equal(contributionCopy(view('starting', true)).ruleHtml, '⏳ Joining the CPU pool...');
   const active = contributionCopy(view('contributing', true, 16));

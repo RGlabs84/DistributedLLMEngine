@@ -11,6 +11,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const childProcess = require('node:child_process');
+const { EventEmitter } = require('node:events');
 
 const stub = require('./helpers/vscode-stub');
 const { WorkerManager } = require('../dist/worker/workerManager');
@@ -169,8 +170,9 @@ test('the worker itself is spawned hidden, with UTF-8 output, from a folder that
 test('a stop does not later kill a worker that was started after it', async () => {
   const wm = manager();
   const kills = [];
-  const oldWorker = { kill: (signal) => kills.push(['old', signal]) };
-  const newWorker = { kill: (signal) => kills.push(['new', signal]) };
+  const fakeWorker = (name) => Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, kill: (signal) => kills.push([name, signal]) });
+  const oldWorker = fakeWorker('old');
+  const newWorker = fakeWorker('new');
   wm.workerProcess = oldWorker;
   wm.isSystemdActive = () => false;
   const realExec = childProcess.execSync;
@@ -183,7 +185,11 @@ test('a stop does not later kill a worker that was started after it', async () =
   wm.findEngineScript = () => path.join(os.tmpdir(), 'dlne engine', 'dlne_server.py');
   global.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return { unref() {} }; };
   try {
-    await wm.stopWorker();
+    const stopping = wm.stopWorker();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(execFiles.length, 0, 'while the worker lives, its engine is not an orphan');
+    oldWorker.emit('exit', 0, null);
+    await stopping;
   } finally {
     global.setTimeout = realSetTimeout;
     childProcess.execSync = realExec;
@@ -200,11 +206,7 @@ test('a stop does not later kill a worker that was started after it', async () =
 
   wm.workerProcess = newWorker; // the owner started contributing again before the timer fired
   timers[0].fn();
-  assert.deepEqual(kills, [['old', 'SIGTERM']], 'the newer worker is untouched');
+  assert.ok(!kills.some(([name]) => name === 'new'), 'the newer worker is untouched');
   assert.equal(wm.workerProcess, newWorker);
-
-  wm.workerProcess = oldWorker; // and a worker that really is still there is killed
-  timers[0].fn();
-  assert.deepEqual(kills, [['old', 'SIGTERM'], ['old', 'SIGKILL']]);
   wm.dispose();
 });

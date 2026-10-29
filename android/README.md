@@ -7,9 +7,12 @@ The native DLNE chat app: Kotlin, Jetpack Compose, Material 3, one activity. Pho
 - minSdk 26 (Android 8.0), targetSdk / compileSdk 36 (Android 16)
 - Two builds of the same app (same package, same signing key), see "Flavors and updates" below:
   `sideload` (the APK on the website, with the in-app updater) and `play` (Google Play, none).
-- Permissions: `play` = `INTERNET` only. `sideload` = `INTERNET` + `REQUEST_INSTALL_PACKAGES`
-  (to hand a verified update to Android's installer; Android still asks for a tap).
-  No analytics, ads, Google Play Services, Firebase or tracking in either.
+- Permissions: both builds ask for `INTERNET`, and for `ACCESS_FINE_LOCATION` with `ACCESS_COARSE_LOCATION` (precise
+  and approximate together, so the person can allow only approximate), which are requested only when the person turns
+  on Settings > Share location or taps "Use my location" on the chat's location card, never at startup or in the
+  background. `sideload` also asks for `REQUEST_INSTALL_PACKAGES` (to hand a verified update to Android's installer;
+  Android still asks for a tap). No camera or storage permission: the system photo picker and the camera app hand the
+  app only the photos the person chooses. No analytics, ads, Google Play Services, Firebase or tracking in either.
 - Talks to `POST /v1/app/chat/completions` (Server-Sent Events) and `GET /v1/cluster/status`
   on `https://dlne.rossgilsonlabs.dev` by default (`ServerUrl.DEFAULT`, since 1.0.4); the
   address is editable in Settings (https only) for self-hosters. The service's older addresses,
@@ -178,9 +181,9 @@ by hand: `aapt2 dump permissions <apk>`.
    the APKs. The address is fixed in the app (`UpdateSource`); it does **not** follow the server
    address someone typed into Settings. No cookies or identifiers are sent; no redirect is followed.
    ```json
-   {"versionCode": 6, "versionName": "1.0.5", "minSdk": 26,
-    "url": "https://dlne.rossgilsonlabs.dev/downloads/DLNE-Chat-1.0.5.apk",
-    "sha256": "<64 hex>", "size": 2017073, "notes": "What changed, one or two lines.", "published": "2026-10-27"}
+   {"versionCode": 7, "versionName": "1.0.6", "minSdk": 26,
+    "url": "https://dlne.rossgilsonlabs.dev/downloads/DLNE-Chat-1.0.6.apk",
+    "sha256": "<64 hex>", "size": 2197756, "notes": "What changed, one or two lines.", "published": "2026-10-28"}
    ```
    It is accepted only if: `versionCode`, `minSdk` and `size` are JSON integers (`versionCode` up
    to 2147483647, `size` from 100,000 bytes to just under 100 MB); `versionName` is 1-32 characters
@@ -190,7 +193,7 @@ by hand: `aapt2 dump permissions <apk>`.
    (optional) is `yyyy-MM-dd`. Anything else is ignored whole. Extra fields are ignored.
    Only a **strictly higher `versionCode`** than the installed app is an update, and a `minSdk`
    above the phone's Android version means "not for this phone" (nothing is offered).
-3. **The offer.** A card at the top of the chat and a row in Settings: "DLNE Chat 1.0.5 is
+3. **The offer.** A card at the top of the chat and a row in Settings: "DLNE Chat 1.0.6 is
    available. <notes> One tap to install: Android will ask you to confirm. [Update] [Later]".
    *Later* hides the chat card for that version until the next check (Settings still offers it).
    The offer is remembered (re-validated) across restarts until the next check replaces it.
@@ -279,9 +282,57 @@ the Play icon is not exactly the official logo as a 512 x 512 32-bit PNG.
   and the question it answered (≤ 4,000). 404 shows "Reporting isn't available on this
   server"; 429 shows when to try again.
 - **Throttling.** On HTTP 429 the server's `detail` is shown and Send is disabled until the
-  `Retry-After` time passes (5 s if the header is missing).
+  `Retry-After` time passes (5 s if the header is missing). The exception is a refusal of the
+  photos themselves: 429 `image_quota` (the hour's photo allowance is used up) or a 400 for a
+  photo the server will not take (`too_many_images`, `image_too_large`, `unsupported_image_type`,
+  `remote_image_url`, `image_*`). Its `detail` is shown and Send is not paused: the message that
+  carried the pictures is marked `photosRefused` (saved with the chat), so every later request
+  sends its photos as `[photo]` marks and messages in words still go through. Retry on that
+  message clears the mark, as the person's own choice to send the photos again.
 - **History sent.** The newest ~12,000 characters of the conversation (about 3k tokens) go
   with each request; answers are capped at 1,024 tokens by the server.
+- **Photos (1.0.6).** The "+" next to the message box opens a sheet with Photos (the system
+  photo picker, up to 4 at a time, no storage permission), Camera (the phone's camera app
+  writes into a file in the cache folder that the app's FileProvider shares; the app declares no
+  camera permission, and a test fails if one is ever added, because the camera app would then
+  refuse to take the picture) and Create image. Photos and Camera show only while
+  `capabilities.app_vision` is true, Create image only while `capabilities.image_generation` is,
+  and the "+" is hidden when neither is. Each photo is turned upright (EXIF), scaled to at most
+  1,200,000 pixels and 2,048 on its longest side and written as a JPEG at quality 85 (70, then
+  half the size again and again, if it is over 4 MiB), which drops the EXIF block and the GPS
+  position (`data/PhotoEncoding.kt` holds the rules and has the tests; `data/PhotoReader.kt` does
+  the decoding). A message holds up to 4 photos and may be photos alone. The JPEGs are kept in
+  `files/images` with the chat and deleted with it. Only the newest message with photos sends
+  them (as `image_url` parts with base64 `data:` URLs), with that message and again with every
+  message after it until a newer message has photos; older photos go as the text `[photo]`,
+  one per photo after that message's text (`ChatHistory.toWire`). A message without photos is
+  still a plain string on the wire. Photos the server refused are sent as `[photo]` marks from then on, until Retry
+  sends them again. A photo that is not ready 30 s after it was chosen (a cloud photo with no connection) is given up
+  on, and its x takes it out at any time. Send is not held up by it: photos still being prepared get 2 s, then the
+  message goes without them and they stay in the box. At start, `AppGraph.tidyUp` clears `cache/camera` (only when
+  the app is opened afresh, not when Android restores it, and not a shot younger than 2 minutes) and, once the chat
+  history has been read in full, removes the files in `files/images` that no chat refers to (`ImageStore.sweep`: only
+  names the store makes, nothing written in the last 10 minutes, nothing at all if the history could not be read).
+- **Pictures from the chat (1.0.6).** Every chat request sends `"features": ["image_jobs"]` (`CHAT_FEATURES` in
+  `net/DlneApi.kt`), so while the server has pictures on, the model is offered its `create_image` tool and the stream
+  carries `image_job` and `image_refused` events (see `docs/image-generation.md`). A reply that made a picture shows
+  a job card (stage, elapsed time against the estimate, Cancel) and then the picture inside that reply, with Save,
+  Share and Report. Several can be on their way at once, one per reply, each keyed by its job id. A refusal shows the
+  server's words as a quiet note. The PNG is kept in `files/images` with the chat. The history sent ends such a reply
+  with `[Picture created: <prompt>]` after a blank line (`data/ReplyPicture.kt`), and adds nothing for a refused,
+  failed or cancelled one; the cards the Create image dialog makes are left out of the history.
+- **Location, asked in the chat (1.0.6).** When a question looks local (`LocalQuestion.asks`), sharing is off and this
+  chat has not been answered "Not now", the send is held and a card above the message box asks "Use your location for
+  this?" (`ui/LocationAskCard.kt`). **Use my location** asks Android for the precise and approximate permissions (the
+  person may allow only approximate; either one is enough): allowed, Settings > Share location turns on and the
+  message goes with a fresh fix; denied, it goes without, with the usual note. When Android will not ask any more the
+  button reads **Open settings** and opens the app's system settings page. **Not now** sends the message without a
+  location, and this chat is not asked again (saved with the chat). The card says that Use my location keeps sharing
+  on until it is turned off in Settings; it goes away when the held words are deleted or stop being a local question,
+  a permission dialog that is interrupted leaves it up (nothing is sent without an answer), and a message of photos
+  alone asks nothing. The Settings switch works as before.
+- **The header** keeps the last good status (the model and the machines serving) when a refresh fails, and refreshes
+  again when the app comes back to the foreground as well as every minute (`ui/StatusRefresher.kt`).
 - **Upgrading to compileSdk 37 (Android 17).** Needs Android Gradle Plugin 9.x, which moves
   Kotlin support into AGP (the `org.jetbrains.kotlin.android` plugin is dropped). Target
   API 36 satisfies Google Play's requirement for new apps and updates until August 2027.

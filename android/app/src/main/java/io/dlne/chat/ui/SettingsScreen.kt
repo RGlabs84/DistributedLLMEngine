@@ -1,6 +1,9 @@
 package io.dlne.chat.ui
 
+import android.Manifest
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -12,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -25,6 +29,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -63,6 +68,9 @@ class SettingsActions(
     val onSaveServerUrl: (String) -> Boolean,
     val onResetServerUrl: () -> Unit,
     val onDeleteAllChats: () -> Unit,
+    /** Called with true only after the location permission is granted. */
+    val onShareLocationChange: (Boolean) -> Unit,
+    val locationPermitted: () -> Boolean,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -93,6 +101,8 @@ fun SettingsScreen(state: ChatUiState, actions: SettingsActions) {
         ) {
             ServerSection(state.serverUrl, actions)
 
+            LocationSection(state.shareLocation, actions)
+
             // Sideload build: the Updates section. Play build: nothing (src/play).
             UpdateSettingsSection()
 
@@ -101,6 +111,8 @@ fun SettingsScreen(state: ChatUiState, actions: SettingsActions) {
             Column(Modifier.padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 BodyText(stringResource(R.string.settings_privacy_body_1))
                 BodyText(stringResource(R.string.settings_privacy_body_2))
+                BodyText(stringResource(R.string.settings_privacy_body_photos))
+                BodyText(stringResource(R.string.settings_privacy_body_pictures))
                 BodyText(stringResource(R.string.settings_privacy_body_3))
                 BodyText(stringResource(R.string.settings_privacy_body_4))
             }
@@ -184,6 +196,55 @@ private fun ServerSection(serverUrl: String, actions: SettingsActions) {
                 actions.onResetServerUrl()
             }) { Text(stringResource(R.string.settings_use_default)) }
         }
+    }
+}
+
+/**
+ * "Share location": off by default. Android is asked for the precise and approximate location
+ * permissions together here, at the moment the person turns this on, and never at startup.
+ * Android 12+ lets them allow only approximate, which is enough to turn it on (just less exact).
+ * If neither is allowed, the switch stays off and a line says why.
+ */
+@Composable
+private fun LocationSection(shareLocation: Boolean, actions: SettingsActions) {
+    var refused by rememberSaveable { mutableStateOf(false) }
+    val askPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { answers ->
+        val granted = answers.values.any { it }
+        refused = !granted
+        actions.onShareLocationChange(granted)
+    }
+
+    SectionDivider()
+    SectionTitle(stringResource(R.string.settings_location_title))
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .toggleable(value = shareLocation, role = Role.Switch) { on ->
+                refused = false
+                if (on && !actions.locationPermitted()) {
+                    askPermission.launch(
+                        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+                    )
+                } else {
+                    actions.onShareLocationChange(on)
+                }
+            }
+            .padding(horizontal = 24.dp, vertical = 8.dp),
+    ) {
+        Column(Modifier.weight(1f).padding(end = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(stringResource(R.string.settings_location_label), style = MaterialTheme.typography.bodyLarge)
+            BodyText(stringResource(R.string.settings_location_help))
+        }
+        Switch(checked = shareLocation, onCheckedChange = null)
+    }
+    if (refused) {
+        Text(
+            stringResource(R.string.settings_location_refused),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.error,
+            modifier = Modifier.padding(horizontal = 24.dp),
+        )
     }
 }
 

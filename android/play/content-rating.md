@@ -13,16 +13,16 @@ given so it can be mapped onto the current wording.
 | Topic | Answer | Reasoning |
 |---|---|---|
 | Violence, blood, gore | No | The app ships no such content. |
-| Sexual content or nudity | No | No images at all; the app ships no sexual content. |
+| Sexual content or nudity | No | The app ships no such content. When the server has image generation on, the app can show pictures a person asks for (from the chat, or with the Create image button); descriptions and finished pictures are checked on the server and sexual content, nudity, minors, real people and graphic violence are refused. |
 | Profanity / crude humour | No | Not part of the app's own content. |
 | Controlled substances (drugs, alcohol, tobacco) | No | |
 | Gambling, simulated gambling | No | |
 | Fear / horror | No | |
-| Does the app let users interact or exchange content with **other users**? | **No** | People never see or message each other; each person chats only with the model. |
+| Does the app let users interact or exchange content with **other users**? | **No** | People never see or message each other; each person chats only with the model. Photos a person adds go only to the model (on DLNE's own server) to be read and are never shown to anyone else. |
 | Does the app share the user's location with other users? | No | |
 | Does the app allow purchases of digital goods? | No | Donation links open external websites in the browser. |
 | Does the app provide unrestricted access to the internet (browser / search engine)? | No | Links open the phone's own browser. |
-| Does the app contain or generate AI-generated content? (if asked) | **Yes** | Answers are written by an open-source language model. |
+| Does the app contain or generate AI-generated content? (if asked) | **Yes** | Answers are written by an open-source language model; with image generation on at the server, pictures too. |
 | Is the app a web browser or search engine? | No | |
 
 Expected outcome: a general-audience rating (e.g. ESRB Everyone, PEGI 3). Because the model
@@ -63,5 +63,6 @@ it.
 **Done:** every answer has a "Report answer" button (flag icon) opening an in-app sheet
 with a reason (Harmful or dangerous / Wrong / Offensive / Something else) and an optional
 note; the report goes to `POST /v1/app/report` on the DLNE server and is kept for review.
+Generated images carry the same flag (it sends the image description, not the picture).
 The server endpoint must be live before review (see README.md, step 0), and someone must
 actually review the reports.

@@ -24,9 +24,9 @@
  * the text (a plain `includes`), and the name-based patterns start from a handful of literal words.
  * Redaction never changes the number of lines, so line numbers shown to the model stay true.
  */
-import { clearPrivacyCaches, excludedNotice, excludedReason, isExcluded } from './exclude';
+import { clearPrivacyCaches, excludedNotice, excludedReason, excludedReasonSkipping, filePathOf, isExcluded } from './exclude';
 
-export { clearPrivacyCaches, excludedNotice, excludedReason, isExcluded };
+export { clearPrivacyCaches, excludedNotice, excludedReason, excludedReasonSkipping, filePathOf, isExcluded };
 export type { UriLike } from './exclude';
 
 /** What replaces a secret. */

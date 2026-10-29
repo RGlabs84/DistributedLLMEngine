@@ -326,8 +326,10 @@ def arg_after(argv: List[str], flag: str) -> Optional[str]:
 # Tiers and the downloader
 # ======================================================================================
 
-def make_tier(tier_id: str, parts: List[bytes], context: int = 65536, enabled: bool = True) -> Dict[str, Any]:
-    """A coding ladder tier for ``parts`` (the model files' bytes), shaped like release.coding_tiers()."""
+def make_tier(tier_id: str, parts: List[bytes], context: int = 65536, enabled: bool = True,
+              **server: Any) -> Dict[str, Any]:
+    """A coding ladder tier for ``parts`` (the model files' bytes), shaped like release.coding_tiers(); ``server``
+    adds the server_* fields (server_slots, server_ctx_checkpoints, server_ubatch, server_spec_type)."""
     stem = f"{tier_id}-Q4"
     names = ([f"{stem}.gguf"] if len(parts) == 1
              else [f"{stem}-{i:05d}-of-{len(parts):05d}.gguf" for i in range(1, len(parts) + 1)])
@@ -335,7 +337,7 @@ def make_tier(tier_id: str, parts: List[bytes], context: int = 65536, enabled: b
               "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
              for name, data in zip(names, parts)]
     return {"id": tier_id, "name": f"Test {tier_id}", "min_vram_gb": 8, "context": context, "enabled": enabled,
-            "blocked": None, "files": files, **files[0], "size": sum(len(p) for p in parts)}
+            "blocked": None, "files": files, **files[0], "size": sum(len(p) for p in parts), **server}
 
 
 class FakeDownloader:

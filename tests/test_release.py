@@ -3,9 +3,11 @@ Tests for engine.release: reproducible archives, the signed manifest, and the ch
 makes before trusting what it downloaded.
 """
 
+import datetime
 import hashlib
 import json
 import os
+import re
 import time
 import zipfile
 
@@ -147,7 +149,7 @@ def test_the_icons_in_engine_static_ship_and_nothing_else_in_it_does(tree, tmp_p
     with zipfile.ZipFile(out) as archive:
         assert archive.namelist() == info["files"]
         assert archive.read("engine/static/icon-192.png") == b"\x89PNG-a"
-        assert archive.getinfo("engine/static/icon-192.png").date_time == (1980, 1, 1, 0, 0, 0)
+        assert archive.getinfo("engine/static/icon-192.png").date_time == archive.getinfo("engine/version.py").date_time
 
 
 def test_a_tree_without_engine_static_still_builds(tree):
@@ -172,13 +174,26 @@ def test_the_archive_depends_on_content(tree, tmp_path):
     assert info_a["sha256"] != info_b["sha256"]
 
 
-def test_entries_have_fixed_dates_and_permissions(tree, tmp_path):
+def test_entries_share_one_past_date_and_fixed_permissions(tree, tmp_path):
     out, _ = _build(tree, tmp_path)
     with zipfile.ZipFile(out) as archive:
+        dates = {info.date_time for info in archive.infolist()}
+        assert len(dates) == 1
+        assert datetime.datetime(1980, 1, 1) < datetime.datetime(*dates.pop()) < datetime.datetime.now()
         for info in archive.infolist():
-            assert info.date_time == (1980, 1, 1, 0, 0, 0)
             assert (info.external_attr >> 16) == 0o100644
             assert info.compress_type == zipfile.ZIP_DEFLATED
+
+
+def test_a_release_whose_version_file_keeps_its_size_still_gets_a_new_date(tree, tmp_path):
+    """unzip keeps the archive's dates and Python trusts a .pyc while the source's mtime and size match:
+    2.4.9's version.py and 2.5.0's were both 616 bytes, so one fixed date kept workers on 2.4.9's bytecode."""
+    a, _ = _build(tree, tmp_path, "a.zip")
+    release.write_version(tree, "2.0.1")
+    b, _ = _build(tree, tmp_path, "b.zip")
+    with zipfile.ZipFile(a) as old, zipfile.ZipFile(b) as new:
+        assert old.getinfo("engine/version.py").file_size == new.getinfo("engine/version.py").file_size
+        assert old.getinfo("engine/version.py").date_time != new.getinfo("engine/version.py").date_time
 
 
 def test_the_archive_round_trips_file_contents(tree, tmp_path):
@@ -375,7 +390,7 @@ def test_the_real_archive_carries_the_real_version(tmp_path):
     out = str(tmp_path / "real.zip")
     info = release.build_source_archive(REPO_ROOT, out)
     assert release.archive_version(out) == release.read_version(REPO_ROOT)
-    assert info["size"] < 3 * 1024 * 1024   # about 1 MB since the icons ship: ~0.7 MB of PNGs, every worker downloads it
+    assert info["size"] < 3 * 1024 * 1024   # about 2.2 MB: ~0.7 MB of PNGs and ~0.9 MB of place list; every worker downloads it
 
 
 def test_the_real_archive_ships_every_icon_the_chat_serves_byte_for_byte(tmp_path):
@@ -389,6 +404,25 @@ def test_the_real_archive_ships_every_icon_the_chat_serves_byte_for_byte(tmp_pat
     with zipfile.ZipFile(out) as archive:
         for name in icons.ICONS:
             assert archive.read(f"engine/static/{name}") == icons.icon_png(name), name
+
+
+# The member pattern of the DLNE Donate 1.0.0 tray installer (desktop/dlne_donate/installer.py at 235cdd2),
+# copied here on purpose and NEVER to be updated to follow later changes: those installers are already on
+# volunteers' machines and refuse a release holding any other file ("NOT installed"), and workers must run
+# the coordinator's exact version, so one stray file would strand them on the old release for good.
+_TRAY_1_0_0_MEMBER_RE = re.compile(
+    r"^(dlne_server\.py|requirements\.txt|engine/[A-Za-z0-9_]+\.py|engine/static/[A-Za-z0-9_.-]+\.png)$")
+
+
+def test_the_real_archive_holds_only_what_the_tray_installers_in_the_field_accept(tmp_path):
+    """The place list (engine/places_data.py) is Python for this reason; a data file would strand Donate 1.0.0."""
+    out = str(tmp_path / "real.zip")
+    info = release.build_source_archive(REPO_ROOT, out)
+    with zipfile.ZipFile(out) as archive:
+        names = archive.namelist()
+    assert "engine/places_data.py" in names
+    assert not [n for n in names if not _TRAY_1_0_0_MEMBER_RE.match(n)]
+    assert names == info["files"]
 
 
 def test_the_baked_in_public_key_is_a_valid_ed25519_key():
