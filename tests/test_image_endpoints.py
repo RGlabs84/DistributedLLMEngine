@@ -155,6 +155,88 @@ async def test_the_status_says_false_and_has_no_block_when_images_cannot_be_made
     assert status["capabilities"]["image_generation"] is False and "image_generation" not in status
 
 
+# --- paused (IMAGE_GEN_ENABLED=paused, 2026-10-30) ----------------------------------------------------------------------
+
+PAUSED_NOTE = ("Pictures are paused for now: DLNE's graphics card is busy running the smarter coding model. "
+               "They will be back.")
+PAUSED_BODY = {"detail": PAUSED_NOTE, "code": "image_generation_paused", "page": "/pictures"}
+
+
+@pytest.fixture
+def paused(images, monkeypatch):
+    """The images environment as config.txt's IMAGE_GEN_ENABLED=paused leaves it: off, and paused. The stand-in image
+    engine is never even asked whether it could run."""
+    images.limits.update(image_gen_enabled=False, image_gen_paused=True)
+    asked = []
+
+    def unavailable_reason():
+        asked.append(1)
+        return None
+
+    monkeypatch.setattr(images.member, "unavailable_reason", unavailable_reason)
+    images.asked = asked
+    return images
+
+
+def test_the_note_is_the_contracts_sentence():
+    assert coordinator.PICTURES_PAUSED_NOTE == PAUSED_NOTE and coordinator.PICTURES_PATH == "/pictures"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("method, path", ROUTES)
+async def test_while_paused_every_endpoint_says_503_paused_with_the_page(paused, method, path):
+    async with client() as c:
+        reply = await getattr(c, method)(path, json={"prompt": "a red fox"}) if method == "post" else await c.get(path)
+    assert reply.status_code == 503 and reply.json() == PAUSED_BODY
+    assert reply.headers["cache-control"] == "no-store"
+    assert paused.quota.summary(5)["chats_used"] == 0                               # not even a free chat was spent
+    assert paused.member.calls == [] and paused.service.status_block()["queue"] == 0 and not paused.service._jobs
+    assert paused.asked == [], "nothing image-related is even asked about"
+
+
+@pytest.mark.anyio
+async def test_while_paused_a_job_made_before_the_pause_is_not_served_either(images):
+    async with client() as c:
+        made = (await post(c)).json()["id"]
+        await finished(c, "/v1/app/images", made)
+        images.limits.update(image_gen_enabled=False, image_gen_paused=True)
+        reply = await c.get(f"/v1/app/images/{made}")
+    assert reply.status_code == 503 and reply.json() == PAUSED_BODY
+
+
+@pytest.mark.anyio
+async def test_while_paused_the_status_says_so_and_offers_nothing(engine, paused, monkeypatch):
+    async def snapshot(_name):
+        return dict(engine.entry)
+
+    monkeypatch.setattr(coordinator.manager, "asnapshot_model", snapshot)
+    async with client(LOCAL) as c:
+        status = (await c.get("/v1/cluster/status")).json()
+    assert status["capabilities"] == {"vision": True, "image_generation": False, "image_generation_paused": True}
+    assert status["images"] == {"paused": True, "note": PAUSED_NOTE, "page": "/pictures"}
+    assert "image_generation" not in status                                         # no block of numbers while paused
+    assert paused.asked == []
+
+
+@pytest.mark.anyio
+async def test_on_or_off_the_status_never_mentions_a_pause(engine, images, monkeypatch):
+    async def snapshot(_name):
+        return dict(engine.entry)
+
+    monkeypatch.setattr(coordinator.manager, "asnapshot_model", snapshot)
+    async with client(LOCAL) as c:
+        on = (await c.get("/v1/cluster/status")).json()
+        images.limits["image_gen_enabled"] = False
+        off = (await c.get("/v1/cluster/status")).json()
+    assert on["capabilities"] == {"vision": True, "image_generation": True} and "images" not in on
+    assert off["capabilities"] == {"vision": True} and "images" not in off and "image_generation" not in off
+
+
+@pytest.mark.anyio
+async def test_while_paused_the_canaries_look_like_a_server_without_pictures(paused):
+    assert await coordinator._image_offered() is False
+
+
 # --- the phone endpoints ---------------------------------------------------------------------------------------------
 
 @pytest.mark.anyio

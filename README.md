@@ -131,7 +131,7 @@ Other keys you will probably want (the full list is in the [operator reference](
 | `ENGINE_SLOTS`, `ENGINE_CONTEXT` | Coding request slots and total context. `0` (the default) lets the engine size itself from the model and the free GPU memory. |
 | `ENGINE_PHONE_SLOTS` | `0` to `8`, default `0` (off). Lanes reserved for the phone chat. The phone chat needs these, or CPU volunteers, or `APP_LOCAL_ENABLED=true` on this machine. |
 | `ENGINE_MMPROJ` | Path to a vision projector `.gguf`: lets the engine read photos and images. |
-| `IMAGE_GEN_ENABLED` | `true` lets phones and the IDE ask for pictures (off by default; needs a second GPU, see [`docs/image-generation.md`](docs/image-generation.md)). |
+| `IMAGE_GEN_ENABLED` | `true` lets phones and the IDE ask for pictures (off by default; needs a second GPU, see [`docs/image-generation.md`](docs/image-generation.md)). `paused` keeps them off but tells whoever asks why, with a link to `/pictures`. |
 | `ENFORCE_CONTRIB_CLAUSE` | See "Who may use it" below. |
 | `TRUST_PROXY_HEADERS` | `true` when a reverse proxy sits in front. |
 | `CUSTOM_GGUF_DIR` | Where model files live (default: `models/` in the install folder). |

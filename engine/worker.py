@@ -954,14 +954,20 @@ class WorkerNode:
         allowed = str(limits.get("allowed_gpu_indices", "-1")).strip()
         if allowed.lower() == "none":
             return []
-        cards = list(hardware.get_all_gpus() or [])
+        every_card = list(hardware.get_all_gpus() or [])
+        cards = every_card
         if allowed != "-1":
             cards = hardware.select_gpus(allowed, cards)
-        from engine.inference_manager import media_gpu_spec
+        from engine.inference_manager import media_gpu_shared, media_gpu_spec
 
         media = hardware.find_gpu(media_gpu_spec(limits), cards)     # the engine's cards only; none on a non-Vulkan build
         cards = [c for c in cards if media is None or c.get("id") != media.get("id")]
         cards = [c for c in cards if hardware.counts_as_gpu(c.get("name") or "", c.get("integrated"))]
+        if media_gpu_shared(limits):
+            # A shared media card (MEDIA_GPU_SHARED) is the model's too, numbered last, as _gpu_environment lists it.
+            shared_card = hardware.find_gpu(media_gpu_spec(limits), every_card)
+            if shared_card is not None:
+                cards.append(shared_card)
         return [c.get("vram_total_gb", 0) for c in cards]
 
     def _coding_allowed(self) -> bool:
@@ -1282,13 +1288,15 @@ class WorkerNode:
         env = os.environ.copy()
         limits = get_worker_limits()
         allowed_gpu = limits.get('allowed_gpu_indices', '-1').lower()
-        from engine.inference_manager import media_gpu_spec
+        from engine.inference_manager import media_gpu_shared, media_gpu_spec
         media_gpu = media_gpu_spec(limits)          # '' on an engine build that is not Vulkan
         if allowed_gpu != 'none' and (media_gpu or ':' in allowed_gpu):
-            # Cards named by PCI address, or a media card to keep out: the node's own process never sees it.
+            # Cards named by PCI address, or a media card to keep out: the node's own process never sees it,
+            # unless the card is shared with the model (MEDIA_GPU_SHARED), when it is one of the node's cards, last.
             from engine import hardware
-            cuda, vulkan, media_device = hardware.engine_gpu_devices(allowed_gpu, media_gpu)
-            if media_device:
+            shared = media_gpu_shared(limits)
+            cuda, vulkan, media_device = hardware.engine_gpu_devices(allowed_gpu, media_gpu, shared=shared)
+            if media_device and not shared:
                 vulkan = vulkan.rpartition(",")[0]
             env['CUDA_VISIBLE_DEVICES'], env['GGML_VK_VISIBLE_DEVICES'] = cuda, vulkan
             log_worker(f"Hardware Isolated to GPU(s): {cuda or 'none'} (Vulkan {vulkan or 'none'})")

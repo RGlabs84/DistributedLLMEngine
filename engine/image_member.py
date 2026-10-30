@@ -59,6 +59,8 @@ READY_TIMEOUT_SECONDS = 180.0             # cold start is about 24 s; this is fo
 CANCEL_WAIT_SECONDS = 30.0                # sd stops at its next step; past this the process is replaced
 POLL_FAILURES_ALLOWED = 3                 # job polls that fail in a row (process alive) before the job is given up
 STEPS, TXT_CFG = 8, 1.0                   # Z-Image-Turbo's settings (measured on TheWall)
+# Why nothing is drawn while the coding model has layers on the media card (for the log, like the other reasons).
+MEDIA_CARD_SHARED_REASON = "the media card is shared with the coding model (MEDIA_GPU_SHARED)"
 
 # What a job's failure says to a person. The code is stable for clients; the sentence is theirs to show.
 UNAVAILABLE = "image_generation_unavailable"
@@ -226,6 +228,9 @@ class ImageMember:
             self.unavailable_until, self.failures = None, 0
         if not self._media_spec(limits):
             return "MEDIA_GPU is not set (or the engine is not a Vulkan build)"
+        if limits.get("media_gpu_shared", False):
+            # The coding model has layers on the card; sd-server needs it to itself (5.6 GiB free, and its time).
+            return MEDIA_CARD_SHARED_REASON
         binary = self.binary()
         if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
             return f"the sd build is not installed ({binary})"

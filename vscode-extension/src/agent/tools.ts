@@ -517,13 +517,15 @@ export class ToolRegistry {
         // Automatic (the default): project facts are saved at once, and the chat shows each with an Undo.
         if (projectFile && !risky && (options.mode === 'auto' || always.remember)) return null;
         const where = check.scope === 'project' ? 'for this project' : 'about you, for every project';
+        // An update or a removal names the old fact by its id too: it is how the agent picked it out, and the
+        // user who opens the file can find the same fact by its text.
         req = {
           tool: name,
           summary: !check.replaced
             ? `remember ${where}: "${whole}"`
             : check.fact
-              ? `update a remembered fact ${where}: "${check.replacedText}" → "${whole}"`
-              : `forget a remembered fact ${where}: "${check.replacedText}"`,
+              ? `update a remembered fact ${where}: [${check.replacedId}] "${check.replacedText}" → "${whole}"`
+              : `forget a remembered fact ${where}: [${check.replacedId}] "${check.replacedText}"`,
           detail: `${check.file}\n\nIt is sent with every DLNE request, to the coordinator or a volunteer's coding member.`,
           sessionAllowed: false,
           always: projectFile ? ALWAYS_REMEMBER : undefined,
@@ -663,13 +665,13 @@ export class ToolRegistry {
         type: 'function',
         function: {
           name: 'remember',
-          description: 'Save, update or remove one lasting fact for later sessions. scope "project" keeps it in this project\'s .dlne/memory.md (how to build and test it, where things live, its conventions, the user\'s corrections); it is saved at once and shown to the user, who can undo it. scope "user" keeps it in ~/.dlne/memory.md, for the user\'s own preferences that hold in every project; the user approves it. To update a fact you saved earlier, give it in replaces; to remove it, give it in replaces and leave fact empty.',
+          description: 'Save, update or remove one lasting fact for later sessions. scope "project" keeps it in this project\'s .dlne/memory.md (how to build and test it, where things live, its conventions, the user\'s corrections); it is saved at once and shown to the user, who can undo it. scope "user" keeps it in ~/.dlne/memory.md, for the user\'s own preferences that hold in every project; the user approves it. Facts you saved show with an id in front, like [a7f3]. To update one, give its id in replaces and the new text in fact; to remove it, give its id in replaces and leave fact empty. Prefer updating a fact to adding a near-copy.',
           parameters: {
             type: 'object',
             properties: {
               fact: { type: 'string', description: 'One short, self-contained sentence (at most 500 characters); empty to remove the fact given in replaces.' },
               scope: { type: 'string', enum: ['project', 'user'], description: 'Where it is kept: project or user.' },
-              replaces: { type: 'string', description: 'Optional: a fact you saved earlier that this one updates or removes. Its opening words are enough to pick it out.' }
+              replaces: { type: 'string', description: 'Optional: the id of a fact you saved earlier (the [a7f3] in front of it), or its opening words.' }
             },
             required: ['fact', 'scope']
           }

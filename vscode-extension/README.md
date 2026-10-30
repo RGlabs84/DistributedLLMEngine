@@ -172,7 +172,7 @@ When a task gets long, the agent does not just forget the early steps. Older ste
 - **The agent's own notes**, which it writes for itself: the goal, what it found, what it decided, what is done and what is next.
 - **A list of what it read, changed and ran**, kept exactly: which files and lines, which edits, which commands and how they ended.
 
-The most recent steps stay word for word. How much fits in a request follows the per-request context the swarm reports, not a fixed size. If the agent's reply is cut off in the middle of a tool call, nothing is run: it is told, and it tries again in smaller pieces. **Stop** ends the run at once and runs nothing from a half-received reply.
+The most recent steps stay word for word. How much fits in a request follows the per-request context the swarm reports, not a fixed size: that of its largest machine, because each request says how big it is and the swarm sends a big one to a machine that can hold it. If the agent's reply is cut off in the middle of a tool call, nothing is run: it is told, and it tries again in smaller pieces. **Stop** ends the run at once and runs nothing from a half-received reply.
 
 ### The step limit
 
@@ -309,6 +309,7 @@ The settings that decide where your code or keys go (`dlne.serverUrl`, `dlne.api
 | `dlne.worker.networkKey` | public swarm key | The swarm's shared worker key. Change it only for a private coordinator. |
 | `dlne.worker.device` | `auto` | What to contribute: `auto` (a GPU if there is one that counts, else the CPU), `gpu`, or `cpu` (power the phone app and keep the GPU for yourself). |
 | `dlne.worker.allowCodingMember` | `true` | Let the swarm give your GPU the coding-member job (answering other people's coding requests). Turn it off and your GPU only joins the shared pool. |
+| `dlne.ownGpu` | `faster` | When your computer is a coding member, which answers your own requests. `faster`: whichever answers sooner, your GPU while it writes at least as fast as the swarm's own engine, otherwise usually the swarm's engine. `smarter`: your own GPU whenever it runs a smarter model than the swarm's engine (a better version on the ladder), even if it writes more slowly. `dlne.privacy` still decides first: a private repository goes to your GPU only if the operator trusts it. |
 | `dlne.worker.allowedGpus` | `""` | GPU indices to lend (e.g. `0,1`). Blank lends all detected GPUs. |
 | `dlne.worker.maxVramGb` | `-1` | Most VRAM to lend, in GB (`-1`: detect). |
 | `dlne.worker.maxRamGb` | `4.0` | Most system RAM the worker may use, in GB. A CPU-only machine needs at least 8; the more it lends, the bigger the phone-app model it runs (16 GB: Qwen3.6). You're offered an amount when you start. |

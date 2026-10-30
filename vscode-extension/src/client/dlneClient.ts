@@ -53,8 +53,10 @@ export interface ClusterStatus {
   /**
    * The swarm's public rules (server 2.4.8). From 2.4.9, `coding_context_tokens` is the smallest per-request
    * context among what can serve a coding request; the agent sizes its history by it (docs/agent-memory.md 5.1).
+   * From 2.6.x, `coding_context_tokens_max` is the largest, and the agent sizes its history by that instead: every route
+   * lookup says how big its request is (`need`, client/route.ts), so a big one goes to a machine that can hold it.
    */
-  policy?: { coding_context_tokens?: number; [rule: string]: unknown };
+  policy?: { coding_context_tokens?: number; coding_context_tokens_max?: number; [rule: string]: unknown };
   /** What this coordinator offers beyond chat (2.6.1); `image_generation` gates the agent's generate_image tool. */
   capabilities?: { image_generation?: boolean; [capability: string]: unknown };
   /** While image generation is on: its queue and the estimate per size (informational; the tool polls the job). */
@@ -337,8 +339,24 @@ export class DlneClient {
     return status?.role === 'coding' ? status.roleDetail?.trustId : undefined;
   }
 
+  /**
+   * dlne.ownGpu: "smarter" sends this user's requests to their own coding member whenever it runs a smarter model than
+   * the coordinator, even if it writes more slowly; "faster" (the default) only while it is as fast. Read at every
+   * lookup, so a change applies to the next request without a reload.
+   */
+  private prefersSmarterOwnGpu(): boolean {
+    return vscode.workspace.getConfiguration('dlne').get<string>('ownGpu', 'faster') === 'smarter';
+  }
+
   private pipelineEnv(base: string, agent?: http.Agent): PipelineEnv {
-    return { base, headers: () => this.getHeaders(), routes: this.routes, agent, own: () => this.ownTrustId() };
+    return {
+      base,
+      headers: () => this.getHeaders(),
+      routes: this.routes,
+      agent,
+      own: () => this.ownTrustId(),
+      preferSmarter: () => this.prefersSmarterOwnGpu(),
+    };
   }
 
   public getServerUrl(): string {

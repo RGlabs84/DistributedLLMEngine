@@ -20,12 +20,15 @@ verified block alone and listed by the operator in TRUSTED_MEMBERS; engine/priva
 is the only place trust is judged. If two workers present one identity (a replayed copy of a
 signed block) only the block with the newest ``signed_at`` is believed, and neither if they tie.
 
-WHICH MEMBER. ``pick`` (for GET /v1/coding/route): members the privacy mode allows (engine/privacy_policy.py), then the
-member that served this session in the last 30 minutes if it still qualifies and has a free
+WHICH MEMBER. ``pick`` (for GET /v1/coding/route): members the privacy mode allows (engine/privacy_policy.py) and,
+when the request says how many tokens it will hold (``need``, 2026-10-30), whose context per request holds them
+(``member_context``: none fits, and the coordinator's own engine answers), then the member that served this session in the last 30 minutes if it still qualifies and has a free
 slot (its model has the session's prompt cached, and a laptop reads prompts at a quarter of
 the speed of the coordinator's own GPUs), then the requester's own machine (``own``, its trust
 id; 2.5.0) if it is among them and writes at least as fast as the coordinator's engine would
-for them right now, else the least busy, ties to the faster reader.
+for them right now, else the least busy, ties to the faster reader. A requester who set
+dlne.ownGpu to "smarter" (``prefer_smarter``) gets their own machine before the speed check
+whenever it runs a smarter model than the coordinator's engine (further down the ladder).
 Load is what the member reported, or what this coordinator has in flight there, whichever is
 higher, plus the routes issued but not yet used (a burst of route lookups is spread out
 instead of all landing on the same member).
@@ -79,7 +82,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Deque, Dict, Iterabl
 
 import httpx
 
-from engine import canary, coding_member_select, e2e, member_identity, no_trace, privacy_policy
+from engine import canary, coding_ladder, coding_member_select, e2e, member_identity, no_trace, privacy_policy
 from engine.logger import log_warning
 from engine.registry import safe_log_text
 from engine.throughput import SealedFrameCounter
@@ -99,6 +102,7 @@ MAX_ATTEMPTS = 3                   # members tried for one request before the lo
 SESSION_ID_MAX_CHARS = 128
 IDENTITY_MAX_SKEW_SECONDS = 300    # a coding block signed longer ago (or further ahead) than this is dropped
 COMPLETION_RESERVE_SLOTS = 1       # autocomplete leaves this many free slots for agents
+MAX_NEED_TOKENS = 10_000_000       # a route lookup's need above this is not a real request, and is ignored
 ERROR_BODY_LIMIT = 64 * 1024
 CANARY_ANSWER_LIMIT = 8 * 1024 * 1024
 MEMBER_ANSWER_LIMIT = 8 * 1024 * 1024        # a whole (not streamed) answer a member may send: more is a runaway (SR-10)
@@ -210,6 +214,34 @@ def _model_key(name: Any) -> str:
     return base if base.endswith(".gguf") else base + ".gguf"
 
 
+def member_context(member: Any, ladder: Iterable[Dict[str, Any]]) -> int:
+    """
+    One coding member's context per request: its tier's ``context`` over the tier's ``server_slots`` (2.5.0), the
+    tier being the one its signed heartbeat says it serves, looked up on ``ladder`` by id. A member gives each request
+    that much however many slots the coordinator asked it to open (engine/coding_member.py ``_start``), so the slot
+    count it reports does not enter into it. ``DEFAULT_CONTEXT`` over ``CODING_SLOTS`` (32,768) when the tier is
+    unknown or says nothing. Routing by ``need`` and the status' ``policy.coding_context_tokens`` both read this.
+    """
+    from engine.coding_member import CODING_SLOTS, DEFAULT_CONTEXT
+
+    wanted = getattr(member, "tier", None)
+    tier = next((t for t in ladder or () if isinstance(t, dict) and t.get("id") == wanted), None) or {}
+    context, slots = tier.get("context"), tier.get("server_slots")
+    if not isinstance(context, int) or isinstance(context, bool) or context < 2048:
+        context = DEFAULT_CONTEXT
+    if not isinstance(slots, int) or isinstance(slots, bool) or slots < 1:
+        slots = CODING_SLOTS
+    return context // slots
+
+
+def normalize_need(need: Any) -> Optional[int]:
+    """The tokens a request says it will hold (prompt and room for its answer), 1 to MAX_NEED_TOKENS; anything
+    else (missing, zero, negative, too big, not a whole number) is None, which asks nothing of a member's context."""
+    if isinstance(need, bool) or not isinstance(need, int):
+        return None
+    return need if 1 <= need <= MAX_NEED_TOKENS else None
+
+
 # ======================================================================================
 # What a request wants, what it gets
 # ======================================================================================
@@ -228,6 +260,14 @@ class _Want:
     need_pubkey: bool = False
     own: Optional[str] = None          # the requester's own member's trust id (2.5.0)
     engine_tps: Optional[float] = None # what the coordinator's engine would write for them now; None: unmeasured
+    # dlne.ownGpu = "smarter": the requester would rather wait for a smarter model on their own GPU.
+    # It needs the coordinator engine's model file and the ladder to tell which model is smarter.
+    prefer_smarter: bool = False
+    engine_model: Optional[str] = None
+    ladder: Tuple[Dict[str, Any], ...] = ()
+    # The tokens the request will hold, prompt and answer ("context is everything", 2026-10-30): a member whose
+    # context per request (member_context, read on ``ladder``) is smaller cannot take it. None asks nothing.
+    need: Optional[int] = None
 
 
 class MemberLease:
@@ -538,6 +578,10 @@ class CodingRouter:
                 continue
             if wanted and _model_key(m.model) != wanted:
                 continue
+            # Too small for the request: a member would cut it short, so it is not a candidate at all, and so
+            # neither the session's sticky member nor the requester's own can be chosen when they do not fit.
+            if want.need is not None and member_context(m, want.ladder) < want.need:
+                continue
             if not privacy_policy.allowed(m, want.privacy, set(want.trusted)):
                 continue
             if ignore_load or self.free_slots(m) > want.reserve:
@@ -548,7 +592,10 @@ class CodingRouter:
              exclude: Iterable[str] = (), *, trusted_ids: Optional[Iterable[str]] = None, reserve: int = 0,
              model: Optional[str] = None, need_pubkey: bool = False,
              commit: bool = True, own: Optional[str] = None,
-             engine_tps: Optional[float] = None) -> Optional[CodingMember]:
+             engine_tps: Optional[float] = None, prefer_smarter: bool = False,
+             engine_model: Optional[str] = None,
+             ladder: Optional[Iterable[Dict[str, Any]]] = None,
+             need: Optional[int] = None) -> Optional[CodingMember]:
         """
         The member for a request: privacy first, then the session's sticky member if it still
         qualifies and has a free slot, then the requester's own machine (``own``, a trust id; 2.5.0)
@@ -557,10 +604,22 @@ class CodingRouter:
         least busy (load as a share of its slots; ties to the faster prompt reader, then the faster
         writer). None when no member qualifies. ``reserve`` free slots are left alone (autocomplete
         leaves one for agents); ``commit`` remembers the choice as the session's sticky member.
+
+        ``prefer_smarter`` (the requester's dlne.ownGpu = "smarter") puts their own machine first,
+        however slowly it writes, while its model sits further down ``ladder`` (smarter) than
+        ``engine_model``, the model the coordinator's own engine answers with. A model on no tier
+        is not smarter, and the speed rule above decides as before.
+
+        ``need`` (the tokens the request will hold, prompt and answer; 2026-10-30) leaves out every
+        member whose context per request (:func:`member_context`, its tier read on ``ladder``) is
+        smaller, before any of the above: a sticky or own member that does not fit is passed over
+        like a full one, and when none fits the answer is None, so the coordinator's own engine
+        answers. Anything but a whole number from 1 to MAX_NEED_TOKENS is no need at all.
         """
         want = _Want(lambda: members, _session_key(session_id), normalize_privacy(privacy),
                      normalize_trust_ids(self.trusted_ids if trusted_ids is None else trusted_ids),
-                     frozenset(exclude), reserve, model, need_pubkey, own, engine_tps)
+                     frozenset(exclude), reserve, model, need_pubkey, own, engine_tps,
+                     prefer_smarter is True, engine_model, tuple(ladder or ()), normalize_need(need))
         chosen = self._choose(want, self._eligible(want))
         if chosen is not None and commit:
             self._remember(want.session_id, chosen)
@@ -574,11 +633,25 @@ class CodingRouter:
             for member in candidates:
                 if member.key == sticky:
                     return member
+        if want.own and want.prefer_smarter:
+            # The owner chose a smarter answer over a faster one. Their machine is only among the
+            # candidates when privacy, readiness, the floors and a free slot already allow it.
+            for member in candidates:
+                if member.trust_id == want.own and self._smarter_than_engine(want, member):
+                    return member
         if want.own:
             for member in candidates:
                 if member.trust_id == want.own and (want.engine_tps is None or member.decode_tps >= want.engine_tps):
                     return member
         return min(candidates, key=lambda m: (self.load(m) / m.slots, -m.prefill_tps, -m.decode_tps, m.key))
+
+    @staticmethod
+    def _smarter_than_engine(want: _Want, member: CodingMember) -> bool:
+        """Whether the member's model is strictly further down the ladder than the engine's. A model
+        the ladder does not know, on either side, is not smarter: the speed rule decides instead."""
+        ladder = list(want.ladder)
+        mine, engine = coding_ladder.rank(ladder, member.model), coding_ladder.rank(ladder, want.engine_model)
+        return mine is not None and engine is not None and mine > engine
 
     # ------------------------------------------------------------------ sessions
     def _sticky(self, session: Optional[str]) -> Optional[str]:

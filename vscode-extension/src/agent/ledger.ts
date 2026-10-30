@@ -47,9 +47,12 @@ const EDIT_OK = 'Successfully patched';
 const DIFF_STATS = /\(\+(\d+) lines?, -(\d+) lines?\)/;
 const SEARCH_HIT = /^Matches found in (\d+) files?:/;
 const SEARCH_MISS = 'No matches found for';
-// What `remember` says when it saved a fact (memory.ts, rememberFact).
-const REMEMBERED_PROJECT = '📝 Remembered for this project: ';
-const REMEMBERED_USER = '📝 Remembered for you: ';
+// What `remember` says when it saved, updated or removed a fact (memory.ts, rememberFact): one line per fact.
+//   📝 Remembered for this project [a7f3]: <fact>
+//   📝 Updated for this project [a7f3] → [b812]: <old> → <new>
+//   📝 Forgot for this project [a7f3]: <old>
+// and the same with "for you". The ids came with Memory 2; a task saved by 1.5.3 holds the lines without them.
+const REMEMBER_LINE = /^📝 (Remembered|Updated|Forgot) for (this project|you)(?: \[[0-9a-f]{4,8}\](?: → \[[0-9a-f]{4,8}\])?)?: (.*)$/;
 const ALREADY_REMEMBERED = 'Already remembered:';
 const FAILED_PREFIX = 'Tool execution failed: ';
 /** What `capOutput` puts between the head and the tail of an output it shortened. */
@@ -476,23 +479,21 @@ export class Ledger {
   }
 
   private noteRemember(output: string): void {
-    // Exactly these two texts mean it was saved. Anything else (declined is handled before this) is a failure.
-    const scoped: Array<[string, 'project' | 'user']> = [[REMEMBERED_PROJECT, 'project'], [REMEMBERED_USER, 'user']];
-    for (const [prefix, scope] of scoped) {
-      if (output.startsWith(prefix)) {
-        this.noteRemembered({ scope, fact: clip(output.slice(prefix.length), FACT_CHARS) });
-        return;
+    // Only an output that opens with a 📝 line was a change. Anything else (declined is handled before this) is a
+    // failure. A fact saved in parts has a 📝 line per part, then a sentence saying so, which is not a fact.
+    const lines = output.split('\n').map((line) => REMEMBER_LINE.exec(line.trim()));
+    if (lines[0]) {
+      for (const line of lines) {
+        if (!line) continue;
+        const [, kind, where, text] = line;
+        const scope = where === 'you' ? 'user' : 'project';
+        // The ids are left out: an update gives a fact a new one, so the text is what stays true.
+        const arrow = text.indexOf(' → ');
+        const fact = kind === 'Forgot'
+          ? `forgot: ${text}`
+          : kind === 'Updated' && arrow !== -1 ? `${text.slice(arrow + 3)} (replacing: ${text.slice(0, arrow)})` : text;
+        this.noteRemembered({ scope, fact: clip(fact, FACT_CHARS) });
       }
-    }
-    // An update ("📝 Updated for …: old → new") or a removal ("📝 Forgot for …: old") of a fact the agent saved.
-    const changed = /^📝 (Updated|Forgot) for (this project|you): ([\s\S]*)$/.exec(output.split('\n')[0]);
-    if (changed) {
-      const scope = changed[2] === 'you' ? 'user' : 'project';
-      const arrow = changed[3].indexOf(' → ');
-      const fact = changed[1] === 'Forgot'
-        ? `forgot: ${changed[3]}`
-        : arrow === -1 ? changed[3] : `${changed[3].slice(arrow + 3)} (replacing: ${changed[3].slice(0, arrow)})`;
-      this.noteRemembered({ scope, fact: clip(fact, FACT_CHARS) });
       return;
     }
     // A fact that was already in the memory is neither saved now nor a failure: nothing to record.

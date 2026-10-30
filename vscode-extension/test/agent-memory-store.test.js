@@ -12,10 +12,14 @@ const path = require('node:path');
 
 const stub = require('./helpers/vscode-stub');
 const { generator, pem } = require('./helpers/fake-secrets');
+const crypto = require('node:crypto');
 const {
-  loadMemory, renderContextBlock, rememberFact, checkRemember,
+  loadMemory, renderContextBlock, rememberFact, checkRemember, factId, factIds,
   CONTEXT_OPEN, CONTEXT_INTRO, CONTEXT_CLOSE, CONTEXT_HEADINGS,
 } = require('../dist/agent/memory');
+
+/** A fact's id worked out here, apart from memory.ts: SHA-256 of the lower-case fact, first 4 hex characters. */
+const idOf = (fact) => crypto.createHash('sha256').update(fact.toLowerCase(), 'utf8').digest('hex').slice(0, 4);
 
 /** A project folder and a home folder, both temporary; the project is the open workspace folder. */
 function world(body) {
@@ -222,22 +226,25 @@ test('a fact for the project starts the file with the header, then one line', ()
   world((w) => {
     const result = rememberFact('project', 'Tests run with `npm test`.', w.root, w.options);
     assert.equal(result.ok, true);
-    assert.equal(result.message, '📝 Remembered for this project: Tests run with `npm test`.');
+    const id = idOf('Tests run with `npm test`.');
+    assert.equal(result.message, `📝 Remembered for this project [${id}]: Tests run with \`npm test\`.`);
+    assert.deepEqual(result.ids, [id]);
     // The line carries the agent's mark (a comment, so the model never sees it), and Undo gets what changed.
     assert.equal(fs.readFileSync(w.projectFile, 'utf8'), PROJECT_HEADER + '- Tests run with `npm test`. <!-- dlne -->\n');
     assert.deepEqual(result.change, { file: w.projectFile, scope: 'project', removed: null, added: '- Tests run with `npm test`. <!-- dlne -->', index: 4 });
     rememberFact('project', 'Source is in src/.', w.root, w.options);
     assert.equal(fs.readFileSync(w.projectFile, 'utf8'),
       PROJECT_HEADER + '- Tests run with `npm test`. <!-- dlne -->\n- Source is in src/. <!-- dlne -->\n');
-    // What was written loads back as just the facts.
-    assert.equal(loadMemory(w.root, w.options).project.text, '- Tests run with `npm test`.\n- Source is in src/.');
+    // What was written loads back as just the facts, each with its id in front.
+    assert.equal(loadMemory(w.root, w.options).project.text,
+      `- [${id}] Tests run with \`npm test\`.\n- [${idOf('Source is in src/.')}] Source is in src/.`);
   }));
 
 test('the user\'s file has its own header wording and mode 0600', () =>
   world((w) => {
     const result = rememberFact('user', 'Prefers short answers.', w.root, w.options);
     assert.equal(result.ok, true);
-    assert.equal(result.message, '📝 Remembered for you: Prefers short answers.');
+    assert.equal(result.message, `📝 Remembered for you [${idOf('Prefers short answers.')}]: Prefers short answers.`);
     const text = fs.readFileSync(w.userFile, 'utf8');
     assert.ok(text.startsWith('# DLNE memory\n\n<!-- What the DLNE agent remembers about your preferences, for every project. It reads this file'));
     assert.ok(text.endsWith('-->\n\n- Prefers short answers. <!-- dlne -->\n'));
@@ -276,7 +283,8 @@ test('the scope must be project or user', () =>
 test('the fact is cleaned: newlines become spaces and the ends are trimmed', () =>
   world((w) => {
     const result = rememberFact('project', '  Build with make,\nthen run ./test\r\nand look.  ', w.root, w.options);
-    assert.equal(result.message, '📝 Remembered for this project: Build with make, then run ./test and look.');
+    const id = idOf('Build with make, then run ./test and look.');
+    assert.equal(result.message, `📝 Remembered for this project [${id}]: Build with make, then run ./test and look.`);
     assert.match(fs.readFileSync(w.projectFile, 'utf8'), /\n- Build with make, then run \.\/test and look\. <!-- dlne -->\n$/);
   }));
 
@@ -332,8 +340,11 @@ test('a file that would pass its load cap is full: the project\'s at 8,000, the 
     w.write('.dlne/memory.md', 'x'.repeat(7_900));
     const full = rememberFact('project', 'y'.repeat(150), w.root, w.options);
     assert.equal(full.ok, false);
-    assert.equal(full.message, `The memory file is full (${w.projectFile}); ask the user to tidy it.`);
+    // All of it is the user's: the agent has nothing of its own to shorten, so only the user can make room.
+    assert.equal(full.message, 'The project memory is full (7900 of 8000 characters), so nothing was saved. ' +
+      'None of it was saved by DLNE, so ask the user to tidy it.');
     assert.equal(fs.readFileSync(w.projectFile, 'utf8'), 'x'.repeat(7_900), 'untouched');
+    // 7,900 + a line break + "- [xxxx] " + 50 = 7,960: it fits, ids counted.
     assert.equal(rememberFact('project', 'y'.repeat(50), w.root, w.options).ok, true, 'a smaller one still fits');
 
     w.write('.dlne/memory.md', 'x'.repeat(3_900), w.home);
@@ -373,6 +384,262 @@ test('checkRemember judges without writing', () =>
     assert.equal(ready.file, w.projectFile);
     assert.equal(fs.existsSync(w.projectFile), false);
     assert.equal(checkRemember('team', 'A fact.', w.root, w.options).ready, false);
+  }));
+
+// ---- Memory 2: fact ids -------------------------------------------------------------------------------
+
+/** A line as the agent writes it. */
+const mine = (fact) => `- ${fact} <!-- dlne -->`;
+
+/** A project file with the header, then `lines` (the agent's made with `mine`, the user's as they are). */
+function seed(w, lines) {
+  w.write('.dlne/memory.md', PROJECT_HEADER + lines.join('\n') + '\n');
+}
+
+/** The facts in the project file, the agent's mark and bullet taken off. */
+const factsIn = (w) => fs.readFileSync(w.projectFile, 'utf8').split('\n')
+  .filter((l) => l.startsWith('- ')).map((l) => l.replace(/^- /, '').replace(/ <!-- dlne -->$/, ''));
+
+test('a fact\'s id is the first 4 hex characters of the SHA-256 of its key, however the line is written', () => {
+  // Hard-coded as well as worked out, so a change to the key or the hash shows here (engine/canary.py must agree).
+  assert.equal(factId('Tests run with npm test.'), 'b468');
+  assert.equal(factId('Tests run with npm test.'), idOf('Tests run with npm test.'));
+  for (const same of ['- Tests run with npm test. <!-- dlne -->', '  *  tests   RUN with npm\ttest.  ', 'TESTS RUN WITH NPM TEST.']) {
+    assert.equal(factId(same), 'b468', same);
+  }
+  assert.notEqual(factId('Tests run with npm test'), 'b468', 'the full stop is part of the fact');
+  // Stable: the same fact keeps its id when other facts come and go around it.
+  const before = factIds([mine('Tests run with npm test.')]).get(mine('Tests run with npm test.'));
+  const after = factIds(['- a note of the user\'s', mine('Source is in src/.'), mine('Tests run with npm test.')]);
+  assert.equal(before, 'b468');
+  assert.equal(after.get(mine('Tests run with npm test.')), 'b468');
+  assert.equal(after.size, 2, 'only the agent\'s lines have ids');
+});
+
+test('two ids that clash make every id in the file longer, to the first length that tells them apart', () => {
+  // "Fact 59." and "Fact 148." share e556; at 5 characters they differ. "Fact 116." and "Fact 1327." share 6cd70.
+  assert.equal(idOf('Fact 59.'), idOf('Fact 148.'));
+  const five = factIds([mine('Fact 59.'), '- the user\'s line', mine('Fact 148.'), mine('Tests run with npm test.')]);
+  assert.deepEqual([...five.values()], ['e5569', 'e5564', 'b4683'], 'the bystander grows too');
+  const six = factIds([mine('Fact 116.'), mine('Fact 1327.')]);
+  assert.deepEqual([...six.values()], ['6cd70f', '6cd708']);
+  // Without the clash the same facts are back to 4.
+  assert.deepEqual([...factIds([mine('Fact 59.'), mine('Tests run with npm test.')]).values()], ['e556', 'b468']);
+  // The same fact twice (copied by hand) never separates: 8 is the limit, used anyway.
+  const twice = factIds([mine('Same fact.'), mine('same   FACT.')]);
+  assert.deepEqual([...twice.values()].map((id) => id.length), [8, 8]);
+});
+
+test('loading shows the id on the agent\'s lines only, and the cap counts it', () =>
+  world((w) => {
+    seed(w, ['- My note: use tabs.', mine('Tests run with npm test.'), '* Starred fact <!-- dlne -->', 'Bare fact <!-- dlne -->']);
+    w.write('AGENTS.md', '- An instruction that happens to end with the mark <!-- dlne -->\n');
+    const sources = loadMemory(w.root, w.options);
+    assert.equal(sources.project.text, [
+      '- My note: use tabs.',
+      '- [b468] Tests run with npm test.',
+      `* [${idOf('Starred fact')}] Starred fact`,
+      `- [${idOf('Bare fact')}] Bare fact`,
+    ].join('\n'));
+    assert.equal(sources.instructions.text, '- An instruction that happens to end with the mark', 'AGENTS.md has no ids');
+
+    // The user's file has them too.
+    w.write('.dlne/memory.md', mine('Prefers short answers.') + '\n', w.home);
+    assert.equal(loadMemory(w.root, w.options).user.text, `- [${idOf('Prefers short answers.')}] Prefers short answers.`);
+
+    // 380 facts of 17 characters: 7,599 without ids, past 8,000 with them, so the loaded text is cut.
+    const many = Array.from({ length: 380 }, (_, n) => mine(`Fact ${String(n).padStart(3, '0')} is here.`));
+    seed(w, many);
+    const text = loadMemory(w.root, w.options).project.text;
+    assert.ok(many.map((l) => l.replace(' <!-- dlne -->', '')).join('\n').length <= 8_000);
+    assert.match(text, /\n\[… \d+ characters cut: the file is longer than DLNE loads\]$/);
+  }));
+
+// ---- Memory 2: replaces -------------------------------------------------------------------------------
+
+test('replaces takes an id: a7f3, [a7f3], id: a7f3, in either case', () =>
+  world((w) => {
+    seed(w, [mine('Tests run with npm test.'), mine('Source is in src/.')]);
+    const forms = ['b468', '[b468]', 'id: b468', 'ID:b468', '  [B468]  ', 'id b468'];
+    for (const form of forms) {
+      const check = checkRemember('project', 'Tests run with npm run test:all.', w.root, w.options, form);
+      assert.equal(check.ready, true, form);
+      assert.equal(check.replacedText, 'Tests run with npm test.', form);
+      assert.equal(check.replacedId, 'b468', form);
+    }
+    const result = rememberFact('project', 'Tests run with npm run test:all.', w.root, w.options, '[b468]');
+    assert.equal(result.message,
+      `📝 Updated for this project [b468] → [${idOf('Tests run with npm run test:all.')}]: Tests run with npm test. → Tests run with npm run test:all.`);
+    assert.deepEqual(factsIn(w), ['Tests run with npm run test:all.', 'Source is in src/.'], 'in place');
+  }));
+
+test('2026-10-30: replaces "project: <the fact>" now finds the fact (a dozen calls failed on the label)', () =>
+  world((w) => {
+    const fact = 'GA102 firmware: the SEC2 image is at 0x1c000 and is signed with the production key.';
+    seed(w, ['- The user\'s note.', mine(fact), mine('Build with make -j8.')]);
+    // As the model wrote it that day, and the other ways a model dresses up a quote.
+    const quotes = [
+      `project: ${fact}`,
+      `Project memory: "${fact}"`,
+      `project:${fact}`,
+      `- [${idOf(fact)}] ${fact}`,
+      `project: - ${fact}`,
+      `\`${fact}\``,
+      fact.replace(/\.$/, ''),
+    ];
+    for (const quote of quotes) {
+      const check = checkRemember('project', '', w.root, w.options, quote);
+      assert.equal(check.ready, true, `${quote}: ${check.ready ? '' : check.result.message}`);
+      assert.equal(check.replacedText, fact, quote);
+    }
+    // And in the user's file, with "user:".
+    w.write('.dlne/memory.md', mine('Prefers short answers.') + '\n', w.home);
+    assert.equal(rememberFact('user', '', w.root, w.options, 'user: Prefers short answers.').message,
+      `📝 Forgot for you [${idOf('Prefers short answers.')}]: Prefers short answers.`);
+  }));
+
+test('a quote cut short with … or ... picks out the fact, also as the no-match list shows it', () =>
+  world((w) => {
+    const fact = 'AD102 BTL1 header: os_data_off=0x7e00, patch_loc=0x7d00, num_sigs=2, sig_size=384.';
+    seed(w, [mine(fact), mine('AD102 DMEM frame: 72-byte header, then zeros.')]);
+    for (const quote of [`${fact.slice(0, 40)}…`, `${fact.slice(0, 40)}...`, `[${idOf(fact)}] "${fact.slice(0, 50)}…"`]) {
+      const check = checkRemember('project', '', w.root, w.options, quote);
+      assert.equal(check.ready && check.replacedText, fact, quote);
+    }
+  }));
+
+test('a quote close in words picks out the fact; one close to two facts asks which', () =>
+  world((w) => {
+    const strip = 'Release builds use cargo build --release, then strip the binary in target/release.';
+    const sign = 'Release builds use cargo build --release, then sign the binary in target/release.';
+    const debug = 'Debug builds use cargo build, then run the tests.';
+    seed(w, [mine(strip), mine(debug)]);
+    // Not a part of the fact ("and then"), but 9 of its 10 words are there: 0.9, well ahead of the debug fact.
+    const close = checkRemember('project', '', w.root, w.options, 'Release builds use cargo build --release and then strip the binary');
+    assert.equal(close.ready && close.replacedText, strip);
+    // Fewer than 4 words say too little to judge by.
+    assert.match(checkRemember('project', '', w.root, w.options, 'release and strip').result.message, /^No fact you saved matches/);
+
+    seed(w, [mine(strip), mine(sign), mine(debug)]);
+    const both = rememberFact('project', '', w.root, w.options, 'release builds use cargo build --release and then the binary');
+    assert.equal(both.ok, false);
+    assert.equal(both.message, '"release builds use cargo build --release and then the binary" matches 2 facts you saved: ' +
+      `[${idOf(strip)}] "${strip.slice(0, 50)}…"; [${idOf(sign)}] "${sign.slice(0, 50)}…". Give the id of the one you mean in replaces.`);
+    assert.equal(factsIn(w).length, 3, 'nothing changed');
+  }));
+
+test('a line the user wrote is refused as theirs, by text or by words, and left as it is', () =>
+  world((w) => {
+    const theirs = 'Use tabs, never spaces, in every Python file of this repository.';
+    seed(w, [`- ${theirs}`, mine('Tests run with npm test.')]);
+    const before = fs.readFileSync(w.projectFile, 'utf8');
+    for (const quote of [theirs, 'project: Use tabs, never spaces', 'use tabs and never spaces in every python file']) {
+      const result = rememberFact('project', 'Use spaces.', w.root, w.options, quote);
+      assert.deepEqual(result, {
+        ok: false,
+        message: 'That fact was written by the user, not by DLNE, so DLNE cannot change it. Ask the user, or save a new fact.',
+      }, quote);
+    }
+    assert.equal(fs.readFileSync(w.projectFile, 'utf8'), before);
+  }));
+
+test('no match lists the saved facts with their ids, at most 40; with none saved it says so', () =>
+  world((w) => {
+    const long = 'The coordinator listens on port 8443 behind Caddy, which renews its certificate.';
+    seed(w, ['- The user\'s note.', mine(long), mine('Source is in src/.')]);
+    assert.equal(rememberFact('project', '', w.root, w.options, 'GA102 DMEM pattern').message,
+      'No fact you saved matches "GA102 DMEM pattern". Yours: ' +
+      `[${idOf(long)}] "${long.slice(0, 50)}…"; [${idOf('Source is in src/.')}] "Source is in src/.". Give the id in replaces.`);
+    // An id no fact has is no match either; the quote is cut at 80 characters.
+    assert.match(rememberFact('project', '', w.root, w.options, 'ffff').message, /^No fact you saved matches "ffff"\. Yours: /);
+    const wordy = 'q'.repeat(100);
+    assert.match(rememberFact('project', '', w.root, w.options, wordy).message, new RegExp(`^No fact you saved matches "${'q'.repeat(80)}"\\. `));
+
+    seed(w, Array.from({ length: 45 }, (_, n) => mine(`Fact number ${n}.`)));
+    assert.match(rememberFact('project', '', w.root, w.options, 'nothing like it').message,
+      /"Fact number 39\."(?!;) and 5 more\. Give the id in replaces\.$/);
+
+    seed(w, ['- Only the user\'s note.']);
+    assert.equal(rememberFact('project', '', w.root, w.options, 'Tests run').message,
+      'No fact you saved matches "Tests run"; you have not saved any in this file.');
+  }));
+
+test('several facts holding the quote: each listed with its id', () =>
+  world((w) => {
+    seed(w, [mine('AD102 BTL1 header.'), mine('AD102 DMEM frame.')]);
+    assert.equal(rememberFact('project', '', w.root, w.options, 'ad102').message,
+      `"ad102" matches 2 facts you saved: [${idOf('AD102 BTL1 header.')}] "AD102 BTL1 header."; ` +
+      `[${idOf('AD102 DMEM frame.')}] "AD102 DMEM frame.". Give the id of the one you mean in replaces.`);
+  }));
+
+test('a full file refuses growth, listing the agent\'s facts largest first, but an update that shrinks it is allowed', () =>
+  world((w) => {
+    const [a, b, c] = ['a'.repeat(300), 'b'.repeat(500), 'c'.repeat(100)];
+    seed(w, ['x'.repeat(7_000), mine(a), mine(b), mine(c)]);
+    const used = loadMemory(w.root, w.options).project.text.length;
+    assert.ok(used > 7_900 && used <= 8_000, String(used));
+
+    const grow = rememberFact('project', 'A new fact of a hundred characters, give or take, which there is no room left for at all.', w.root, w.options);
+    assert.equal(grow.ok, false);
+    assert.equal(grow.message, `The project memory is full (${used} of 8000 characters), so nothing was saved. ` +
+      'Make room first: merge or shorten facts with replaces, or remove ones that no longer matter. Yours, largest first: ' +
+      `[${idOf(b)}] (500 chars) "${'b'.repeat(50)}…"; [${idOf(a)}] (300 chars) "${'a'.repeat(50)}…"; [${idOf(c)}] (100 chars) "${'c'.repeat(50)}…"`);
+
+    // Shorter: allowed. Longer than there is room for: refused, the same way.
+    assert.equal(rememberFact('project', 'b'.repeat(200), w.root, w.options, idOf(b)).ok, true);
+    assert.match(rememberFact('project', 'c'.repeat(600), w.root, w.options, idOf(c)).message, /^The project memory is full/);
+    assert.deepEqual(factsIn(w), [a, 'b'.repeat(200), c]);
+  }));
+
+test('a file the user filled past the cap by hand: shrinking and removing still work, growing does not', () =>
+  world((w) => {
+    const fact = 'd'.repeat(200);
+    seed(w, ['x'.repeat(8_100), mine(fact)]);
+    assert.match(loadMemory(w.root, w.options).project.text, /characters cut/);
+    assert.match(rememberFact('project', 'A new fact.', w.root, w.options).message, /^The project memory is full \(\d+ of 8000 characters\)/);
+    assert.match(rememberFact('project', 'd'.repeat(201), w.root, w.options, idOf(fact)).message, /^The project memory is full/, 'one character more');
+    assert.equal(rememberFact('project', 'e'.repeat(200), w.root, w.options, idOf(fact)).ok, true, 'the same size is allowed');
+    assert.equal(rememberFact('project', 'e'.repeat(120), w.root, w.options, idOf('e'.repeat(200))).ok, true, 'smaller is allowed');
+    assert.equal(rememberFact('project', '', w.root, w.options, idOf('e'.repeat(120))).ok, true, 'a removal is allowed');
+    assert.deepEqual(factsIn(w), []);
+  }));
+
+test('the messages carry ids: saved, updated, forgot, and a fact saved in parts', () =>
+  world((w) => {
+    const saved = rememberFact('project', 'Source is in src/.', w.root, w.options);
+    const id = idOf('Source is in src/.');
+    assert.equal(saved.message, `📝 Remembered for this project [${id}]: Source is in src/.`);
+    assert.deepEqual(saved.ids, [id]);
+
+    const updated = rememberFact('project', 'Source is in lib/.', w.root, w.options, id);
+    assert.equal(updated.message, `📝 Updated for this project [${id}] → [${idOf('Source is in lib/.')}]: Source is in src/. → Source is in lib/.`);
+    assert.deepEqual(updated.ids, [idOf('Source is in lib/.')]);
+
+    const forgot = rememberFact('project', '', w.root, w.options, idOf('Source is in lib/.'));
+    assert.equal(forgot.message, `📝 Forgot for this project [${idOf('Source is in lib/.')}]: Source is in lib/.`);
+    assert.deepEqual(forgot.ids, []);
+
+    // Two sentences of about 300 and 240 characters: together over 500, so each is a part of its own.
+    const one = `First half of a long note: ${'alpha beta gamma delta '.repeat(12).trim()}.`;
+    const two = `Second half: ${'epsilon zeta eta theta '.repeat(10).trim()}.`;
+    const parts = rememberFact('project', `${one} ${two}`, w.root, w.options);
+    assert.equal(parts.message, [
+      `📝 Remembered for this project [${idOf(one)}]: ${one}`,
+      `📝 Remembered for this project [${idOf(two)}]: ${two}`,
+      'It is over 500 characters, so it was saved as these 2 facts, one after the other. That is expected: nothing more to do.',
+    ].join('\n'));
+    assert.deepEqual(parts.ids, [idOf(one), idOf(two)]);
+
+    assert.equal(rememberFact('user', 'Likes Rust.', w.root, w.options).message, `📝 Remembered for you [${idOf('Likes Rust.')}]: Likes Rust.`);
+  }));
+
+test('the ids in a message are the ones the next load shows, a clash included', () =>
+  world((w) => {
+    rememberFact('project', 'Fact 59.', w.root, w.options);
+    const second = rememberFact('project', 'Fact 148.', w.root, w.options);
+    assert.deepEqual(second.ids, ['e5564'], 'the clash makes it 5 characters');
+    assert.equal(loadMemory(w.root, w.options).project.text, '- [e5569] Fact 59.\n- [e5564] Fact 148.');
+    assert.equal(checkRemember('project', '', w.root, w.options, 'e5569').replacedText, 'Fact 59.');
   }));
 
 // ---- git-ignore and the memory files ------------------------------------------------------------------

@@ -7,6 +7,10 @@ turns it on and for the people writing clients (the web chat, the Android app, t
 With none of the settings below present the coordinator behaves exactly as 2.6.0: the status does not mention images, and
 every image endpoint answers `503 image_generation_unavailable`.
 
+It can also be **paused** (`IMAGE_GEN_ENABLED=paused`, 2026-10-30), for when the media card is lent to the coding model:
+nothing image-related is loaded, but every request for a picture is told so in plain words with a link to a page that
+explains it. See [Paused](#paused-image_gen_enabledpaused).
+
 ## What it is made of
 
 | Part | What |
@@ -42,7 +46,8 @@ every image endpoint answers `503 image_generation_unavailable`.
    generation is not available: ..."): the media card is not named, the sd build or a model file is missing or the wrong
    size, vision is off, the engine is restarting, or `sd-server` failed three times in a row and is paused.
 
-Requirements, all of them: `IMAGE_GEN_ENABLED=true`; `MEDIA_GPU` set on a Vulkan engine build; the engine reads images
+Requirements, all of them: `IMAGE_GEN_ENABLED=true`; `MEDIA_GPU` set on a Vulkan engine build, and the card not
+shared with the coding model (`MEDIA_GPU_SHARED` unset or `false`); the engine reads images
 (vision on); `bin-sd/sd-server` installed; the three model files present with the right sizes. Any one missing means
 unavailable.
 
@@ -50,7 +55,7 @@ unavailable.
 
 | Key | Default | Range | Meaning |
 |---|---|---|---|
-| `IMAGE_GEN_ENABLED` | `false` | `true`/`false` | The master switch. |
+| `IMAGE_GEN_ENABLED` | `false` | `true`/`false`/`paused` | The master switch. `paused` is off, but says so to everyone who asks ([below](#paused-image_gen_enabledpaused)). Any other word is `false`. |
 | `IMAGE_MODEL_DIR` | `models/image` | a path | Where the three model files are. |
 | `IMAGE_THREADS` | 4 | 1 to 16 | CPU threads for the text encoder (`-t`). |
 | `IMAGE_CPU_MASK` | unset | hex, e.g. `0xf0` | Pins `sd-server` to those CPUs with `taskset` (needs `taskset`; unpinned with a warning without it). |
@@ -114,7 +119,7 @@ A network (the trial's own identity: an IPv4 address, an IPv6 /64) from which **
 | `202` | `{"id", "status": "queued", "position", "eta_seconds"}` |
 | `400` | `{"detail", "code"}`: `bad_request`, `prompt_empty`, `prompt_too_long`, `bad_size`, `prompt_refused` (+ `"category"`) |
 | `429` | `{"detail", "code"}` with `Retry-After`: `image_quota` (the hourly cap, or the free trial is used up and the network is no contributor's), `image_busy` (the queue is full) |
-| `503` | `{"detail", "code": "image_generation_unavailable"}`. While the engine restarts the `detail` is "DLNE is restarting, try again in a moment." |
+| `503` | `{"detail", "code": "image_generation_unavailable"}`. While the engine restarts the `detail` is "DLNE is restarting, try again in a moment." While pictures are paused: `{"detail", "code": "image_generation_paused", "page": "/pictures"}` ([Paused](#paused-image_gen_enabledpaused)). |
 
 `position` is 1 for a job that will start next, counting the running job (an idle server gives 1 and starts at once). `eta_seconds` is the estimate for the whole wait from now: the running job's remainder, the jobs queued before it, and its own median time. Estimates are the median of the last nine real jobs of that size, seeded with the figures above.
 
@@ -144,7 +149,7 @@ A phone user can just ask the chat ("hey, can I get a picture of a fox in the sn
 
 `POST /v1/app/chat/completions` takes an optional `"features"`: a list of strings. `"image_jobs"` means: this client shows the `image_job` and `image_refused` events below. Unknown values, and any other type (a string, an object, a list of lists), are ignored, never an error. Android 1.0.6 and the 2.6.2 web chat send `["image_jobs"]`.
 
-The tool and its line in the system prompt are offered only when the request's features include `image_jobs` **and** pictures can be made right now (the test behind `capabilities.image_generation`: switched on, installed, vision on, the engine up and not restarting). It is asked again when the model calls the tool, because that can come a minute later. A request without the feature is answered exactly as in 2.6.1: no tool, no picture line, and image generation is not even asked about. Lookups and pictures can be offered together.
+The tool and its line in the system prompt are offered only when the request's features include `image_jobs` **and** pictures can be made right now (the test behind `capabilities.image_generation`: switched on, installed, vision on, the engine up and not restarting), or are paused (then every call is refused with the pause's words, see [Paused](#paused-image_gen_enabledpaused)). It is asked again when the model calls the tool, because that can come a minute later. A request without the feature is answered exactly as in 2.6.1: no tool, no picture line, and image generation is not even asked about. Lookups and pictures can be offered together.
 
 ### The tool
 
@@ -177,7 +182,7 @@ data: {"dlne": {"event": "image_refused", "code": "prompt_refused", "detail": "I
 | `size` | `768x768`, `768x1024` or `1024x768`. |
 | `position`, `eta_seconds` | As in the `202` answer: `position` counts the running job, `eta_seconds` is the whole wait from now. |
 
-`image_refused` carries the `code` and `detail` that `POST /v1/app/images` would have answered, and nothing else (no category, no retry time): `prompt_refused` (the term list), `prompt_empty`, `prompt_too_long`, `image_quota` (the hour's cap, or the trial used up on a network that is nobody's contributor), `image_busy`, `image_generation_unavailable` (the engine restarted since the tool was offered), and `generation_failed` for an unexpected error while queueing, the one code the endpoint has no answer for. A refusal costs nothing. A prompt the checks refuse later is not an `image_refused` event: the job is made and then ends `refused`, as from the dialog.
+`image_refused` carries the `code` and `detail` that `POST /v1/app/images` would have answered, and nothing else (no category, no retry time): `prompt_refused` (the term list), `prompt_empty`, `prompt_too_long`, `image_quota` (the hour's cap, or the trial used up on a network that is nobody's contributor), `image_busy`, `image_generation_unavailable` (the engine restarted since the tool was offered), `image_generation_paused` (pictures are paused; its `detail` ends with " More: " and the `/pictures` page's full address), and `generation_failed` for an unexpected error while queueing, the one code the endpoint has no answer for. A refusal costs nothing. A prompt the checks refuse later is not an `image_refused` event: the job is made and then ends `refused`, as from the dialog.
 
 **What the model is told** (the tool result): "The picture is being made and will appear below your reply in about N seconds. Tell the user in one short sentence. Do not describe it as if you could see it, and add no link or placeholder." (N is the event's `eta_seconds`); or "The picture was not made: <detail> Tell the user briefly and kindly, in your own words."; or "Only one picture per message."
 
@@ -212,11 +217,49 @@ The tool call runs on the coordinator whichever machine answers the chat: the en
 
 - With `IMAGE_GEN_ENABLED` off (the default) neither appears.
 - Enabled but unavailable right now: `capabilities.image_generation` is `false` and there is no block.
+- Paused: `capabilities` has `"image_generation": false, "image_generation_paused": true`, there is no
+  `image_generation` block, and a top-level `images` says why (the same sentence the endpoints answer):
+
+  ```json
+  "images": {"paused": true, "note": "Pictures are paused for now: DLNE's graphics card is busy running the smarter coding model. They will be back.", "page": "/pictures"}
+  ```
+
+  `images` appears only while paused; with pictures on or off the status is as above.
 - `queue` is the jobs waiting, `busy` whether one is running, `eta_seconds` the current median per size, `per_hour` the configured `IMAGE_PER_HOUR`. Pages should read these, never type them.
+
+## Paused (`IMAGE_GEN_ENABLED=paused`)
+
+Since 2026-10-30, for when the media card is busy with something else: on TheWall the RX 580 runs a third of the smarter
+coding model (`MEDIA_GPU_SHARED=true`), and a picture needs the card to itself. Paused is off as far as the machine goes
+(nothing loads or starts `sd-server`, no model file is looked at, the canary decoys are those of a server without
+pictures) but it is never silent. Everything ends at one sentence, `PICTURES_PAUSED_NOTE` in `engine/pictures_page.py`:
+
+> Pictures are paused for now: DLNE's graphics card is busy running the smarter coding model. They will be back.
+
+| Who asks | What they get |
+|---|---|
+| Any of the six endpoints (`/v1/images`, `/v1/images/{id}`, `/v1/images/{id}/cancel` and the three `/v1/app/...`) | `503 {"detail": <the sentence>, "code": "image_generation_paused", "page": "/pictures"}`, `Cache-Control: no-store`. Nothing is queued or charged, and a job made before the pause is not served either. |
+| The phone app or the web chat, asking in words | The model is still offered `create_image` (so a plain ask is still required to call it, and the model never has to guess). Every call is refused: the stream gets `{"event": "image_refused", "code": "image_generation_paused", "detail": "<the sentence> More: https://dlne.rossgilsonlabs.dev/pictures"}`, and the model is told "The picture was not made: <that detail> Tell the user briefly and kindly, in your own words." Nothing is queued or charged. |
+| The web chat's "+" | A greyed "Pictures paused" item where Create image would be, a link to `/pictures` (in a new tab). The Android app is unchanged: it shows no picture button, as with pictures off, and the chat's answer says why. |
+| The status | As in [The status](#the-status) above. |
+
+The address after "More:" is the coordinator's public one (`PUBLIC_URL` in `engine/landing.py`). The public name passes
+only some paths to the coordinator (Caddy on TheWall), so `/pictures` must be one of them.
+
+### The page, `GET /pictures`
+
+Public, like `/chat`, and served with the chat's headers (the same Content-Security-Policy, `X-Frame-Options: DENY`,
+`nosniff`, no referrer). It reads `/v1/cluster/status` when it opens, every minute while it is in view and whenever it is
+shown again, and says one of four things: **Pictures are paused** (with the status's own `images.note`), **Pictures are
+on** (with a link to the chat), **Pictures aren't available right now** (off, or on but not ready), or **DLNE is
+restarting** (no status). Nothing on it is typed in: the note comes from the status, so the page and the chat can never
+word it differently. Tests: `tests/test_pictures_page.py`.
 
 ## For client authors
 
-- Show "Create image" only while `capabilities.image_generation === true` (missing means false).
+- Show "Create image" only while `capabilities.image_generation === true` (missing means false). While `images.paused`
+  is `true`, a client may show a greyed "Pictures paused" in its place that opens `images.page` (the web chat does);
+  one that does not know the key simply shows no picture button, as with pictures off.
 - Poll every 2 s while visible, 5 s in the background. Show elapsed time against `eta_seconds`, not a progress bar (there are no step previews). A `GET` is cheap until `completed`, which carries the whole PNG (about 1 MB at 768x768): stop polling then.
 - Show the server's `detail` for every refusal and error. Show `Retry-After` for a 429.
 - A picture made from the Create image dialog is a card in the conversation whose saved text is `[Image: <prompt>]`; never send the picture's bytes to the chat model. (The Android app leaves those cards out of the history it sends; the web chat sends the placeholder text. A reply that the chat itself made a picture for is different: its history text is `[Picture created: <prompt>]`, see below.)
@@ -227,6 +270,6 @@ The tool call runs on the coordinator whichever machine answers the chat: the en
 ## For the maintainer
 
 - `canary` decoys: while the coordinator offers images, a decoy request to a coding member carries the same ninth tool and prompt line the extension adds (`generate_image`), byte for byte (`engine/canary.py`, `tests/test_image_canary.py`, which reads `vscode-extension/src/agent/imageTool.ts`). With images off the decoys are unchanged. The prompt itself never goes to a coding member.
-- Tests: `tests/test_image_policy.py`, `test_image_member.py`, `test_image_pool.py`, `test_image_endpoints.py`, `test_image_canary.py`, `test_image_packaging.py`; for the phone chat's tool `test_phone_pictures.py` (the stream, `IMAGE_ASK`, a fake engine on a phone lane that calls the tool, the 2.6.1 pin) and for the contributor rule `test_contributor_networks.py`. The real `sd-server` is not needed; a fake speaks its API.
+- Tests: `tests/test_image_policy.py`, `test_image_member.py`, `test_image_pool.py`, `test_image_endpoints.py`, `test_image_canary.py`, `test_image_packaging.py`, and for the pause and its page `test_pictures_page.py`; for the phone chat's tool `test_phone_pictures.py` (the stream, `IMAGE_ASK`, a fake engine on a phone lane that calls the tool, the 2.6.1 pin) and for the contributor rule `test_contributor_networks.py`. The real `sd-server` is not needed; a fake speaks its API.
 - The phone chat's picture tool is not the extension's: the canary decoys copy `generate_image` (the coding agent's tool), and nothing in `engine/canary.py` knows `create_image`, which only ever goes to the model that answers a phone.
 - Moving to a newer stable-diffusion.cpp: change the three pins in `scripts/package_sd.py`, run those tests, measure on TheWall, update the figures above and `SEED_ETA_SECONDS` in `engine/image_pool.py`.

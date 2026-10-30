@@ -34,8 +34,8 @@ class Clock:
 
 
 def member(worker_id, *, slots=2, busy=0, prefill=100.0, decode=30.0, trust=OTHER, ready=True,
-           base="http://127.0.0.1:9", floors=True, pubkey="KEY", model=MODEL):
-    return CodingMember(worker_id=worker_id, model=model, tier="qwen36-a3b", ready=ready, slots=slots, busy=busy,
+           base="http://127.0.0.1:9", floors=True, pubkey="KEY", model=MODEL, tier="qwen36-a3b"):
+    return CodingMember(worker_id=worker_id, model=model, tier=tier, ready=ready, slots=slots, busy=busy,
                         decode_tps=decode, prefill_tps=prefill, pubkey=pubkey, no_trace=True, base_url=base,
                         floors_met=floors, trust_id=trust)
 
@@ -294,12 +294,168 @@ def test_the_requesters_own_member_comes_before_the_least_busy_while_it_is_fast_
     assert pick(router, [mine, other], own=TRUSTED.upper()).worker_id == "other", "a trust id is compared as given"
 
 
+# dlne.ownGpu = "smarter": the ladder, smallest (least smart) first, and the coordinator's engine on its first rung.
+SMARTER = "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"
+LADDER = [{"id": "qwen36-a3b", "file": MODEL}, {"id": "qwen36-a3b-iq4xs", "file": SMARTER}]
+
+
+def smarter_pick(router, members, engine_model=MODEL, **kwargs):
+    kwargs.setdefault("own", TRUSTED)
+    return pick(router, members, prefer_smarter=True, engine_model=engine_model, ladder=LADDER, **kwargs)
+
+
+def test_prefer_smarter_takes_the_requesters_own_member_when_its_model_is_smarter_however_slow(router):
+    """The owner's laptop on IQ4_XS at 27 tok/s against TheWall on IQ3_S at 65."""
+    mine = member("mine", busy=1, decode=27.0, trust=TRUSTED, model=SMARTER)
+    other = member("other", decode=40.0, prefill=300.0)
+    assert pick(router, [mine, other], own=TRUSTED, engine_tps=65.0).worker_id == "other", "faster (the default): speed rules"
+    assert smarter_pick(router, [mine, other], engine_tps=65.0).worker_id == "mine", "smarter: own, though slower"
+    assert smarter_pick(router, [mine, other], engine_tps=65.0, own=None).worker_id == "other", "no own: nothing to prefer"
+    assert smarter_pick(router, [mine, other], engine_tps=65.0, own=OTHER).worker_id == "other", "own is not this member"
+
+
+def test_prefer_smarter_leaves_an_own_member_that_is_no_smarter_to_the_speed_rule(router):
+    same = member("mine", decode=27.0, trust=TRUSTED, model=MODEL)
+    other = member("other", decode=40.0, prefill=300.0)
+    assert smarter_pick(router, [same, other], engine_tps=65.0).worker_id == "other", "the same model: not smarter"
+    assert smarter_pick(router, [same, other], engine_tps=20.0).worker_id == "mine", "but still own when it is faster"
+    # Auto-swap moved the coordinator's sharded engine up to IQ4_XS: the laptop's IQ4_XS is no smarter.
+    mine = member("mine", decode=27.0, trust=TRUSTED, model=SMARTER)
+    assert smarter_pick(router, [mine, other], engine_model=SMARTER, engine_tps=65.0).worker_id == "other"
+    # The engine smarter than the laptop: less smart is never preferred.
+    assert smarter_pick(router, [same, other], engine_model=SMARTER, engine_tps=65.0).worker_id == "other"
+
+
+def test_prefer_smarter_with_a_model_the_ladder_does_not_know_falls_back_to_the_speed_rule(router):
+    odd = member("mine", decode=27.0, trust=TRUSTED, model="qwen2.5-coder-14b-instruct-q4_k_m.gguf")
+    mine = member("mine", decode=27.0, trust=TRUSTED, model=SMARTER)
+    other = member("other", decode=40.0, prefill=300.0)
+    assert smarter_pick(router, [odd, other], engine_tps=65.0).worker_id == "other", "the member's model is unknown"
+    assert smarter_pick(router, [mine, other], engine_model="phi3-mini.gguf", engine_tps=65.0).worker_id == "other", \
+        "the engine's model is unknown"
+    assert smarter_pick(router, [mine, other], engine_model=None, engine_tps=65.0).worker_id == "other", "no engine model"
+    assert pick(router, [mine, other], own=TRUSTED, prefer_smarter=True, engine_model=MODEL,
+                engine_tps=65.0).worker_id == "other", "no ladder: nothing ranks"
+
+
+def test_prefer_smarter_never_gets_past_privacy_a_full_member_or_the_sticky_one(router):
+    mine = member("mine", decode=27.0, trust=TRUSTED, model=SMARTER)
+    other = member("other", decode=40.0, prefill=300.0)
+    assert smarter_pick(router, [mine, other], privacy="trusted", trusted_ids={OTHER}).worker_id == "other", \
+        "an untrusted own member is never sent a private request"
+    assert smarter_pick(router, [mine], privacy="trusted", trusted_ids=set()) is None
+    full = member("mine", busy=2, trust=TRUSTED, model=SMARTER)
+    assert smarter_pick(router, [full, other]).worker_id == "other", "own is full"
+    assert pick(router, [mine, other], "s").worker_id == "other"
+    assert smarter_pick(router, [mine, other], session="s").worker_id == "other", "the session's prompt is cached there"
+
+
 def test_the_sessions_sticky_member_still_comes_before_the_requesters_own(router):
     mine, other = member("mine", trust=TRUSTED), member("other", prefill=300.0)
     assert pick(router, [mine, other], "s").worker_id == "other"
     assert pick(router, [mine, other], "s", own=TRUSTED).worker_id == "other", "the session's prompt is cached there"
     assert pick(router, [mine, other], "s2", own=TRUSTED).worker_id == "mine"
     assert pick(router, [mine, other], "s2").worker_id == "mine", "and own is sticky in its turn"
+
+
+# ======================================================================================
+# pick: need, the tokens a request will hold ("context is everything", 2026-10-30)
+# ======================================================================================
+
+# A shipped Qwen3.6 tier (81,920 over 2 slots: 40,960 a request) and a big one (262,144 over 2: 131,072 a request).
+CONTEXT_LADDER = [{"id": "qwen36-a3b", "file": MODEL, "context": 81920, "server_slots": 2},
+                  {"id": "qwen36-a3b-iq4xs", "file": SMARTER, "context": 262144, "server_slots": 2}]
+
+
+def small(worker_id="small", **kwargs):
+    return member(worker_id, tier="qwen36-a3b", **kwargs)
+
+
+def big(worker_id="big", **kwargs):
+    return member(worker_id, tier="qwen36-a3b-iq4xs", model=SMARTER, **kwargs)
+
+
+def need_pick(router, members, need, **kwargs):
+    return pick(router, members, ladder=CONTEXT_LADDER, need=need, **kwargs)
+
+
+def test_a_members_context_per_request_is_its_tiers_context_over_the_tiers_slots():
+    assert cr.member_context(small(), CONTEXT_LADDER) == 40960
+    assert cr.member_context(big(), CONTEXT_LADDER) == 131072
+    assert cr.member_context(big(slots=1), CONTEXT_LADDER) == 131072, "the slots it reports do not enter into it"
+    odd = [{"id": "qwen36-a3b", "context": 65537}, {"id": "tiny", "context": 1024, "server_slots": 4}]
+    assert cr.member_context(small(), odd) == 32768, "65,537 over the default 2 slots"
+    assert cr.member_context(member("t", tier="tiny"), odd) == 16384, "an implausible context is the default 65,536 / 4"
+    assert cr.member_context(member("u", tier="unknown"), CONTEXT_LADDER) == 32768, "a tier the ladder does not know"
+    assert cr.member_context(small(), []) == 32768, "no ladder at all"
+
+
+@pytest.mark.parametrize("need, read", [(1, 1), (131072, 131072), (10_000_000, 10_000_000), (0, None), (-4096, None),
+                                         (10_000_001, None), (True, None), (4096.0, None), ("4096", None), (None, None)])
+def test_a_need_is_a_whole_number_of_tokens_from_one_to_ten_million(need, read):
+    assert cr.normalize_need(need) == read
+
+
+def test_only_a_member_whose_context_holds_the_need_is_picked(router):
+    s, b = small(prefill=300.0), big(prefill=100.0)
+    assert need_pick(router, [s, b], None).worker_id == "small", "no need: the faster reader, as before"
+    assert need_pick(router, [s, b], 40960).worker_id == "small", "exactly its context fits"
+    assert need_pick(router, [s, b], 40961).worker_id == "big"
+    assert need_pick(router, [s, b], 131072).worker_id == "big"
+    assert need_pick(router, [s, b], 131073) is None, "none fits: the coordinator's own engine answers"
+    assert need_pick(router, [s], 65536) is None
+    for ignored in (0, -1, 10_000_001, True, 65536.0, "65536"):
+        assert need_pick(router, [s], ignored).worker_id == "small", ignored
+
+
+def test_with_a_need_and_no_ladder_every_member_holds_the_default(router):
+    assert pick(router, [big()], need=32768).worker_id == "big"
+    assert pick(router, [big()], need=32769) is None, "a tier nobody can look up is taken at the default 32,768"
+
+
+def test_a_sticky_member_too_small_for_the_need_is_passed_over_and_the_one_that_fits_sticks(router):
+    s, b = small(prefill=300.0), big(prefill=100.0)
+    assert need_pick(router, [s, b], 8192, session="s").worker_id == "small"
+    assert need_pick(router, [s, b], 65536, session="s").worker_id == "big", "the sticky member cannot hold it"
+    assert need_pick(router, [s, b], 8192, session="s").worker_id == "big", "and its prompt is cached there now"
+    assert need_pick(router, [s, b], 8192, session="t").worker_id == "small"
+    assert need_pick(router, [s], 65536, session="t") is None
+    assert need_pick(router, [s, b], 8192, session="t").worker_id == "small", "no route picked: the session keeps its member"
+
+
+def test_the_requesters_own_member_too_small_for_the_need_is_passed_over(router):
+    mine = small("mine", trust=TRUSTED, decode=50.0)
+    other = big("other", decode=20.0, prefill=50.0)
+    assert need_pick(router, [mine, other], 8192, own=TRUSTED, engine_tps=30.0).worker_id == "mine"
+    assert need_pick(router, [mine, other], 65536, own=TRUSTED, engine_tps=30.0).worker_id == "other"
+    assert need_pick(router, [mine], 65536, own=TRUSTED, engine_tps=None) is None, "own, but it cannot hold it"
+
+
+def test_prefer_smarter_never_takes_an_own_member_too_small_for_the_need(router):
+    """The owner's laptop on a smarter model with a 40,960-token slot, a 65,536-token request: the laptop would cut it
+    short, so the smarter rule passes it over like a full one, and the speed rule and the rest decide."""
+    roomy = [{"id": "qwen36-a3b", "file": MODEL, "context": 262144, "server_slots": 2},
+             {"id": "qwen36-a3b-iq4xs", "file": SMARTER, "context": 81920, "server_slots": 2}]
+    mine = big("mine", trust=TRUSTED, decode=27.0)                  # smarter, 40,960 a request on this ladder
+    other = small("other", decode=40.0, prefill=300.0)              # 131,072 a request
+    smart = dict(own=TRUSTED, prefer_smarter=True, engine_model=MODEL, engine_tps=65.0, ladder=roomy)
+    assert pick(router, [mine, other], need=8192, **smart).worker_id == "mine", "it fits: smarter wins"
+    assert pick(router, [mine, other], need=65536, **smart).worker_id == "other", "it does not: passed over"
+    assert pick(router, [mine], need=65536, **smart) is None
+
+
+@pytest.mark.anyio
+async def test_a_request_that_no_member_can_hold_does_not_wait_for_one(router):
+    only = [small(slots=1)]
+    held = await router.place(cr._Want(lambda: only, None, "any", frozenset()), 0, 0)
+    assert held is not None
+    too_big = cr._Want(lambda: only, None, "any", frozenset(), ladder=tuple(CONTEXT_LADDER), need=65536)
+    assert await router.place(too_big, 0, 5) is None, "no member could ever hold it: nothing to wait for"
+    held.release()
+    fits = cr._Want(lambda: only, None, "any", frozenset(), ladder=tuple(CONTEXT_LADDER), need=40960)
+    lease = await router.place(fits, 0, 0)
+    assert lease is not None and lease.member.worker_id == "small"
+    lease.release()
 
 
 def test_commit_false_leaves_no_memory(router):

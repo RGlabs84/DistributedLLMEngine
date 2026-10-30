@@ -6,7 +6,8 @@
  *   - the same call (the tool and its arguments, compared as JSON with sorted keys) that got the same result (the error
  *     flag and the first 2,000 characters of the output), 3 times;
  *   - the same terminal command failing, 3 times, even when its output differs a little (a time, a duration);
- *   - the same file read again, 4 times, with no change to that file in between.
+ *   - the same file read again, 4 times, with no change to that file in between: the same lines, judged by the lines
+ *     that came back, not the lines asked for (a long answer is cut short, so asking for more is not reading more).
  * Work is not a loop. A call that really changed a file starts the count again: for a repeated command, search or read,
  * an edit of any file between the two ("run the tests, edit, run the tests"); for a file read again, only an edit of that
  * file (an edit to another file leaves it as it was). A command whose output keeps changing (a log being tailed) is not
@@ -219,11 +220,43 @@ interface Event {
   path: string | null;
   /** The files an edit changed; null when unknown. */
   paths: string[] | null;
-  /** The lines a read asked for (the whole file: 1 to Infinity). */
+  /** The lines a read got back (see linesReturned), or, when its output does not say, the lines it asked for. */
   from: number;
   to: number;
   /** What names the call in words: the command, the path or the query. */
   subject: string;
+}
+
+/**
+ * Where capOutput (tools.ts) cut a long output short. After it come the file's last lines, which capOutput adds to every
+ * long output. The blank line in front matters: every line of a numbered output starts with its number, so none is
+ * blank, and a file that holds these words (tools.ts does) is not taken for a cut. The note about hidden secrets
+ * (redactionNote) does start with a blank line, but it comes last and starts with "[DLNE hid", so it is never a line.
+ */
+const OUTPUT_CUT = '\n\n... [Output truncated: ';
+/** A line as the agent's read_file numbers it: "12: text". */
+const NUMBERED_LINE = /^(\d+): /gm;
+
+/**
+ * The lines a read really got back, from the numbers the agent's read_file puts in front of each line. A read that
+ * asks for a start and no end gets the rest of the file, and a long answer is cut to its first few thousand characters,
+ * so the lines asked for say little about the lines seen: a model paging forward (1, 81, 161, ... with no end) asks
+ * for ranges that all overlap and sees ones that do not. Only the lines before the cut count; the file's tail after it
+ * is the tool's doing, added to every long answer, not the model's. Null when the output has no numbered
+ * lines (VS Code's own read_file, in the model picker, does not number them), and then the lines asked for are used.
+ */
+function linesReturned(output: string): { from: number; to: number } | null {
+  const cut = output.indexOf(OUTPUT_CUT);
+  const seen = cut >= 0 ? output.slice(0, cut) : output;
+  let from = Number.POSITIVE_INFINITY;
+  let to = 0;
+  for (const m of seen.matchAll(NUMBERED_LINE)) {
+    const line = Number(m[1]);
+    if (line < 1) continue;
+    from = Math.min(from, line);
+    to = Math.max(to, line);
+  }
+  return to >= 1 ? { from, to } : null;
 }
 
 function describe(call: GuardCall, step: number): Event {
@@ -235,8 +268,9 @@ function describe(call: GuardCall, step: number): Event {
   for (const key of Object.keys(args)) if (!WHY_ARGUMENTS.has(key)) own[key] = args[key];
   const start = Number(args.start_line ?? args.startLine);
   const end = Number(args.end_line ?? args.endLine);
-  const from = Number.isFinite(start) && start >= 1 ? Math.floor(start) : 1;
-  const to = Number.isFinite(end) && end >= 1 ? Math.max(from, Math.floor(end)) : Number.POSITIVE_INFINITY;
+  const askedFrom = Number.isFinite(start) && start >= 1 ? Math.floor(start) : 1;
+  const askedTo = Number.isFinite(end) && end >= 1 ? Math.max(askedFrom, Math.floor(end)) : Number.POSITIVE_INFINITY;
+  const { from, to } = (kind === 'read' ? linesReturned(output) : null) ?? { from: askedFrom, to: askedTo };
   const path = kind === 'read' || kind === 'edit' || /^list_dir/.test(call.name) ? pathOf(args) : null;
   const query = stringAt(args, ['query', 'pattern']);
   return {
@@ -318,7 +352,8 @@ function findLoop(steps: ReadonlyArray<ReadonlyArray<GuardCall>>): Found | null 
     }
     if (e.kind === 'read' && !e.failed && e.path !== null) {
       // "No change to that path in between": only an edit of this file starts the count again. And reading other parts
-      // of a long file is how the tool's own advice says to read it, so only lines read before count.
+      // of a long file is how the tool's own advice says to read it, so only lines read before count: the lines that
+      // came back, which for a long file are fewer than the lines asked for.
       const again = chain(events, at, 'file', (o) => o.kind === 'read' && !o.failed && o.path === e.path && overlap(o, e));
       if (again >= REREAD_TIMES) found.push({ rule: 'reread', count: again, threshold: REREAD_TIMES, event: e });
     }

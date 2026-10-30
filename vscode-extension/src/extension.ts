@@ -378,9 +378,52 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // What the agent remembers, in an editor, so the user can read it and tidy it by hand (docs/agent-memory.md 7.1).
+  context.subscriptions.push(
+    vscode.commands.registerCommand('dlne.memory.open', () => openAgentMemory())
+  );
+
   // Sends the active file's errors to `@dlne /fix` in the Chat view, or to the sidebar chat where there is no Chat view.
   context.subscriptions.push(
     vscode.commands.registerCommand('dlne.fixDiagnostics', () => fixDiagnostics(sidebarProvider))
+  );
+}
+
+/** True when `file` is there and is a file (a folder of that name is not a memory). */
+function isFile(file: string): boolean {
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * DLNE: Open Agent Memory. It opens this project's `.dlne/memory.md`, the file `remember` writes for the first workspace
+ * folder. With no folder open, or no memory in this project yet, it offers the user's own `~/.dlne/memory.md` when there
+ * is one, and otherwise says plainly that there is no memory yet. It never makes a file: the agent starts one when it
+ * first remembers something. `homeDir` is for the tests.
+ */
+export async function openAgentMemory(homeDir: string = os.homedir()): Promise<void> {
+  const folders = vscode.workspace.workspaceFolders;
+  const project = folders && folders.length > 0 ? path.join(folders[0].uri.fsPath, '.dlne', 'memory.md') : undefined;
+  if (project && isFile(project)) {
+    await vscode.window.showTextDocument(vscode.Uri.file(project));
+    return;
+  }
+  const where = project ? 'this project has no .dlne/memory.md' : 'no folder is open';
+  const user = path.join(homeDir, '.dlne', 'memory.md');
+  if (isFile(user)) {
+    // Asked, not just opened: the user's file holds what goes with every project, not this one's.
+    const choice = await vscode.window.showInformationMessage(
+      `DLNE: There is no project memory here (${where}). Open your own memory, ~/.dlne/memory.md, which goes with every project?`,
+      'Open Your Memory'
+    );
+    if (choice === 'Open Your Memory') await vscode.window.showTextDocument(vscode.Uri.file(user));
+    return;
+  }
+  vscode.window.showInformationMessage(
+    `DLNE: There is no agent memory yet: ${where}, and you have no ~/.dlne/memory.md. The agent starts one when it first remembers something.`
   );
 }
 

@@ -1382,12 +1382,31 @@ def test_photos_come_from_two_hidden_file_inputs_png_or_jpeg_and_the_camera():
 def test_the_plus_shows_only_what_the_server_can_do_and_camera_only_on_touch_screens():
     page = chat_page.CHAT_HTML
     assert "visionSupport = !!(data && data.capabilities && data.capabilities.app_vision === true);" in page   # missing is false
-    assert "ui.plus.hidden = !canPhotos && !canPictures;" in page                       # neither: no "+"
+    assert "ui.plus.hidden = !canPhotos && !canPictures && !paused;" in page            # none of them: no "+"
     assert "ui.addPhotos.hidden = !canPhotos;" in page
     assert "ui.addCamera.hidden = !(canPhotos && coarse);" in page
     assert "const coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);" in page
     assert "ui.field.classList.toggle('has-plus', !ui.plus.hidden);" in page            # the box gives the "+" its room
     assert "if (ui.plus.hidden) closePlus();" in page                                   # an open menu does not outlive its items
+
+
+def test_while_pictures_are_paused_a_greyed_item_in_the_plus_links_to_the_pictures_page():
+    """IMAGE_GEN_ENABLED=paused (2026-10-30): the status says images.paused, and where Create image would be the "+" holds
+    "Pictures paused", a plain link to /pictures in a new tab. It is shown only while the server does not make pictures."""
+    page = chat_page.CHAT_HTML
+    field = page.split('<div class="field" id="field">', 1)[1].split('<textarea id="input"', 1)[0]
+    item = next(t for t in _tags("a") if t.get("id") == "pictures-paused")
+    assert item["href"] == "/pictures" and item["target"] == "_blank" and item["rel"] == "noopener noreferrer"
+    assert "hidden" in item and item["class"] == "popitem popitem-off"
+    assert re.search(r'id="make-image"[^>]*>Create image</button>\s*<a [^>]*id="pictures-paused"[^>]*>Pictures paused ', field)
+    assert "picturesPaused = !!(data && data.images && data.images.paused === true);" in page   # only an explicit true
+    assert "const paused = picturesPaused && !canPictures;" in page
+    assert "ui.picturesPaused.hidden = !paused;" in page
+    assert ": canPictures ? 'Create an image' : 'Pictures are paused');" in page
+    assert "ui.picturesPaused.addEventListener('click', () => closePlus());" in page
+    assert "querySelectorAll('button, a')" in page                       # a keyboard reader can land on the link too
+    # The note itself is never typed into the chat: the page that explains it reads it live from the status.
+    assert "graphics card is busy" not in page
 
 
 def test_a_photo_is_made_ready_in_the_page_with_its_orientation_scaled_and_as_a_jpeg():

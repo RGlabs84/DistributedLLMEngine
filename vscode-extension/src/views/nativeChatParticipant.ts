@@ -318,8 +318,9 @@ export function registerNativeChatParticipant(
             }
           }
         } else if (result.terminalCommand) {
+          // ⚠️ for a command the tool marked as an error (it was stopped), as for every other tool below.
           stream.markdown(
-            `\n\n💻 **Executed \`${result.terminalCommand}\`**:\n\`\`\`text\n${result.output.slice(0, 1000)}\n\`\`\`\n`
+            `\n\n${result.is_error ? '⚠️' : '💻'} **Executed \`${result.terminalCommand}\`**:\n\`\`\`text\n${result.output.slice(0, 1000)}\n\`\`\`\n`
           );
         } else {
           stream.markdown(`\n\n${result.is_error ? '⚠️' : '✅'} **\`${result.name}\`**: ${result.output.slice(0, 200)}\n\n`);

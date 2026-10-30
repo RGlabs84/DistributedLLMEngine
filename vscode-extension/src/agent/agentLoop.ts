@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { DlneClient, ChatMessage, EngineDropped, StreamChatResult, AGENT_MAX_TOKENS } from '../client/dlneClient';
 import { QueueUpdate } from '../client/queue';
 import { newSessionId } from '../client/session';
-import { ToolRegistry, ToolContext, ToolCallResult, withoutLocalPaths } from './tools';
+import { ToolRegistry, ToolContext, ToolCallResult, STOPPED_NOTICE, withoutLocalPaths } from './tools';
 import { IMAGE_PROMPT_LINE, IMAGE_TOOL_NAME, imageGenerationOffered, imageToolDefinition, withImageLine } from './imageTool';
 import { Ledger, LedgerJSON, LEDGER_MAX_CHARS } from './ledger';
 import { GuardCall, LoopGuard, loopNote, loopProgressLine, loopStopNote, loopStopNotice, loopSummary } from './loopGuard';
@@ -256,14 +256,29 @@ const TAIL_ARGUMENT_MAX_CHARS = 1000;
 /** A message longer than this (a huge paste) keeps its head and tail when nothing else makes room. */
 const HUGE_MESSAGE_CHARS = 12000;
 
+/** The largest per-request context believed from `policy.coding_context_tokens_max`: 1M tokens. Above it, a typo. */
+const MAX_CONTEXT_TOKENS = 1_048_576;
+
 /**
- * What the coordinator's status says one coding request may hold, in tokens: `policy.coding_context_tokens`
- * (2.4.9), or DEFAULT_CONTEXT_TOKENS when it does not say. Shared with the Chat view's model entry
- * (client/modelProvider.ts), so both size a prompt from the same figure.
+ * What the coordinator's status says one coding request may hold, in tokens. From 2.6.x that is
+ * `policy.coding_context_tokens_max`, the largest machine's: every route lookup says how big its request is (`need`), and
+ * the coordinator sends a request too big for the smaller machines to one that holds it ("context is everything",
+ * 2026-10-30). It is used only when it is a whole number above `policy.coding_context_tokens` (2.4.9, the smallest
+ * machine's) and no more than 1M; otherwise the smallest is used, as before, or DEFAULT_CONTEXT_TOKENS when neither
+ * says. Shared with the Chat view's model entry (client/modelProvider.ts), so both size a prompt from the same figure.
  */
-export function contextTokensFrom(status: { policy?: { coding_context_tokens?: unknown } } | null | undefined): number {
+export function contextTokensFrom(
+  status: { policy?: { coding_context_tokens?: unknown; coding_context_tokens_max?: unknown } } | null | undefined
+): number {
   const reported = Number(status?.policy?.coding_context_tokens);
-  return Number.isFinite(reported) && reported >= 4096 ? Math.floor(reported) : DEFAULT_CONTEXT_TOKENS;
+  const usable = Number.isFinite(reported) && reported >= 4096;
+  const smallest = usable ? Math.floor(reported) : DEFAULT_CONTEXT_TOKENS;
+  // Only alongside a usable smallest figure: a status that sends the largest without it is not one this was built for.
+  const largest = status?.policy?.coding_context_tokens_max;
+  if (usable && typeof largest === 'number' && Number.isInteger(largest) && largest > smallest && largest <= MAX_CONTEXT_TOKENS) {
+    return largest;
+  }
+  return smallest;
 }
 
 /**
@@ -307,9 +322,59 @@ export const REFLECT_MIN_TURNS = 5;
 /** The look back's request, word for word (docs/agent-memory.md 7.7). */
 export const REFLECT_REQUEST = [
   '<dlne_reflect>',
-  'The task is finished. Save, with remember, what a later session in this project would otherwise have to rediscover: how to build, test or run it (exact commands), where things live, the conventions its code follows, and any correction or preference the user gave. One fact per call; usually one to three are worth keeping. Use replaces to update or remove an outdated fact you saved. Skip details that mattered only for this task. If there is truly nothing new, reply with just: nothing.',
+  'The task is finished. Save, with remember, what a later session in this project would otherwise have to rediscover: how to build, test or run it (exact commands), where things live, the conventions its code follows, and any correction or preference the user gave. Look at Project memory first: update a fact that is now wrong or incomplete (its id in replaces) instead of adding another, and remove one that no longer holds. One fact per call; usually one to three changes are worth making. Skip details that mattered only for this task. If there is truly nothing new, reply with just: nothing.',
   '</dlne_reflect>',
 ].join('\n');
+
+/** After this many failed `remember` calls in a row, a run stops running the tool (Memory 2). */
+export const REMEMBER_FAILURE_LIMIT = 3;
+
+/** What each `remember` call is answered with once the run has stopped running it, word for word (Memory 2). */
+export const REMEMBER_STOPPED_NOTICE =
+  'remember has failed 3 times in a row in this task, so DLNE stopped running it. Carry on with the task, and tell ' +
+  'the user what you wanted to save.';
+
+/** How the approval check in tools.ts (checkApproval) begins its answer when the user says no. */
+const DECLINED_PREFIX = 'The user declined: ';
+
+/**
+ * The `remember` calls of one run that failed in a row (Memory 2). On 2026-10-30 a model tried a dozen times to tidy a
+ * nearly full memory file, each call failing the same way, and nothing stopped it. Now a third failure in a row ends
+ * that: later calls in the run are not run, and the model is told to carry on and tell the user instead.
+ *
+ * Only the error flag counts: the tool's own wording is memory.ts's business. A success starts the count again. The
+ * user saying no is not a failure of the tool, and neither is a Stop, so those two leave the count as it was. The
+ * reflect step shares the run's count. A new run, Continue included, starts at zero; nothing of it is saved.
+ */
+class RememberStreak {
+  private failures = 0;
+
+  /** `say` writes a line in the run log: names and numbers only, never a fact's text. */
+  constructor(private readonly say: (text: string) => void) {}
+
+  /** Whether the run has stopped running `remember`. */
+  get stopped(): boolean {
+    return this.failures >= REMEMBER_FAILURE_LIMIT;
+  }
+
+  /** Counts what a `remember` call that ran came to. `where` names the step for the log ("step 4", "the look back"). */
+  record(result: ToolCallResult, where: string): void {
+    const output = typeof result?.output === 'string' ? result.output : '';
+    if (output.startsWith(DECLINED_PREFIX) || output === STOPPED_NOTICE) return;
+    if (result?.is_error !== true) {
+      this.failures = 0;
+      return;
+    }
+    this.failures++;
+    if (this.stopped) this.say(`remember check: stopped running remember after ${where} (${this.failures} failures in a row)`);
+  }
+
+  /** The answer to a `remember` call that is not run, so the call still has its result. */
+  refuse(where: string): ToolCallResult {
+    this.say(`remember check: a remember call in ${where} was not run`);
+    return { name: 'remember', output: REMEMBER_STOPPED_NOTICE, is_error: true };
+  }
+}
 
 /** What the model is told after a reply was cut off in the middle of a tool call (docs/agent-memory.md 5.5). */
 export const CUT_OFF_NOTICE =
@@ -702,7 +767,7 @@ export class AgentLoop {
 
   /**
    * How many tokens the history may take: the per-request context the coordinator reports
-   * (policy.coding_context_tokens, 32,768 when it does not say), less the reply's room and a margin, or less
+   * (contextTokensFrom: the largest machine's from 2.6.x, 32,768 when it does not say), less the reply's room and a margin, or less
    * again after an overflow (docs/agent-memory.md 5.1).
    */
   public promptBudget(): number {
@@ -925,13 +990,15 @@ export class AgentLoop {
   /**
    * The look back at the end of a long task (docs/agent-memory.md 7.7): one request with the task's history, after
    * which only `remember` calls are run. Nothing of it is kept in the history; the ledger records what was saved.
-   * Best effort: the task is already done, so a failure changes nothing.
+   * Best effort: the task is already done, so a failure changes nothing. It shares the run's `remember` streak: once
+   * the task has stopped running remember, the look back does not run it either, and it can stop it too.
    */
   private async reflect(
     callbacks: AgentCallbacks,
     signal: AbortSignal,
     stale: () => boolean,
-    tools: ReturnType<typeof ToolRegistry.getToolDefinitions>
+    tools: ReturnType<typeof ToolRegistry.getToolDefinitions>,
+    streak: RememberStreak
   ): Promise<void> {
     try {
       callbacks.onReviewProgress?.('📝 Looking back for anything worth remembering…');
@@ -951,10 +1018,16 @@ export class AgentLoop {
       let saved = false;
       for (const call of calls) {
         if (call.name !== 'remember' || !call.args || typeof call.args !== 'object') continue;
+        // Nothing goes back to the model from here, so a call that is not run is simply left out.
+        if (streak.stopped) {
+          streak.refuse('the look back');
+          continue;
+        }
         // Housekeeping after the answer: shown only when a fact was saved (with its Undo), never as a step or an
         // error, so the task's own ending stays the last thing the user reads.
         const outcome = await this.toolResult(call.name, () => ToolRegistry.executeTool(call.name, call.args, this.approveAll(), { signal }));
         if (signal.aborted || stale()) return;
+        streak.record(outcome, 'the look back');
         this.ledger.record(call.name, call.args, outcome);
         if (!outcome.is_error && outcome.memoryChange) callbacks.onToolEnd(outcome);
         saved = true;
@@ -1053,6 +1126,10 @@ export class AgentLoop {
 
     // An agent that keeps repeating itself (loopGuard.ts). Each run has a guard of its own, so Continue starts clean.
     const guard = new LoopGuard((text) => logText(text, 2000));
+    // remember failing again and again (RememberStreak). Also one per run, and the look back at the end shares it.
+    // A call it stops is still shown and answered, so every call in the history keeps its result; it changed nothing,
+    // so the ledger has nothing to record of it.
+    const streak = new RememberStreak(say);
     /**
      * Asks the guard about the step whose tool results are now in the history. A nudge puts a note for the model's next
      * step into the history, and a line in front of the user. True is a stop: the notice is shown, the history ends with
@@ -1323,7 +1400,7 @@ export class AgentLoop {
         this.history.push({ role: 'assistant', content: streamedRaw || streamResult.content || '' });
         callbacks.onStateChanged?.();
         // (No look back while a newer message waits: it is housekeeping, and the message is what the user wants next.)
-        if (options.reflect && turns >= REFLECT_MIN_TURNS && !options.shouldYield?.()) await this.reflect(callbacks, controller.signal, stale, tools);
+        if (options.reflect && turns >= REFLECT_MIN_TURNS && !options.shouldYield?.()) await this.reflect(callbacks, controller.signal, stale, tools, streak);
         return 'done';
       }
 
@@ -1381,11 +1458,19 @@ export class AgentLoop {
             continue;
           }
           callbacks.onToolStart(tc.name, args);
-          const result = await this.toolResult(tc.name, () => ToolRegistry.executeTool(tc.name, args, this.approveAll(), this.toolContext(controller.signal, callbacks)));
+          const notRun = tc.name === 'remember' && streak.stopped;
+          const result = notRun
+            ? streak.refuse(`step ${turns}`)
+            : await this.toolResult(tc.name, () => ToolRegistry.executeTool(tc.name, args, this.approveAll(), this.toolContext(controller.signal, callbacks)));
           if (stale()) return 'aborted';
-          this.ledger.record(tc.name, args, result);
+          if (!notRun) {
+            if (tc.name === 'remember') streak.record(result, `step ${turns}`);
+            this.ledger.record(tc.name, args, result);
+            if (MACHINE_CHANGING_TOOLS.has(tc.name)) changedMachine = true;
+          }
+          // A call that was not run is still the model's step: the loop check sees it, so the same call made again
+          // and again is caught as a loop as well.
           ran.push({ name: tc.name, args, isError: result.is_error === true, output: result.output });
-          if (MACHINE_CHANGING_TOOLS.has(tc.name)) changedMachine = true;
           callbacks.onToolEnd(result);
 
           toolObservationMessages.push({
@@ -1428,11 +1513,17 @@ export class AgentLoop {
             continue;
           }
           callbacks.onToolStart(call.name, call.args);
-          const result = await this.toolResult(call.name, () => ToolRegistry.executeTool(call.name, call.args, this.approveAll(), this.toolContext(controller.signal, callbacks)));
+          const notRun = call.name === 'remember' && streak.stopped;
+          const result = notRun
+            ? streak.refuse(`step ${turns}`)
+            : await this.toolResult(call.name, () => ToolRegistry.executeTool(call.name, call.args, this.approveAll(), this.toolContext(controller.signal, callbacks)));
           if (stale()) return 'aborted';
-          this.ledger.record(call.name, call.args, result);
+          if (!notRun) {
+            if (call.name === 'remember') streak.record(result, `step ${turns}`);
+            this.ledger.record(call.name, call.args, result);
+            if (MACHINE_CHANGING_TOOLS.has(call.name)) changedMachine = true;
+          }
           ran.push({ name: call.name, args: call.args, isError: result.is_error === true, output: result.output });
-          if (MACHINE_CHANGING_TOOLS.has(call.name)) changedMachine = true;
           callbacks.onToolEnd(result);
           observations.push(`Observation from tool [${call.name}]:\n${result.output}`);
         }
@@ -1475,7 +1566,7 @@ export class AgentLoop {
       }
       callbacks.onStateChanged?.();
       if (options.reflect && turns >= REFLECT_MIN_TURNS && !options.shouldYield?.()) {
-        await this.reflect(callbacks, controller.signal, stale, tools);
+        await this.reflect(callbacks, controller.signal, stale, tools, streak);
       }
       return 'done';
     }

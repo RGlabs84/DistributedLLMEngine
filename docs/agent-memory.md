@@ -64,7 +64,7 @@ The text is everything between the four-backtick `text` fence and its closing fo
 
 ## 3. Tools
 
-`ToolRegistry.getToolDefinitions()` keeps today's seven tools, unchanged and in today's order, and appends `remember` last, exactly as below. `engine/canary.py`'s `_AGENT_TOOLS` must equal this list, compared as JSON.
+`ToolRegistry.getToolDefinitions()` keeps today's seven tools, unchanged and in today's order, and appends `remember` last, exactly as below. `engine/canary.py`'s `_AGENT_TOOLS` must equal this list, compared as JSON. The text is Memory 2's (section 7.8): the agent's facts carry ids, and `replaces` takes one.
 
 <!-- REMEMBER_TOOL begin -->
 ```json
@@ -72,13 +72,13 @@ The text is everything between the four-backtick `text` fence and its closing fo
   "type": "function",
   "function": {
     "name": "remember",
-    "description": "Save, update or remove one lasting fact for later sessions. scope \"project\" keeps it in this project's .dlne/memory.md (how to build and test it, where things live, its conventions, the user's corrections); it is saved at once and shown to the user, who can undo it. scope \"user\" keeps it in ~/.dlne/memory.md, for the user's own preferences that hold in every project; the user approves it. To update a fact you saved earlier, give it in replaces; to remove it, give it in replaces and leave fact empty.",
+    "description": "Save, update or remove one lasting fact for later sessions. scope \"project\" keeps it in this project's .dlne/memory.md (how to build and test it, where things live, its conventions, the user's corrections); it is saved at once and shown to the user, who can undo it. scope \"user\" keeps it in ~/.dlne/memory.md, for the user's own preferences that hold in every project; the user approves it. Facts you saved show with an id in front, like [a7f3]. To update one, give its id in replaces and the new text in fact; to remove it, give its id in replaces and leave fact empty. Prefer updating a fact to adding a near-copy.",
     "parameters": {
       "type": "object",
       "properties": {
         "fact": { "type": "string", "description": "One short, self-contained sentence (at most 500 characters); empty to remove the fact given in replaces." },
         "scope": { "type": "string", "enum": ["project", "user"], "description": "Where it is kept: project or user." },
-        "replaces": { "type": "string", "description": "Optional: a fact you saved earlier that this one updates or removes. Its opening words are enough to pick it out." }
+        "replaces": { "type": "string", "description": "Optional: the id of a fact you saved earlier (the [a7f3] in front of it), or its opening words." }
       },
       "required": ["fact", "scope"]
     }
@@ -120,6 +120,7 @@ Older steps of this task were replaced by this summary to make room. The most re
 ### 5.1 The budget
 
 - `contextTokens` is the per-request context of whatever serves coding requests. It comes from the coordinator's `/v1/cluster/status` → `policy.coding_context_tokens` (section 9.2). If the field is missing (coordinator before 2.4.9) or unusable, use **32,768**. Read it live, as the rest of the status is (the owner's rule: nothing that changes is hard-coded).
+  - From coordinator 2.6.5 (extension 1.5.4, "context is everything", 2026-10-30): when `policy.coding_context_tokens_max` is an integer larger than `coding_context_tokens` (and at most 1,048,576), `contextTokens` is that largest figure instead. Every route lookup then sends `need` (the request's tokens at 3 characters a token plus its answer room, rounded up to 4,096), and the coordinator routes it only to a machine whose context holds it (docs/coding-members.md section 5). With TheWall at 131,072 and members at 40,960, the prompt budget is 94,371 instead of 29,491.
 - `promptBudget` = `min(contextTokens − AGENT_MAX_TOKENS − 1,024, 72% of contextTokens)`, never below 6,000. That is 21,504 at 32,768 and 29,491 at 40,960 (the coordinator counts the prompt at 3 characters a token and rewrites it once that count reaches the slot; 72% keeps the real prompt under it). An overflow (section 5.5) lowers it for the rest of the conversation.
 - **Estimating tokens:** characters ÷ `charsPerToken`. `charsPerToken` starts at **3.0**, more cautious than the old 3.2.
   - When a stream reports the prompt's token count (`usage.prompt_tokens` on a chunk, or llama.cpp's `timings.prompt_n + timings.cache_n`), `streamChat` returns it as `promptTokens` (section 10.1). The AgentLoop then sets `charsPerToken` = 0.7 × old + 0.3 × (characters sent ÷ `promptTokens`), clamped to 2.0-5.0. Characters sent are the sum of every message's content and tool-call arguments.
@@ -230,7 +231,7 @@ Two user messages may stand together: the context block, then the working memory
 
 Before the turn limit, an agent that keeps repeating itself is told once to change approach, and stopped if it carries on (the owner, 2026-10-28: "First the model is told what it keeps repeating and to change approach. If it carries on, the run stops with a plain message and a Continue button").
 
-- **What counts.** Within the last 12 steps (a step is one model turn, with its tool calls and their results): the same call (the tool and its arguments as JSON with sorted keys) with the same result (the error flag and the first 2,000 characters of the output), 3 times; the same terminal command failing, 3 times, even when its output differs a little (an error result, or an output that starts `Command failed (exit code`); the same file read again, 4 times, counting only reads of lines that were read before, with no change to that file in between (another part of a long file is how the tool says to read it). Work is not a loop: a tool that changed a file and succeeded (`write_file`, `edit_file_diff`, `generate_image`, VS Code's edit tools) starts the count again between two runs of a command, and between two identical reads, searches and the like, whichever file it changed; for the same file read again (4 times), only an edit of that file does. A command that edits files through the shell is not seen as an edit.
+- **What counts.** Within the last 12 steps (a step is one model turn, with its tool calls and their results): the same call (the tool and its arguments as JSON with sorted keys) with the same result (the error flag and the first 2,000 characters of the output), 3 times; the same terminal command failing, 3 times, even when its output differs a little (an error result, or an output that starts `Command failed (exit code`); the same file read again, 4 times, counting only reads of lines that were read before, with no change to that file in between (another part of a long file is how the tool says to read it). The lines are the ones that came back, not the ones asked for: the numbers `read_file` puts in front of each line, before the `[Output truncated: …]` note when the answer was cut. A read with a start and no end asks for the rest of the file, and a long answer is cut to its first 3,500 characters plus the file's last 1,500, so a model paging forward asks for ranges that overlap but sees ones that do not; the tail after the note is the tool's doing, added to every long answer, and does not count. An answer with no numbered lines (VS Code's own `read_file`) is judged by the lines asked for. Work is not a loop: a tool that changed a file and succeeded (`write_file`, `edit_file_diff`, `generate_image`, VS Code's edit tools) starts the count again between two runs of a command, and between two identical reads, searches and the like, whichever file it changed; for the same file read again (4 times), only an edit of that file does. A command that edits files through the shell is not seen as an edit.
 - **In a run.** The first hit is a nudge; a hit after it, in the same run, is a stop. A hit is a step that is itself part of a repeat. After 12 steps in a row with no hit (a whole window: the loop that was nudged is behind the run) the guard starts over, so a second loop later in a long task is nudged first too. After the step's tool results are in the history:
   - the nudge is added to the history as a user message (to the observations, when the calls were written as text, so that two user messages never stand together): `Loop check: you have been <what>. That is not working. Try a different approach, or stop and tell the user what is blocking you.` The user sees a progress line: `🔁 The agent was repeating itself (<what>); DLNE told it to change approach.`
   - the stop shows `⏹️ DLNE stopped this task: the agent kept <what> without getting anywhere. Everything so far is kept: say continue with a hint about what to try, or ask for something else.` and the run returns `paused`, so Continue appears (section 6). The notice is the user's; the model is left a note of why, a user message after the last step's results (appended to the observations, when the calls were written as text): `DLNE stopped the last task because you kept <what>; take a different approach.` So a Continue that says nothing more still tells it. The next run's words follow it as a second user message, which Qwen's template accepts (section 5.4).
@@ -265,6 +266,10 @@ The setting `dlne.agent.memory` (application scope) has three values. The owner 
 ### 7.2 Loading (at the start of every `run()`)
 
 - **Exclusions:** a file the privacy rules exclude (`excludedReason(path)` non-null, e.g. listed in `.dlneignore`) is not loaded, and the extension does not write to it. **One exception, for the two memory files only:** being ignored by `.gitignore` or `.git/info/exclude` does not count. People commonly git-ignore tool folders such as `.dlne/`, and memory must not silently stop because of it. `.dlneignore` and the credential-file rules still exclude them. `AGENTS.md` keeps the full rules.
+- **Ids (Memory 2, section 7.8):** in the two memory files, every line the agent wrote (`- <fact> <!-- dlne -->`) is rendered `- [<id>] <fact>`, so the model sees which facts are its own and can name one in `replaces`. Lines the user wrote are rendered as they are, with no id. `AGENTS.md` has no ids: the agent never writes it.
+  - The id is not stored in the file; it is computed. `factKey(text)` removes `<!-- … -->` comments, strips a leading list marker (`^\s*[-*]\s+`), collapses whitespace to one space, trims and lowercases (the normalisation the duplicate check always used). The id is the first 4 lowercase hex characters of SHA-256 (UTF-8) of `factKey(line)`.
+  - **Collisions:** if two agent lines in the same file share their 4-character id, every agent line in that file uses the shortest length from 4 to 8 at which all of them differ; if 8 does not separate them (the same fact twice), 8 anyway.
+  - The ids are added before the comments are stripped and before the cap is applied; redaction still runs on the result.
 - **Cleaning:** HTML comments (`<!-- … -->`) and a first line that is exactly `# DLNE memory` are removed, then the text is trimmed.
 - **Redaction:** `redactSecrets(text, path)` runs on what is left.
 - **Cap:** a file over its cap is cut to the cap, with `[… N characters cut: the file is longer than DLNE loads]` appended.
@@ -323,23 +328,28 @@ Between sections there is exactly one empty line. `<text>` stands for the loaded
     - **Project scope** offers `Always allow remembering in this project`, kept under the workspaceState key `dlne.agent.alwaysAllowRemember`. `DLNE: Forget Agent Approvals` clears it too.
 - **Updating and removing (`replaces`).**
   - The agent can only change lines it wrote: lines ending in the marker `<!-- dlne -->`. Lines the user wrote are never touched.
-  - `replaces` is matched against the marked lines as the model sees them (marker and comments removed, compared case-insensitively with whitespace collapsed): the whole fact, or any part of it (its opening words are enough) that only one marked line holds.
-  - No match: `No fact you saved matches "<replaces>"; only facts DLNE saved can be updated or removed.`, followed by `Yours begin: "<first 60 characters>"; …` (at most 20) when there are any.
-  - Several matches: `"<replaces>" is in <n> facts you saved: "<first 60 characters>"; … Give more of the one you mean in replaces.`
+  - **Picking the fact out (`findSaved`, Memory 2).** Three steps, in this order; the first that gives exactly one agent line wins:
+    1. **An id.** `replaces`, trimmed, matching `^\[?(?:id[:\s]*)?([0-9a-f]{4,8})\]?$` (case-insensitive) is the agent line with that id, as rendered for that file (7.2). `a7f3`, `[a7f3]` and `id: a7f3` all work.
+    2. **Cleaned text.** Remove, in order: a leading `[<hex>]`; a leading list marker; a leading scope label (`project:`, `user:`, `project memory:`, `user memory:`, case-insensitive, optional spaces); surrounding quotes or backticks; a trailing `…` or `...`; a trailing `.`. Then `factKey`. An exact match wins; otherwise the one agent line whose key contains it (its opening words are enough, as before).
+    3. **Words.** The words (`[a-z0-9_]{2,}`) of the cleaned key, if there are at least 4. A line's score is the share of `replaces`' distinct words found among its own. The best line wins if it scores at least 0.8 and beats the second best by at least 0.1.
+  - **A line the user wrote.** If steps 2-3 would pick out a line the user wrote, the answer is `That fact was written by the user, not by DLNE, so DLNE cannot change it. Ask the user, or save a new fact.`
+  - **No match:** `No fact you saved matches "<replaces, first 80 chars>". Yours: <list>. Give the id in replaces.`, where `<list>` is `[<id>] "<first 50 chars of the fact>…"` joined by `; `, at most 40, then ` and <n> more`. With none saved: `No fact you saved matches "<…>"; you have not saved any in this file.`
+  - **Several matches:** `"<replaces>" matches <n> facts you saved: <list>. Give the id of the one you mean in replaces.`
   - An empty `fact` with `replaces` removes that line.
   - A non-empty `fact` replaces it in place, keeping its position; a fact saved in parts takes that place, its parts one after the other.
 - **Writing:**
   - `.dlne/` or `~/.dlne/` is created if missing;
   - a new file starts with the header below;
-  - a new fact is added as one line `- <fact> <!-- dlne -->` (loading strips the marker, so the model sees `- <fact>`);
+  - a new fact is added as one line `- <fact> <!-- dlne -->` (loading strips the marker and puts the fact's id in front, so the model sees `- [<id>] <fact>`);
   - the write is atomic (temp file + rename), with mode 0600 for the user's file;
-  - if the file would pass its load cap: `The memory file is full (<path>); ask the user to tidy it.`
-- **Output to the model:**
-  - `📝 Remembered for this project: <fact>` or `📝 Remembered for you: <fact>`;
-  - `📝 Updated for this project: <old> → <new>` (or `for you`);
-  - `📝 Forgot for this project: <old>` (or `for you`);
+  - **a full file:** a save that would make the file pass its load cap is refused with `The <project|user> memory is full (<used> of <cap> characters), so nothing was saved. Make room first: merge or shorten facts with replaces, or remove ones that no longer matter. Yours, largest first: [<id>] (<n> chars) "<first 50 chars>…"; …` (at most 40). Only growth past the cap is refused: an update that makes the file smaller, or keeps its size, is always allowed, even when the file is already over the cap (a user may have filled it by hand). Until Memory 2 the answer was `The memory file is full (<path>); ask the user to tidy it.`, which gave the model no way out.
+- **Output to the model** (the ledger, 5.2, reads these):
+  - `📝 Remembered for this project [<id>]: <fact>` or `📝 Remembered for you [<id>]: <fact>`;
+  - `📝 Updated for this project [<old id>] → [<new id>]: <old> → <new>` (or `for you`);
+  - `📝 Forgot for this project [<id>]: <old>` (or `for you`);
   - `<old>` is the saved fact `replaces` picked out, in full;
-  - a fact saved in parts gets one line per part, then `It is over 500 characters, so it was saved as these <n> facts, one after the other. That is expected: nothing more to do.`
+  - a fact saved in parts gets one `Remembered` line per part, each with its id, then `It is over 500 characters, so it was saved as these <n> facts, one after the other. That is expected: nothing more to do.`
+  - everything else (`Already remembered: …`, the secret refusals, memory off, no folder) is unchanged.
 - **The undo record:** the tool result also carries `memoryChange: { file, scope, removed: string | null, added: string | null }`. The two fields are the exact file lines removed and added, with markers.
 
 New-file header (project; the user's file says `your preferences, for every project` in place of `this project`):
@@ -371,6 +381,11 @@ From the automatic-memory change, `MemoryOptions` gains `mode?: 'auto' | 'ask' |
 - `riskyFact(text: string): boolean`;
 - `undoMemoryChange(change): { ok: boolean; message: string }`.
 
+Memory 2 (section 7.8) adds:
+- `factId(text: string): string`, the 4-character id of one fact (7.2);
+- `factIds(lines: string[]): Map<string, string>`, each agent line of one file to its id, with the collision rule;
+- `rememberFact(...)` returns `{ ok, message, change?, ids?: string[] }`, where `ids` are the ids of the lines added.
+
 ### 7.6 Undo
 
 - **Where it shows:** every change the agent makes to a memory file shows in the chat with an **Undo** button: the VS Code chat through `stream.button` and the command `dlne.memory.undo`; the sidebar through a button that posts `undoMemory`.
@@ -384,12 +399,32 @@ When a run ends `done` after at least `REFLECT_MIN_TURNS` = 5 turns, and the mod
 - **What shows:** each change shows in the chat with Undo.
 - **What is kept:** the exchange itself is not kept in the history, but the ledger records what was remembered.
 - **Failure:** if the request fails, nothing happens; the task is already done.
+- **The failure streak (Memory 2)** counts here too: the reflect step is part of the run (7.8).
+
+The text (Memory 2's: it sends the model to Project memory first, to update or remove by id before adding):
 
 ```text
 <dlne_reflect>
-The task is finished. Save, with remember, what a later session in this project would otherwise have to rediscover: how to build, test or run it (exact commands), where things live, the conventions its code follows, and any correction or preference the user gave. One fact per call; usually one to three are worth keeping. Use replaces to update or remove an outdated fact you saved. Skip details that mattered only for this task. If there is truly nothing new, reply with just: nothing.
+The task is finished. Save, with remember, what a later session in this project would otherwise have to rediscover: how to build, test or run it (exact commands), where things live, the conventions its code follows, and any correction or preference the user gave. Look at Project memory first: update a fact that is now wrong or incomplete (its id in replaces) instead of adding another, and remove one that no longer holds. One fact per call; usually one to three changes are worth making. Skip details that mattered only for this task. If there is truly nothing new, reply with just: nothing.
 </dlne_reflect>
 ```
+
+### 7.8 Memory 2 (extension 1.5.x, coordinator 2.6.x)
+
+On 2026-10-30 the owner asked for the memory tool to be made "more robust, more effective", after watching it fail.
+
+**What went wrong.** In the owner's gpu-unlock project, `.dlne/memory.md` stood at 7,541 of its 8,000 characters. The model (Qwen3.6) set out to tidy it with `remember` and `replaces`, but wrote `replaces: "project: <the fact's text>"`. The `project: ` label made the text match nothing, so a dozen calls in a row failed with `No fact you saved matches …`. The sidebar showed each failure with a green ✅, because it ignored `is_error`. Nothing told the model how to make room, and nothing stopped the streak.
+
+**What changed.** The caps, the approval rules, the risky-fact rules, the marker `<!-- dlne -->`, the atomic write, Undo and the `<dlne_context>` block's headings and layout are as before. The system prompt (section 2) is unchanged too, so the canaries' copy of it stands.
+- **Ids.** The agent's facts reach it as `- [<id>] <fact>`, the id a hash of the fact, never stored (7.2). The model no longer has to quote a fact back exactly to change it: it names the id.
+- **`replaces` forgives.** An id is tried first; then the text, with a scope label, list marker, quotes or a trailing ellipsis taken off; then a word match that must be clear-cut (7.4). A fact the user wrote is refused in so many words, rather than as "no match". When nothing matches, the answer lists the agent's facts with their ids and asks for one.
+- **A full file says how to make room.** It gives the used and allowed sizes and the agent's facts, largest first, with their ids. An update that does not grow the file always goes through, even over the cap (7.4).
+- **The messages carry ids** (`📝 Remembered for this project [a7f3]: …`), and the ledger reads them.
+- **The tool's text** (section 3) tells the model about ids and to update rather than add a near-copy, and the reflect text (7.7) sends it to Project memory before it adds anything.
+- **A failure streak stops.** Within one run, the reflect step included, `remember` results with `is_error` are counted in a row; a success resets the count, and a user's refusal ("The user declined…") does not count. From the third, later `remember` calls in that run are not executed. Each is answered, with `is_error`: `remember has failed 3 times in a row in this task, so DLNE stopped running it. Carry on with the task, and tell the user what you wanted to save.`
+- **A failure looks like one.** In both chats a tool result with `is_error` shows ⚠️ instead of ✅, for every tool, live and when a saved sidebar chat is shown again.
+- **The file is one command away.** `DLNE: Open Agent Memory` (`dlne.memory.open`) opens `<workspace>/.dlne/memory.md` in an editor, or offers `~/.dlne/memory.md` when no folder is open or the project has none.
+- **The canaries follow** (9.1): their tool text is the new one, and their memory sections carry ids, computed the same way.
 
 ## 8. The saved task (`vscode-extension/src/agent/agentState.ts`, `chatThreads.ts`)
 
@@ -428,6 +463,7 @@ interface AgentStateJSON {
 
 - **Mirrors:** `_AGENT_SYSTEM_PROMPT` equals section 2's text, and `_AGENT_TOOLS` equals the full tool list (section 3).
 - **Context blocks:** about 40% of canaries carry a decoy `<dlne_context>` message at index 1 in exactly section 7.3's format, with one or more of the three sections. Its contents are plausible and varied: build commands, layouts and conventions for the made-up project the canary is about.
+- **Ids (Memory 2):** a decoy's memory sections (project and user) are rendered as the extension renders real files (7.2). Some lines are the agent's, `- [<id>] <fact>`, with the id computed exactly as 7.2 says (SHA-256 of the normalised fact, 4 hex, the collision rule over that section's agent lines: `fact_key`, `fact_id` and `fact_ids` in `canary.py`); the others are the user's own, `- <fact>`. Files are all the agent's, mixed, or all the user's, varied like real ones. A real request has carried ids since extension 1.5.x, so a decoy without them, or with ids that are not the hash of their facts, could be told apart. `AGENTS.md` sections never carry ids.
 - **SR-03 still holds:** a decoy context block holds nothing the extension's redactor would change.
 - **No working-memory decoys:** canaries never carry a `<dlne_working_memory>` block, because canaries imitate the start of a conversation.
 - **Python test:** `tests/test_canary*.py` checks the shapes.
@@ -435,6 +471,7 @@ interface AgentStateJSON {
   - It reads this file between the `AGENT_SYSTEM_PROMPT`, `REMEMBER_TOOL` and `CONTEXT_BLOCK` markers.
   - It checks the extension against them: `AGENT_SYSTEM_PROMPT` from `dist/agent/agentLoop`, the last entry of `ToolRegistry.getToolDefinitions()`, and the `CONTEXT_*` constants and a rendered block from `dist/agent/memory`.
   - It checks `engine/canary.py` against them, read without importing it: `python3 -I -c` with `ast` evaluates the literal assignments and prints JSON.
+  - **Ids:** it works the ids out a third way, with Node's crypto, from known facts (and a known collision), and checks `canary.py`'s `fact_id`/`fact_ids`, memory.ts's `factId`/`factIds` and every decoy's memory sections against them. It also writes each decoy's facts back into memory files (the agent's with the marker) and checks that the extension's `loadMemory` gives the decoy's section back byte for byte.
 
 ### 9.2 `policy.coding_context_tokens`
 
@@ -443,6 +480,12 @@ interface AgentStateJSON {
 - each ready coding member's per-request context, which is its tier's `context` ÷ the tier's `server_slots` (2.5.0; `DEFAULT_CONTEXT / CODING_SLOTS` = 32,768 when the tier says nothing, 40,960 for the shipped Qwen3.6 tiers). It is the tier's figure, not the slot count the member reports: a member the coordinator asked to open fewer slots gives each request the same context (docs/coding-members.md section 4).
 
 It is an integer number of tokens, and 32,768 when nothing better is known. `tests/test_public_policy.py` covers it.
+
+**`policy.coding_context_tokens_max`** (2026-10-30). The owner's call for TheWall, "context is everything": two coding lanes of 131,072 tokens each, while volunteer members give 40,960 a request. Sizing every prompt to the smallest would throw away most of TheWall's context. So `policy` also carries the **largest** per-request context among the same things: the coordinator's own engine's per-slot context and every ready coding member's (`coding_router.member_context`).
+- It is an integer number of tokens, and 32,768 when nothing is known (the same default as the smallest).
+- A new extension sizes its budget (section 5.1) to it, and sends the request's estimated tokens as `need` with its route lookup. The coordinator then routes the request only to a member whose context holds it, and otherwise answers it on its own engine (docs/coding-members.md section 5, "Route by context").
+- `coding_context_tokens` (the smallest) is unchanged, so an older extension, which sends no `need`, still sizes its prompt to fit whatever answers it.
+- The largest can belong to a member this request may not use (its privacy mode, or no free slot). When no member it may use holds the request, the lookup answers `{"route": null}`, and the coordinator's engine handles a prompt larger than its slot as it always did.
 
 ## 10. Small changes elsewhere in the extension
 
@@ -467,6 +510,8 @@ It is an integer number of tokens, and 32,768 when nothing better is known. `tes
 | docs | `vscode-extension/README.md`, `vscode-extension/CHANGELOG.md`, privacy wording wherever the extension and site already describe what is sent |
 
 `package.json` (settings) belongs to the lead. Anyone else who needs a setting asks.
+
+Memory 2 (7.8) was built in four parts along the same lines: the store and the tool (`memory.ts`, `remember` in `tools.ts`); the chats and the ledger (`sidebarProvider.ts`, `nativeChatParticipant.ts`, `ledger.ts`, and the `dlne.memory.open` command in `extension.ts` and `package.json`); the agent loop (`agentLoop.ts`: the failure streak and the reflect text); and the coordinator and this document (`engine/canary.py`, `tests/test_canary*.py`, `test/canary-parity.test.js`).
 
 ## 12. Safety rules added after the review (2026-10-26)
 

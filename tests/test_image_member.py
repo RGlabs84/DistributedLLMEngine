@@ -182,6 +182,28 @@ def test_anything_missing_makes_it_unavailable_and_says_what(env, change, words)
     assert words in env.member.unavailable_reason()
 
 
+def test_a_media_card_shared_with_the_coding_model_makes_no_pictures(env):
+    env.limits["media_gpu_shared"] = True
+    assert env.member.unavailable_reason() == "the media card is shared with the coding model (MEDIA_GPU_SHARED)"
+
+    env.limits["media_gpu_shared"] = False
+    assert env.member.unavailable_reason() is None
+
+
+def test_switched_off_says_so_before_the_card_is_looked_at(env):
+    env.limits.update(media_gpu_shared=True, image_gen_enabled=False)
+    assert "IMAGE_GEN_ENABLED" in env.member.unavailable_reason()
+
+
+@pytest.mark.anyio
+async def test_sd_server_never_starts_on_a_shared_card(env):
+    env.limits["media_gpu_shared"] = True
+    with pytest.raises(MemberError) as caught:
+        await draw(env)
+    assert caught.value.code == "image_generation_unavailable"
+    assert env.spawner.starts == [] and env.member.failures == 0
+
+
 def test_the_model_directory_can_be_moved(env, tmp_path):
     other = tmp_path / "elsewhere"
     other.mkdir()

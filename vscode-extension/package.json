@@ -2,7 +2,7 @@
   "name": "dlne-code-assistant",
   "displayName": "DLNE Coding Assistant: Free AI Agent",
   "description": "A free AI coding agent and autocomplete, running on GPUs its users share. 100 free chats, no account or API key.",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "publisher": "dlne",
   "license": "MIT",
   "repository": {
@@ -154,6 +154,11 @@
         "command": "dlne.forgetApprovals",
         "title": "DLNE: Forget Agent Approvals for This Project",
         "category": "DLNE"
+      },
+      {
+        "command": "dlne.memory.open",
+        "title": "DLNE: Open Agent Memory",
+        "category": "DLNE"
       }
     ],
     "configuration": {
@@ -225,6 +230,17 @@
           "default": true,
           "scope": "application",
           "description": "Let the swarm give this GPU the coding-member job (it answers other people's coding requests with a whole model). Off: the GPU only joins the shared pool."
+        },
+        "dlne.ownGpu": {
+          "type": "string",
+          "scope": "application",
+          "enum": ["faster", "smarter"],
+          "enumDescriptions": [
+            "Your requests go to whichever answers sooner: your own GPU when it writes at least as fast as the swarm's own engine, otherwise usually the swarm's engine.",
+            "Your requests go to your own GPU whenever it runs a smarter model than the swarm's own engine, even if it writes more slowly. When it runs the same model or a less smart one, the faster one answers."
+          ],
+          "default": "faster",
+          "description": "When this computer is a coding member: \"faster\" lets your requests go to whichever answers sooner (usually the swarm's own engine); \"smarter\" sends them to your own GPU whenever it runs a smarter model than the swarm's engine, even if it writes more slowly. Your privacy setting still decides first."
         },
         "dlne.worker.allowedGpus": {
           "type": "string",

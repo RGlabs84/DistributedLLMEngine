@@ -40,7 +40,7 @@ test("the dashboard shows the coordinator's live numbers and this machine's work
   const m = dashboardModel(STATUS, WORKER);
   assert.equal(m.online, true);
   assert.equal(m.serverVersion, '2.5.3');
-  assert.deepEqual(m.model, { name: 'Qwen3.6 35B-A3B (IQ4_XS)', tokensPerSecond: 37.3, contextPerRequest: 54613, loadingPct: null });
+  assert.deepEqual(m.model, { name: 'Qwen3.6 35B-A3B (IQ4_XS)', tokensPerSecond: 37.3, contextPerRequest: 54613, contextPerRequestMax: null, loadingPct: null });
   assert.deepEqual(m.queue, { slots: 3, inUse: 1, waiting: 0 });
   assert.equal(m.gpuPool.gpus, 3);
   assert.deepEqual(m.gpuPool.reach, { host: 2, best: 1, good: 0, usable: 0, tooFar: 0, unmeasured: 0 });
@@ -197,4 +197,24 @@ test('"held" is a warning chip, not an error, and the coordinator\'s sentence is
   assert.equal(held.label, '◷ Held');
   assert.deepEqual(held.details, [detail], 'the sentence is the line under the chip');
   assert.equal(dashboardModel({ ...STATUS, auto_swap: { enabled: true, state: 'held', detail } }, null).swap.state, 'held');
+});
+
+test('the context per request reads "up to" the largest machine\'s when the swarm reports one bigger than the smallest', () => {
+  // 2.6.x: TheWall's coding lanes hold 131,072 tokens and members 40,960; a big request goes where it fits.
+  const contextLine = (policy) => {
+    const rows = dashboardPage({ ...STATUS, policy })['model-card'].descendants();
+    const at = rows.findIndex((node) => node.textContent === 'Context per request');
+    return rows[at + 1].textContent;
+  };
+  const both = dashboardModel({ ...STATUS, policy: { coding_context_tokens: 40960, coding_context_tokens_max: 131072 } }, null);
+  assert.equal(both.model.contextPerRequest, 40960);
+  assert.equal(both.model.contextPerRequestMax, 131072);
+  assert.equal(contextLine({ coding_context_tokens: 40960, coding_context_tokens_max: 131072 }),
+    'up to 131.1K tokens (41.0K on the smallest machine)');
+  // An old coordinator, or a largest that is no bigger (or not a number): one figure, as before.
+  assert.equal(contextLine({ coding_context_tokens: 54613 }), '54.6K tokens');
+  assert.equal(contextLine({ coding_context_tokens: 54613, coding_context_tokens_max: 54613 }), '54.6K tokens');
+  const odd = dashboardModel({ ...STATUS, policy: { coding_context_tokens: 54613, coding_context_tokens_max: '1M' } }, null);
+  assert.equal(odd.model.contextPerRequestMax, null);
+  assert.equal(contextLine({}), '–');
 });

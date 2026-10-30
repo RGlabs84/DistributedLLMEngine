@@ -44,6 +44,11 @@ export function dashboardModel(s: any, worker: WorkerStatus | null, error: strin
   const reach = gpu.reach ?? {};
   const tiers: any[] = Array.isArray(s?.coding_tiers) ? s.coding_tiers : [];
   const tokensLastHour = (num(gpu.tokens_last_hour) ?? 0) + (num(cpu.tokens_last_hour) ?? 0);
+  // The smallest machine's context per request (2.4.9) and, from 2.6.x, the largest's: a big request goes to a
+  // machine that holds it, so the page says "up to" the largest. Shown only when it is bigger than the smallest.
+  const contextPerRequest = num(s?.policy?.coding_context_tokens);
+  const largest = num(s?.policy?.coding_context_tokens_max);
+  const contextPerRequestMax = largest !== null && contextPerRequest !== null && largest > contextPerRequest ? largest : null;
   return {
     online: !!s && !error,
     error,
@@ -51,7 +56,8 @@ export function dashboardModel(s: any, worker: WorkerStatus | null, error: strin
     model: {
       name: str(s?.coding_model?.name) ?? str(s?.global_active_model),
       tokensPerSecond: num(s?.coding_model?.tokens_per_second),
-      contextPerRequest: num(s?.policy?.coding_context_tokens),
+      contextPerRequest,
+      contextPerRequestMax,
       loadingPct: loading.is_loading === true ? num(loading.progress_pct) ?? 0 : null,
     },
     swap: { state: str(swap.state) ?? 'unknown', detail: str(swap.detail) ?? '' },
@@ -276,6 +282,12 @@ export function dashboardHtml(nonce: string): string {
     return Number.isInteger(n) ? String(n) : n.toFixed(1);
   }
   function orDash(v, unit) { return v === null || v === undefined ? '\\u2013' : v + (unit || ''); }
+  // "up to" the largest machine's context when the swarm reports one bigger than the smallest's (2.6.x).
+  function contextText(model) {
+    if (!model.contextPerRequest) return '\\u2013';
+    if (!model.contextPerRequestMax) return compact(model.contextPerRequest) + ' tokens';
+    return 'up to ' + compact(model.contextPerRequestMax) + ' tokens (' + compact(model.contextPerRequest) + ' on the smallest machine)';
+  }
   function clock(t) { return new Date(t).toLocaleTimeString(); }
 
   // Status: a fixed colour, always with an icon and a label (never colour alone).
@@ -453,7 +465,7 @@ export function dashboardHtml(nonce: string): string {
     const s = swapStatus(m.swap.state);
     const modelRows = el('dl');
     modelRows.append(el('dt', null, 'Serving'), el('dd', null, m.model.name || '\\u2013'),
-                     el('dt', null, 'Context per request'), el('dd', null, m.model.contextPerRequest ? compact(m.model.contextPerRequest) + ' tokens' : '\\u2013'),
+                     el('dt', null, 'Context per request'), el('dd', null, contextText(m.model)),
                      el('dt', null, 'Automatic switching'), el('dd', null));
     modelRows.lastChild.append(statusChip(s[0], s[1]));
     modelCard.append(modelRows);

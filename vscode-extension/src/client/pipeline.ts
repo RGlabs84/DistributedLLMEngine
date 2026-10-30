@@ -4,8 +4,9 @@
  *
  *   privacy mode  ->  X-DLNE-Privacy
  *   redaction     ->  secrets in messages, tool calls and prompts become [REDACTED]
- *   route lookup  ->  when the coordinator offers a coding member, the body is sealed for it
- *                     (end-to-end) and X-DLNE-Route names it; otherwise the plain body goes as it always did
+ *   route lookup  ->  says how many tokens the request needs; when the coordinator offers a coding member that can
+ *                     hold them, the body is sealed for it (end-to-end) and X-DLNE-Route names it; otherwise the
+ *                     plain body goes as it always did
  *
  * and the answer comes back through `SealedAnswer` when the request was sealed.
  * Nothing here ever logs a body.
@@ -13,7 +14,7 @@
 import * as http from 'http';
 import * as vscode from 'vscode';
 import { AnswerOpener, openerFor, privacyModeFor, PrivacyMode, redactPayload, sealForMember } from '../privacy';
-import { RouteLookup } from './route';
+import { RouteLookup, requestNeed } from './route';
 
 export interface PreparedRequest {
   /** The bytes to send: the redacted JSON, or the sealed envelope. */
@@ -67,6 +68,8 @@ export interface PipelineEnv {
   agent?: http.Agent;
   /** The trust id of this machine's own coding member, when the worker is one: the route lookup names it. */
   own?: () => string | undefined;
+  /** dlne.ownGpu is "smarter", read at each lookup: that member is wanted whenever its model is smarter, not only faster. */
+  preferSmarter?: () => boolean;
 }
 
 /** The request exactly as it was built, with nothing added: the shape a direct caller gets by default. */
@@ -107,7 +110,10 @@ export async function prepareRequest(
     return prepared;
   }
   try {
-    const offer = await env.routes.lookup(env.base, env.headers(), ctx.sessionId, privacy, ctx.routeTtlMs, env.agent, env.own?.());
+    // The lookup says how big the request is (`need`, rounded up to 4,096 tokens), so the coordinator offers only a
+    // member that can hold it; a request too big for every member stays on the coordinator's own engine.
+    const offer = await env.routes.lookup(env.base, env.headers(), ctx.sessionId, privacy, ctx.routeTtlMs, env.agent,
+      env.own?.(), env.preferSmarter?.(), requestNeed(redacted.payload));
     if (offer) {
       const sealed = sealForMember(redacted.payload, offer.pubkey);
       if (sealed) {

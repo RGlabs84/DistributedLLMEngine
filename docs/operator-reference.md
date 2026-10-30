@@ -120,6 +120,9 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Eight groups matter for most
   `ENGINE_PHONE_CONTEXT` tokens (4096 to 65536, default 8192). They come on top of the coding slots, so coding is
   not shrunk to make room: `ENGINE_SLOTS=2 ENGINE_PHONE_SLOTS=2 ENGINE_CONTEXT=109226` starts
   `-np 4 -c 125952 --kv-unified --kv-unified-per-slot 54784` and coding still advertises 54,613 tokens per request.
+  `ENGINE_KV_TYPE` (2.6.5: `auto`, `q8_0`, `q4_0` or `f16`; default `auto`) is the context memory's type. `auto` is
+  q8_0, and q4_0 once a slot reaches 131,072 tokens; any other value is used whatever the slot size. TheWall runs
+  `ENGINE_KV_TYPE=q8_0` with its 2 x 131,072 lanes, because the owner's rule is that q8_0 is never lowered.
   A phone chat then answers on the GPU on a lane of its own and never takes a coding slot (coding never takes a
   phone lane); with every lane busy for 25 seconds it gets a 429 with `Retry-After: 5`, and with the engine down
   or swapping the CPU pool answers (and when no CPU machine is ready either, the phone reads "DLNE is restarting,
@@ -147,6 +150,18 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Eight groups matter for most
   nvidia-smi, clinfo, Windows or macOS use the id. A card named twice is one device, and every entry left out (no
   such card, or the media card) is said once in the log. On a llama.cpp build that is not Vulkan `MEDIA_GPU` is
   ignored, in the engine command and in the pool this machine advertises alike.
+  `MEDIA_GPU_SHARED=true` (default `false`; only the word `true` turns it on) lends the media card to the model as
+  well (2026-10-30, "Smarter Wall"): the card holds layers like the others and its memory counts in the pool this
+  machine advertises (what the coordinator, the "Needs X GB Total" check and automatic switching size the model
+  for), while the projector stays on it. It keeps its place, last: `--device` lists the engine's cards and then the
+  media card, so `-ts` in `ENGINE_EXTRA_ARGS` takes one more number, the last one, for it. On TheWall
+  (`MEDIA_GPU=0000:0c:00.0`, `ENGINE_EXTRA_ARGS=-ts 15,15,10 ...`) that is `--device Vulkan0,Vulkan1,Vulkan2
+  -ts 15,15,10 --mmproj-device Vulkan2` and a pool of 24 GB. Picture making needs the card to itself, so it never
+  starts while the card is shared (the log says "the media card is shared with the coding model
+  (MEDIA_GPU_SHARED)"). An engine running across volunteers' GPUs drops the card as it always has (and the `-ts`
+  with the rest of the card placement), so the model then runs on the other cards and the volunteers'; the pool
+  this machine advertises still counts the card. Without `MEDIA_GPU`, or on a build that is not Vulkan, the flag
+  changes nothing.
   Details in the [changelog](../CHANGELOG.md#260---2026-10-28) and [`docs/privacy.md`](privacy.md).
 
   Images, on the coding chat (`POST /v1/chat/completions`) and, from 2.6.2, the phone chat (Photos, below): up to 4
@@ -214,6 +229,11 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Eight groups matter for most
   word list and by the model, the picture by the model, and its metadata (which holds the prompt) is stripped; nothing
   is written to disk and no prompt is logged. Volunteers' machines never take part in making or checking a picture.
   Keys, install and API in [`docs/image-generation.md`](image-generation.md).
+  `IMAGE_GEN_ENABLED=paused` (2026-10-30) is off with a reason: nothing image-related loads, every picture endpoint
+  answers `503 image_generation_paused` with "Pictures are paused for now: ..." and `"page": "/pictures"`, the chats'
+  model is still offered its picture tool and is told the same (with the page's address) when it calls it, the status
+  has `capabilities.image_generation_paused: true` and a top-level `images: {paused, note, page}`, and `GET /pictures`
+  is a small public page that reads the status live and says whether pictures are paused, on or restarting.
 
   Pictures asked for in the phone chat (2.6.2): a `POST /v1/app/chat/completions` that sends `"features":
   ["image_jobs"]` (the app and the web chat do) is offered a `create_image` tool while pictures are on, and is told of

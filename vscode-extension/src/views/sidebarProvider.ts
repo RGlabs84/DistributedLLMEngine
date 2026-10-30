@@ -1851,18 +1851,34 @@ ${DONATE_CSS}
       parentElem.appendChild(card);
     }
 
-    function renderTerminalCard(parentElem, cmd, output) {
+    // A result the tool marked as an error shows ⚠️, never ✅, whatever the tool (a failed remember once showed a
+    // row of green ticks while nothing was saved).
+    function resultMark(res) {
+      return res && res.is_error ? '⚠️' : '✅';
+    }
+
+    function renderTerminalCard(parentElem, cmd, output, isError) {
       const card = document.createElement('div');
       card.className = 'terminal-card';
       const cmdLine = document.createElement('div');
       cmdLine.className = 'terminal-cmd';
-      cmdLine.textContent = '⚡ Terminal: ' + cmd;          // the command is the model's, the output may be a repository's
+      // the command is the model's, the output may be a repository's
+      cmdLine.textContent = (isError ? '⚠️' : '⚡') + ' Terminal: ' + cmd;
       const out = document.createElement('div');
       out.className = 'terminal-out';
       out.textContent = output || '';
       card.appendChild(cmdLine);
       card.appendChild(out);
       parentElem.appendChild(card);
+    }
+
+    // Any other tool's result: one line, its mark, its name and the start of what it said.
+    function renderResultPill(parentElem, res) {
+      const pill = document.createElement('div');
+      pill.className = 'tool-pill';
+      pill.textContent = resultMark(res) + ' ' + res.name + ': ' + res.output.slice(0, 100);
+      parentElem.appendChild(pill);
+      return pill;
     }
 
     // The wording comes from the extension (contributionCopy), so the first render and these
@@ -1916,11 +1932,15 @@ ${DONATE_CSS}
         }
 
         if (item.toolCalls && item.toolCalls.length > 0) {
+          // Each result as the live chat drew it, its ⚠️ or ✅ included; only the Undo button is left out.
           item.toolCalls.forEach((tc) => {
             if (tc.result && tc.result.fileDiff) {
               renderDiffCard(asstDiv, tc.result.fileDiff);
             } else if (tc.result && tc.result.terminalCommand) {
-              renderTerminalCard(asstDiv, tc.result.terminalCommand, tc.result.output);
+              renderTerminalCard(asstDiv, tc.result.terminalCommand, tc.result.output, tc.result.is_error === true);
+            } else if (tc.result && typeof tc.result.output === 'string') {
+              // (a saved result in a shape the page cannot draw is left out, so the rest of the chat still shows)
+              renderResultPill(asstDiv, tc.result);
             }
           });
         }
@@ -2137,12 +2157,9 @@ ${DONATE_CSS}
           if (res && res.fileDiff && currentAssistantMsg) {
             renderDiffCard(currentAssistantMsg, res.fileDiff);
           } else if (res && res.terminalCommand && currentAssistantMsg) {
-            renderTerminalCard(currentAssistantMsg, res.terminalCommand, res.output);
+            renderTerminalCard(currentAssistantMsg, res.terminalCommand, res.output, res.is_error === true);
           } else if (res && currentAssistantMsg) {
-            const pill = document.createElement('div');
-            pill.className = 'tool-pill';
-            pill.textContent = '✅ ' + res.name + ': ' + (res.output.slice(0, 100));
-            currentAssistantMsg.appendChild(pill);
+            const pill = renderResultPill(currentAssistantMsg, res);
             // A memory change is made at once, so it comes with a way back.
             if (res.memoryChange) {
               const change = res.memoryChange;

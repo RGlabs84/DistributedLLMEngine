@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.5.4] - 2026-10-30
+
+Pairs with DLNE coordinator **2.6.5** for the big context and "smarter"; with an older coordinator those read as
+before. The agent's memory is rebuilt, the loop check stops mistaking paging for a loop, and long requests get room.
+
+### Added
+- **Much more room per request.** When the coordinator reports `policy.coding_context_tokens_max` (2.6.5), the agent
+  plans against the largest context available instead of the smallest machine's: with TheWall at 131,072 tokens and
+  volunteers at 40,960, a request can hold about 94,000 tokens of prompt instead of 29,000. Every route lookup says
+  how big the request is (`need`), so it goes to a machine that can hold it. The swarm dashboard shows "up to N tokens".
+- **Your own GPU: faster or smarter** (`dlne.ownGpu`). While this computer serves as a coding member, "faster" (the
+  default) sends your requests wherever they are answered soonest; "smarter" sends them to your own GPU whenever it
+  runs a smarter model than the coordinator, even if it writes more slowly.
+- **DLNE: Open Agent Memory** opens the project's memory file (or offers yours).
+
+### Changed
+- **The agent's memory, rebuilt (Memory 2).** Every fact the agent saved shows with a short id, like `[a7f3]`, and
+  `remember` updates or removes a fact by that id. `replaces` is forgiving: a "project:" label, quotes, a cut-off quote
+  or most of the fact's words still find it. A full memory file tells the agent which of its facts to merge, largest
+  first, instead of "ask the user"; an update that does not grow the file always goes through. After three failed
+  `remember` calls in a row a task stops calling it and tells you what it wanted to save. The look back at the end of a
+  task updates facts by id rather than adding near-copies.
+- **A failed tool shows ⚠️, not ✅**, in the sidebar (live and in saved chats) and in `@dlne`.
+
+### Fixed
+- **The loop check called paging through a long file a loop.** It compared the lines asked for, and a read with only
+  `start_line` asks for "to the end", so reading a long file in pages looked like reading it again: a warning on the
+  4th read, a stop on the 5th. It now judges a read by the lines that came back. Reading the same lines again is
+  still caught.
+
 ## [1.5.3] - 2026-10-30
 
 Pairs with DLNE coordinator **2.6.4** for the Wi-Fi verdict; with an older coordinator the card reads as before.

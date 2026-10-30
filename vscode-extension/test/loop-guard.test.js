@@ -20,7 +20,7 @@ const { generator } = require('./helpers/fake-secrets');
 const {
   LOOP_WINDOW_STEPS, LoopGuard, checkHistory, trailingSteps, stepsBeforeUser, loopNote, loopProgressLine, loopStopNotice, loopStopNote, loopStopError, loopSummary,
 } = require('../dist/agent/loopGuard');
-const { redactSecrets } = require('../dist/privacy/redact');
+const { redactSecrets, redactionNote } = require('../dist/privacy/redact');
 const { AgentLoop } = require('../dist/agent/agentLoop');
 const { ToolRegistry } = require('../dist/agent/tools');
 
@@ -187,6 +187,83 @@ test('reading different parts of a long file is how the tool says to read it, so
   assert.deepEqual(kinds(guard, chunks), quiet(7));
 });
 
+// What the agent's read_file really sends back: each line numbered ("12: text"), and an answer over 8,000 characters cut
+// by capOutput (tools.ts) to its first 3,500 characters, a note that it was cut, and its last 1,500. A read with a start
+// and no end asks for the rest of the file, so a long file's answer is always cut.
+
+/** A file of `count` lines of code, each about 70 characters long. */
+const codeLines = (count) => Array.from({ length: count }, (_, i) => `  total += weigh(items[${i}], options.scale); // keep the running total`);
+/** read_file's answer for `lines` from `start` to `end` (no end: the rest of the file), cut as capOutput cuts it. */
+function readAnswer(lines, start, end = lines.length) {
+  const numbered = lines.slice(start - 1, end).map((line, i) => `${start + i}: ${line}`).join('\n');
+  return ToolRegistry.capOutput({ name: 'read_file', output: numbered }).output; // private, so the real one is run
+}
+
+test('the answers are shaped as the tool shapes them: cut, with a note, and the file\'s last lines after it', () => {
+  const answer = readAnswer(codeLines(600), 81);
+  assert.match(answer, /^81: /);
+  assert.match(answer, /\n\n\.\.\. \[Output truncated: \d+ characters omitted/);
+  assert.match(answer, /\n600: .*$/, 'the tail is the end of the file');
+  assert.doesNotMatch(answer, /\n200: /, 'what is in the middle was cut');
+});
+
+test('paging forward with a start and no end is not rereading, though every read asks for the rest of the file', () => {
+  // Every read asks for lines 1, 81, 161, ... to the end, so the lines asked for all overlap, and every answer ends with
+  // the same last lines of the file. What came back before the cut is about 50 lines each time, and none of it is seen
+  // twice. Before the guard judged by the lines that came back, this was a nudge on the 4th read and a stop on the 5th.
+  const lines = codeLines(600);
+  const guard = newGuard();
+  const pages = [1, 81, 161, 241, 321, 401].map((start) => read('src/big.ts', readAnswer(lines, start), { start_line: start }));
+  assert.deepEqual(kinds(guard, pages), quiet(6));
+});
+
+test('a big range cut short and paged forward is not rereading either', () => {
+  // 1-2000, then 80-2000, 160-2000, 240-2000: the model moves on past what it saw, and the answers share only their tails.
+  const lines = codeLines(2000);
+  const guard = newGuard();
+  const pages = [1, 80, 160, 240, 320].map((start) => read('src/big.ts', readAnswer(lines, start, 2000), { start_line: start, end_line: 2000 }));
+  assert.deepEqual(kinds(guard, pages), quiet(5));
+});
+
+test('the same cut-short lines read 4 times are still the same file read again, however the reads ask for them', () => {
+  // Each asks differently (so the same-call rule stays quiet) and each answer has another tail, but every one of them
+  // shows the model lines 1 to about 50, again.
+  const lines = codeLines(2000);
+  const asks = [{ start_line: 1 }, { start_line: 1, end_line: 2000 }, { start_line: 1, end_line: 1500 }, { start_line: 1, end_line: 1800 }];
+  const guard = newGuard();
+  const reads = asks.map((range) => read('src/big.ts', readAnswer(lines, range.start_line, range.end_line), range));
+  assert.deepEqual(kinds(guard, reads.slice(0, 3)), quiet(3));
+  const fourth = guard.record([reads[3]]);
+  assert.equal(fourth.kind, 'nudge');
+  assert.deepEqual(fourth.hit, { rule: 'reread', tool: 'read_file', count: 4, threshold: 4 });
+
+  // A short file is never cut, so a start with no end still sees the lines up to the end: paging through one that way
+  // shows the last lines every time, which is reading them again.
+  const short = codeLines(90);
+  const tail = newGuard();
+  assert.deepEqual(kinds(tail, [1, 21, 41, 61].map((start) => read('src/short.ts', readAnswer(short, start), { start_line: start }))),
+    ['none', 'none', 'none', 'nudge']);
+});
+
+test('the note about hidden secrets at the end of an answer is not a line read', () => {
+  const lines = codeLines(400);
+  const guard = newGuard();
+  const chunks = [1, 101, 201, 301].map((start) =>
+    read('src/config.ts', readAnswer(lines, start, start + 99) + redactionNote(2), { start_line: start, end_line: start + 99 }));
+  assert.deepEqual(kinds(guard, chunks), quiet(4));
+});
+
+test('an answer with no numbered lines (VS Code\'s own read_file) is judged by the lines asked for, as before', () => {
+  // Each answer differs, so only the rule for a file read again can speak.
+  const answer = (n) => `\`\`\`ts\nexport const version = ${n};\n\`\`\``;
+  const overlapping = newGuard();
+  const again = [1, 10, 20, 30].map((start, n) => call('read_file', { filePath: 'src/a.ts', startLine: start, endLine: start + 49 }, answer(n)));
+  assert.deepEqual(kinds(overlapping, again), ['none', 'none', 'none', 'nudge']);
+  const apart = newGuard();
+  const parts = [1, 101, 201, 301].map((start, n) => call('read_file', { filePath: 'src/a.ts', startLine: start, endLine: start + 99 }, answer(n)));
+  assert.deepEqual(kinds(apart, parts), quiet(4));
+});
+
 test('reading four different files is not a loop, and nor is the same tool with different arguments', () => {
   const files = newGuard();
   assert.deepEqual(kinds(files, ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'].map((path) => read(path))), quiet(5));
@@ -266,8 +343,9 @@ test('for a file read again (4 times, however its answers differ), only an edit 
 
 test('a path is the same path however it is written: ./a.ts, a.ts and a\\b\\c.ts', () => {
   const guard = newGuard();
-  assert.deepEqual(kinds(guard, [read('./src/a.ts', '1: x', { start_line: 1 }), read('src//a.ts', '2: x', { start_line: 1 }),
-    read('src\\a.ts', '3: x', { start_line: 1 }), read('src/a.ts', '4: x', { start_line: 1 })]), ['none', 'none', 'none', 'nudge']);
+  // Each answer differs (so the same-call rule stays quiet), but each is line 1: the same line read again.
+  assert.deepEqual(kinds(guard, [read('./src/a.ts', '1: w', { start_line: 1 }), read('src//a.ts', '1: x', { start_line: 1 }),
+    read('src\\a.ts', '1: y', { start_line: 1 }), read('src/a.ts', '1: z', { start_line: 1 })]), ['none', 'none', 'none', 'nudge']);
 });
 
 // ---- the window ---------------------------------------------------------------------------------------------------

@@ -11,7 +11,12 @@
  *
  * Nothing in this file touches VS Code: the `dlne.agent.memory` setting and the home folder arrive as options,
  * so the tests run it on plain Node with a temporary folder.
+ *
+ * Memory 2 (2026-10-30): every fact the agent saved has a short id, shown to the model as `- [a7f3] <fact>`, so
+ * it can name the fact it means in `replaces` without copying the text back. The id is computed from the fact,
+ * never stored in the file.
  */
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -133,6 +138,15 @@ function readHead(file: string, cap: number): string {
   }
 }
 
+/**
+ * A memory file's text as the model sees it, before redaction and the cap: the agent's lines carry their ids,
+ * then comments (the agent's mark among them) and the title are dropped. The cap is measured on this, so a save
+ * that fits never pushes the model's own facts out of what is loaded.
+ */
+function shown(raw: string): string {
+  return cleaned(withIds(raw));
+}
+
 /** The file's text as it will be sent, or null when it is missing, unreadable, empty, excluded or a link out of `root`. Never throws. */
 function loadFile(file: string, cap: number, isMemoryFile: boolean, root: string): string | null {
   try {
@@ -140,7 +154,9 @@ function loadFile(file: string, cap: number, isMemoryFile: boolean, root: string
     if (leavesRoot(file, root)) return null;
     if (!fs.statSync(file).isFile()) return null;
 
-    const text = redactSecrets(cleaned(readHead(file, cap)), file).text;
+    // Only the memory files have the agent's lines, and so ids. AGENTS.md is the user's alone.
+    const raw = readHead(file, cap);
+    const text = redactSecrets(isMemoryFile ? shown(raw) : cleaned(raw), file).text;
     if (!text) return null;
     if (text.length <= cap) return text;
     return `${text.slice(0, cap)}\n[… ${text.length - cap} characters cut: the file is longer than DLNE loads]`;
@@ -226,8 +242,11 @@ export function riskyFact(text: string): boolean {
     || /\bpowershell(\.exe)?\s+-e/i.test(text);
 }
 
-/** Two facts are the same when only their case, spacing, list marker or comments (the agent's mark) differ. */
-function sameFactKey(text: string): string {
+/**
+ * A fact reduced to what makes it that fact: no comments (the agent's mark), no list marker, one space between
+ * words, lower case. Two facts are the same when their keys are, and a fact's id is made from its key.
+ */
+function factKey(text: string): string {
   return text.replace(/<!--[\s\S]*?-->/g, '').replace(/^\s*[-*]\s+/, '').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
@@ -239,6 +258,48 @@ function agentLine(fact: string): string {
 /** Whether a file line was written by the agent (only those can it update or remove). */
 function isAgentLine(line: string): boolean {
   return line.trimEnd().endsWith(AGENT_MARK);
+}
+
+// ---- fact ids (Memory 2) --------------------------------------------------------------------------------
+
+/** The SHA-256 of a fact's key, in hex. Its first characters are the fact's id. */
+function keyHash(text: string): string {
+  return crypto.createHash('sha256').update(factKey(text), 'utf8').digest('hex');
+}
+
+/** The usual id of a fact or a file line: 4 hex characters. Only a clash in the same file makes ids longer (factIds). */
+export function factId(text: string): string {
+  return keyHash(text).slice(0, 4);
+}
+
+/**
+ * The id of every line the agent wrote among `lines` (one file's lines). Ids are 4 characters, unless two of the
+ * agent's lines would share one: then every id in the file grows, up to 8, to the first length at which they all
+ * differ. engine/canary.py computes them the same way for its decoys.
+ */
+export function factIds(lines: string[]): Map<string, string> {
+  const saved = lines.filter(isAgentLine);
+  const hashes = saved.map(keyHash);
+  let length = 4;
+  while (length < 8 && new Set(hashes.map((hash) => hash.slice(0, length))).size < hashes.length) length++;
+  return new Map(saved.map((line, i) => [line, hashes[i].slice(0, length)]));
+}
+
+/**
+ * The text with each of the agent's lines shown with its id: `- fact <!-- dlne -->` becomes
+ * `- [a7f3] fact <!-- dlne -->`. The mark itself goes when comments are stripped (cleaned), so the model sees
+ * `- [a7f3] fact` for its own facts and the user's lines as they are.
+ */
+function withIds(raw: string): string {
+  const lines = raw.split('\n');
+  const ids = factIds(lines);
+  return lines.map((line) => {
+    const id = ids.get(line);
+    if (!id) return line;
+    // A line the user stripped of its bullet still shows as a list item, so every id stands in the same place.
+    const [, indent, bullet, rest] = /^(\s*)([-*]\s+)?([\s\S]*)$/.exec(line) as RegExpExecArray;
+    return `${indent}${bullet ?? '- '}[${id}] ${rest}`;
+  }).join('\n');
 }
 
 /** A change to a memory file, kept so the chat's Undo can put it back (section 7.6). */
@@ -264,6 +325,8 @@ export type RememberCheck =
     replaced: string | null;
     /** The fact on that line, as the model sees it. */
     replacedText: string | null;
+    /** That line's id, as the model saw it in front of the fact. */
+    replacedId: string | null;
   };
 
 /** A fact, or the fact it replaces, as one trimmed line. */
@@ -315,35 +378,156 @@ function factProblem(clean: string): string | null {
   return null;
 }
 
-/** Saved facts by their opening words, for a model that has to pick one out again. */
-function openings(lines: string[]): string {
-  const shown = lines.slice(0, 20).map((line) => {
-    const fact = factOf(line);
-    return `"${fact.length > 60 ? `${fact.slice(0, 60)}…` : fact}"`;
-  });
-  return shown.join('; ') + (lines.length > shown.length ? ` and ${lines.length - shown.length} more` : '');
+/** The most saved facts a message to the model lists; the rest are counted. */
+const LISTED_FACTS = 40;
+
+/** The opening of a fact, for a list in a message: its first 50 characters, with … when there is more. */
+function opening(line: string): string {
+  const fact = factOf(line);
+  return fact.length > 50 ? `${fact.slice(0, 50)}…` : fact;
+}
+
+/** At most LISTED_FACTS items joined by "; ", then " and <n> more" for the rest. */
+function listOf(items: string[]): string {
+  const listed = items.slice(0, LISTED_FACTS);
+  return listed.join('; ') + (items.length > listed.length ? ` and ${items.length - listed.length} more` : '');
+}
+
+/** Saved facts with their ids, for a model that has to pick one out again: `[a7f3] "Tests run with…"; …`. */
+function savedList(lines: string[], ids: Map<string, string>): string {
+  return listOf(lines.map((line) => `[${ids.get(line)}] "${opening(line)}"`));
+}
+
+/** `replaces` when it is nothing but an id: `a7f3`, `[a7f3]`, `id: a7f3`. */
+const ID_ONLY = /^\[?(?:id[:\s]*)?([0-9a-f]{4,8})\]?$/i;
+
+/**
+ * `replaces` as the key of the fact it quotes. Models dress a quote up: they copy the id or the bullet in front
+ * of it, say which memory it is in ("project: …", which made a dozen calls in a row fail on 2026-10-30), put it in
+ * quotes, or cut it short with an ellipsis. All of that goes. The front is cleaned until nothing more comes off,
+ * so `- [a7f3] …` and `project: - …` work as well as the contract's order.
+ */
+function quotedKey(replaces: string): string {
+  let text = replaces.trim();
+  for (let before = ''; before !== text;) {
+    before = text;
+    text = text
+      .replace(/^\[[0-9a-f]+\]\s*/i, '')                        // the id the model saw in front of the fact
+      .replace(/^[-*]\s+/, '')                                  // the list marker
+      .replace(/^(?:project|user)(?:\s+memory)?\s*:\s*/i, '')   // the memory it is in
+      .trim();
+  }
+  const quoted = /^(["'`“‘])([\s\S]*)(["'`”’])$/.exec(text);
+  if (quoted) text = quoted[2].trim();
+  return factKey(text.replace(/(?:…|\.\.\.)$/, '').replace(/\.$/, ''));
+}
+
+/** A key without its full stop, so "Tests run with npm test" names "Tests run with npm test." exactly. */
+function withoutStop(key: string): string {
+  return key.replace(/\.$/, '');
+}
+
+/** The lines `key` names by text: the one it equals, else every one that holds it. */
+function byText(lines: string[], key: string): string[] {
+  if (!key) return [];
+  const exact = lines.filter((line) => withoutStop(factKey(line)) === key);
+  return exact.length > 0 ? exact : lines.filter((line) => factKey(line).includes(key));
+}
+
+/** The words of a key that the word match counts: letters, digits and _, at least 2 long. */
+function wordsOf(key: string): Set<string> {
+  return new Set(key.match(/[a-z0-9_]{2,}/g) ?? []);
+}
+
+/** Below this share of words in common, a line is not the one `replaces` means; and the best must lead by MARGIN. */
+const WORD_SHARE = 0.8;
+const WORD_MARGIN = 0.1;
+const NEARLY = 1e-9; // 0.9 - 0.8 is 0.0999… in floating point: a lead of exactly 0.1 still counts
+
+/**
+ * The lines `key` names by its words, for a quote that is close but not exact (a word changed, one left out).
+ * The share of `key`'s words found in a line is its score. One line wins if it scores at least 0.8 and leads the
+ * next by 0.1; when the top lines are closer than that, all of them come back and the model is asked which.
+ * A key of fewer than 4 words says too little to judge by.
+ */
+function byWords(lines: string[], key: string): string[] {
+  const wanted = wordsOf(key);
+  if (wanted.size < 4 || lines.length === 0) return [];
+  const scored = lines.map((line) => {
+    const words = wordsOf(factKey(line));
+    let shared = 0;
+    for (const word of wanted) if (words.has(word)) shared++;
+    return { line, score: shared / wanted.size };
+  }).sort((a, b) => b.score - a.score);
+  const best = scored[0].score;
+  if (best < WORD_SHARE - NEARLY) return [];
+  const second = scored.length > 1 ? scored[1].score : 0;
+  if (best - second >= WORD_MARGIN - NEARLY) return [scored[0].line];
+  return scored.filter((s) => s.score > best - WORD_MARGIN + NEARLY).map((s) => s.line);
 }
 
 /**
- * The line of the agent's own fact that `old` names: the whole fact, or any part of it (its opening words are
- * enough) that no other saved fact holds. A local model copying a 500-character fact back word for word got it
- * wrong, so a miss lists the saved facts' openings and the model can retry without reading the file.
+ * The line of the agent's own fact that `replaces` names, tried in this order, the first one that names exactly
+ * one line winning:
+ *   1. its id (`a7f3`, `[a7f3]`, `id: a7f3`);
+ *   2. its text, cleaned of what models put around a quote (quotedKey): the whole fact, or a part only it holds;
+ *   3. most of its words (byWords).
+ * A miss lists the saved facts with their ids, so the model can retry with one without reading the file. A quote
+ * of a line the user wrote is refused as such: those lines are theirs.
  */
-function findSaved(lines: string[], old: string): { line: string } | { problem: string } {
-  const saved = lines.filter(isAgentLine);
-  const key = sameFactKey(old);
-  const exact = saved.find((line) => sameFactKey(line) === key);
-  if (exact) return { line: exact };
-  const matches = saved.filter((line) => sameFactKey(line).includes(key));
-  if (matches.length === 1) return { line: matches[0] };
-  if (matches.length > 1) {
-    return { problem: `"${old}" is in ${matches.length} facts you saved: ${openings(matches)}. Give more of the one you mean in replaces.` };
+function findSaved(lines: string[], replaces: string): { line: string; id: string } | { problem: string } {
+  const ids = factIds(lines);
+  const saved = [...new Set(lines.filter(isAgentLine))]; // a line copied twice by hand is one fact
+  const found = (line: string) => ({ line, id: ids.get(line) as string });
+
+  const asId = ID_ONLY.exec(replaces.trim());
+  if (asId) {
+    const named = saved.filter((line) => ids.get(line) === asId[1].toLowerCase());
+    if (named.length === 1) return found(named[0]);
   }
-  if (saved.length === 0) return { problem: `No fact you saved matches "${old}"; only facts DLNE saved can be updated or removed.` };
-  return {
-    problem: `No fact you saved matches "${old}"; only facts DLNE saved can be updated or removed. ` +
-      `Yours begin: ${openings(saved)}. Give the opening words of the one you mean in replaces.`,
-  };
+
+  const key = quotedKey(replaces);
+  const byQuote = byText(saved, key);
+  if (byQuote.length === 1) return found(byQuote[0]);
+  const byWord = byWords(saved, key);
+  if (byWord.length === 1) return found(byWord[0]);
+
+  const several = byQuote.length > 1 ? byQuote : byWord;
+  if (several.length > 1) {
+    return {
+      problem: `"${replaces}" matches ${several.length} facts you saved: ${savedList(several, ids)}. ` +
+        'Give the id of the one you mean in replaces.',
+    };
+  }
+
+  // Not one of the agent's: is it one the user wrote? Those are never changed, and the model should hear why.
+  const theirs = lines.filter((line) => !isAgentLine(line) && line.trim() !== MEMORY_TITLE && factKey(line) !== '');
+  if (byText(theirs, key).length > 0 || byWords(theirs, key).length > 0) {
+    return { problem: 'That fact was written by the user, not by DLNE, so DLNE cannot change it. Ask the user, or save a new fact.' };
+  }
+
+  const quote = replaces.slice(0, 80);
+  if (saved.length === 0) return { problem: `No fact you saved matches "${quote}"; you have not saved any in this file.` };
+  return { problem: `No fact you saved matches "${quote}". Yours: ${savedList(saved, ids)}. Give the id in replaces.` };
+}
+
+/**
+ * What the model is told when a save would pass the cap: how full the file is, and its own facts, largest first,
+ * so it can make room by merging, shortening or removing them. 2026-10-30: told only "ask the user to tidy it",
+ * a model at 7,541 of 8,000 characters kept trying and failing instead.
+ */
+function fullMessage(scope: 'project' | 'user', used: number, cap: number, lines: string[]): string {
+  const ids = factIds(lines);
+  const saved = [...new Set(lines.filter(isAgentLine))];
+  const head = `The ${scope} memory is full (${used} of ${cap} characters), so nothing was saved.`;
+  if (saved.length === 0) {
+    // All of it is the user's, and the agent cannot change their lines: only the user can make room.
+    return `${head} None of it was saved by DLNE, so ask the user to tidy it.`;
+  }
+  // Stable sort: facts of the same size stay in file order.
+  const largest = [...saved].sort((a, b) => factOf(b).length - factOf(a).length);
+  return `${head} Make room first: merge or shorten facts with replaces, or remove ones that no longer matter. ` +
+    `Yours, largest first: ${listOf(largest.map((line) => `[${ids.get(line)}] (${factOf(line).length} chars) "${opening(line)}"`))}`;
 }
 
 /**
@@ -382,11 +566,14 @@ export function checkRemember(
     return refuse(`The memory file (${file}) leads outside ${scope === 'project' ? 'the project' : 'the home folder'} through a link, so nothing was saved.`);
   }
 
-  // The whole file is read, because a fact is added by rewriting it; one far past its cap is simply full.
+  // The whole file is read, because a fact is added by rewriting it. One far past its cap is more than DLNE
+  // reads at all (section 12): it is the user's to tidy, and no change through remember is offered.
+  const cap = scope === 'project' ? PROJECT_CAP : USER_CAP;
   let existing = '';
   try {
-    if (fs.statSync(file).size > (scope === 'project' ? PROJECT_CAP : USER_CAP) * 4 + 4096) {
-      return refuse(`The memory file is full (${file}); ask the user to tidy it.`);
+    if (fs.statSync(file).size > cap * 4 + 4096) {
+      return refuse(`The ${scope} memory is full (its file is larger than DLNE reads), so nothing was saved, ` +
+        `and DLNE cannot change it. Ask the user to tidy ${file}.`);
     }
     existing = fs.readFileSync(file, 'utf-8');
   } catch (err: any) {
@@ -396,26 +583,32 @@ export function checkRemember(
   const lines = existing.split(/\r?\n/);
   // Only a line the agent wrote can be updated or removed: the user's own lines are theirs.
   let replaced: string | null = null;
+  let replacedId: string | null = null;
   if (old) {
     const found = findSaved(lines, old);
     if ('problem' in found) return refuse(found.problem);
     replaced = found.line;
+    replacedId = found.id;
   }
   let parts: string[] = [];
   if (clean) {
     // A part already in the file (an earlier save of the same long fact, say) is not added twice.
-    const kept = new Set(lines.filter((line) => line !== replaced).map(sameFactKey));
-    parts = splitFact(clean).filter((part) => !kept.has(sameFactKey(part)));
+    const kept = new Set(lines.filter((line) => line !== replaced).map(factKey));
+    parts = splitFact(clean).filter((part) => !kept.has(factKey(part)));
     if (parts.length === 0) return { ready: false, result: { ok: true, message: `Already remembered: ${clean}` } };
-    // Full is judged on what loading would keep: the text without comments, with the change made.
-    const cap = scope === 'project' ? PROJECT_CAP : USER_CAP;
+    // Full is judged on what loading would send (ids in, comments out), with the change made. Only growth past
+    // the cap is refused: a change that leaves the file no larger is always allowed, even in a file already
+    // over it (the user may have filled it by hand), since that is how room is made.
     const added = parts.map(agentLine).join('\n');
     const after = replaced ? existing.replace(replaced, () => added) : `${existing}\n${added}`;
-    if (cleaned(after).length > cap) {
-      return refuse(`The memory file is full (${file}); ask the user to tidy it.`);
-    }
+    const used = shown(existing).length;
+    const usedAfter = shown(after).length;
+    if (usedAfter > cap && usedAfter > used) return refuse(fullMessage(scope, used, cap, lines));
   }
-  return { ready: true, scope, fact: clean, parts, file, existing, replaced, replacedText: replaced && factOf(replaced) };
+  return {
+    ready: true, scope, fact: clean, parts, file, existing, replaced,
+    replacedText: replaced && factOf(replaced), replacedId,
+  };
 }
 
 /** Writes `content` to `file` in one step, so a crash never leaves half a memory file. */
@@ -446,7 +639,7 @@ function rewrite(file: string, scope: 'project' | 'user', content: string): void
 /**
  * Saves, updates or removes one fact (any approval has already been given). A long fact is saved in parts, one after
  * the other, where the fact it replaces was. Never throws: the result is the model's answer, with the change the
- * chat's Undo needs (section 7.6), one per part.
+ * chat's Undo needs (section 7.6), one per part, and the ids of the lines added, as the model will see them.
  */
 export function rememberFact(
   scope: 'project' | 'user',
@@ -454,13 +647,14 @@ export function rememberFact(
   workspaceRoot: string | undefined,
   options: MemoryOptions = {},
   replaces?: string
-): { ok: boolean; message: string; change?: MemoryChange | MemoryChange[] } {
+): { ok: boolean; message: string; change?: MemoryChange | MemoryChange[]; ids?: string[] } {
   const check = checkRemember(scope, fact, workspaceRoot, options, replaces);
   if (!check.ready) return check.result;
 
   const where = scope === 'project' ? 'for this project' : 'for you';
   const added = check.parts.map(agentLine);
   let changes: MemoryChange[];
+  let ids: string[];
   try {
     fs.mkdirSync(path.dirname(check.file), { recursive: true, mode: scope === 'user' ? 0o700 : 0o755 });
     const body = check.existing
@@ -473,19 +667,23 @@ export function rememberFact(
       ? [{ file: check.file, scope, removed: check.replaced, added: null, index }]
       : added.map((line, i) => ({ file: check.file, scope, removed: i === 0 ? check.replaced : null, added: line, index: index + i }));
     rewrite(check.file, scope, lines.join('\n'));
+    // The new lines' ids in the file as it is now, which is how the next load will show them.
+    const now = factIds(lines);
+    ids = added.map((line) => now.get(line) as string);
   } catch (err: any) {
     return { ok: false, message: `The memory file (${check.file}) could not be written (${err?.code ?? 'error'}), so nothing was saved.` };
   }
   // 📝, not the brain emoji: that one stood in for the DLNE logo once, and only the logo is the mark now.
+  // Each line says the fact's id, so the model can name it in a later replaces without waiting for a new load.
   const messages = check.parts.map((part, i) => i === 0 && check.replaced
-    ? `📝 Updated ${where}: ${check.replacedText} → ${part}`
-    : `📝 Remembered ${where}: ${part}`);
-  if (messages.length === 0) messages.push(`📝 Forgot ${where}: ${check.replacedText}`);
+    ? `📝 Updated ${where} [${check.replacedId}] → [${ids[i]}]: ${check.replacedText} → ${part}`
+    : `📝 Remembered ${where} [${ids[i]}]: ${part}`);
+  if (messages.length === 0) messages.push(`📝 Forgot ${where} [${check.replacedId}]: ${check.replacedText}`);
   // Said outright: a model that saw its fact come back as two lines took it for a failure and kept redoing it.
   if (messages.length > 1) {
     messages.push(`It is over ${FACT_MAX_CHARS} characters, so it was saved as these ${messages.length} facts, one after the other. That is expected: nothing more to do.`);
   }
-  return { ok: true, message: messages.join('\n'), change: changes.length === 1 ? changes[0] : changes };
+  return { ok: true, message: messages.join('\n'), change: changes.length === 1 ? changes[0] : changes, ids };
 }
 
 /** A file line as the fact it holds: no list marker, no comments. */

@@ -64,7 +64,11 @@ running when the page reloads picks its polling up again from the saved job id.
 THE "+" MENU AND PHOTOS (server 2.6.2). A "+" at the left of the message box opens a small popover: Photos (a file
 picker for PNG and JPEG, several at once), Camera (the same picker with ``capture``, offered on touch devices only)
 and Create image. Photos and Camera appear only while ``capabilities.app_vision`` is true, Create image only while
-``capabilities.image_generation`` is; with neither the "+" is hidden. A chosen photo is made ready in the page,
+``capabilities.image_generation`` is; with neither the "+" is hidden. While the status says ``images.paused`` (the
+server's ``IMAGE_GEN_ENABLED=paused``: its picture card runs the coding model), Create image's place holds a greyed
+"Pictures paused" item, a plain link to ``/pictures`` (engine/pictures_page.py) in a new tab, and the "+" shows for it
+alone if need be. Asked in the chat, the model's create_image call comes back as an ``image_refused`` that says the
+same (below). A chosen photo is made ready in the page,
 before anything is sent: decoded with its EXIF orientation applied (``createImageBitmap`` with
 ``imageOrientation: 'from-image'``, or an ``<img>`` where the browser lacks the option; first its own header is read, a
 PNG's first 24 bytes or a JPEG's segments walked to its frame header, a few bytes of each, and a file over 64 MiB, a PNG
@@ -420,6 +424,9 @@ a.source:hover { border-color: var(--user-border); }
   font-size: 1rem; text-align: left; cursor: pointer;
 }
 .popitem:hover { background: var(--surface-2); }
+/* Pictures paused: where Create image would be, greyed out, and a link to the page that says why */
+.popitem-off { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--faint); text-decoration: none; }
+.popwhy { font-size: .85rem; color: var(--link); text-decoration: underline; text-underline-offset: 2px; }
 
 /* Photos waiting to be sent, above the box; and the same photos in the reader's own bubble */
 .tray { max-width: 760px; margin: 0 auto 8px; }
@@ -607,6 +614,7 @@ dialog::backdrop { background: rgba(2, 8, 10, .62); }
         <button type="button" class="popitem" id="add-photos">Photos</button>
         <button type="button" class="popitem" id="add-camera" hidden>Camera</button>
         <button type="button" class="popitem" id="make-image" aria-haspopup="dialog">Create image</button>
+        <a class="popitem popitem-off" id="pictures-paused" href="/pictures" target="_blank" rel="noopener noreferrer" hidden>Pictures paused <span class="popwhy">Why?</span></a>
       </div>
       <textarea id="input" rows="1" maxlength="8000" placeholder="Message DLNE" aria-label="Message"></textarea>
       <button type="submit" class="round" id="send" aria-label="Send" disabled>
@@ -1788,7 +1796,7 @@ const DLNEChat = (() => {
     reportReasons: $('report-reasons'), reportNote: $('report-note'), reportStatus: $('report-status'),
     reportSend: $('report-send'), shareLocation: $('share-location'), locationStatus: $('location-status'),
     field: $('field'), plus: $('plus'), plusMenu: $('plus-menu'), addPhotos: $('add-photos'), addCamera: $('add-camera'),
-    makeImage: $('make-image'), pickPhotos: $('pick-photos'), pickCamera: $('pick-camera'),
+    makeImage: $('make-image'), picturesPaused: $('pictures-paused'), pickPhotos: $('pick-photos'), pickCamera: $('pick-camera'),
     tray: $('tray'), trayThumbs: $('tray-thumbs'), trayNote: $('tray-note'), trayHint: $('tray-hint'),
     askLocation: $('ask-location'), askYes: $('ask-location-yes'), askNo: $('ask-location-no'),
     photo: $('photo'), photoBox: $('photo-box'),
@@ -2428,9 +2436,11 @@ const DLNEChat = (() => {
   const jobOf = (m) => (m.kind === 'image' ? m : m.job || null);   // the job a message is or carries
 
   // The status says what the server can do; the page offers it only while it can: photos while ``app_vision`` is true
-  // (a missing key is false), pictures while ``image_generation`` is.
+  // (a missing key is false), pictures while ``image_generation`` is. ``images.paused`` (the server lent the picture card
+  // to the coding model) shows a greyed "Pictures paused" item instead, which opens the page that says why.
   function readCapabilities(data) {
     visionSupport = !!(data && data.capabilities && data.capabilities.app_vision === true);
+    picturesPaused = !!(data && data.images && data.images.paused === true);
     readImageSupport(data);
     updatePlus();
   }
@@ -2636,21 +2646,26 @@ const DLNEChat = (() => {
   let preparing = 0;                 // photos still being made ready
   let trayNote = '';                 // what last went wrong with a photo, in words
   let visionSupport = false;         // capabilities.app_vision
+  let picturesPaused = false;        // images.paused
   let plusOpen = false;
 
   // The "+" shows only what the server can do now: Photos and Camera while it reads photos (Camera on touch screens, where
   // ``capture`` opens the camera app; on a computer it would open the same file picker twice), Create image while it makes
-  // pictures. With neither there is no "+".
+  // pictures, and in its place "Pictures paused" (a link to /pictures) while the server has paused them. With none of
+  // these there is no "+".
   function updatePlus() {
     const canPhotos = visionSupport;
     const canPictures = !!imageSupport;
-    ui.plus.hidden = !canPhotos && !canPictures;
+    const paused = picturesPaused && !canPictures;   // a server that makes pictures is not paused, whatever else it says
+    ui.plus.hidden = !canPhotos && !canPictures && !paused;
     ui.field.classList.toggle('has-plus', !ui.plus.hidden);
     ui.addPhotos.hidden = !canPhotos;
     ui.addCamera.hidden = !(canPhotos && coarse);
     ui.makeImage.hidden = !canPictures;
+    ui.picturesPaused.hidden = !paused;
     ui.plus.setAttribute('aria-label',
-      canPhotos && canPictures ? 'Add a photo or create an image' : canPhotos ? 'Add a photo' : 'Create an image');
+      canPhotos && canPictures ? 'Add a photo or create an image' : canPhotos ? 'Add a photo'
+        : canPictures ? 'Create an image' : 'Pictures are paused');
     if (ui.plus.hidden) closePlus();
   }
 
@@ -2665,7 +2680,7 @@ const DLNEChat = (() => {
     ui.plusMenu.hidden = false;
     ui.plus.setAttribute('aria-expanded', 'true');
     if (byKeyboard) {   // a keyboard reader lands on the first item; a touch reader is left where they are
-      const first = Array.from(ui.plusMenu.querySelectorAll('button')).find((b) => !b.hidden);
+      const first = Array.from(ui.plusMenu.querySelectorAll('button, a')).find((b) => !b.hidden);
       if (first) first.focus();
     }
   }
@@ -2916,6 +2931,7 @@ const DLNEChat = (() => {
     if (trayFull()) { trayNote = FULL_NOTE; renderTray(); } else ui.pickCamera.click();
   });
   ui.makeImage.addEventListener('click', () => { closePlus(); openImage(null); });
+  ui.picturesPaused.addEventListener('click', () => closePlus());   // the link opens /pictures in a new tab
   document.addEventListener('click', (e) => {
     if (plusOpen && !ui.plus.contains(e.target) && !ui.plusMenu.contains(e.target)) closePlus();
   });

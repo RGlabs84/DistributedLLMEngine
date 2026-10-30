@@ -156,8 +156,9 @@ def make_decoy(base_url: Optional[str] = None) -> Decoy:
 # that brought the file in, and sometimes the <dlne_context> message that carries a project's notes.
 # If the extension changes its prompt, tools or context block, a canary that still carries the old
 # ones is a little easier to spot; keep this in step when it does. docs/agent-memory.md (sections 2,
-# 3, 7.3 and 9.1) is the single source for all four, and vscode-extension/test/canary-parity.test.js
-# compares this file against it and against the extension's own copies.
+# 3, 7.2, 7.3, 7.8 and 9.1) is the single source for all of them, and
+# vscode-extension/test/canary-parity.test.js compares this file against it and against the extension's
+# own copies.
 
 _AGENT_SYSTEM_PROMPT = """You are the DLNE coding agent, a software engineering assistant working inside the user's VS Code workspace.
 
@@ -213,16 +214,17 @@ _AGENT_TOOLS: List[dict] = [
     _tool("get_workspace_diagnostics", "Get active compiler, linter, and type-check errors in the workspace or specific file.",
           {"file_path": ("string", "Optional relative file path")}, []),
     # The eighth tool (extension 1.4.0), last as in ToolRegistry.getToolDefinitions(). Written out rather than
-    # built with _tool() because its "scope" carries an enum.
+    # built with _tool() because its "scope" carries an enum. Memory 2 (docs/agent-memory.md section 7.8): a fact
+    # the agent saved is shown to it with an id in front, and replaces takes that id.
     {"type": "function", "function": {
         "name": "remember",
-        "description": "Save, update or remove one lasting fact for later sessions. scope \"project\" keeps it in this project's .dlne/memory.md (how to build and test it, where things live, its conventions, the user's corrections); it is saved at once and shown to the user, who can undo it. scope \"user\" keeps it in ~/.dlne/memory.md, for the user's own preferences that hold in every project; the user approves it. To update a fact you saved earlier, give it in replaces; to remove it, give it in replaces and leave fact empty.",
+        "description": "Save, update or remove one lasting fact for later sessions. scope \"project\" keeps it in this project's .dlne/memory.md (how to build and test it, where things live, its conventions, the user's corrections); it is saved at once and shown to the user, who can undo it. scope \"user\" keeps it in ~/.dlne/memory.md, for the user's own preferences that hold in every project; the user approves it. Facts you saved show with an id in front, like [a7f3]. To update one, give its id in replaces and the new text in fact; to remove it, give its id in replaces and leave fact empty. Prefer updating a fact to adding a near-copy.",
         "parameters": {
             "type": "object",
             "properties": {
                 "fact": {"type": "string", "description": "One short, self-contained sentence (at most 500 characters); empty to remove the fact given in replaces."},
                 "scope": {"type": "string", "enum": ["project", "user"], "description": "Where it is kept: project or user."},
-                "replaces": {"type": "string", "description": "Optional: a fact you saved earlier that this one updates or removes. Its opening words are enough to pick it out."},
+                "replaces": {"type": "string", "description": "Optional: the id of a fact you saved earlier (the [a7f3] in front of it), or its opening words."},
             },
             "required": ["fact", "scope"],
         },
@@ -537,7 +539,8 @@ _CONTEXT_AGENTS: Dict[str, List[str]] = {
     ],
 }
 
-# Lines of a project's .dlne/memory.md (each is one fact, as `remember` writes them), any language.
+# Lines of a project's .dlne/memory.md (each is one fact, as `remember` writes them), any language. A decoy shows
+# some as the agent's own, with their id in front, and some as lines the user wrote (see _memory_section).
 _CONTEXT_PROJECT: List[str] = [
     "Tests run with `make test` from the repository root.",
     "The configuration for {p} is in `{path}`.",
@@ -551,9 +554,16 @@ _CONTEXT_PROJECT: List[str] = [
     "Port numbers are set per environment and are never hard-coded in a script.",
     "The old v1 routes are deprecated; do not extend them.",
     "Logs are JSON, one object per line; keep that format.",
+    "Run the linter before the tests; CI runs them in that order and stops at the first failure.",
+    "Generated files are under `build/` and are never edited by hand.",
+    "The user wants a plan before any change to `{path}`.",
+    "Database migrations are numbered and live in `migrations/`; never edit one that has shipped.",
+    "Error messages in {p} say what to do next, not only what went wrong.",
+    "Fixtures for the tests are in `tests/fixtures/`; reuse them rather than adding near-copies.",
 ]
 
-# Lines of the user's own ~/.dlne/memory.md, which `remember` only writes when the user asks.
+# Lines of the user's own ~/.dlne/memory.md, which `remember` writes only with the user's approval (so they may be the
+# agent's, with an id, or the user's own, like the project's).
 _CONTEXT_USER: List[str] = [
     "Prefers short answers and small diffs.",
     "Uses 2-space indentation in every language except Go.",
@@ -570,6 +580,55 @@ _CONTEXT_SECTIONS = [(("instructions",), 4), (("project",), 3), (("user",), 1), 
                      (("instructions", "user"), 1), (("project", "user"), 1), (("instructions", "project", "user"), 2)]
 
 
+# Fact ids (Memory 2, docs/agent-memory.md sections 7.2 and 7.8). Every line of a memory file the agent wrote
+# (`- <fact> <!-- dlne -->`) reaches the model as `- [<id>] <fact>`, so it can name the fact in `replaces`; lines
+# the user wrote come through as they are. The id is never stored: memory.ts (factId, factIds) computes it from
+# the fact, and so does this, the same way, because a decoy whose ids were not the hash of their facts would be
+# a decoy anyone could check for. The parity test compares the two on known facts.
+
+def fact_key(text: str) -> str:
+    """memory.ts's ``factKey`` (the old ``sameFactKey``): comments removed, a leading list marker stripped,
+    whitespace collapsed to one space, trimmed, lowercased. (JavaScript's ``\\s`` and ``toLowerCase`` agree with
+    Python's on everything a decoy holds, which is plain ASCII.)"""
+    text = re.sub(r"<!--[\s\S]*?-->", "", text)
+    text = re.sub(r"^\s*[-*]\s+", "", text, count=1)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def fact_id(text: str) -> str:
+    """The 4-character id of one fact: the first 4 hex of SHA-256 (UTF-8) of its key."""
+    return hashlib.sha256(fact_key(text).encode("utf-8")).hexdigest()[:4]
+
+
+def fact_ids(lines: List[str]) -> Dict[str, str]:
+    """The id of each of a file's agent lines, with the collision rule: when two of them share their 4-character
+    id, all of them use the shortest length from 4 to 8 at which every one differs, and 8 if none does (two
+    identical facts never separate; saving deduplicates them anyway)."""
+    digests = [hashlib.sha256(fact_key(line).encode("utf-8")).hexdigest() for line in lines]
+    length = next((n for n in range(4, 9) if len({d[:n] for d in digests}) == len(digests)), 8)
+    return {line: digest[:length] for line, digest in zip(lines, digests)}
+
+
+# How a decoy's memory file is made up: all the agent's (the default, automatic mode writes every fact), a mix of
+# the agent's and the user's own lines, or all the user's (written by hand, or before 1.4.0).
+_MEMORY_STYLES = [("agent", 5), ("mixed", 4), ("user", 2)]
+
+
+def _memory_section(facts: List[str], r: random.Random) -> str:
+    """One memory file's loaded text as the extension renders it (section 7.2): ``facts`` in file order, each the
+    agent's (``- [<id>] <fact>``, its id computed over the agent lines of this file) or the user's (``- <fact>``)."""
+    style = r.choices([s for s, _ in _MEMORY_STYLES], weights=[w for _, w in _MEMORY_STYLES])[0]
+    if style == "mixed" and len(facts) > 1:
+        # at least one of each, in any order: the user adds lines between the agent's, and the agent after the user's
+        mine = set(r.sample(range(len(facts)), r.randint(1, len(facts) - 1)))
+    elif style == "mixed":
+        mine = {0} if r.random() < 0.5 else set()
+    else:
+        mine = set(range(len(facts))) if style == "agent" else set()
+    ids = fact_ids([facts[i] for i in sorted(mine)])
+    return "\n".join(f"- [{ids[fact]}] {fact}" if i in mine else f"- {fact}" for i, fact in enumerate(facts))
+
+
 def _context_message(sample: _Sample, project: str, r: random.Random) -> dict:
     """The decoy ``<dlne_context>`` user message for a canary about ``sample`` (docs/agent-memory.md section 7.3):
     the three sections it may hold, in this order, joined by one empty line, with no empty line between a heading
@@ -578,8 +637,8 @@ def _context_message(sample: _Sample, project: str, r: random.Random) -> dict:
     fill = {"p": project, "path": sample.path}
     texts = {
         "instructions": r.choice(_CONTEXT_AGENTS.get(sample.lang) or _CONTEXT_AGENTS["python"]).format(**fill),
-        "project": "\n".join("- " + line.format(**fill) for line in r.sample(_CONTEXT_PROJECT, r.randint(1, 4))),
-        "user": "\n".join("- " + line for line in r.sample(_CONTEXT_USER, r.randint(1, 3))),
+        "project": _memory_section([line.format(**fill) for line in r.sample(_CONTEXT_PROJECT, r.randint(1, 6))], r),
+        "user": _memory_section(r.sample(_CONTEXT_USER, r.randint(1, 3)), r),
     }
     parts = [f"{CONTEXT_HEADINGS[name]}\n{texts[name]}" for name in ("instructions", "project", "user") if name in chosen]
     body = "\n\n".join([CONTEXT_OPEN + "\n" + CONTEXT_INTRO] + parts)

@@ -55,6 +55,7 @@ from engine import media
 from engine.config import get_base_dir, get_config, get_worker_limits
 from engine.landing import LANDING_HTML
 from engine.chat_page import chat_router
+from engine.pictures_page import PICTURES_PATH, PICTURES_PAUSED_NOTE, paused_note_with_link, pictures_router
 # Imported as symbols, not copied as string literals. start_model's message is a control
 # signal — see the sentinel block at the top of engine/inference_manager.py — and the two
 # modules must never grow independent copies of the same set of magic strings.
@@ -868,6 +869,8 @@ async def root():
 
 # The phone chat at /chat (engine/chat_page.py): an installable page over the CPU pool.
 app.include_router(chat_router)
+# Whether pictures are on, paused or restarting, read live from the status (engine/pictures_page.py, at /pictures).
+app.include_router(pictures_router)
 
 
 @app.api_route("/c/{token}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -3451,7 +3454,13 @@ async def get_cluster_status(request: Request):
         # feature up mentions it: with no phone lanes the status is what 2.6.1 sent.
         capabilities["app_vision"] = _app_vision_offered()
     images: Dict[str, Any] = {}
-    if get_worker_limits().get("image_gen_enabled", False):
+    if _pictures_paused():
+        # Paused (IMAGE_GEN_ENABLED=paused): image_generation is false, so every shipped client hides its picture button
+        # as it does with pictures off, and ``images`` says why and where to read more (the /pictures page).
+        capabilities["image_generation"] = False
+        capabilities["image_generation_paused"] = True
+        images["images"] = {"paused": True, "note": PICTURES_PAUSED_NOTE, "page": PICTURES_PATH}
+    elif get_worker_limits().get("image_gen_enabled", False):
         # Only while IMAGE_GEN_ENABLED is on does the status mention images at all; with it off it is what 2.6.0 sent.
         available, _why = await _image_available(vision)
         capabilities["image_generation"] = available
@@ -3733,24 +3742,6 @@ async def _image_refused_response(request: Request, exc: ImageRefused) -> JSONRe
     return JSONResponse({"detail": exc.detail, "code": exc.code}, status_code=exc.status_code, headers=exc.headers)
 
 
-def _member_slot_context(member: Any, tiers: List[Dict[str, Any]]) -> int:
-    """
-    One coding member's context per request: its tier's ``context`` over the tier's ``server_slots`` (2.5.0), which
-    is what a member gives each request however many slots the coordinator asked it to open (engine/coding_member.py
-    ``_start``), so the slot count it reports does not enter into it. ``DEFAULT_CONTEXT`` over ``CODING_SLOTS``
-    when the tier is unknown or says nothing.
-    """
-    from engine.coding_member import CODING_SLOTS, DEFAULT_CONTEXT
-
-    tier = next((t for t in tiers if t.get("id") == getattr(member, "tier", None)), None) or {}
-    context, slots = tier.get("context"), tier.get("server_slots")
-    if not isinstance(context, int) or isinstance(context, bool) or context < 2048:
-        context = DEFAULT_CONTEXT
-    if not isinstance(slots, int) or isinstance(slots, bool) or slots < 1:
-        slots = CODING_SLOTS
-    return context // slots
-
-
 def _public_policy(engine_slot_context: Optional[int] = None) -> Dict[str, Any]:
     """
     The rules the websites tell visitors (the free trial, what a CPU contributor gets back, what a machine needs to
@@ -3760,7 +3751,13 @@ def _public_policy(engine_slot_context: Optional[int] = None) -> Dict[str, Any]:
     ``coding_context_tokens`` (2.4.9, docs/agent-memory.md section 9.2) is the smallest context per request among
     what can serve a coding request right now, so the extension can size its prompt to fit all of them: this
     coordinator's own engine (``engine_slot_context``, which the status handler reads from the running engine) and
-    every ready coding member. 32,768 (the default coding member's 65,536 over its 2 slots) when nothing is known.
+    every ready coding member (coding_router.member_context). 32,768 (the default coding member's 65,536 over its 2
+    slots) when nothing is known.
+
+    ``coding_context_tokens_max`` (2026-10-30, "context is everything") is the largest among the same: what a new
+    extension may size its prompt to, because it tells /v1/coding/route how many tokens the request holds
+    (``need``) and is only routed to a member that fits, or else to this engine. The smallest stays for older
+    extensions, which send no need. The same 32,768 when nothing is known.
     """
     from engine.coding_member import CODING_SLOTS, DEFAULT_CONTEXT
     from engine.coding_member_select import MIN_VRAM_GB
@@ -3770,11 +3767,13 @@ def _public_policy(engine_slot_context: Optional[int] = None) -> Dict[str, Any]:
     if limits.get("coding_members_enabled", False):
         try:
             tiers = _coding_ladder()
-            per_request += [c for c in (_member_slot_context(m, tiers) for m in _coding_members(limits)) if c]
+            per_request += [c for c in (coding_members_lib.member_context(m, tiers)
+                                        for m in _coding_members(limits)) if c]
         except Exception as exc:  # noqa: BLE001 - the status must answer even if the members cannot be read
             log_warning(f"Coding member contexts unavailable ({type(exc).__name__}: {exc}).")
     return {
         "coding_context_tokens": int(min(per_request)) if per_request else DEFAULT_CONTEXT // CODING_SLOTS,
+        "coding_context_tokens_max": int(max(per_request)) if per_request else DEFAULT_CONTEXT // CODING_SLOTS,
         "trial_chats": int(limits.get("starter_quota_inferences", 100)),
         # The same reads, with the same fallbacks, as the CPU pool's chat limit and the CPU admission check above.
         "cpu_chats": int(limits.get("cpu_coding_limit", 50)),
@@ -6101,12 +6100,17 @@ coding_route_window = UsageWindow()
 @app.get("/v1/coding/route")
 async def coding_route(request: Request):
     """
-    ``GET /v1/coding/route?session=<id>&privacy=<mode>[&own=<trust id>]``: a coding member for the
-    client to seal its next request to (docs/coding-members.md, sections 5 and 6), or ``{"route":
+    ``GET /v1/coding/route?session=<id>&privacy=<mode>[&own=<trust id>[&prefer=smarter]][&need=<tokens>]``: a coding
+    member for the client to seal its next request to (docs/coding-members.md, sections 5 and 6), or ``{"route":
     null}`` when the local engine should answer. The route id is opaque and good for 10 minutes; the
     client sends it back as ``X-DLNE-Route`` with the sealed body. Counts as a little load on the
     member until used. ``own`` (2.5.0) names the requester's own coding member, preferred while it
-    writes at least as fast as this engine would for them (_own_member_floor).
+    writes at least as fast as this engine would for them (_own_member_floor). ``prefer=smarter``
+    (the requester's dlne.ownGpu setting) prefers it instead whenever it runs a smarter model than
+    this engine does, however slowly; it means nothing without ``own``. ``need`` (2026-10-30) is the
+    tokens the request will hold, prompt and room to answer: only a member whose context per request
+    holds them is offered, the sticky and own members included, and with none this engine answers,
+    whatever its own size. Anything but a whole number from 1 to 10,000,000 is ignored.
     """
     no_store = {"Cache-Control": "no-store"}
     limits = get_worker_limits()
@@ -6126,13 +6130,29 @@ async def coding_route(request: Request):
     privacy = request.query_params.get("privacy")
     own = request.query_params.get("own")
     own = own if isinstance(own, str) and re.fullmatch(r"[0-9a-f]{32}", own) else None   # anything else is ignored
+    # Only the exact word counts, and only with an own member to prefer; anything else is today's speed rule.
+    smarter = own is not None and request.query_params.get("prefer") == "smarter"
+    need = _route_need(request.query_params.get("need"))
     member = coding_router.pick(_coding_members(limits), session, privacy, need_pubkey=True,
-                                own=own, engine_tps=_own_member_floor() if own else None)
+                                own=own, engine_tps=_own_member_floor() if own else None,
+                                prefer_smarter=smarter, engine_model=_engine_coding_model() if smarter else None,
+                                ladder=_coding_ladder() if smarter or need else None, need=need)
     if member is None:
         return JSONResponse({"route": None}, headers=no_store)
     route = coding_router.issue_route(member, session, privacy, hold=not trial)
     return JSONResponse({"route": route, "pubkey": member.pubkey, "alg": coding_members_lib.E2E_ALG},
                         headers=no_store)
+
+
+def _route_need(raw: Optional[str]) -> Optional[int]:
+    """
+    A route lookup's ``need`` as the router takes it: plain ASCII digits (no sign, spaces, decimals or exponent),
+    no more than eight of them, read as a whole number and kept only from 1 to 10,000,000
+    (coding_router.normalize_need). Anything else is None: the lookup is routed as if no need were given.
+    """
+    if not isinstance(raw, str) or not re.fullmatch(r"[0-9]{1,8}", raw):
+        return None
+    return coding_members_lib.normalize_need(int(raw))
 
 
 def _own_member_floor() -> Optional[float]:
@@ -6142,9 +6162,18 @@ def _own_member_floor() -> Optional[float]:
     the status' ``coding_model.tokens_per_second``) shared among the requests the engine is answering. None until a
     speed has been measured, which lets the member through.
     """
-    running = manager.get_active_model_names()
-    rate, _measured_at = coding_speed.meter.speed(canonical_model_tag(running[0] if running else global_active_model) or None)
+    rate, _measured_at = coding_speed.meter.speed(_engine_coding_model())
     return None if rate is None else rate / max(1, coding_gate.stats()["in_use"])
+
+
+def _engine_coding_model() -> Optional[str]:
+    """
+    The model file this coordinator's own engine answers coding requests with: the running one, else the one the
+    next request starts. An automatic switch (engine/auto_swap.py) changes both, so a sharded pool that moved up to a
+    smarter tier is read as that tier. None when there is none.
+    """
+    running = manager.get_active_model_names()
+    return canonical_model_tag(running[0] if running else global_active_model) or None
 
 
 # ======================================================================================
@@ -6246,7 +6275,7 @@ async def app_chat_completions(request: Request):
     (app_pool.photo_notice). ``capabilities.app_vision`` in the status says whether the server takes photos.
 
     A client that sends ``"features": ["image_jobs"]`` (2.6.2) is offered the model's create_image tool while pictures
-    can be made (:func:`_with_picture_tool`); any other ``features`` value, or none, changes nothing.
+    can be made or are paused (:func:`_with_picture_tool`); any other ``features`` value, or none, changes nothing.
     """
     try:
         body = await _capped_json(request, APP_CHAT_MAX_BYTES)
@@ -6506,11 +6535,14 @@ def _app_features(body: Dict[str, Any]) -> Set[str]:
 async def _with_picture_tool(request: Request, body: Dict[str, Any], tools, run_tool):
     """
     ``(tools, run_tool)`` with the create_image tool added (engine/app_pool.py, :func:`with_pictures`) when this client
-    says it shows pictures (``features`` has "image_jobs") and they can be made right now. Otherwise they are returned as
-    they came, and image generation is not even asked about, so a client without the feature is answered exactly as it
-    was before 2.6.2.
+    says it shows pictures (``features`` has "image_jobs") and they can be made right now, or are paused: a paused
+    tool is still offered so that a person who asks for a picture is told why not (:func:`_chat_picture`), instead of
+    the model guessing. Otherwise they are returned as they came, and image generation is not even asked about, so a
+    client without the feature is answered exactly as it was before 2.6.2.
     """
-    if "image_jobs" not in _app_features(body) or not (await _image_available())[0]:
+    if "image_jobs" not in _app_features(body):
+        return tools, run_tool
+    if not _pictures_paused() and not (await _image_available())[0]:
         return tools, run_tool
     return with_pictures(tools, run_tool, functools.partial(_chat_picture, request))
 
@@ -6596,6 +6628,11 @@ async def admin_app_reports(request: Request, limit: int = 100):
 # Off unless IMAGE_GEN_ENABLED=true. The jobs, the queue and the worker are engine/image_pool.py, sd-server is
 # engine/image_member.py, the rules are engine/image_policy.py; this section is the HTTP face of them and the
 # one place that asks the coordinator's own engine to read a prompt or a picture.
+#
+# IMAGE_GEN_ENABLED=paused (2026-10-30) is off for everything that loads or starts, but it is never silent: each of the
+# six endpoints answers 503 image_generation_paused with PICTURES_PAUSED_NOTE and the /pictures page, and the phone and
+# web chat's model is still offered create_image, so a person who asks for a picture is told, kindly, the same sentence
+# (with the page's full address). Nothing is queued and nothing is charged.
 
 image_service = ImageService(
     ImageMember(limits=lambda: get_worker_limits(), base_dir=lambda: get_base_dir()),
@@ -6616,6 +6653,8 @@ async def _image_available(vision: Optional[bool] = None) -> Tuple[bool, Optiona
     up and not swapping, and vision on (the result check uses it). The reason is for the log, once per change.
     """
     global _image_reason_seen
+    if _pictures_paused():
+        return False, "pictures are paused (IMAGE_GEN_ENABLED=paused)"     # the operator's choice: nothing to log
     if not get_worker_limits().get("image_gen_enabled", False):
         return False, None
     reason = image_service.member.unavailable_reason()
@@ -6636,6 +6675,11 @@ async def _image_available(vision: Optional[bool] = None) -> Tuple[bool, Optiona
     return reason is None, reason
 
 
+def _pictures_paused() -> bool:
+    """IMAGE_GEN_ENABLED=paused: no picture is made, and every request for one is told so (PICTURES_PAUSED_NOTE)."""
+    return bool(get_worker_limits().get("image_gen_paused", False))
+
+
 async def _image_offered() -> bool:
     """What the status says (capabilities.image_generation), for the canaries: they look like the extension's requests."""
     return (await _image_available())[0]
@@ -6648,6 +6692,8 @@ def _image_unavailable_detail() -> str:
 
 
 def _image_unavailable_response() -> JSONResponse:
+    if _pictures_paused():
+        return _image_error(503, "image_generation_paused", PICTURES_PAUSED_NOTE, page=PICTURES_PATH)
     return JSONResponse({"detail": _image_unavailable_detail(), "code": "image_generation_unavailable"},
                         status_code=503, headers={"Cache-Control": "no-store"})
 
@@ -6821,11 +6867,14 @@ async def _chat_picture(request: Request, arguments: Any) -> Picture:
     (None when they did not parse): a ``prompt`` that is missing or not text is the endpoint's own "Describe the picture
     you'd like."; a ``shape`` that is missing or unknown is square. Pictures are asked about again here: this can come a
     minute after the tool was offered. Never raises, so a picture that cannot be made never ends the chat's answer.
+    While pictures are paused the answer is the pause, with the /pictures page's full address, and nothing is queued.
     """
     args = arguments if isinstance(arguments, dict) else {}
     try:
-        if not (await _image_available())[0]:
-            made: Job | _ImageRefusal = _ImageRefusal(503, "image_generation_unavailable", _image_unavailable_detail())
+        if _pictures_paused():
+            made: Job | _ImageRefusal = _ImageRefusal(503, "image_generation_paused", paused_note_with_link())
+        elif not (await _image_available())[0]:
+            made = _ImageRefusal(503, "image_generation_unavailable", _image_unavailable_detail())
         else:
             made = _create_image_job(request, "app", args.get("prompt"), image_policy.size_for_shape(args.get("shape")))
     except Exception as exc:  # noqa: BLE001 - whatever went wrong is a picture not made, and the chat goes on
@@ -6841,8 +6890,9 @@ async def _chat_picture(request: Request, arguments: Any) -> Picture:
 
 
 def _image_job_or_404(request: Request, kind: str, job_id: str):
-    """``(job, None)``, or ``(None, response)``: 503 while the feature is off, 404 for any job that is not this network's."""
-    if not get_worker_limits().get("image_gen_enabled", False):
+    """``(job, None)``, or ``(None, response)``: 503 while the feature is off or paused, 404 for any job that is not this
+    network's."""
+    if _pictures_paused() or not get_worker_limits().get("image_gen_enabled", False):
         return None, _image_unavailable_response()
     job = image_service.get(trial_identity(get_client_ip(request)), kind, job_id)
     if job is None:

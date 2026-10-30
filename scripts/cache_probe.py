@@ -99,10 +99,10 @@ TOOLS = [
         {"command": {"type": "string", "description": "Shell command to execute"}}, ["command"]),
     _fn("get_workspace_diagnostics", "Get active compiler, linter, and type-check errors in the workspace or specific file.",
         {"file_path": {"type": "string", "description": "Optional relative file path"}}),
-    _fn("remember", "Save, update or remove one lasting fact for later sessions. scope \"project\" keeps it in this project's .dlne/memory.md (how to build and test it, where things live, its conventions, the user's corrections); it is saved at once and shown to the user, who can undo it. scope \"user\" keeps it in ~/.dlne/memory.md, for the user's own preferences that hold in every project; the user approves it. To update a fact you saved earlier, give it in replaces; to remove it, give it in replaces and leave fact empty.",
+    _fn("remember", "Save, update or remove one lasting fact for later sessions. scope \"project\" keeps it in this project's .dlne/memory.md (how to build and test it, where things live, its conventions, the user's corrections); it is saved at once and shown to the user, who can undo it. scope \"user\" keeps it in ~/.dlne/memory.md, for the user's own preferences that hold in every project; the user approves it. Facts you saved show with an id in front, like [a7f3]. To update one, give its id in replaces and the new text in fact; to remove it, give its id in replaces and leave fact empty. Prefer updating a fact to adding a near-copy.",
         {"fact": {"type": "string", "description": "One short, self-contained sentence (at most 500 characters); empty to remove the fact given in replaces."},
          "scope": {"type": "string", "enum": ["project", "user"], "description": "Where it is kept: project or user."},
-         "replaces": {"type": "string", "description": "Optional: a fact you saved earlier that this one updates or removes. Its opening words are enough to pick it out."}}, ["fact", "scope"]),
+         "replaces": {"type": "string", "description": "Optional: the id of a fact you saved earlier (the [a7f3] in front of it), or its opening words."}}, ["fact", "scope"]),
 ]
 
 # fimProvider.ts (MAX_TOKENS_LINE inside a line, MAX_TOKENS_BLOCK at the start of a line or a body)

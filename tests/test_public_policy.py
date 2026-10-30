@@ -30,6 +30,7 @@ async def test_the_status_states_the_rules_the_coordinator_enforces(monkeypatch)
         "cpu_min_ram_gb": 8.0, "cpu_min_cores": 4, "cpu_min_bandwidth_gbs": 30.0,
         "coding_member_min_vram_gb": float(MIN_VRAM_GB),
         "coding_context_tokens": 32768,        # nothing running, no members: the default coding member's 65,536 / 2
+        "coding_context_tokens_max": 32768,    # and the largest of nothing is the same default
         "shared_max_rtt_ms": 80.0, "coding_member_max_rtt_ms": 120.0,    # the owner's limits (defaults)
         "image_input": None,                   # null while the engine cannot read images
     }
@@ -139,3 +140,38 @@ async def test_the_running_engines_slot_context_is_its_context_over_its_slots(mo
 
     monkeypatch.setattr(coordinator.manager, "asnapshot_model", gone)
     assert await coordinator._engine_slot_context(["m.gguf"]) is None
+
+
+# --- coding_context_tokens_max ("context is everything", 2026-10-30) ----------------------------------------------
+
+def test_the_largest_is_the_biggest_among_the_engine_and_every_ready_member(monkeypatch):
+    """A new extension sizes its prompt to the largest and tells /v1/coding/route how much it needs; an old one reads
+    the smallest, which does not change."""
+    tiers = [{"id": "qwen36", "context": 81920, "server_slots": 2}, {"id": "small", "context": 16384}]
+    _members(monkeypatch, _member("qwen36", 2), _member("small", 2), tiers=tiers)
+    # TheWall's target: 2 coding lanes of 131,072 tokens, and members at 40,960 and 8,192 a request.
+    policy = coordinator._public_policy(engine_slot_context=131072)
+    assert policy["coding_context_tokens_max"] == 131072 and policy["coding_context_tokens"] == 8192
+    # A member bigger than the engine is the largest.
+    assert coordinator._public_policy(engine_slot_context=20000)["coding_context_tokens_max"] == 40960
+    # No engine running (between restarts): the members alone.
+    assert coordinator._public_policy()["coding_context_tokens_max"] == 40960
+
+
+def test_with_only_the_engine_both_figures_are_its_context_per_slot(monkeypatch):
+    _members(monkeypatch)
+    policy = coordinator._public_policy(engine_slot_context=131072)
+    assert policy["coding_context_tokens"] == policy["coding_context_tokens_max"] == 131072
+
+
+def test_the_largest_counts_no_member_while_members_are_switched_off_or_unreadable(monkeypatch):
+    _members(monkeypatch, _member("wide", 2), enabled=False, tiers=[{"id": "wide", "context": 524288}])
+    assert coordinator._public_policy(engine_slot_context=65536)["coding_context_tokens_max"] == 65536
+    _members(monkeypatch)
+
+    def broken(_limits=None):
+        raise RuntimeError("registry")
+
+    monkeypatch.setattr(coordinator, "_coding_members", broken)
+    assert coordinator._public_policy(engine_slot_context=30000)["coding_context_tokens_max"] == 30000
+    assert coordinator._public_policy()["coding_context_tokens_max"] == 32768

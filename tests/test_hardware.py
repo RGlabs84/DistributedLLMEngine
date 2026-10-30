@@ -380,6 +380,13 @@ def test_no_limit_with_a_media_card_writes_out_every_discrete_card_but_that_one(
     assert hardware.engine_gpu_devices("-1", "0000:0c:00.0") == ("0,1", "1,2,3", "Vulkan2")
 
 
+def test_a_shared_media_card_is_listed_the_same_way_last(thewall_gpus):
+    # MEDIA_GPU_SHARED: the same list, so -ts 15,15,10 lines up with BC-160 #1, BC-160 #2, RX 580
+    assert hardware.engine_gpu_devices("-1", "0000:0c:00.0", shared=True) == ("0,1", "1,2,3", "Vulkan2")
+    assert hardware.engine_gpu_devices("0,1", "0000:0c:00.0", shared=True) == ("0,1", "1,2,3", "Vulkan2")
+    assert hardware.engine_gpu_devices("0,0000:0c:00.0,1", "2", shared=True) == ("0,1", "1,2,3", "Vulkan2")
+
+
 def test_a_media_card_that_is_not_there_changes_nothing(thewall_gpus):
     assert hardware.engine_gpu_devices("0,1", "0000:ff:00.0") == ("0,1", "1,2", "")
     assert hardware.engine_gpu_devices("-1", "0000:ff:00.0") == ("", "", "")
@@ -420,6 +427,12 @@ def test_every_entry_that_is_left_out_is_said_once_in_the_log(thewall_gpus, warn
 def test_nothing_is_said_when_nothing_is_left_out(thewall_gpus, warnings_logged):
     hardware.engine_gpu_devices("0,1", "0000:0c:00.0")
     hardware.engine_gpu_devices("-1", "0000:0c:00.0")
+
+    assert warnings_logged == []
+
+
+def test_a_shared_media_card_named_in_the_allowed_list_is_no_mistake(thewall_gpus, warnings_logged):
+    assert hardware.engine_gpu_devices("0,1,0000:0c:00.0", "0000:0c:00.0", shared=True) == ("0,1", "1,2,3", "Vulkan2")
 
     assert warnings_logged == []
 
@@ -481,6 +494,28 @@ def test_on_a_cuda_build_the_pool_a_node_advertises_keeps_the_card_the_engine_us
     info = hardware.get_gpu_info()
 
     assert info["count"] == 3 and info["vram_total_gb"] == 24.0 and "RX 580" in info["name"]
+
+
+def test_a_shared_media_card_counts_in_the_pool_a_node_advertises(thewall_gpus, monkeypatch, vulkan_install):
+    """MEDIA_GPU_SHARED: the RX 580 holds layers too, so TheWall advertises 24 GB (the coordinator's pool)."""
+    _limits(monkeypatch, allowed_gpu_indices="-1", media_gpu="0000:0c:00.0", media_gpu_shared=True)
+    info = hardware.get_gpu_info()
+
+    assert info["count"] == 3 and info["vram_total_gb"] == 24.0 and "RX 580" in info["name"]
+
+    # the engine is given the card whether ALLOWED_GPU_INDICES names it or not, so the pool counts it either way
+    _limits(monkeypatch, allowed_gpu_indices="0,1", media_gpu="0000:0c:00.0", media_gpu_shared=True)
+    assert hardware.get_gpu_info()["vram_total_gb"] == 24.0
+    _limits(monkeypatch, allowed_gpu_indices="0,1,2", media_gpu="2", media_gpu_shared=True)
+    assert hardware.get_gpu_info()["count"] == 3                      # counted once
+
+
+def test_a_media_card_that_is_not_shared_stays_out_of_the_pool(thewall_gpus, monkeypatch, vulkan_install):
+    _limits(monkeypatch, allowed_gpu_indices="-1", media_gpu="0000:0c:00.0", media_gpu_shared=False)
+    assert hardware.get_gpu_info()["vram_total_gb"] == 16.0
+
+    _limits(monkeypatch, allowed_gpu_indices="0,1", media_gpu_shared=True)       # shared, but no media card named
+    assert hardware.get_gpu_info()["vram_total_gb"] == 16.0
 
 
 def test_the_pool_is_what_it_was_without_a_media_card(thewall_gpus, monkeypatch):

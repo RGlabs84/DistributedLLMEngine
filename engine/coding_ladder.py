@@ -154,6 +154,18 @@ def tier_for_file(tiers: List[Dict[str, Any]], file: Any) -> Optional[Dict[str, 
     return None
 
 
+def rank(tiers: List[Dict[str, Any]], file: Any) -> Optional[int]:
+    """
+    How smart the model ``file`` is, as its place on the ladder: 0 for the first tier, and a
+    bigger number is a smarter model (ladder order is quality order). None when the file is on
+    no tier: an unknown model is never called smarter or less smart than another.
+    """
+    tier = tier_for_file(tiers or [], file)
+    if tier is None:
+        return None
+    return next(i for i, t in enumerate(tiers) if t is tier)
+
+
 def tier_label(tier: Dict[str, Any]) -> str:
     """How a tier is named in recommended_tier: "Qwen3.6 35B-A3B (15 GB+ VRAM)"."""
     return f"{tier['name']} ({tier['min_vram_gb']} GB+ VRAM)"

@@ -560,7 +560,7 @@ def limits_with(monkeypatch, values):
 def test_the_defaults_are_the_contracts(monkeypatch):
     limits = limits_with(monkeypatch, {})
     assert {k: limits[k] for k in engine_config.IMAGE_DEFAULTS} == {
-        "image_gen_enabled": False, "image_model_dir": "", "image_threads": 4, "image_cpu_mask": "", "image_per_hour": 6,
+        "image_gen_enabled": False, "image_gen_paused": False, "image_model_dir": "", "image_threads": 4, "image_cpu_mask": "", "image_per_hour": 6,
         "image_queue_max": 4, "image_job_timeout_seconds": 300, "image_idle_unload_minutes": 20, "image_result_ttl_seconds": 1800}
 
 
@@ -585,6 +585,19 @@ def test_numbers_are_taken_inside_their_range_and_a_value_outside_it_keeps_the_d
                                            ("yes", False), ("1", False), ("", False)])
 def test_only_the_word_true_turns_it_on(monkeypatch, raw, expected):
     assert limits_with(monkeypatch, {"IMAGE_GEN_ENABLED": raw})["image_gen_enabled"] is expected
+    assert limits_with(monkeypatch, {"IMAGE_GEN_ENABLED": raw})["image_gen_paused"] is False     # true/false: as before
+
+
+@pytest.mark.parametrize("raw", ["paused", "PAUSED", " Paused "])
+def test_paused_is_its_own_word_and_never_also_on(monkeypatch, raw):
+    limits = limits_with(monkeypatch, {"IMAGE_GEN_ENABLED": raw})
+    assert limits["image_gen_paused"] is True and limits["image_gen_enabled"] is False   # nothing that loads anything runs
+
+
+@pytest.mark.parametrize("raw", ["pause", "paused!", "true paused", "", "stopped"])
+def test_any_other_word_is_off_as_before(monkeypatch, raw):
+    limits = limits_with(monkeypatch, {"IMAGE_GEN_ENABLED": raw})
+    assert limits["image_gen_paused"] is False and limits["image_gen_enabled"] is False
 
 
 def test_the_model_directory_is_taken_as_written_with_a_home_expanded(monkeypatch):

@@ -262,6 +262,9 @@ test('the prompt budget is the agent loop\'s, at any context (one formula, share
   }
   assert.equal(contextTokensFrom(undefined), 32768);
   assert.equal(contextTokensFrom({ policy: { coding_context_tokens: 'many' } }), 32768);
+  // From 2.6.x the Chat view's entry offers the largest machine's context too, as the agent does.
+  assert.equal(contextTokensFrom({ policy: { coding_context_tokens: 40960, coding_context_tokens_max: 131072 } }), 131072);
+  assert.equal(contextTokensFrom({ policy: { coding_context_tokens: 40960, coding_context_tokens_max: 'big' } }), 40960);
 });
 
 test('VS Code is told to ask again when the context or the model changes, not on every status poll', () => {

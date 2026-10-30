@@ -839,6 +839,22 @@ def test_the_media_card_is_no_part_of_the_cards_the_coding_model_may_see(vulkan_
     assert totals({"allowed_gpu_indices": "0000:09:00.0,0000:03:00.0"}) == [12.0, 8.0], "PCI addresses name cards too"
 
 
+def test_a_shared_media_card_is_the_last_of_the_cards_the_coding_model_may_see(vulkan_install, monkeypatch):
+    from engine import hardware
+    cards = [{"id": 0, "name": "RTX A", "address": "0000:03:00.0", "vram_total_gb": 8.0},
+             {"id": 1, "name": "RX 580", "address": "0000:0c:00.0", "vram_total_gb": 8.0},
+             {"id": 2, "name": "RTX B", "address": "0000:09:00.0", "vram_total_gb": 12.0}]
+    monkeypatch.setattr(hardware, "get_all_gpus", lambda: cards)
+    monkeypatch.setattr(hardware, "counts_as_gpu", lambda name, integrated=None: True)
+    totals = worker.WorkerNode._gpu_totals_gib
+    shared = {"media_gpu": "0000:0c:00.0", "media_gpu_shared": True}
+    # numbered as the engine numbers them: the media card last, wherever it sits on the bus
+    assert totals({"allowed_gpu_indices": "-1", **shared}) == [8.0, 12.0, 8.0]
+    assert totals({"allowed_gpu_indices": "2,0", **shared}) == [12.0, 8.0, 8.0]
+    assert totals({"allowed_gpu_indices": "1,2,0", **shared}) == [12.0, 8.0, 8.0], "listed once"
+    assert totals({"allowed_gpu_indices": "-1", "media_gpu": "0000:0c:00.0", "media_gpu_shared": False}) == [8.0, 12.0]
+
+
 def test_the_coding_member_is_given_the_limits_reader(node, monkeypatch):
     made = []
     monkeypatch.setattr(worker, "download_and_extract_engine", lambda *a, **k: "x")
@@ -1177,6 +1193,18 @@ def test_the_media_card_is_hidden_from_the_nodes_own_process(node, monkeypatch, 
     monkeypatch.setattr(worker, "get_worker_limits", lambda: {"allowed_gpu_indices": "-1", "media_gpu": "0000:0c:00.0"})
     env, _ = node._gpu_environment()
     assert env["CUDA_VISIBLE_DEVICES"] == "0" and env["GGML_VK_VISIBLE_DEVICES"] == "1"
+
+
+def test_a_shared_media_card_is_one_of_the_nodes_cards_last(node, monkeypatch, clean_env, vulkan_install):
+    from engine import hardware
+    monkeypatch.setattr(hardware, "get_all_gpus", lambda: [
+        {"id": 0, "name": "A", "address": "0000:03:00.0", "vram_total_gb": 8.0, "vk_index": 1},
+        {"id": 1, "name": "B", "address": "0000:0c:00.0", "vram_total_gb": 8.0, "vk_index": 3}])
+    monkeypatch.setattr(hardware, "counts_as_gpu", lambda name, integrated=None: True)
+    monkeypatch.setattr(worker, "get_worker_limits", lambda: {
+        "allowed_gpu_indices": "-1", "media_gpu": "0000:0c:00.0", "media_gpu_shared": True})
+    env, _ = node._gpu_environment()
+    assert env["GGML_VK_VISIBLE_DEVICES"] == "1,3"
 
 
 def test_on_a_cuda_build_the_media_card_stays_in_the_nodes_environment(node, monkeypatch, tmp_path, clean_env):

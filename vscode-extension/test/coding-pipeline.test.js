@@ -65,6 +65,10 @@ async function ask(client, text = 'hello', options = {}, tools = []) {
   return { out, progress, queue, result };
 }
 
+// What a one-message chat of 'q' says it needs: (1 + 16 characters) / 3 = 6 tokens of prompt, plus the agent's 10,240
+// of answer, rounded up to a multiple of 4,096.
+const Q_NEED = '12288';
+
 const sealed = (c) => c.of('/v1/chat/completions').filter((r) => r.body && r.body.dlne_e2e);
 const epks = (c) => c.of('/v1/chat/completions').filter((r) => r.body && r.body.dlne_e2e).map((r) => r.body.dlne_e2e.epk);
 
@@ -132,7 +136,7 @@ test('{route: null} sends the plain request, with the privacy mode and session h
     assert.equal(chat.headers['x-dlne-privacy'], 'trusted');
     assert.equal(chat.headers['x-dlne-session'], 'session-from-test');
     const [route] = w.c.of('/v1/coding/route');
-    assert.deepEqual(route.query, { session: 'session-from-test', privacy: 'trusted' });
+    assert.deepEqual(route.query, { session: 'session-from-test', privacy: 'trusted', need: Q_NEED });
   } finally {
     w.close();
   }
@@ -150,10 +154,140 @@ test('the route lookup names this machine\'s own coding member (own=<trust id>) 
     w.client.setWorkerManager(worker({ state: 'contributing', role: 'coding', roleDetail: { trustId: 'not a trust id' } }));
     await ask(w.client, 'q', { sessionId: 's-odd' });
     assert.deepEqual(w.c.of('/v1/coding/route').map((r) => r.query), [
-      { session: 's-own', privacy: 'trusted', own: trustId },
-      { session: 's-rpc', privacy: 'trusted' },           // a shard has no member of its own
-      { session: 's-odd', privacy: 'trusted' },           // only 32 hex characters are ever sent
+      { session: 's-own', privacy: 'trusted', own: trustId, need: Q_NEED },
+      { session: 's-rpc', privacy: 'trusted', need: Q_NEED },           // a shard has no member of its own
+      { session: 's-odd', privacy: 'trusted', need: Q_NEED },           // only 32 hex characters are ever sent
     ]);
+  } finally {
+    w.close();
+  }
+});
+
+test('dlne.ownGpu = "smarter" adds prefer=smarter to a lookup that names this machine\'s member, and only then', async () => {
+  const w = await world({ route: 'none', chat: (ctx) => swarm.plainStream(ctx.res, ['local']) });
+  try {
+    const trustId = 'cd'.repeat(16);
+    const worker = (status) => ({ isContributing: () => true, getStatus: () => status });
+    const member = worker({ state: 'contributing', role: 'coding', roleDetail: { slots: 2, trustId } });
+    w.client.setWorkerManager(member);
+    await ask(w.client, 'q', { sessionId: 's-default' });          // unset: "faster", today's rule
+    stub.state.settings['dlne.ownGpu'] = 'smarter';                // read live: no reload
+    await ask(w.client, 'q', { sessionId: 's-smarter' });
+    stub.state.settings['dlne.ownGpu'] = 'faster';
+    await ask(w.client, 'q', { sessionId: 's-faster' });
+    stub.state.settings['dlne.ownGpu'] = 'Smarter';                // not the setting's value: faster
+    await ask(w.client, 'q', { sessionId: 's-odd' });
+    stub.state.settings['dlne.ownGpu'] = 'smarter';
+    w.client.setWorkerManager(worker({ state: 'contributing', role: 'rpc' }));
+    await ask(w.client, 'q', { sessionId: 's-rpc' });
+    assert.deepEqual(w.c.of('/v1/coding/route').map((r) => r.query), [
+      { session: 's-default', privacy: 'trusted', own: trustId, need: Q_NEED },
+      { session: 's-smarter', privacy: 'trusted', own: trustId, prefer: 'smarter', need: Q_NEED },
+      { session: 's-faster', privacy: 'trusted', own: trustId, need: Q_NEED },
+      { session: 's-odd', privacy: 'trusted', own: trustId, need: Q_NEED },
+      { session: 's-rpc', privacy: 'trusted', need: Q_NEED },           // no member of its own: prefer is never sent alone
+    ]);
+  } finally {
+    delete stub.state.settings['dlne.ownGpu'];
+    w.close();
+  }
+});
+
+test('a cached route answer is kept apart for "faster" and "smarter"', async () => {
+  const { RouteLookup } = require('../dist/client/route');
+  const w = await world({ route: 'none' });
+  try {
+    const routes = new RouteLookup();
+    const own = 'ef'.repeat(16);
+    await routes.lookup(w.c.url, {}, 's', 'trusted', 20_000, undefined, own, false);
+    await routes.lookup(w.c.url, {}, 's', 'trusted', 20_000, undefined, own, false);
+    await routes.lookup(w.c.url, {}, 's', 'trusted', 20_000, undefined, own, true);
+    await routes.lookup(w.c.url, {}, 's', 'trusted', 20_000, undefined, own, true);
+    await routes.lookup(w.c.url, {}, 's', 'trusted', 20_000, undefined, undefined, true);
+    assert.deepEqual(w.c.of('/v1/coding/route').map((r) => r.query), [
+      { session: 's', privacy: 'trusted', own },
+      { session: 's', privacy: 'trusted', own, prefer: 'smarter' },
+      { session: 's', privacy: 'trusted' },
+    ], 'each answer reused within its own key, and prefer is never sent without own');
+  } finally {
+    w.close();
+  }
+});
+
+// ---- need: how many tokens the request will hold (Smarter Wall, 2026-10-30) -------------------------------
+
+test('need is the prompt at 3 characters a token plus the answer\'s room, rounded up to 4,096, and never 0 or below', () => {
+  const { requestNeed, roundNeed, promptChars, NEED_CHARS_PER_TOKEN, NEED_STEP, NEED_MAX } = require('../dist/client/route');
+  const { DEFAULT_CHARS_PER_TOKEN } = require('../dist/agent/agentLoop');
+  assert.equal(NEED_CHARS_PER_TOKEN, DEFAULT_CHARS_PER_TOKEN, 'the figure compaction starts from (docs/agent-memory.md 5.1)');
+  assert.equal(NEED_STEP, 4096);
+  // 30,000 characters (29,984 of words, 16 for the message): 10,000 tokens, with 10,240 of answer 20,240, sent as 20,480.
+  assert.equal(requestNeed({ messages: [{ role: 'user', content: 'x'.repeat(29984) }], max_tokens: 10240 }), 20480);
+  // Tool calls and the tools' definitions count, as they do for compaction.
+  const call = { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }] };
+  const tools = [{ type: 'function', function: { name: 'read_file', parameters: {} } }];
+  assert.equal(promptChars({ messages: [call] }), 16 + 9 + 12 + 16);
+  assert.equal(promptChars({ messages: [call], tools }), 16 + 9 + 12 + 16 + JSON.stringify(tools).length);
+  // Autocomplete: a 6,000-character prompt is 2,000 tokens, with 64 of answer one step of 4,096.
+  assert.equal(requestNeed({ prompt: 'x'.repeat(6000), max_tokens: 64 }), 4096);
+  assert.equal(requestNeed({ prompt: 'x'.repeat(12291), max_tokens: 0 }), 8192, '4,097 tokens is the next step up');
+  // Nothing to estimate is nothing to send; nonsense is ignored, never sent.
+  assert.equal(requestNeed({}), 0);
+  assert.equal(requestNeed({ prompt: '', max_tokens: 'lots' }), 0);
+  for (const bad of [0, -1, -4096, NaN, Infinity, -Infinity]) assert.equal(roundNeed(bad), 0, String(bad));
+  assert.equal(roundNeed(1), 4096);
+  assert.equal(roundNeed(4096), 4096);
+  assert.equal(roundNeed(1e12), NEED_MAX, 'held below the coordinator\'s 10,000,000');
+  assert.ok(NEED_MAX % 4096 === 0 && NEED_MAX <= 10_000_000 && NEED_MAX + 4096 > 10_000_000);
+});
+
+test('the route lookup sends need, keeps it in the cache key, and sends nothing for a need that is not above 0', async () => {
+  const { RouteLookup } = require('../dist/client/route');
+  const w = await world({ route: 'none' });
+  try {
+    const routes = new RouteLookup();
+    for (const need of [12288, 12000, 12289, 0, -5, NaN]) {
+      await routes.lookup(w.c.url, {}, 's', 'trusted', 20_000, undefined, undefined, false, need);
+    }
+    assert.deepEqual(w.c.of('/v1/coding/route').map((r) => r.query), [
+      { session: 's', privacy: 'trusted', need: '12288' },  // 12,000 rounds to the same step: the cached answer
+      { session: 's', privacy: 'trusted', need: '16384' },  // one token over is the next step: asked again
+      { session: 's', privacy: 'trusted' },                 // 0, -5 and NaN: no need at all, one key between them
+    ]);
+  } finally {
+    w.close();
+  }
+});
+
+test('with the largest context reported, the agent sends a big task whole and its lookup asks for a machine that holds it', async () => {
+  const status = swarm.statusBody({ ...swarm.MEMBERS_ON, policy: { coding_context_tokens: 40960, coding_context_tokens_max: 131072 } });
+  const w = await world({ route: 'none', status, chat: (ctx) => swarm.plainStream(ctx.res, ['ok']) });
+  try {
+    await w.client.getClusterStatusDetailed(); // what the status bar's poll does
+    const loop = new AgentLoop(w.client);
+    assert.equal(loop.promptBudget(), 94371, '72% of 131,072, not the 29,491 a 40,960 member allows');
+    const words = 'word '.repeat(30000);    // 150,000 characters: 50,000 tokens, too big for a member
+    await loop.run(words, { onThinkingDelta() {}, onContentDelta() {}, onToolStart() {}, onToolEnd() {} });
+    const [chat] = w.c.of('/v1/chat/completions');
+    assert.ok(chat.body.messages.some((m) => m.content === words), 'nothing was cut to fit the smallest machine');
+    const { requestNeed } = require('../dist/client/route');
+    const need = Number(w.c.of('/v1/coding/route')[0].query.need);
+    assert.equal(need, requestNeed(chat.body), 'the request as sent, estimated');
+    assert.ok(need > 40960 && need <= 131072, `${need}: more than a member holds, within the largest`);
+    assert.equal(need % 4096, 0);
+  } finally {
+    w.close();
+  }
+});
+
+test('autocomplete sends need as well, and a prompt a step bigger asks for a route again', async () => {
+  const w = await world({ route: 'none', completions: (ctx) => swarm.json(ctx.res, 200, { choices: [{ text: 'x' }] }) });
+  try {
+    await w.client.getClusterStatusDetailed();
+    await w.client.getCompletion('a'.repeat(3000));             // 1,000 + 64 tokens: 4,096
+    await w.client.getCompletion('b'.repeat(6000));             // 2,000 + 64: the same step, the cached answer
+    await w.client.getCompletion('c'.repeat(15000));            // 5,000 + 64: 8,192
+    assert.deepEqual(w.c.of('/v1/coding/route').map((r) => r.query.need), ['4096', '8192']);
   } finally {
     w.close();
   }

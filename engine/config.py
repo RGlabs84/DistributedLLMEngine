@@ -235,6 +235,10 @@ SPEC_DEFAULTS = {
 # runs there so the other cards keep their memory for the model, and later image and voice work
 # gets the card to itself. ENGINE_IMAGE_MAX_TOKENS caps what one image costs in context. All three
 # are off (empty) by default, and then the engine starts exactly as it did before.
+# MEDIA_GPU_SHARED (2026-10-30, default false) lends the media card to the model as well: it holds layers like the other
+# cards (it comes last in --device, so -ts takes one more number, for it), its memory counts in the pool, and the
+# projector stays on it. Picture making needs the card to itself, so it never starts while the card is shared. Only
+# the literal "true" shares it; anything else keeps the card the media card's alone, as before.
 # IMAGE_INPUT_PER_HOUR (2.6.1, default 30, 0 to 600) is how many different images one network may send the coding
 # engine in an hour, in the coding chat and (2.6.2) the phone chat; 0 refuses images. An image counts once an hour
 # however often it is sent again. Encoding an image stalls every slot of the engine for about a second.
@@ -242,6 +246,11 @@ SPEC_DEFAULTS = {
 # ENGINE_PHONE_SLOTS adds request slots reserved for the phone app (2.6), each ENGINE_PHONE_CONTEXT
 # tokens long, so a phone answers on the engine's GPU without ever waiting behind coding. They are
 # extra to ENGINE_SLOTS, and with ENGINE_CONTEXT set they come on top of it. 0 keeps today's engine.
+#
+# ENGINE_KV_TYPE (2.6.5) is the engine's context-memory type: auto (the default: q8_0, and q4_0 from 131,072 tokens a
+# slot, as always), or q8_0 / q4_0 / f16 to fix it whatever the slot size. The owner's rule for TheWall is that q8_0 is
+# never lowered, and TheWall's 2 x 131,072 lanes sit exactly on the line where auto would switch to q4_0.
+ENGINE_KV_TYPES = ("auto", "q8_0", "q4_0", "f16")
 ENGINE_DEFAULTS = {
     "engine_context": 0,
     "engine_slots": 0,
@@ -249,6 +258,8 @@ ENGINE_DEFAULTS = {
     "engine_phone_context": 8192,
     "engine_extra_args": (),
     "media_gpu": "",
+    "media_gpu_shared": False,
+    "engine_kv_type": "auto",
     "engine_mmproj": "",
     "engine_image_max_tokens": 1024,
     "image_input_per_hour": 30,
@@ -261,8 +272,12 @@ IMAGE_INPUT_PER_HOUR_MAX = 600
 # of these keys set nothing here is read and the coordinator behaves exactly as 2.6.0. IMAGE_MODEL_DIR ""
 # means models/image under the install; IMAGE_CPU_MASK "" pins nothing. Each number has the range below:
 # a value outside it keeps the default rather than starting sd-server with something nobody asked for.
+# IMAGE_GEN_ENABLED=paused (2026-10-30) is off as far as anything image-related goes (nothing is loaded or started),
+# but every picture request is answered "Pictures are paused for now" with a link to /pictures
+# (engine/pictures_page.py), and the status says so. Any other word is false, as before.
 IMAGE_DEFAULTS = {
     "image_gen_enabled": False,
+    "image_gen_paused": False,
     "image_model_dir": "",
     "image_threads": 4,
     "image_cpu_mask": "",
@@ -925,6 +940,14 @@ def get_worker_limits() -> dict:
     if "MEDIA_GPU" in config:
         limits["media_gpu"] = config["MEDIA_GPU"].strip()
 
+    if "MEDIA_GPU_SHARED" in config:
+        limits["media_gpu_shared"] = _as_bool(config["MEDIA_GPU_SHARED"])
+
+    if "ENGINE_KV_TYPE" in config:
+        kv_type = config["ENGINE_KV_TYPE"].strip().lower()
+        # Anything else keeps auto: a typo must not start an engine on a cache type nobody chose.
+        limits["engine_kv_type"] = kv_type if kv_type in ENGINE_KV_TYPES else "auto"
+
     if "ENGINE_MMPROJ" in config:
         limits["engine_mmproj"] = config["ENGINE_MMPROJ"].strip()
 
@@ -947,6 +970,8 @@ def get_worker_limits() -> dict:
 
     if "IMAGE_GEN_ENABLED" in config:
         limits["image_gen_enabled"] = _as_bool(config["IMAGE_GEN_ENABLED"])
+        # Paused is never also enabled: image_gen_enabled stays false, so nothing that loads or starts sd-server runs.
+        limits["image_gen_paused"] = config["IMAGE_GEN_ENABLED"].strip().lower() == "paused"
 
     if "IMAGE_MODEL_DIR" in config:
         limits["image_model_dir"] = os.path.expanduser(config["IMAGE_MODEL_DIR"].strip())

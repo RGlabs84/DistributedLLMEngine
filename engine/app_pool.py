@@ -35,7 +35,7 @@ PICTURES (2.6.2). To a client that says it shows them (``"features": ["image_job
 them, the model is also offered a create_image tool: it writes the description and the coordinator queues the job
 (engine/coordinator.py), so the tool works on a CPU member as well as on the engine's lanes. The phone is told with
 an "image_job" or "image_refused" event and polls the job itself. A request without the feature is answered exactly
-as before.
+as before. While pictures are paused the tool is offered too, and every call is an "image_refused" that says so.
 
 PRIVACY. A volunteer's machine sees the question and answer text of the requests it serves,
 and any search results for it; the phone app says so. Searches go from the coordinator to the
@@ -167,6 +167,8 @@ SAMPLING = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1
 # Offered only to a client that said it shows the pictures (the request's ``features`` has "image_jobs") and only while
 # the coordinator can make them (coordinator._with_picture_tool). The model writes the description; the coordinator
 # makes the job, never a member, so a CPU-pool member can ask for a picture as well as the engine's lanes.
+# While pictures are paused (IMAGE_GEN_ENABLED=paused) the tool is still offered, and every call is refused with the
+# pause's own words and the /pictures page's address (PICTURE_REFUSED_REPLY), so the model tells the user why.
 IMAGE_TOOL_NAME = "create_image"
 IMAGE_TOOL = {"type": "function", "function": {
     "name": IMAGE_TOOL_NAME,

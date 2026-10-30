@@ -152,7 +152,7 @@ def env(fakes, monkeypatch, tmp_path):
     ips = {}
 
     def add(fake, worker_id=None, *, slots=2, busy=0, decode=33.0, prefill=121.0, ready=True, tunnel=True,
-            pubkey=True, model=MODEL_FILE, identity="own", signed_at=None, tamper=None):
+            pubkey=True, model=MODEL_FILE, identity="own", signed_at=None, tamper=None, tier="qwen36-a3b"):
         """Register a member whose heartbeat block is signed by the fake's own identity key, or by
         ``identity`` = (key, public b64) of another, or unsigned (None); ``tamper`` changes the block after signing."""
         if worker_id is None:
@@ -160,7 +160,7 @@ def env(fakes, monkeypatch, tmp_path):
             worker_id = f"member-{fake.name}-{count['n']}"
         if worker_id not in ips:
             ips[worker_id] = f"10.8.0.{len(ips) + 2}"
-        block = {"model": model, "tier": "qwen36-a3b", "ready": ready, "slots": slots, "busy": busy,
+        block = {"model": model, "tier": tier, "ready": ready, "slots": slots, "busy": busy,
                  "decode_tps": decode, "prefill_tps": prefill, "no_trace": True}
         if pubkey and fake.pubkey:
             block["pubkey"] = fake.pubkey
@@ -855,6 +855,85 @@ async def test_the_requesters_own_member_is_preferred_while_it_is_as_fast_as_the
         assert await chosen(c, "s4", None) == "a", "and own is the session's sticky member from then on"
         for odd in (mine.trust_id.upper(), mine.trust_id[:31], "x" * 32, "", other.trust_id):
             assert await chosen(c, f"s-{odd[:8]}", odd) == "b", odd
+
+
+@pytest.mark.anyio
+async def test_prefer_smarter_sends_the_requesters_own_requests_to_their_smarter_model(env, monkeypatch):
+    """``prefer=smarter`` (dlne.ownGpu): the owner's laptop on IQ4_XS answers them although this coordinator's engine,
+    on IQ3_S, writes faster; only while the laptop's model is further down the ladder, and never past privacy."""
+    from engine import coding_speed
+    smarter = "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"
+    monkeypatch.setattr(coordinator, "_coding_tiers", [dict(TIER), {**TIER, "id": "qwen36-a3b-iq4xs", "file": smarter,
+                                                                    "min_vram_gb": 24, "files": [{"file": smarter}]}])
+    monkeypatch.setattr(coordinator, "global_active_model", MODEL_FILE)
+    monkeypatch.setattr(coding_speed, "meter", SimpleNamespace(speed=lambda file: (65.0, "2026-10-30T09:00:00Z")))
+    mine, other = env.fakes["a"], env.fakes["b"]
+    env.add(mine, "mine", slots=4, decode=27.0, prefill=121.0, model=smarter)
+    env.add(other, "other", slots=4, decode=40.0, prefill=300.0)
+    count = {"n": 0}
+
+    async def chosen(c, privacy="any", **params):
+        count["n"] += 1                         # a new session each time: no sticky member
+        reply = (await c.get("/v1/coding/route", params={"session": f"s{count['n']}", "privacy": privacy, **params})).json()
+        env.clock.t += 31
+        return member_name(env, reply["pubkey"]) if reply["route"] else None
+
+    async with client() as c:
+        assert await chosen(c, own=mine.trust_id) == "b", "faster (the default): the engine writes 65, the laptop 27"
+        assert await chosen(c, own=mine.trust_id, prefer="smarter") == "a", "smarter: the laptop's IQ4_XS"
+        assert await chosen(c, prefer="smarter") == "b", "prefer without own means nothing"
+        for odd in ("Smarter", "smarter ", "1", "", "faster"):
+            assert await chosen(c, own=mine.trust_id, prefer=odd) == "b", odd
+        # The private repository: only trusted members, and the laptop is not (yet) one of them.
+        env.limits["trusted_members"] = [other.trust_id]
+        assert await chosen(c, "trusted", own=mine.trust_id, prefer="smarter") == "b"
+        env.limits["trusted_members"] = []
+        assert await chosen(c, "trusted", own=mine.trust_id, prefer="smarter") is None, "this engine answers"
+        env.limits["trusted_members"] = [mine.trust_id]
+        assert await chosen(c, "trusted", own=mine.trust_id, prefer="smarter") == "a", "trusted: the laptop may have it"
+        # An automatic switch moved this coordinator's engine up to IQ4_XS too: the laptop is no smarter now.
+        monkeypatch.setattr(coordinator, "global_active_model", smarter)
+        assert await chosen(c, own=mine.trust_id, prefer="smarter") == "b"
+
+
+@pytest.mark.anyio
+async def test_need_offers_only_a_member_whose_context_holds_the_request(env, monkeypatch):
+    """``need=<tokens>`` ("context is everything", 2026-10-30): the tokens the request will hold, prompt and answer.
+    Only a member whose context per request (its tier's context over its server_slots) holds them is offered; with
+    none, this coordinator's engine answers. Anything but a whole number from 1 to 10,000,000 is ignored."""
+    smarter = "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"
+    monkeypatch.setattr(coordinator, "_coding_tiers", [
+        {**TIER, "context": 81920, "server_slots": 2},                                       # 40,960 a request
+        {**TIER, "id": "qwen36-a3b-iq4xs", "file": smarter, "min_vram_gb": 24, "context": 262144, "server_slots": 2,
+         "files": [{"file": smarter}]}])                                                     # 131,072 a request
+    env.add(env.fakes["a"], "small", slots=4, prefill=300.0)
+    env.add(env.fakes["b"], "big", slots=4, prefill=100.0, model=smarter, tier="qwen36-a3b-iq4xs")
+    count = {"n": 0}
+
+    async def chosen(c, session=None, **params):
+        count["n"] += 1
+        reply = (await c.get("/v1/coding/route", params={"session": session or f"s{count['n']}", "privacy": "any",
+                                                          **params})).json()
+        env.clock.t += 31                       # the route's hold on the member runs out: a clean slate
+        return member_name(env, reply["pubkey"]) if reply["route"] else None
+
+    async with client() as c:
+        assert await chosen(c) == "a", "no need: the faster reader, as before"
+        assert await chosen(c, need="40960") == "a", "exactly its context fits"
+        assert await chosen(c, need="40961") == "b"
+        assert await chosen(c, need="131072") == "b"
+        assert await chosen(c, need="131073") is None, "no member holds it: this engine answers"
+        for odd in ("0", "-65536", "10000001", "000065536", "65536.0", "1e5", " 65536", "+65536", "0x10000", "abc", ""):
+            assert await chosen(c, need=odd) == "a", odd
+        # A session whose request outgrew its member moves to one that holds it, and stays there (its prompt is
+        # cached there now) while it fits.
+        assert await chosen(c, "agent", need="8192") == "a"
+        assert await chosen(c, "agent", need="65536") == "b"
+        assert await chosen(c, "agent", need="8192") == "b"
+        # The requester's own member is passed over too when it cannot hold the request.
+        mine = env.fakes["a"].trust_id
+        assert await chosen(c, own=mine, need="8192") == "a"
+        assert await chosen(c, own=mine, need="65536") == "b"
 
 
 @pytest.mark.anyio

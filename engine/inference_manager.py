@@ -180,6 +180,7 @@ def plan_slots_and_context(
     fixed_context: int = 0,
     phone_slots: int = 0,
     phone_context: int = 0,
+    kv_type: str = "auto",
 ) -> SlotPlan:
     """
     Chooses -np and -c. Pure arithmetic: no files, no locks, so the same call answers the
@@ -251,7 +252,11 @@ def plan_slots_and_context(
     # --kv-unified-per-slot caps every lane, the phone's too, at the coding slot's padded size, so a phone lane
     # never holds more than that: the number recorded (and the coordinator's bound) is the one that holds.
     phone_context = min(phone_context, pad_context(per_slot))
-    cache_type = "q4_0" if per_slot >= Q4_KV_SLOT_CONTEXT else "q8_0"
+    # ENGINE_KV_TYPE: auto is the rule above; q8_0, q4_0 or f16 is the operator's and wins, whatever the slot size.
+    if kv_type in ("q8_0", "q4_0", "f16"):
+        cache_type = kv_type
+    else:
+        cache_type = "q4_0" if per_slot >= Q4_KV_SLOT_CONTEXT else "q8_0"
     # llama-server pads every slot of a unified pool to 256, so the pool is built from padded slots
     # and each coding slot keeps the context the coordinator advertises. Without phone lanes -c is
     # the plain total, as it always was.
@@ -632,6 +637,15 @@ def media_gpu_spec(limits: dict) -> str:
     return spec
 
 
+def media_gpu_shared(limits: dict) -> bool:
+    """
+    Whether the media card also holds model layers (MEDIA_GPU_SHARED): only when a media card applies to this engine
+    at all (``media_gpu_spec``). A shared card is one of the engine's cards, in its --device list and in the pool,
+    and the projector still runs on it; picture making, which needs it to itself, does not start.
+    """
+    return bool(limits.get("media_gpu_shared")) and bool(media_gpu_spec(limits))
+
+
 # How long the projector stays out after an engine died encoding an image (a load failure stays until a restart).
 PROJECTOR_RETRY_SECONDS = 30 * 60
 _LOG_CHUNK = 256 * 1024
@@ -695,17 +709,24 @@ def _engine_devices(limits: dict, remote: bool) -> Optional[Tuple[str, str, str]
     ``media_device`` is the llama.cpp name of the media card (MEDIA_GPU), "" when none is in use: not
     named, not found, the only card ALLOWED_GPU_INDICES leaves, or an engine sharded over volunteers'
     GPUs, which drops the card because ``--device`` would hide the RPC devices from the model.
+
+    A shared media card (MEDIA_GPU_SHARED) is listed the same way, last, so the tuple is the same with the flag on
+    or off; ``_media_args`` decides whether the model may use it.
     """
     allowed = str(limits.get("allowed_gpu_indices", "-1")).lower()
     media_spec = media_gpu_spec(limits)
     if allowed == "none" or not (media_spec or ":" in allowed):
         return None
     from engine.hardware import engine_gpu_devices
-    cuda, vulkan, media_device = engine_gpu_devices(allowed, media_spec)
+    cuda, vulkan, media_device = engine_gpu_devices(allowed, media_spec, shared=media_gpu_shared(limits))
     if media_device == "Vulkan0":
         # Nothing else to run the model on: the "media" card is the engine's after all.
         cuda, vulkan, media_device = engine_gpu_devices(allowed, "")
-    elif media_device and remote:
+    elif media_device and remote and not media_gpu_shared(limits):
+        # A media card of its own is dropped while volunteers' GPUs are in the pipeline: --device would hide the
+        # RPC devices from the model. A SHARED card stays: this node's pool counts it, so the coordinator plans with
+        # it (24 GB here plus a docked 8 GB laptop is the 32 GB that unlocks Q4_K_M), and the engine must really
+        # have it. _media_args then passes no --device at all, so the model sees every local card and every RPC one.
         vulkan, media_device = vulkan.rpartition(",")[0], ""
     if allowed == "-1" and not (cuda or vulkan):
         return None
@@ -1626,14 +1647,15 @@ class InferenceManager:
     def _projector_charge_gb(self, remote: bool, model_path: str = "") -> float:
         """
         What the projector takes from the pool's cards, in GiB: nothing while vision is off, or while it runs
-        on the media card (which is no part of the pool); its file and working buffer otherwise.
+        on a media card that is no part of the pool; its file and working buffer otherwise (a shared media card is
+        part of the pool, so the projector on it takes from the pool like anywhere else).
         """
         limits = get_worker_limits()
         path = self._projector_path(limits, model_path=model_path)
         if not path:
             return 0.0
         devices = _engine_devices(limits, remote)
-        if devices and devices[2]:
+        if devices and devices[2] and not media_gpu_shared(limits):
             return 0.0
         try:
             return os.path.getsize(path) / _GIB + PROJECTOR_WORKING_GB
@@ -1650,17 +1672,23 @@ class InferenceManager:
             _engine_devices(limits, False)
 
     def _media_args(self, limits: dict, devices: Optional[Tuple[str, str, str]],
-                    model_path: str = "") -> Tuple[List[str], str]:
+                    model_path: str = "", remote: bool = False) -> Tuple[List[str], str]:
         """
         ``(arguments, projector_path)``: ``--device`` for the engine's own cards when a media card is in use
         (so the model gets none of it), and the projector's arguments when vision is on, on the media card if
         there is one. ``projector_path`` is "" without vision, and for a model the projector is not for.
+        A shared media card (MEDIA_GPU_SHARED) is in ``--device`` too, last, so ``-ts`` gives it the last share.
         """
         args: List[str] = []
         media_device = devices[2] if devices else ""
-        if media_device:
-            engine_cards = len(devices[1].split(",")) - 1
+        if media_device and not (remote and media_gpu_shared(limits)):
+            engine_cards = len(devices[1].split(","))
+            if not media_gpu_shared(limits):
+                engine_cards -= 1            # the media card is the last one listed, and the model gets none of it
             args += ["--device", ",".join(f"Vulkan{i}" for i in range(engine_cards))]
+        # A shared card with volunteers' GPUs in the pipeline: no --device, which would hide the RPC devices. Every
+        # local card is visible already (GGML_VK_VISIBLE_DEVICES), the media card among them, and --mmproj-device
+        # below still puts the projector on it.
         projector = self._projector_path(limits, warn=True, model_path=model_path)
         if projector:
             no_ffmpeg = _private_empty_dir("no-ffmpeg")
@@ -1987,6 +2015,7 @@ class InferenceManager:
             fixed_context=int(limits.get("engine_context") or 0),
             phone_slots=int(limits.get("engine_phone_slots") or 0),
             phone_context=int(limits.get("engine_phone_context") or 0),
+            kv_type=str(limits.get("engine_kv_type") or "auto"),
         )
         safe_context = sized.total_context
         reserved_gb = weights + sized.kv_gb
@@ -2354,7 +2383,7 @@ class InferenceManager:
 
             # The media card and the vision projector; with MEDIA_GPU and ENGINE_MMPROJ unset, nothing is added.
             devices = _engine_devices(limits, bool(remote_rpc_endpoints))
-            media_args, projector = self._media_args(limits, devices, resolved_path)
+            media_args, projector = self._media_args(limits, devices, resolved_path, remote=bool(remote_rpc_endpoints))
             cmd.extend(media_args)
             if media_gpu_spec(limits) and not (devices and devices[2]):
                 log_warning(

@@ -119,6 +119,21 @@ test('the budget follows the coordinator\'s policy.coding_context_tokens, and 32
   assert.equal(new AgentLoop({}).promptBudget(), 21504, 'a client with no status at all');
 });
 
+test('the budget follows policy.coding_context_tokens_max when it is bigger (TheWall\'s 131,072), and nothing changes without it', () => {
+  const loopWith = (policy) => new AgentLoop({ lastKnownClusterStatus: () => ({ policy }) });
+  assert.equal(loopWith({ coding_context_tokens: 40960, coding_context_tokens_max: 131072 }).promptBudget(), Math.floor(131072 * 0.72),
+    'the largest machine\'s context: a request too big for a member is routed to one that holds it');
+  // An old coordinator, or a largest figure that is no use: the smallest, exactly as before.
+  const before = loopWith({ coding_context_tokens: 40960 }).promptBudget();
+  assert.equal(before, 29491);
+  for (const max of [40960, 32768, 131072.5, '131072', null, -1, NaN, 2_000_000]) {
+    assert.equal(loopWith({ coding_context_tokens: 40960, coding_context_tokens_max: max }).promptBudget(), before, String(max));
+  }
+  // The largest is only believed alongside a usable smallest; without one, 32,768 as before.
+  assert.equal(loopWith({ coding_context_tokens_max: 131072 }).promptBudget(), 21504);
+  assert.equal(loopWith({ coding_context_tokens: 2000, coding_context_tokens_max: 131072 }).promptBudget(), 21504);
+});
+
 test('a conversation that fits its slot is never compacted (1.4.1 compacted at 15,360 of a 32K slot)', async () => {
   const turns = [];
   for (let n = 1; n <= 12; n++) turns.push({ toolCalls: [{ id: `c${n}`, ...read(`src/f${n}.ts`, 3500) }] });
@@ -457,4 +472,143 @@ test('the look back after a task shows only facts it saved, never a failure, so 
   const shownAfterAnswer = ended.filter((r) => r.name === 'remember');
   assert.deepEqual(shownAfterAnswer.map((r) => r.output), ['📝 Remembered for this project: saved']);
   assert.equal(shown.tools.filter((t) => t === 'remember').length, 0, 'not announced as a step');
+});
+
+// ---- remember failing again and again (Memory 2) -------------------------------------------------------------
+// 2026-10-30: a model tidying a nearly full memory file failed a dozen remember calls in a row, and nothing stopped it.
+
+const REMEMBER_STOPPED = 'remember has failed 3 times in a row in this task, so DLNE stopped running it. Carry on with '
+  + 'the task, and tell the user what you wanted to save.';
+
+/** A fake remember: a fact starting "bad" fails, "no" is declined by the user, anything else is saved. */
+function fakeRemember() {
+  ToolRegistry.executeTool = async (name, args) => {
+    executed.push({ name, args });
+    if (name !== 'remember') return { name, output: `1: ${args.path}` };
+    if (args.fact.startsWith('bad')) return { name, output: `No fact you saved matches "${args.fact}".`, is_error: true };
+    if (args.fact.startsWith('no')) {
+      return { name, output: `The user declined: remember for you: "${args.fact}". Do not retry it; ask the user or choose another approach.`, is_error: true };
+    }
+    return { name, output: `📝 Remembered for this project [abcd]: ${args.fact}` };
+  };
+}
+
+/** One step of remember calls, written natively, one per fact. */
+const rememberStep = (step, facts) => ({
+  toolCalls: facts.map((fact, k) => ({ id: `m${step}-${k}`, name: 'remember', arguments: JSON.stringify({ fact, scope: 'project' }) })),
+});
+
+const remembered = () => executed.filter((e) => e.name === 'remember').map((e) => e.args.fact);
+
+test('after 3 failed remember calls in a row, later ones in the run are answered, not run', async () => {
+  fakeRemember();
+  const client = scriptedClient([
+    rememberStep(1, ['bad one', 'bad two', 'bad three', 'Tests run with make test.']),
+    rememberStep(2, ['Build with make.']),
+    { content: 'Done; I could not save two facts: the test and build commands.' },
+  ]);
+  const log = [];
+  const loop = new AgentLoop(client, { log: (line) => log.push(line) });
+  const ended = [];
+  const { shown, callbacks } = recorder();
+  callbacks.onToolEnd = (result) => ended.push(result);
+  assert.equal(await loop.run('tidy the memory', callbacks), 'done');
+
+  assert.deepEqual(remembered(), ['bad one', 'bad two', 'bad three'], 'the fourth and fifth were not run');
+  // Every call keeps its answer, so the history is one a saved task can be taken back from.
+  const answers = loop.messages.filter((m) => m.role === 'tool');
+  assert.deepEqual(answers.map((m) => m.tool_call_id), ['m1-0', 'm1-1', 'm1-2', 'm1-3', 'm2-0']);
+  assert.equal(answers[3].content, REMEMBER_STOPPED);
+  assert.equal(answers[4].content, REMEMBER_STOPPED);
+  assert.ok(new AgentLoop(scriptedClient([])).importState(JSON.parse(JSON.stringify(loop.exportState()))));
+  // Each call is still shown, as the error it is.
+  assert.equal(shown.tools.length, 5);
+  assert.deepEqual(ended.slice(3).map((r) => [r.output, r.is_error]), [[REMEMBER_STOPPED, true], [REMEMBER_STOPPED, true]]);
+  // The log says so with names and numbers only, never the facts.
+  assert.ok(log.some((l) => /remember check: stopped running remember after step 1 \(3 failures in a row\)/.test(l)));
+  assert.equal(log.filter((l) => /remember check: a remember call in step \d+ was not run/.test(l)).length, 2);
+  assert.ok(!log.some((l) => /make test|bad one/.test(l)), 'no fact text in the log');
+
+  // The next run, a Continue included, starts again from nothing.
+  loop.client = scriptedClient([rememberStep(3, ['Build with make.']), { content: 'Saved.' }]);
+  assert.equal(await loop.run('continue', recorder().callbacks), 'done');
+  assert.equal(remembered().at(-1), 'Build with make.');
+});
+
+test('a saved fact starts the count again', async () => {
+  fakeRemember();
+  const client = scriptedClient([
+    rememberStep(1, ['bad one', 'bad two', 'Tests run with make test.']),
+    rememberStep(2, ['bad three', 'bad four', 'bad five', 'bad six']),
+    { content: 'Done.' },
+  ]);
+  assert.equal(await new AgentLoop(client).run('tidy', recorder().callbacks), 'done');
+  assert.deepEqual(remembered(), ['bad one', 'bad two', 'Tests run with make test.', 'bad three', 'bad four', 'bad five']);
+});
+
+test('the user saying no is not a failure: it neither counts nor starts the count again', async () => {
+  fakeRemember();
+  const client = scriptedClient([
+    rememberStep(1, ['bad one', 'no thanks', 'no again', 'bad two', 'no third', 'bad three', 'Build with make.']),
+    { content: 'Done.' },
+  ]);
+  const loop = new AgentLoop(client);
+  assert.equal(await loop.run('tidy', recorder().callbacks), 'done');
+  assert.deepEqual(remembered(), ['bad one', 'no thanks', 'no again', 'bad two', 'no third', 'bad three']);
+  assert.equal(loop.messages.filter((m) => m.role === 'tool').at(-1).content, REMEMBER_STOPPED);
+});
+
+test('a call written as text is answered the same way once remember is stopped', async () => {
+  fakeRemember();
+  const inline = (fact) => `<tool_call>{"name": "remember", "arguments": {"fact": "${fact}", "scope": "project"}}</tool_call>`;
+  const client = scriptedClient([
+    { content: inline('bad one') }, { content: inline('bad two') }, { content: inline('bad three') },
+    { content: inline('Build with make.') },
+    { content: 'Done.' },
+  ]);
+  const loop = new AgentLoop(client);
+  assert.equal(await loop.run('tidy', recorder().callbacks), 'done');
+  assert.deepEqual(remembered(), ['bad one', 'bad two', 'bad three']);
+  const observation = agentRequests(client)[4].messages.at(-1).content;
+  assert.ok(observation.startsWith(`Observation from tool [remember]:\n${REMEMBER_STOPPED}`));
+});
+
+/** `first` steps, reads up to five steps, the answer, then the look back's reply. */
+function taskThenLookBack(first, lookBack) {
+  const turns = [...first];
+  for (let n = turns.length + 1; n <= 5; n++) turns.push({ toolCalls: [{ id: `c${n}`, ...read(`f${n}.ts`) }] });
+  turns.push({ content: 'All done.' });
+  turns.push(lookBack);
+  return scriptedClient(turns);
+}
+
+test('the look back sends the Memory 2 request, and shares the task\'s remember count', async () => {
+  fakeRemember();
+  // Two failures in the task; the look back's first failure is the third, so its next call is not run.
+  let sent;
+  const client = taskThenLookBack([rememberStep(1, ['bad one', 'bad two'])], (req) => {
+    sent = req.messages.at(-1).content;
+    return rememberStep(9, ['bad three', 'Tests run with make test.']);
+  });
+  const log = [];
+  const ended = [];
+  const { callbacks } = recorder();
+  callbacks.onToolEnd = (result) => ended.push(result);
+  assert.equal(await new AgentLoop(client, { log: (line) => log.push(line) }).run('do it', callbacks, { reflect: true }), 'done');
+  assert.equal(sent, [
+    '<dlne_reflect>',
+    'The task is finished. Save, with remember, what a later session in this project would otherwise have to rediscover: how to build, test or run it (exact commands), where things live, the conventions its code follows, and any correction or preference the user gave. Look at Project memory first: update a fact that is now wrong or incomplete (its id in replaces) instead of adding another, and remove one that no longer holds. One fact per call; usually one to three changes are worth making. Skip details that mattered only for this task. If there is truly nothing new, reply with just: nothing.',
+    '</dlne_reflect>',
+  ].join('\n'));
+  assert.deepEqual(remembered(), ['bad one', 'bad two', 'bad three']);
+  assert.ok(log.some((l) => /remember check: stopped running remember after the look back \(3 failures in a row\)/.test(l)));
+  assert.ok(log.some((l) => /remember check: a remember call in the look back was not run/.test(l)));
+  assert.ok(!ended.some((r) => r.output === REMEMBER_STOPPED), 'after the answer nothing but a saved fact is shown');
+
+  // A task that already stopped remember: the look back runs none.
+  executed = [];
+  const stopped = taskThenLookBack([rememberStep(1, ['bad one', 'bad two', 'bad three'])],
+    rememberStep(9, ['Tests run with make test.']));
+  assert.equal(await new AgentLoop(stopped).run('do it', recorder().callbacks, { reflect: true }), 'done');
+  assert.deepEqual(remembered(), ['bad one', 'bad two', 'bad three']);
 });

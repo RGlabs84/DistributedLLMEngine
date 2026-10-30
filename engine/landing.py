@@ -22,7 +22,8 @@ DISCORD_INVITE_URL = "https://discord.gg/RNxvxWn8cw"
 WEBSITE_URL = "https://dlne.rossgilsonlabs.dev"
 # The public swarm's address, for link previews (LinkedIn, Discord, X need absolute URLs). The same
 # name serves the website at / and passes /chat, /c, /v1, /worker and /ws to this coordinator (Caddy,
-# 2.4.7); dlne.duckdns.org still answers too.
+# 2.4.7), and /pictures from 2.6.5 (the RGlabs site repo's server/deploy/rglabs.caddy); dlne.duckdns.org
+# still answers too.
 PUBLIC_URL = "https://dlne.rossgilsonlabs.dev"
 # One preview card for both pages: the official logo.
 OG_IMAGE_URL = PUBLIC_URL + icon_url("icon-512.png")

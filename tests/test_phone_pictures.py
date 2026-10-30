@@ -23,6 +23,7 @@ from engine import app_pool as ap
 from engine import coordinator, image_policy, search
 from engine.contributor_networks import ContributorBook
 from engine.image_pool import ImageService
+from engine.landing import PUBLIC_URL
 from tests.app_pool_fakes import DONE
 from tests.test_app_lookups import (ANSWER, TODAY, TOOLS, WEB_TOOLS, Member_, Result, content, dlne, events, sse, text,
                                     tool_call)
@@ -1038,6 +1039,68 @@ async def test_a_question_about_pictures_is_not_forced(pictures):
     (sent,) = pictures.engine.chats
     assert "tool_choice" not in sent and "create_image" in tools_of(sent)
     assert dlne(out) == [] and len(pictures.service._jobs) == 0
+
+
+# --- paused (IMAGE_GEN_ENABLED=paused, 2026-10-30) ----------------------------------------------------------------------
+
+PAUSED_DETAIL = ("Pictures are paused for now: DLNE's graphics card is busy running the smarter coding model. They will "
+                 "be back. More: " + PUBLIC_URL + "/pictures")
+
+
+@pytest.fixture
+def paused(pictures):
+    pictures.limits.update(image_gen_enabled=False, image_gen_paused=True)
+    return pictures
+
+
+def nothing_made(p):
+    return len(p.service._jobs) == 0 and p.member.calls == [] and p.quota.summary(5)["chats_used"] == 0
+
+
+@pytest.mark.anyio
+async def test_while_paused_the_tool_and_its_line_are_still_offered(paused):
+    await chat("Tell me about foxes.")
+    (sent,) = paused.engine.chats
+    assert sent["tools"] == search.TOOLS + [ap.IMAGE_TOOL] and CONTRACT_LINE in lanes.system_of(sent)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("features", [None, ["future_thing"]])
+async def test_while_paused_a_request_without_the_feature_is_still_answered_as_in_2_6_1(paused, features):
+    await chat("Tell me about foxes.", features)
+    (sent,) = paused.engine.chats
+    assert "create_image" not in tools_of(sent) and CONTRACT_LINE not in lanes.system_of(sent)
+
+
+@pytest.mark.anyio
+async def test_while_paused_a_call_is_told_the_pause_with_the_page_and_nothing_is_made(paused):
+    paused.engine.script = [[calls_create({"prompt": SNOW_PROMPT})], [reply("Pictures are paused right now, sorry!")]]
+    out = await chat(ON_ITS_OWN)
+    assert dlne(out) == [{"event": "image_refused", "code": "image_generation_paused", "detail": PAUSED_DETAIL}]
+    assert paused.engine.chats[1]["messages"][-1]["content"] == REFUSED.format(detail=PAUSED_DETAIL)
+    assert text(out) == "Pictures are paused right now, sorry!"
+    assert nothing_made(paused) and nothing_held(paused.env)
+
+
+@pytest.mark.anyio
+async def test_while_paused_a_plain_ask_whose_model_talks_instead_is_told_the_pause_too(paused):
+    paused.engine.script = [[TALK], [reply("Pictures are paused for now.")]]
+    out = await chat(SKETCH)
+    assert paused.engine.chats[0]["tool_choice"] == "required"
+    assert dlne(out) == [{"event": "image_refused", "code": "image_generation_paused", "detail": PAUSED_DETAIL}]
+    assert paused.engine.chats[1]["messages"][-1]["content"] == REFUSED.format(detail=PAUSED_DETAIL)
+    assert nothing_made(paused)
+
+
+@pytest.mark.anyio
+async def test_while_paused_the_cpu_pool_is_offered_the_tool_and_told_the_same(paused):
+    paused.limits["engine_phone_slots"] = 0
+    paused.env.manager.phone_slots = 0
+    paused.cpu.script = [[calls_create({"prompt": SNOW_PROMPT})], [reply("They're paused.")]]
+    out = await chat(SKETCH)
+    assert "create_image" in tools_of(paused.cpu.payloads[0])
+    assert dlne(out) == [{"event": "image_refused", "code": "image_generation_paused", "detail": PAUSED_DETAIL}]
+    assert nothing_made(paused)
 
 
 # --- who pays ------------------------------------------------------------------------------------------------------------

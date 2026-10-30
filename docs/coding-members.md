@@ -237,13 +237,23 @@ floors would be missed. Ladder order is quality order (smallest and least smart 
 
 `engine/coding_router.py` (coordinator side):
 - `CodingRouter.members(registry, relay_lookup) -> List[CodingMember]` (ready, tunnel up, floors met).
-- `pick(members, session_id, privacy, exclude, own=None, engine_tps=None) -> Optional[CodingMember]`: privacy
-  filter first (section 7), then **sticky**: the member that served this session in the last 30 minutes if it
-  is still eligible and not full; then (2.5.0) the requester's **own** machine, `own` being its trust id, if it
-  is among the eligible members and its `decode_tps` is at least `engine_tps`, what the coordinator's own
-  engine would write for them right now (its measured coding speed shared among the requests its gate has
-  in use; no measurement yet lets it through); else the least busy (ties: higher `prefill_tps`, then
-  `decode_tps`).
+- `pick(members, session_id, privacy, exclude, own=None, engine_tps=None, prefer_smarter=False, engine_model=None,
+  ladder=None, need=None) -> Optional[CodingMember]`: privacy filter first (section 7), with it the **context**
+  filter when the request gives `need` (below), then **sticky**: the member that
+  served this session in the last 30 minutes if it is still eligible and not full; then the requester's **own**
+  machine (2.5.0), `own` being its trust id, if it is among the eligible members and its `decode_tps` is at least
+  `engine_tps`, what the coordinator's own engine would write for them right now (its measured coding speed
+  shared among the requests its gate has in use; no measurement yet lets it through); else the least busy
+  (ties: higher `prefill_tps`, then `decode_tps`).
+  - **Smarter, not faster** (`prefer_smarter`, the requester's `dlne.ownGpu` = `"smarter"`, section 10): after
+    sticky and before the speed check, the requester's own machine is chosen, however slowly it writes, if it is
+    among the eligible members and its `model` sits strictly further down `ladder` (smarter) than `engine_model`,
+    the coordinator engine's coding model. Otherwise the speed check decides as above.
+  - Ranks are `coding_ladder.rank`: the tier's place on the ladder, matched on the model file name as
+    `tier_for_file` does. A model on no tier, on either side, is not smarter.
+  - The engine's model is the running one, else the one the next request starts. An automatic switch
+    (`engine/auto_swap.py`) changes it, so a sharded engine moved up to the member's tier makes the member no
+    smarter.
 - Forwarding: only the body goes to the member. No client IP, no API key, no user identity, no
   coordinator headers: a member learns nothing about who asked (anonymity).
 - Wiring in `engine/coordinator.py` (`chat_completions`, `completions`): when
@@ -251,12 +261,30 @@ floors would be missed. Ladder order is quality order (smallest and least smart 
   to that route's member; every plain request takes today's local engine path, unchanged. Queue order
   (GPU contributors, CPU contributors, trial) applies at the local engine's gate. The public model rule
   stays: callers cannot choose the model.
-- `GET /v1/coding/route?session=<id>&privacy=<mode>[&own=<trust id>]` → `{"route": "<opaque id>", "pubkey":
-  "<b64>", "alg": "x25519-hkdf-sha256-chacha20poly1305"}` for a member, or `{"route": null}` for the local
-  engine. The route id is opaque and short-lived (10 min); it is what the client sends back as
+- `GET /v1/coding/route?session=<id>&privacy=<mode>[&own=<trust id>[&prefer=smarter]][&need=<tokens>]` → `{"route":
+  "<opaque id>", "pubkey": "<b64>", "alg": "x25519-hkdf-sha256-chacha20poly1305"}` for a member, or `{"route":
+  null}` for the local engine. The route id is opaque and short-lived (10 min); it is what the client sends back as
   `X-DLNE-Route`. `own` (2.5.0) is the trust id of the requester's own coding member, which the extension
   takes from the worker's `DLNE_ROLE` line while its job is `coding` (section 10); anything but 32 lower-case
-  hex characters is ignored.
+  hex characters is ignored. `prefer` is the requester's `dlne.ownGpu`: only the exact string `smarter`
+  counts, and only with a valid `own`; anything else, or `prefer` alone, is ignored (today's speed rule).
+- **Route by context** (`need`, 2026-10-30, "context is everything"): the tokens the request will hold, its
+  prompt plus the room it leaves to answer. Only plain digits that make a whole number from 1 to 10,000,000
+  count; anything else (a sign, a space, a decimal point, more than eight digits, zero) is ignored, and the
+  lookup is routed as it was before.
+  - With `need`, a member is eligible only when its **context per request** holds it: its tier's `context` ÷
+    the tier's `server_slots` (section 4; `coding_router.member_context`), the tier being the one its signed
+    heartbeat says it serves, looked up on the ladder. A tier the ladder does not know counts as 65,536 ÷ 2 =
+    32,768. Exactly the context fits.
+  - The check comes with privacy, before anything else is chosen, so a **sticky** member, the requester's
+    **own** member and a **smarter** own member are all passed over, like a full member, when they cannot hold
+    the request. A member chosen because the sticky one could not becomes the session's sticky member (the
+    prompt is cached there now). When no member is chosen, the session keeps the one it had.
+  - No member holds it: `{"route": null}`, and the coordinator's own engine answers, whatever its own
+    size. A prompt larger than the engine's slot is handled there as it always was; the extension compacts
+    to the figure it was given (`policy.coding_context_tokens_max`, docs/agent-memory.md section 9.2).
+  - A sealed request is never checked again on arrival: the coordinator cannot read it, and the route was
+    issued for that need.
 - Status: `"coding_members": {"enabled": bool, "members": n, "ready": n, "slots": n, "busy": n,
   "decode_tps_median": x, "decode_tps_min": x, "prefill_tps_median": x, "prefill_tps_min": x}` in
   `/v1/cluster/status` (counts and pool-wide figures only: the four speeds, 2.5.0, are the ready members'
@@ -437,7 +465,7 @@ text must say exactly this and must not claim the member cannot see the request.
     workspace or folder value (`config.inspect()`) can only narrow it (`trustedOnly < auto < anyMember`; an
     unknown value → `trusted`). A cloned repo's `.vscode/settings.json` cannot widen it, trusted or not.
     Review SR-05: every other setting that decides where code or keys go (`dlne.serverUrl`, `dlne.apiKey`,
-    `dlne.autoApproveReads`, `dlne.autoUpdate`, `dlne.worker.*`) has `scope: application` (`pythonPath`:
+    `dlne.autoApproveReads`, `dlne.autoUpdate`, `dlne.ownGpu`, `dlne.worker.*`) has `scope: application` (`pythonPath`:
     `machine`), so a folder's settings are not read for them.
   - The remote is read from the folder's own `.git/config` (a linked checkout's or submodule's `.git` file is followed;
     a parent folder's repository is not adopted). Exactly one `remote.*.url`; a `pushurl` that names another
@@ -602,10 +630,18 @@ half-written. Used by coding members and by auto-swap for split models. It block
    (`read_file` is refused before the user is asked, `search_codebase` skips them) and get no autocomplete.
 3. *Privacy mode* (section 7): `X-DLNE-Privacy` on every request while members are on, and `privacy=` on the
    route lookup. A lookup that is slow (1.5 s), throws, or returns anything else reads as `trusted`.
-4. *Route* (section 5): `GET /v1/coding/route?session=&privacy=` with the usual Authorization. Chat asks
-   before every request; autocomplete reuses an answer for 20 s. 404/405/501 mean "older coordinator": not
+4. *Route* (section 5): `GET /v1/coding/route?session=&privacy=[&own=[&prefer=smarter]]` with the usual
+   Authorization. Chat asks before every request; autocomplete reuses an answer for 20 s (an answer is kept per
+   session, privacy, `own` and `prefer`). 404/405/501 mean "older coordinator": not
    asked again for 10 minutes. Any other failure, `{route: null}`, or an offer the client cannot use (route id
    not `[A-Za-z0-9._~:-]{1,256}`, key not 32 bytes of base64, `alg` other than ours) is the plain path.
+   - `own` is this machine's trust id while its worker is a coding member (the `DLNE_ROLE` line below).
+   - `prefer=smarter` is added only with `own`, when the setting `dlne.ownGpu` (scope `application`) is
+     `"smarter"`: the user's requests go to their own GPU whenever it runs a smarter model than the
+     coordinator's engine, even if it writes more slowly. `"faster"` (the default) sends nothing new: the
+     own machine is preferred only while it is as fast. The setting is read at every lookup, so a change
+     needs no reload. Privacy still filters first: a private repository reaches the own machine only if the
+     operator lists it in `TRUSTED_MEMBERS`.
 5. *Seal* (section 6): the redacted body is sealed with `sealRequest`; the request carries
    `X-DLNE-Route: <route id>` and the envelope as its body. **An envelope is sent once.** Every attempt
    (a retry after a socket error, a busy answer, a failed member) asks for a route again and seals again.

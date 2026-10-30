@@ -1,10 +1,12 @@
 /**
  * Asks the coordinator whether a coding member should serve a request (docs/coding-members.md section 5):
- * `GET /v1/coding/route?session=<id>&privacy=<mode>[&own=<trust id>]` answers `{route, pubkey, alg}` for a
- * member or `{route: null}` for the coordinator's own engine (`own` names this machine's own coding member,
- * which the coordinator prefers while it is fast enough). A coordinator from before coding members answers 404,
- * which is remembered for ten minutes so an old server is asked once, not before every request. No
- * vscode import, so tests load it straight from dist/.
+ * `GET /v1/coding/route?session=<id>&privacy=<mode>[&own=<trust id>[&prefer=smarter]][&need=<tokens>]` answers
+ * `{route, pubkey, alg}` for a member or `{route: null}` for the coordinator's own engine (`own` names this machine's
+ * own coding member, which the coordinator prefers while it is fast enough; `prefer=smarter`, from dlne.ownGpu, prefers
+ * it instead whenever it runs a smarter model than the coordinator's engine; `need`, from 2.6.x, is how many tokens the
+ * request will hold, so only a machine with that much context per request is offered). A coordinator from before
+ * coding members answers 404, which is remembered for ten minutes so an old server is asked once, not before every
+ * request. One from before `need` ignores it. No vscode import, so tests load it straight from dist/.
  */
 import * as http from 'http';
 import * as https from 'https';
@@ -26,6 +28,63 @@ const MAX_CACHED = 64;
 
 const ROUTE_ID = /^[A-Za-z0-9._~:-]{1,256}$/;
 const BASE64 = /^[A-Za-z0-9+/]{43}=?$/;
+
+// ---- how much context a request needs ------------------------------------------------------------------
+
+/**
+ * Characters per token for `need`. The same figure the agent's compaction starts from (DEFAULT_CHARS_PER_TOKEN in
+ * agent/agentLoop.ts, docs/agent-memory.md 5.1), and the coordinator's own count: it measures a prompt at 3 characters
+ * a token when it decides whether the prompt fits a slot. The agent's calibrated figure is not used here: it is
+ * usually larger, which would ask for less room than the coordinator will count.
+ */
+export const NEED_CHARS_PER_TOKEN = 3.0;
+/** `need` is rounded up to a multiple of this, so a conversation that grows by a few lines keeps one cache key. */
+export const NEED_STEP = 4096;
+/** The coordinator ignores a need above 10,000,000; this is the largest multiple of NEED_STEP below that. */
+export const NEED_MAX = Math.floor(10_000_000 / NEED_STEP) * NEED_STEP;
+
+/** A string's length, or 0 for anything else. */
+function chars(value: unknown): number {
+  return typeof value === 'string' ? value.length : 0;
+}
+
+/**
+ * The characters a request's prompt holds, counted the way the agent's compaction counts them (messageChars in
+ * agent/agentLoop.ts, plus the tools' definitions): every message's content and tool calls with 16 characters each
+ * for the wrapping, the tools as JSON, and an autocomplete's prompt and suffix.
+ */
+export function promptChars(payload: Record<string, any>): number {
+  let total = chars(payload.prompt) + chars(payload.suffix);
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  for (const m of messages) {
+    total += chars(m?.content) + 16;
+    for (const tc of Array.isArray(m?.tool_calls) ? m.tool_calls : []) {
+      total += chars(tc?.function?.name) + chars(tc?.function?.arguments) + 16;
+    }
+  }
+  if (Array.isArray(payload.tools) && payload.tools.length > 0) {
+    total += JSON.stringify(payload.tools).length;
+  }
+  return total;
+}
+
+/** `tokens` rounded up to a multiple of NEED_STEP and kept within NEED_MAX; 0 (nothing to send) for anything not above 0. */
+export function roundNeed(tokens: number): number {
+  if (!Number.isFinite(tokens) || tokens <= 0) {
+    return 0;
+  }
+  return Math.min(NEED_MAX, Math.ceil(tokens / NEED_STEP) * NEED_STEP);
+}
+
+/**
+ * The tokens a request will hold: its prompt, estimated at NEED_CHARS_PER_TOKEN, and the room it asks for its answer
+ * (`max_tokens`), rounded up to a multiple of 4,096. A 30,000-character agent prompt with 10,240 tokens of answer is
+ * 10,000 + 10,240 = 20,240, sent as 20,480. 0 when there is nothing to estimate.
+ */
+export function requestNeed(payload: Record<string, any>): number {
+  const answer = Number.isInteger(payload.max_tokens) && payload.max_tokens > 0 ? payload.max_tokens : 0;
+  return roundNeed(Math.ceil(promptChars(payload) / NEED_CHARS_PER_TOKEN) + answer);
+}
 
 /** The member to use, or null for the local engine (also for anything that is not a well-formed offer). */
 export function parseRouteOffer(body: unknown): RouteOffer | null {
@@ -106,6 +165,10 @@ export class RouteLookup {
    *   right for chat, where the router should see each turn; autocomplete passes a few seconds)
    * @param own the trust id of this machine's own coding member, when the worker is one (32 hex characters;
    *   anything else is not sent)
+   * @param preferSmarter dlne.ownGpu is "smarter": ask for this machine's member whenever its model is smarter than
+   *   the coordinator's, even if it writes more slowly. Only sent with `own`; alone it would mean nothing.
+   * @param need the tokens the request will hold (requestNeed). Rounded up to a multiple of 4,096 here too, and part of
+   *   the cache key, so a cached answer is only reused for a request of the same size. Not sent when it is not above 0.
    */
   async lookup(
     base: string,
@@ -114,14 +177,18 @@ export class RouteLookup {
     privacy: string,
     ttlMs: number,
     agent?: http.Agent,
-    own?: string
+    own?: string,
+    preferSmarter?: boolean,
+    need?: number
   ): Promise<RouteOffer | null> {
     const now = Date.now();
     if ((this.unsupportedUntil.get(base) ?? 0) > now) {
       return null;
     }
     const mine = own && /^[0-9a-f]{32}$/.test(own) ? own : '';
-    const key = `${base}|${session}|${privacy}|${mine}`;
+    const prefer = mine && preferSmarter === true ? 'smarter' : '';
+    const tokens = roundNeed(need ?? 0);
+    const key = `${base}|${session}|${privacy}|${mine}|${prefer}|${tokens}`;
     if (ttlMs > 0) {
       const hit = this.cache.get(key);
       if (hit && hit.until > now) {
@@ -131,7 +198,7 @@ export class RouteLookup {
     let reply: { status: number; body: unknown };
     try {
       const url = new URL(`${base}/v1/coding/route?session=${encodeURIComponent(session)}&privacy=${encodeURIComponent(privacy)}` +
-        (mine ? `&own=${mine}` : ''));
+        (mine ? `&own=${mine}` : '') + (prefer ? `&prefer=${prefer}` : '') + (tokens > 0 ? `&need=${tokens}` : ''));
       reply = await getJson(url, headers, LOOKUP_TIMEOUT_MS, agent);
     } catch {
       return null; // the network is struggling: the plain path now, and ask again next time

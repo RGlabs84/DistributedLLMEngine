@@ -283,6 +283,36 @@ def test_remember_is_the_eighth_and_last_tool_with_a_scope_of_project_or_user():
     assert set(parameters["properties"]) == {"fact", "scope", "replaces"}   # replaces: update or remove a saved fact
 
 
+# The remember tool of Memory 2 (docs/agent-memory.md section 3, extension 1.5.x), word for word. The docs folder is
+# not on the CI copy, so the text is here too; canary-parity.test.js compares the docs, the extension and canary.py.
+MEMORY_2_REMEMBER_TOOL = r'''
+{
+  "type": "function",
+  "function": {
+    "name": "remember",
+    "description": "Save, update or remove one lasting fact for later sessions. scope \"project\" keeps it in this project's .dlne/memory.md (how to build and test it, where things live, its conventions, the user's corrections); it is saved at once and shown to the user, who can undo it. scope \"user\" keeps it in ~/.dlne/memory.md, for the user's own preferences that hold in every project; the user approves it. Facts you saved show with an id in front, like [a7f3]. To update one, give its id in replaces and the new text in fact; to remove it, give its id in replaces and leave fact empty. Prefer updating a fact to adding a near-copy.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "fact": { "type": "string", "description": "One short, self-contained sentence (at most 500 characters); empty to remove the fact given in replaces." },
+        "scope": { "type": "string", "enum": ["project", "user"], "description": "Where it is kept: project or user." },
+        "replaces": { "type": "string", "description": "Optional: the id of a fact you saved earlier (the [a7f3] in front of it), or its opening words." }
+      },
+      "required": ["fact", "scope"]
+    }
+  }
+}
+'''
+
+
+def test_remember_is_memory_2s_tool_compared_as_json():
+    """A decoy still carrying the old text (no ids, "its opening words are enough") would be one a member could
+    tell from a real 1.5.x request."""
+    assert canary._AGENT_TOOLS[-1] == json.loads(MEMORY_2_REMEMBER_TOOL)
+    assert canary.agent_tools(True)[-2] == json.loads(MEMORY_2_REMEMBER_TOOL)      # generate_image goes after it
+    assert "Its opening words are enough" not in json.dumps(canary._AGENT_TOOLS)
+
+
 def test_about_two_in_five_canaries_carry_a_context_message_at_index_one():
     carrying = 0
     for seed in range(1000):
@@ -353,6 +383,98 @@ def test_the_notes_fit_the_canarys_language_and_sometimes_name_its_file():
         if path.endswith(".py"):
             assert "go test" not in content and "npm ci" not in content, content
     assert named > 20
+
+
+# ------------------------------------------------------------------------------------------
+# Fact ids in the memory sections (Memory 2: docs/agent-memory.md sections 7.2 and 7.8)
+# ------------------------------------------------------------------------------------------
+
+ID_LINE = re.compile(r"- \[([0-9a-f]{4,8})\] (.+)")
+
+
+def test_a_fact_key_is_memory_ts_normalisation():
+    assert canary.fact_key("- Tests run with `make test`. <!-- dlne -->") == "tests run with `make test`."
+    assert canary.fact_key("  *   Two\t spaces   and\nA BREAK  ") == "two spaces and a break"
+    assert canary.fact_key("<!-- a --> - x <!-- b\nc -->") == "x"           # comments first, then the marker
+    assert canary.fact_key("- - nested") == "- nested"                      # one list marker only
+    assert canary.fact_key("-no space") == "-no space"                      # not a list marker without a space
+
+
+def test_a_fact_id_is_the_first_four_hex_of_sha256_of_its_key():
+    # Worked out with `printf %s '<key>' | sha256sum`, not with hashlib, so the vectors check the code.
+    assert canary.fact_id("Tests run with `make test` from the repository root.") == "f6d5"
+    assert canary.fact_id("- Prefers short answers and small diffs. <!-- dlne -->") == "6675"
+    assert canary.fact_id("The configuration for orders is in `orders/settings.py`.") == "0aa0"
+    assert canary.fact_id("  TESTS   run with `make test` from the repository root.  ") == "f6d5"
+
+
+def test_ids_grow_past_four_characters_only_when_two_facts_share_theirs():
+    plain = canary.fact_ids(["Tests run with `make test` from the repository root.", "Prefers short answers and small diffs."])
+    assert list(plain.values()) == ["f6d5", "6675"]
+    # These two share f056 (f0566863… and f0560eb5…), so every agent line of the file takes 5 characters, the
+    # shortest length at which all of them differ, the unrelated one too.
+    a, b, c = "Fact number 222 for the collision test.", "Fact number 739 for the collision test.", "Prefers short answers and small diffs."
+    assert canary.fact_id(a) == canary.fact_id(b) == "f056"
+    assert canary.fact_ids([a, b, c]) == {a: "f0566", b: "f0560", c: "66759"}
+    # Two lines with the same fact never separate, so they stop at 8.
+    same = canary.fact_ids(["- Same fact. <!-- dlne -->", "- same   FACT."])
+    assert set(same.values()) == {hashlib.sha256(b"same fact.").hexdigest()[:8]}
+    assert canary.fact_ids([]) == {}
+
+
+def _memory_sections(count=1500):
+    """The text of every memory section (project and user) in the decoys of the first ``count`` seeds."""
+    sections = []
+    for _, body in _context_bodies(count):
+        content = body["messages"][1]["content"]
+        for heading in HEADINGS[1:]:
+            if heading in content:
+                text = content.split(heading + "\n", 1)[1]
+                sections.append((heading, re.split(r"\n\n## |\n</dlne_context>", text, maxsplit=1)[0]))
+    return sections
+
+
+def test_the_agents_facts_in_a_decoy_carry_the_id_the_extension_would_give_them():
+    ids_seen = set()
+    for _, text in _memory_sections():
+        lines = text.split("\n")
+        mine = [ID_LINE.fullmatch(line) for line in lines]
+        facts = [m.group(2) for m in mine if m]
+        expected = canary.fact_ids(facts)                                   # the rule runs over this file's agent lines
+        for match in filter(None, mine):
+            assert match.group(1) == expected[match.group(2)] == hashlib.sha256(
+                canary.fact_key(match.group(2)).encode()).hexdigest()[:len(match.group(1))]
+            ids_seen.add(match.group(1))
+        for line, match in zip(lines, mine):
+            if not match:
+                assert line.startswith("- ") and not re.match(r"- \[", line), line   # the user's own line, as written
+        assert len(set(m.group(1) for m in mine if m)) == len(facts), "ids in one file differ"
+    assert len(ids_seen) > 30
+
+
+def test_memory_sections_mix_the_agents_facts_and_the_users_like_real_files():
+    kinds = {"agent": 0, "user": 0, "mixed": 0}
+    project_lines, users_with_ids = set(), 0
+    for heading, text in _memory_sections():
+        flags = [bool(ID_LINE.fullmatch(line)) for line in text.split("\n")]
+        kinds["agent" if all(flags) else "user" if not any(flags) else "mixed"] += 1
+        if heading == HEADINGS[1]:
+            project_lines.add(len(flags))
+        else:
+            users_with_ids += any(flags)
+    total = sum(kinds.values())
+    assert all(n > total * 0.1 for n in kinds.values()), kinds               # each kind of file comes up, often
+    assert kinds["agent"] > kinds["user"], kinds                             # the agent writes most files itself
+    assert project_lines == {1, 2, 3, 4, 5, 6}, project_lines
+    assert users_with_ids > 10, "the user's file holds the agent's facts too, saved with approval"
+
+
+def test_only_memory_sections_carry_ids_never_agents_md():
+    for _, body in _context_bodies(800):
+        content = body["messages"][1]["content"]
+        if HEADINGS[0] in content:
+            instructions = content.split(HEADINGS[0] + "\n", 1)[1].split("\n\n## ")[0]
+            assert not re.search(r"\[[0-9a-f]{4,8}\]", instructions), instructions
 
 
 def test_a_context_message_changes_nothing_else_about_the_request():

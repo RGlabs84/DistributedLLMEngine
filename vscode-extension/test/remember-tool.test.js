@@ -12,6 +12,10 @@ const path = require('node:path');
 
 const stub = require('./helpers/vscode-stub');
 const { ToolRegistry } = require('../dist/agent/tools');
+const { factId } = require('../dist/agent/memory');
+
+/** "[a7f3]": a fact's id as the messages show it (4 characters: no two facts in these tests clash). */
+const tag = (fact) => `[${factId(fact)}]`;
 
 const realApprover = ToolRegistry.approver;
 const realStore = ToolRegistry.store;
@@ -89,7 +93,7 @@ test('a project fact asks with the contract\'s summary and detail, and offers "A
       always: 'Always allow remembering in this project',
     });
     assert.equal(result.is_error, undefined);
-    assert.equal(result.output, '📝 Remembered for this project: Tests run with npm test.');
+    assert.equal(result.output, `📝 Remembered for this project ${tag('Tests run with npm test.')}: Tests run with npm test.`);
     assert.match(fs.readFileSync(projectFile, 'utf8'), /- Tests run with npm test\. <!-- dlne -->\n$/);
   }, { answers: ['once'] }));
 
@@ -99,7 +103,7 @@ test('a user fact asks with the user wording, the user\'s file, and no "Always" 
     assert.equal(asked[0].summary, 'remember about you, for every project: "Prefers short answers."');
     assert.ok(asked[0].detail.startsWith(`${userFile}\n\n`));
     assert.equal(asked[0].always, undefined);
-    assert.equal(result.output, '📝 Remembered for you: Prefers short answers.');
+    assert.equal(result.output, `📝 Remembered for you ${tag('Prefers short answers.')}: Prefers short answers.`);
     assert.ok(fs.existsSync(userFile));
   }, { answers: ['once'] }));
 
@@ -118,7 +122,7 @@ test('"Always allow remembering in this project": later project facts are saved 
     ToolRegistry.resetApprovals();
     const second = await remember('Second.', 'project');
     assert.equal(asked.length, 1, 'not asked again');
-    assert.equal(second.output, '📝 Remembered for this project: Second.');
+    assert.equal(second.output, `📝 Remembered for this project ${tag('Second.')}: Second.`);
     assert.match(fs.readFileSync(projectFile, 'utf8'), /- First\. <!-- dlne -->\n- Second\. <!-- dlne -->\n$/);
     assert.deepEqual(ToolRegistry.alwaysApprovals(), { edits: false, commands: [], remember: true });
   }, { answers: ['always'] }));
@@ -203,7 +207,7 @@ test('with no folder open a user fact can still be saved, after asking', () =>
   project(async ({ asked, userFile }) => {
     const result = await remember('About me.', 'user');
     assert.equal(asked.length, 1);
-    assert.equal(result.output, '📝 Remembered for you: About me.');
+    assert.equal(result.output, `📝 Remembered for you ${tag('About me.')}: About me.`);
     assert.ok(fs.existsSync(userFile));
   }, { folder: false, answers: ['once'] }));
 
@@ -223,7 +227,7 @@ test('a full memory file is answered without a question', () =>
     const result = await remember('y'.repeat(100), 'project');
     assert.equal(asked.length, 0);
     assert.equal(result.is_error, true);
-    assert.match(result.output, /^The memory file is full/);
+    assert.match(result.output, /^The project memory is full \(7950 of 8000 characters\), so nothing was saved\./);
   }));
 
 // ---- automatic memory (dlne.agent.memory "auto", the default; docs/agent-memory.md 7.4, 7.6) --------------
@@ -235,7 +239,7 @@ test('auto: a project fact is saved without a question, marked as the agent\'s, 
   project(async ({ asked, projectFile }) => {
     const result = await remember('Tests run with npm test.', 'project');
     assert.equal(asked.length, 0);
-    assert.equal(result.output, '📝 Remembered for this project: Tests run with npm test.');
+    assert.equal(result.output, `📝 Remembered for this project ${tag('Tests run with npm test.')}: Tests run with npm test.`);
     assert.equal(result.memoryChange.added, '- Tests run with npm test. <!-- dlne -->');
     assert.equal(result.memoryChange.removed, null);
     assert.match(fs.readFileSync(projectFile, 'utf8'), /- Tests run with npm test\. <!-- dlne -->\n$/);
@@ -260,40 +264,88 @@ test('replaces: the agent updates or removes its own fact in place; a line the u
     await remember('Source is in src/.', 'project');
 
     const updated = await change('Tests run with npm run test:all.', 'project', 'Tests run with npm test.');
-    assert.equal(updated.output, '📝 Updated for this project: Tests run with npm test. → Tests run with npm run test:all.');
+    assert.equal(updated.output, `📝 Updated for this project ${tag('Tests run with npm test.')} → ${tag('Tests run with npm run test:all.')}: ` +
+      'Tests run with npm test. → Tests run with npm run test:all.');
     assert.equal(fs.readFileSync(projectFile, 'utf8'),
       '- My own note: use tabs.\n- Tests run with npm run test:all. <!-- dlne -->\n- Source is in src/. <!-- dlne -->\n', 'updated in place');
 
     const removed = await change('', 'project', 'source is in   SRC/.');
-    assert.equal(removed.output, '📝 Forgot for this project: Source is in src/.', 'the saved fact, as it was saved');
+    assert.equal(removed.output, `📝 Forgot for this project ${tag('Source is in src/.')}: Source is in src/.`, 'the saved fact, as it was saved');
     assert.doesNotMatch(fs.readFileSync(projectFile, 'utf8'), /Source is in/);
 
     const theirs = await change('', 'project', 'My own note: use tabs.');
     assert.equal(theirs.is_error, true);
-    assert.match(theirs.output, /only facts DLNE saved can be updated or removed/);
+    assert.equal(theirs.output, 'That fact was written by the user, not by DLNE, so DLNE cannot change it. Ask the user, or save a new fact.');
     assert.match(fs.readFileSync(projectFile, 'utf8'), /^- My own note: use tabs\.\n/);
     assert.equal(asked.length, 0);
   }, { mode: 'auto' }));
 
-test('replaces: the opening words of a saved fact pick it out; several or none say which facts there are', () =>
+test('replaces: the opening words of a saved fact pick it out; several or none list the facts with their ids', () =>
   project(async ({ projectFile }) => {
-    await remember('AD102 BTL1 header: os_data_off=0x7e00, patch_loc=0x7d00.', 'project');
-    await remember('AD102 DMEM frame: 72-byte header, then zeros.', 'project');
+    const btl = 'AD102 BTL1 header: os_data_off=0x7e00, patch_loc=0x7d00.';
+    const btl2 = 'AD102 BTL1 header: os_data_off=0x7e00, patch_loc=0x7d00, num_sigs=2.';
+    const dmem = 'AD102 DMEM frame: 72-byte header, then zeros.';
+    await remember(btl, 'project');
+    await remember(dmem, 'project');
 
-    const updated = await change('AD102 BTL1 header: os_data_off=0x7e00, patch_loc=0x7d00, num_sigs=2.', 'project', 'AD102 BTL1 header');
-    assert.equal(updated.output,
-      '📝 Updated for this project: AD102 BTL1 header: os_data_off=0x7e00, patch_loc=0x7d00. → AD102 BTL1 header: os_data_off=0x7e00, patch_loc=0x7d00, num_sigs=2.');
+    const updated = await change(btl2, 'project', 'AD102 BTL1 header');
+    assert.equal(updated.output, `📝 Updated for this project ${tag(btl)} → ${tag(btl2)}: ${btl} → ${btl2}`);
 
     const several = await change('', 'project', 'ad102');
     assert.equal(several.is_error, true);
-    assert.match(several.output, /^"ad102" is in 2 facts you saved: "AD102 BTL1 header: os_data_off=0x7e00, patch_loc=0x7d00, num…"; "AD102 DMEM frame: 72-byte header, then zeros\."\. Give more of the one you mean in replaces\.$/);
+    assert.equal(several.output, `"ad102" matches 2 facts you saved: ${tag(btl2)} "${btl2.slice(0, 50)}…"; ${tag(dmem)} "${dmem}". ` +
+      'Give the id of the one you mean in replaces.');
 
     const none = await change('', 'project', 'GA102 DMEM pattern');
     assert.equal(none.is_error, true);
-    assert.match(none.output, /^No fact you saved matches "GA102 DMEM pattern"; only facts DLNE saved can be updated or removed\. Yours begin: "AD102 BTL1/);
+    assert.equal(none.output, `No fact you saved matches "GA102 DMEM pattern". Yours: ${tag(btl2)} "${btl2.slice(0, 50)}…"; ${tag(dmem)} "${dmem}". ` +
+      'Give the id in replaces.');
 
-    assert.equal((await change('', 'project', 'dmem frame')).output, '📝 Forgot for this project: AD102 DMEM frame: 72-byte header, then zeros.');
+    assert.equal((await change('', 'project', 'dmem frame')).output, `📝 Forgot for this project ${tag(dmem)}: ${dmem}`);
     assert.equal(fs.readFileSync(projectFile, 'utf8').split('\n').filter((l) => l.startsWith('- ')).length, 1);
+  }, { mode: 'auto' }));
+
+test('an update or a removal that asks names the old fact by its id', () =>
+  project(async ({ asked }) => {
+    await remember('Tests run with npm test.', 'project');
+    await change('Tests run with npm run test:all.', 'project', tag('Tests run with npm test.'));
+    await change('', 'project', `id: ${factId('Tests run with npm run test:all.')}`);
+    await remember('Prefers short answers.', 'user');
+    await change('Prefers short answers, with code first.', 'user', 'user: Prefers short answers.');
+    assert.deepEqual(asked.map((a) => a.summary), [
+      'remember for this project: "Tests run with npm test."',
+      `update a remembered fact for this project: ${tag('Tests run with npm test.')} "Tests run with npm test." → "Tests run with npm run test:all."`,
+      `forget a remembered fact for this project: ${tag('Tests run with npm run test:all.')} "Tests run with npm run test:all."`,
+      'remember about you, for every project: "Prefers short answers."',
+      `update a remembered fact about you, for every project: ${tag('Prefers short answers.')} "Prefers short answers." → "Prefers short answers, with code first."`,
+    ]);
+  }, { answers: ['once', 'once', 'once', 'once', 'once'] }));
+
+test('2026-10-30 replayed: a nearly full file, a new fact refused with the facts to shrink, "project: <fact>" accepted, then room', () =>
+  project(async ({ root, home, projectFile }) => {
+    const { loadMemory } = require('../dist/agent/memory');
+    const finding = (n) => `Finding ${n}: ${'the GA102 SEC2 image keeps its signature table after the header '.repeat(7).trim()}.`;
+    const findings = Array.from({ length: 15 }, (_, n) => finding(n + 1));
+    fs.mkdirSync(path.dirname(projectFile), { recursive: true });
+    fs.writeFileSync(projectFile, ['- The user\'s own note: ' + 'x'.repeat(500), ...findings.map((f) => `- ${f} <!-- dlne -->`)].join('\n') + '\n');
+    const used = loadMemory(root, { homeDir: home }).project.text.length;
+    assert.ok(used > 7_400 && used < 8_000, String(used));
+
+    const fresh = `The SEC2 unlock needs the BTL1 header patched first: ${'patch_loc 0x7d00 then os_data_off 0x7e00, '.repeat(10).trim()}`;
+    const refused = await remember(fresh, 'project');
+    assert.equal(refused.is_error, true);
+    assert.ok(refused.output.startsWith(`The project memory is full (${used} of 8000 characters), so nothing was saved. Make room first: `), refused.output);
+    assert.match(refused.output, new RegExp(`Yours, largest first: \\${tag(finding(10))} \\(${finding(10).length} chars\\) "Finding 10: `));
+
+    // The call that failed a dozen times that day: the fact quoted with its memory's name in front.
+    const merged = await change('Findings 1 and 2: the GA102 SEC2 signature table follows the header.', 'project', `project: ${findings[0]}`);
+    assert.equal(merged.is_error, undefined, merged.output);
+    assert.match(merged.output, /^📝 Updated for this project \[[0-9a-f]{4}\] → \[[0-9a-f]{4}\]: Finding 1: /);
+    assert.equal((await change('', 'project', tag(findings[1]))).is_error, undefined, 'removed by its id');
+
+    const saved = await remember(fresh, 'project');
+    assert.equal(saved.is_error, undefined, saved.output);
+    assert.equal(saved.output, `📝 Remembered for this project ${tag(fresh)}: ${fresh}`);
   }, { mode: 'auto' }));
 
 test('a long update takes the old fact\'s place in parts, says so, and repeating it adds nothing', () =>
@@ -311,8 +363,8 @@ test('a long update takes the old fact\'s place in parts, says so, and repeating
 
     const r = await change(abcd, 'project', 'AD102 SEC2 repeating');
     assert.equal(r.is_error, undefined, r.output);
-    assert.match(r.output, /^📝 Updated for this project: /);
-    assert.match(r.output, /\n📝 Remembered for this project: Secondary D .*\nIt is over 500 characters, so it was saved as these 2 facts, one after the other\. That is expected: nothing more to do\.$/);
+    assert.ok(r.output.startsWith(`📝 Updated for this project ${tag(abc)} → [`), r.output);
+    assert.match(r.output, /\n📝 Remembered for this project \[[0-9a-f]{4}\]: Secondary D .*\nIt is over 500 characters, so it was saved as these 2 facts, one after the other\. That is expected: nothing more to do\.$/);
     assert.equal(facts().length, 3);
     assert.match(facts()[1], /Secondary D/, 'the second part right after the first, not at the end');
     assert.match(facts()[2], /Key files/);

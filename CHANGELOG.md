@@ -10,6 +10,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.6.5] - 2026-10-30
+
+Released with extension 1.5.4. TheWall can run the smarter coding model across all three of its cards with 128k of
+context a request, pictures can be paused with a clear answer for everyone who asks, and long requests go to a machine
+that can hold them.
+
+### Added
+- **A shared media card** (`MEDIA_GPU_SHARED`, default false). The media card (`MEDIA_GPU`) can hold model layers too,
+  while the vision projector stays on it (`--mmproj-device`). The engine runs on every card (`--device` lists the media
+  card last, so `-ts a,b,c` lines up), the node's pool counts it, and image generation never starts on a shared card.
+  When volunteers' GPUs join, a shared card stays in the engine (no `--device`, which would hide them), so the pool
+  the coordinator plans with is the pool the engine has: TheWall's 24 GB plus a docked 8 GB laptop is a real 32 GB.
+- **Pictures can be paused** (`IMAGE_GEN_ENABLED=paused`). Nothing image-related loads. Every picture endpoint answers
+  503 `image_generation_paused` with one sentence ("Pictures are paused for now: DLNE's graphics card is busy running
+  the smarter coding model. They will be back.") and a link to **`/pictures`**, a new live page that says whether
+  pictures are paused, on, or unavailable. The phone and web chats still offer the picture tool, so someone who asks
+  is told kindly and pointed to the page; the web chat's "+" menu shows "Pictures paused" with a "Why?" link. The
+  status gains `capabilities.image_generation_paused` and `images.paused/note/page`.
+- **Route by context.** `/v1/coding/route` takes `need=<tokens>` and only sends a request to a coding member whose
+  per-request context holds it; otherwise the coordinator's own engine answers. `policy.coding_context_tokens_max` is
+  the largest per-request context available (`coding_context_tokens`, the smallest, is unchanged for older
+  extensions). "Context is everything" (owner, 2026-10-30).
+- **`dlne.ownGpu = smarter`** (extension 1.5.4): with `prefer=smarter` and `own`, the requester's own coding member is
+  chosen before the speed check whenever its model ranks above the coordinator engine's on the ladder.
+- **`ENGINE_KV_TYPE`** (`auto`, `q8_0`, `q4_0`, `f16`; default `auto`). `auto` is the rule as before (q8_0, and q4_0
+  from 131,072 tokens a slot); any other value fixes the type. TheWall runs `q8_0` with its 2 x 131,072 lanes: the
+  owner's rule is that q8_0 is never lowered.
+
+### Changed
+- **Canary decoys match Memory 2** (extension 1.5.4): the `remember` tool's new text, and `[id]`-prefixed facts the
+  agent saved in decoy memory sections, with ids computed exactly as the extension does.
+
 ## [2.6.4] - 2026-10-30
 
 Released with extension 1.5.3. A GPU on Wi-Fi may share the big model when its

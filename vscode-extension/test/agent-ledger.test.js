@@ -317,6 +317,96 @@ test('remember: the same fact twice is one entry', () => {
   assert.equal(l.render(), 'Remembered:\n- project: Same.');
 });
 
+// Memory 2 puts each fact's id in the message (the contract's section 4). The ledger keeps the fact, not the id: an
+// update gives the fact a new id, so an id in the ledger would soon point at nothing.
+test('remember (Memory 2): saved, updated and forgotten facts with ids are recorded as before, without the ids', () => {
+  const l = new Ledger();
+  l.record('remember', {}, ok('remember', '📝 Remembered for this project [a7f3]: Tests run with `npm test` from vscode-extension/.'));
+  l.record('remember', {}, ok('remember', '📝 Remembered for you [0c9e1]: Prefers tabs.'));
+  l.record('remember', {}, ok('remember', '📝 Updated for this project [a7f3] → [b812]: Tests run with `npm test`. → Tests run with `npm test` from vscode-extension/, after `npm run compile`.'));
+  l.record('remember', {}, ok('remember', '📝 Forgot for you [d00d]: Likes long answers.'));
+  assert.equal(l.render(), [
+    'Remembered:',
+    '- project: Tests run with `npm test` from vscode-extension/.',
+    '- user: Prefers tabs.',
+    '- project: Tests run with `npm test` from vscode-extension/, after `npm run compile`. (replacing: Tests run with `npm test`.)',
+    '- user: forgot: Likes long answers.',
+  ].join('\n'));
+});
+
+test('remember: an update or removal without ids (a task saved by 1.5.3) is recorded the same way', () => {
+  const withIds = new Ledger();
+  withIds.record('remember', {}, ok('remember', '📝 Updated for you [1234] → [5678]: Old. → New.'));
+  withIds.record('remember', {}, ok('remember', '📝 Forgot for this project [9abc]: Gone.'));
+  const without = new Ledger();
+  without.record('remember', {}, ok('remember', '📝 Updated for you: Old. → New.'));
+  without.record('remember', {}, ok('remember', '📝 Forgot for this project: Gone.'));
+  assert.equal(without.render(), withIds.render());
+  assert.equal(without.render(), 'Remembered:\n- user: New. (replacing: Old.)\n- project: forgot: Gone.');
+});
+
+test('remember: a fact saved in parts is one entry per part, and the sentence after them is not a fact', () => {
+  const note = 'It is over 500 characters, so it was saved as these 2 facts, one after the other. That is expected: nothing more to do.';
+  const l = new Ledger();
+  l.record('remember', {}, ok('remember', `📝 Remembered for this project [aa11]: Part one.\n📝 Remembered for this project [bb22]: Part two.\n${note}`));
+  // An update in parts: the first part takes the old fact's place, the rest follow it.
+  l.record('remember', {}, ok('remember', `📝 Updated for you [cc33] → [dd44]: Old. → New one.\n📝 Remembered for you [ee55]: New two.\n${note}`));
+  assert.equal(l.render(), [
+    'Remembered:',
+    '- project: Part one.',
+    '- project: Part two.',
+    '- user: New one. (replacing: Old.)',
+    '- user: New two.',
+  ].join('\n'));
+});
+
+test('remember (Memory 2): a full memory and an unmatched replaces are failures; a line that only looks like a save is too', () => {
+  const l = new Ledger();
+  l.record('remember', {}, err('remember', 'The project memory is full (7541 of 8000 characters), so nothing was saved. Make room first: merge or shorten facts with replaces, or remove ones that no longer matter. Yours, largest first: [a7f3] (212 chars) "Tests run with…"'));
+  l.record('remember', {}, err('remember', 'No fact you saved matches "project: Tests run". Yours: [a7f3] "Tests run with `npm test`…". Give the id in replaces.'));
+  l.record('remember', {}, ok('remember', 'Saved: 📝 Remembered for this project [a7f3]: not at the start'));
+  const failed = l.render().split('\n');
+  assert.equal(failed[0], 'Refused or failed:');
+  assert.equal(failed.length, 4);
+  assert.match(failed[1], /^- remember did not save: The project memory is full \(7541 of 8000 characters\)/);
+  assert.match(failed[2], /^- remember did not save: No fact you saved matches "project: Tests run"/);
+  assert.match(failed[3], /^- remember did not save: Saved: 📝/);
+});
+
+// The wording above is written by hand. This runs the real store, so the ledger and memory.ts cannot drift apart: it
+// passes with the messages with ids (Memory 2) and without them (1.5.3).
+test('remember: what the real store says is what the ledger records', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { rememberFact } = require('../dist/agent/memory');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dlne-ledger-ws-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dlne-ledger-home-'));
+  try {
+    const options = { homeDir: home };
+    const l = new Ledger();
+    const save = (scope, fact, replaces) => {
+      const result = rememberFact(scope, fact, root, options, replaces);
+      assert.equal(result.ok, true, result.message);
+      l.record('remember', { scope, fact, replaces }, { name: 'remember', output: result.message });
+    };
+    save('project', 'Tests run with npm test from vscode-extension.');
+    save('user', 'Prefers short answers.');
+    save('project', 'Tests run with npm test from vscode-extension, after npm run compile.', 'Tests run with npm test from vscode-extension.');
+    save('user', '', 'Prefers short answers.');
+    assert.equal(l.render(), [
+      'Remembered:',
+      '- project: Tests run with npm test from vscode-extension.',
+      '- user: Prefers short answers.',
+      '- project: Tests run with npm test from vscode-extension, after npm run compile. (replacing: Tests run with npm test from vscode-extension.)',
+      '- user: forgot: Prefers short answers.',
+    ].join('\n'));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // --- declined, refused, failed from any tool ---
 
 test('declined: the summary, with the command added for a command', () => {

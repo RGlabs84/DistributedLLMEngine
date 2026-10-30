@@ -87,6 +87,18 @@ def test_media_and_vision_are_off_by_default(monkeypatch):
     assert (limits["media_gpu"], limits["engine_mmproj"], limits["engine_image_max_tokens"]) == ("", "", 1024)
 
 
+def test_the_media_card_is_not_shared_by_default(monkeypatch):
+    assert _limits(monkeypatch, {"MEDIA_GPU": "0000:0c:00.0"})["media_gpu_shared"] is False
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("true", True), (" TRUE ", True), ("True", True),
+    ("false", False), ("yes", False), ("1", False), ("", False), ("ture", False),   # like the other switches
+])
+def test_only_true_shares_the_media_card(monkeypatch, raw, expected):
+    assert _limits(monkeypatch, {"MEDIA_GPU_SHARED": raw})["media_gpu_shared"] is expected
+
+
 def test_media_card_and_projector_are_read_as_written_without_the_spaces(monkeypatch):
     limits = _limits(monkeypatch, {"MEDIA_GPU": " 0000:0c:00.0 ", "ENGINE_MMPROJ": " ~/models/mmproj-F16.gguf "})
     assert limits["media_gpu"] == "0000:0c:00.0" and limits["engine_mmproj"] == "~/models/mmproj-F16.gguf"
@@ -127,3 +139,15 @@ def test_engine_phone_slots_are_bounded(monkeypatch, raw, expected):
 ])
 def test_engine_phone_context_is_bounded(monkeypatch, raw, expected):
     assert _limits(monkeypatch, {"ENGINE_PHONE_CONTEXT": raw})["engine_phone_context"] == expected
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("q8_0", "q8_0"), (" Q8_0 ", "q8_0"), ("q4_0", "q4_0"), ("f16", "f16"), ("auto", "auto"),
+    ("q8", "auto"), ("q5_1", "auto"), ("", "auto"),   # a typo keeps the engine on its own rule
+])
+def test_engine_kv_type_is_one_of_the_known_types(monkeypatch, raw, expected):
+    assert _limits(monkeypatch, {"ENGINE_KV_TYPE": raw})["engine_kv_type"] == expected
+
+
+def test_engine_kv_type_is_auto_by_default(monkeypatch):
+    assert _limits(monkeypatch, {})["engine_kv_type"] == "auto"

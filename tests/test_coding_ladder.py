@@ -530,6 +530,16 @@ def test_tier_for_file(file, expected):
     assert (found["id"] if found else None) == expected
 
 
+def test_rank_is_the_place_on_the_ladder_and_unknown_is_none():
+    """Ladder order is quality order: further down is smarter (dlne.ownGpu = "smarter" compares these)."""
+    assert coding_ladder.rank(LADDER, LIVE_FILE) == 0
+    assert coding_ladder.rank(LADDER, "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf") == 1
+    assert coding_ladder.rank(LADDER, "Qwen3.6-35B-A3B-UD-Q6_K.gguf") > coding_ladder.rank(LADDER, "qwen3.6-35b-a3b-ud-iq4_xs")
+    for unknown in ("qwen2.5-coder-14b-instruct-q4_k_m.gguf", "", None):
+        assert coding_ladder.rank(LADDER, unknown) is None, unknown
+    assert coding_ladder.rank([], LIVE_FILE) is None
+
+
 @pytest.mark.parametrize("file, expected", [
     (LIVE_FILE, "Qwen3.6 35B-A3B"),
     ("Qwen3.6-35B-A3B-UD-Q6_K.gguf", "Qwen3.6 35B-A3B (Q6_K)"),

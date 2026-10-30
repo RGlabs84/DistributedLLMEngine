@@ -2391,6 +2391,21 @@ def test_q4_0_starts_at_131072_tokens_a_slot_not_on_the_total():
     assert _plan(fixed_context=131_072, fixed_slots=2).cache_type == "q8_0"   # 2 x 65,536
 
 
+def test_engine_kv_type_fixes_the_cache_type_whatever_the_slot_size():
+    """
+    The owner's rule for TheWall (2026-10-30): q8_0 is never lowered. Its 2 x 131,072 lanes sit exactly on the line
+    where auto switches to q4_0, so ENGINE_KV_TYPE=q8_0 keeps them at q8_0, and the cache is priced as q8_0 too.
+    """
+    auto = _plan(fixed_context=262_144, fixed_slots=2)
+    kept = _plan(fixed_context=262_144, fixed_slots=2, kv_type="q8_0")
+    assert (auto.cache_type, kept.cache_type) == ("q4_0", "q8_0")
+    assert kept.context_per_slot == 131_072
+    assert kept.kv_gb > auto.kv_gb                                        # priced at what it really costs
+    assert _plan(fixed_context=131_072, fixed_slots=2, kv_type="q4_0").cache_type == "q4_0"
+    assert _plan(fixed_context=262_144, fixed_slots=2, kv_type="auto").cache_type == "q4_0"
+    assert _plan(fixed_context=262_144, fixed_slots=2, kv_type="nonsense").cache_type == "q4_0"
+
+
 # --- TheWall, with its real configuration -----------------------------------------------
 
 THEWALL_EXTRA_ARGS = ("--n-cpu-moe 5 -ts 23,17 --threads 4 --threads-batch 4 --cpu-mask 0xc3 --cpu-strict 1 "
@@ -2547,6 +2562,13 @@ def test_a_cache_slot_of_131072_tokens_is_the_only_way_to_q4_0(thewall):
     assert (_flag(cmd, "-ctk"), _flag(cmd, "-ctv")) == ("q4_0", "q4_0")
 
     thewall.manager.stop_all_models()
+    # ENGINE_KV_TYPE=q8_0 keeps the same two 131,072-token slots at q8_0 (TheWall's 2.6.5 setting)
+    thewall.limits.update(engine_kv_type="q8_0")
+    cmd, _entry = _thewall_start(thewall)
+    assert (_flag(cmd, "-ctk"), _flag(cmd, "-ctv"), _flag(cmd, "-np")) == ("q8_0", "q8_0", "2")
+    thewall.limits.update(engine_kv_type="auto")
+
+    thewall.manager.stop_all_models()
     # 262,144 shared by eight slots used to flip the cache to q4_0 on the total alone
     thewall.limits.update(engine_slots=0, engine_context=262_144)
     cmd, _entry = _thewall_start(thewall)
@@ -2653,9 +2675,9 @@ def cards(thewall, monkeypatch):
     return thewall
 
 
-def _start(env, endpoints=("127.0.0.1:50052",), **limits):
+def _start(env, endpoints=("127.0.0.1:50052",), pool_gb=THEWALL_VRAM_GB, **limits):
     env.limits.update(limits)
-    ok, _port, message = env.manager.start_model(env.tag, list(endpoints), THEWALL_VRAM_GB, THEWALL_SYSRAM_GB)
+    ok, _port, message = env.manager.start_model(env.tag, list(endpoints), pool_gb, THEWALL_SYSRAM_GB)
     assert ok is True, message
     process = env.spawned[-1]
     return process.cmd, next(iter(env.manager.running_models.values())), process.env
@@ -2798,6 +2820,90 @@ def test_a_vulkan_build_keeps_the_media_card(cuda_build, dlne_root):
     assert cuda_build.logged == []
 
 
+# --- A media card shared with the model (MEDIA_GPU_SHARED, "Smarter Wall", 2026-10-30) ---------------------------
+
+SMARTER_WALL_EXTRA_ARGS = ("-ts 15,15,10 --threads 4 --threads-batch 4 --cpu-mask 0xc3 --cpu-strict 1 "
+                           "--chat-template-kwargs '{\"enable_thinking\":false}' --ctx-checkpoints 4 --cache-ram 8192")
+
+
+@pytest.mark.parametrize("allowed", ["-1", "0,1", "0,1,2"])
+def test_a_shared_media_card_holds_layers_and_keeps_the_projector(cards, allowed):
+    # the pool is 24 GB with the RX 580 in it, and the projector is charged to it
+    cmd, entry, env = _start(cards, pool_gb=24.0, allowed_gpu_indices=allowed, media_gpu=RX580, media_gpu_shared=True,
+                             engine_mmproj=cards.projector, engine_extra_args=parse_engine_args(SMARTER_WALL_EXTRA_ARGS))
+
+    assert (env[CUDA], env[VK]) == ("0,1", "1,2,3")                  # Vulkan0, Vulkan1 = the BC-160s, Vulkan2 = the RX 580
+    assert _flag(cmd, "--device") == "Vulkan0,Vulkan1,Vulkan2"
+    assert _flag(cmd, "-ts") == "15,15,10"                            # one share each, in that order
+    assert (_flag(cmd, "--mmproj"), _flag(cmd, "--mmproj-device")) == (cards.projector, "Vulkan2")
+    assert entry["mmproj_path"] == cards.projector
+    assert cards.logged == []
+
+
+def test_shared_or_not_the_media_card_keeps_its_name_and_the_engine_cards_keep_theirs(cards):
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580, media_gpu_shared=False,
+                               engine_mmproj=cards.projector)
+    assert (_flag(cmd, "--device"), _flag(cmd, "--mmproj-device")) == ("Vulkan0,Vulkan1", "Vulkan2")
+
+    cards.manager.stop_all_models()
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580, media_gpu_shared=True,
+                               engine_mmproj=cards.projector)
+    assert (_flag(cmd, "--device"), _flag(cmd, "--mmproj-device")) == ("Vulkan0,Vulkan1,Vulkan2", "Vulkan2")
+
+
+def test_shared_without_a_media_card_changes_nothing(cards):
+    cmd, entry, env = _start(cards, allowed_gpu_indices="0,1", media_gpu_shared=True)
+
+    assert _normalised(cmd, entry) == THEWALL_2_5_4_COMMAND
+    assert (env[CUDA], env[VK]) == ("0,1", "1,2")
+
+
+def test_on_a_cuda_build_shared_changes_nothing_either(cuda_build):
+    cmd, _entry, env = _start(cuda_build, allowed_gpu_indices="0,1", media_gpu=RX580, media_gpu_shared=True,
+                              engine_mmproj=cuda_build.projector)
+
+    assert (env[CUDA], env[VK]) == ("0,1", "1,2")
+    assert "--device" not in cmd and "--mmproj-device" not in cmd
+
+
+def test_an_engine_sharded_over_volunteers_keeps_a_shared_media_card(cards):
+    """
+    A shared card stays in the engine when volunteers' GPUs join (2.6.5). This node's pool counts it, so the
+    coordinator plans with it: TheWall's 24 GB plus a docked 8 GB laptop is the 32 GB that unlocks Q4_K_M, and the
+    engine must really have those 32. No --device (it would hide the RPC devices): every local card is visible, the
+    projector still goes on the RX 580, and the -ts written for three local cards is left out as before.
+    """
+    cmd, _entry, env = _start(cards, endpoints=SHARDED, allowed_gpu_indices="0,1", media_gpu=RX580,
+                              media_gpu_shared=True, engine_mmproj=cards.projector,
+                              engine_extra_args=parse_engine_args(SMARTER_WALL_EXTRA_ARGS))
+
+    assert (env[CUDA], env[VK]) == ("0,1", "1,2,3")
+    assert "--device" not in cmd and "-ts" not in cmd and "--rpc" in cmd
+    assert (_flag(cmd, "--mmproj"), _flag(cmd, "--mmproj-device")) == (cards.projector, "Vulkan2")
+    assert not any("MEDIA_GPU is not used" in line for line in cards.logged)
+
+
+def test_the_smarter_wall_config_starts_the_engine_the_contract_names(cards):
+    """TheWall's target config (docs: operator-reference, the media card): 2 coding lanes of 131,072 tokens and 2 phone
+    lanes of 8,192 over all three cards, the projector on the RX 580, and the coordinator's pool 24 GB."""
+    cards.limits.update(
+        allowed_gpu_indices="-1", media_gpu=RX580, media_gpu_shared=True, engine_mmproj=cards.projector,
+        engine_context=262_144, engine_slots=2, engine_phone_slots=2, engine_phone_context=8192,
+        engine_kv_type="q8_0", engine_extra_args=parse_engine_args(SMARTER_WALL_EXTRA_ARGS))
+
+    cmd, entry, env = _start(cards, pool_gb=24.0)
+
+    assert (_flag(cmd, "-c"), _flag(cmd, "-np"), _flag(cmd, "--kv-unified-per-slot")) == ("278528", "4", "131072")
+    assert "--kv-unified" in cmd and "--no-slots" in cmd
+    assert (_flag(cmd, "-ctk"), _flag(cmd, "-ctv")) == ("q8_0", "q8_0")       # ENGINE_KV_TYPE=q8_0: never lowered
+    assert _flag(cmd, "-ts") == "15,15,10" and _flag(cmd, "--cache-ram") == "8192"
+    assert _flag(cmd, "--device") == "Vulkan0,Vulkan1,Vulkan2"
+    assert (_flag(cmd, "--mmproj"), _flag(cmd, "--mmproj-device")) == (cards.projector, "Vulkan2")
+    assert env[VK] == "1,2,3"
+    assert cards.logged == []
+    assert (entry["safe_context"], entry["dynamic_slots"], entry["phone_slots"]) == (262_144, 2, 2)
+
+
 def _reserved(env, **limits):
     _cmd, entry, _env = _start(env, **limits)
     return entry["reserved_gb"]
@@ -2816,6 +2922,10 @@ def test_the_sizer_charges_the_projector_only_when_it_is_not_on_the_media_card(c
     assert reserved(media_gpu="0000:ff:00.0", engine_mmproj=cards.projector) == pytest.approx(base + projector_gb)
     assert reserved(media_gpu=RX580) == pytest.approx(base)
     assert reserved(engine_mmproj="/nowhere/mmproj.gguf") == pytest.approx(base)
+    # a shared media card is part of the pool, so the projector on it takes from the pool
+    assert reserved(media_gpu=RX580, media_gpu_shared=True, engine_mmproj=cards.projector) == pytest.approx(
+        base + projector_gb)
+    assert reserved(media_gpu=RX580, media_gpu_shared=True, engine_mmproj="") == pytest.approx(base)
 
 
 def test_the_sizer_charges_the_pool_for_a_projector_on_a_sharded_engine(cards):

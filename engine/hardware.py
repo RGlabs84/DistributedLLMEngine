@@ -796,7 +796,7 @@ def _warn_dropped(why: str) -> None:
         log_warning(f"ALLOWED_GPU_INDICES entry left out, {why}.")
 
 
-def engine_gpu_devices(allowed: str, media_spec: str = "") -> Tuple[str, str, str]:
+def engine_gpu_devices(allowed: str, media_spec: str = "", shared: bool = False) -> Tuple[str, str, str]:
     """
     The devices the coordinator's engine sees, as ``(cuda_ids, vulkan_devices, media_device)``.
 
@@ -806,6 +806,10 @@ def engine_gpu_devices(allowed: str, media_spec: str = "") -> Tuple[str, str, st
     cards, so the engine's cards keep the llama.cpp names Vulkan0, Vulkan1... that the operator's
     ``-ts`` is written for; ``media_device`` is the name llama.cpp gives it (Vulkan<position in the
     list>), or "" when no media card is in use. A card named in both lists is the media card.
+
+    ``shared`` is MEDIA_GPU_SHARED. The list is the same with it on: the media card is still last, now with a
+    share of the model as well (the operator's ``-ts`` then has one more number, the last one, for it). Naming
+    it in ALLOWED_GPU_INDICES is then no mistake, so that is not warned about.
     """
     try:
         gpus = get_all_gpus()
@@ -829,9 +833,9 @@ def engine_gpu_devices(allowed: str, media_spec: str = "") -> Tuple[str, str, st
     for token in tokens:
         gpu = find_gpu(token, gpus)
         if gpu is not None and media is not None and gpu["id"] == media["id"]:
-            if named:
+            if named and not shared:
                 _warn_dropped(f"{token}: it is the media card (MEDIA_GPU), which the engine never uses")
-            continue
+            continue                    # listed once, last, below
         if gpu is not None:
             # A card named twice (an index and its address, say) is one device: llama.cpp would split
             # the model across it twice, and CUDA refuses a repeated id.
@@ -900,15 +904,22 @@ def get_gpu_info() -> Dict[str, Any]:
 
     if allowed.lower() == "none":
         return {"has_gpu": False, "vram_total_gb": 0, "vram_free_gb": 0, "name": None, "load_percent": 0.0}
-    elif allowed != "-1":
+    every_card = gpus
+    if allowed != "-1":
         gpus = select_gpus(allowed, gpus)
 
-    # The media card is never the engine's memory, so the pool this node advertises leaves it out. On a build
+    # The media card is not the engine's memory, so the pool this node advertises leaves it out. On a build
     # that is not Vulkan the engine ignores MEDIA_GPU (the card is the model's then), and so does this.
-    from engine.inference_manager import media_gpu_spec
+    # A shared media card (MEDIA_GPU_SHARED) is the model's too: it counts, whether or not ALLOWED_GPU_INDICES
+    # names it, because the engine is given it either way (engine_gpu_devices).
+    from engine.inference_manager import media_gpu_shared, media_gpu_spec
     media = find_gpu(media_gpu_spec(limits), gpus)
     if media is not None:
         gpus = [g for g in gpus if g["id"] != media["id"]]
+    if media_gpu_shared(limits):
+        shared_card = find_gpu(media_gpu_spec(limits), every_card)
+        if shared_card is not None:
+            gpus = gpus + [shared_card]
 
     # Integrated GPUs (other than the allowed few) are not GPU contributions: a machine with
     # only those contributes its CPU (counts_as_gpu).
