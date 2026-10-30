@@ -153,7 +153,7 @@ def test_a_change_is_reported_only_after_it_has_held_a_minute(monkeypatch):
     readings = [{"link": "wired", "power": "ac"}]
     monkeypatch.setattr(hardware, "_probe_dock", lambda: dict(readings[-1]))
     assert hardware.get_dock_state() == {"link": "wired", "power": "ac"}, "the first reading is reported at once"
-    readings.append({"link": "wifi", "power": "battery"})           # the dock is unplugged
+    readings.append({"link": "wifi", "power": "ac"})                # the dock's cable is pulled, still on mains
     clock.t += hardware._DOCK_TTL_SECONDS + 1
     assert hardware.get_dock_state() == {"link": "wired", "power": "ac"}, "not yet"
     clock.t += 30
@@ -161,11 +161,32 @@ def test_a_change_is_reported_only_after_it_has_held_a_minute(monkeypatch):
     readings.append({"link": "wired", "power": "ac"})               # replugged inside the hold: nothing moved
     clock.t += hardware._DOCK_TTL_SECONDS + 1
     assert hardware.get_dock_state() == {"link": "wired", "power": "ac"}
-    readings.append({"link": "wifi", "power": "battery"})           # unplugged for good
+    readings.append({"link": "wifi", "power": "ac"})                # unplugged for good
     clock.t += hardware._DOCK_TTL_SECONDS + 1
     hardware.get_dock_state()
     clock.t += hardware._DOCK_HOLD_SECONDS + 1
-    assert hardware.get_dock_state() == {"link": "wifi", "power": "battery"}
+    assert hardware.get_dock_state() == {"link": "wifi", "power": "ac"}
+
+
+def test_going_onto_battery_is_reported_at_once_and_back_onto_mains_waits(monkeypatch):
+    """2.6.4: never shard on battery. A laptop just unplugged may be shut and asleep within the minute, so the
+    coordinator hears of it at once and its drain starts while the machine is awake; plugging back in waits."""
+    clock = SimpleNamespace(t=1000.0)
+    monkeypatch.setattr(hardware.time, "monotonic", lambda: clock.t)
+    readings = [{"link": "wifi", "power": "ac"}]
+    monkeypatch.setattr(hardware, "_probe_dock", lambda: dict(readings[-1]))
+    assert hardware.get_dock_state() == {"link": "wifi", "power": "ac"}
+    readings.append({"link": "wifi", "power": "battery"})           # unplugged
+    clock.t += hardware._DOCK_TTL_SECONDS + 1
+    assert hardware.get_dock_state() == {"link": "wifi", "power": "battery"}, "no hold onto battery"
+    readings.append({"link": "wifi", "power": "ac"})                # plugged back in
+    clock.t += hardware._DOCK_TTL_SECONDS + 1
+    assert hardware.get_dock_state() == {"link": "wifi", "power": "battery"}, "the way back waits out the hold"
+    clock.t += hardware._DOCK_HOLD_SECONDS + 1
+    assert hardware.get_dock_state() == {"link": "wifi", "power": "ac"}
+    readings.append({"link": "unknown", "power": "battery"})        # a fact lost on the way does not delay it
+    clock.t += hardware._DOCK_TTL_SECONDS + 1
+    assert hardware.get_dock_state() == {"link": "unknown", "power": "battery"}
 
 
 def test_the_probe_is_cached_and_never_raises(monkeypatch):
@@ -240,6 +261,7 @@ class _Node:
     """Just enough of WorkerNode for _report_dock."""
     companion_of = None
     hardware_profile = {}
+    _wifi_check = None
     _report_dock = worker.WorkerNode._report_dock
 
 
@@ -262,3 +284,57 @@ def test_the_worker_prints_the_dock_marker_once_per_change(capsys):
     node.hardware_profile = {"link": "wired", "power": "ac", "docked": True}
     node._report_dock()
     assert not capsys.readouterr().out, "a companion stays quiet"
+
+
+def test_on_wifi_and_mains_the_marker_carries_the_coordinators_verdict(capsys):
+    """2.6.4: the editor and the tray app say why a Wi-Fi GPU does or does not share the model."""
+    node = _Node()
+    node.hardware_profile = {"link": "wifi", "power": "ac", "docked": False}
+    node._report_dock()                                                      # no answer yet: being tested
+    node._wifi_check = {"ok": True, "why": "round trip 4 ms, jitter 2 ms, download 312 Mbit/s"}
+    node._report_dock()
+    node._report_dock()
+    node.hardware_profile = {"link": "wifi", "power": "battery", "docked": False}
+    node._report_dock()                                                      # on battery: no verdict to give
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith(worker.DOCK_MARKER)]
+    assert [json.loads(l[len(worker.DOCK_MARKER):]) for l in lines] == [
+        {"link": "wifi", "power": "ac", "docked": False, "wifi_ok": None, "wifi_why": ""},
+        {"link": "wifi", "power": "ac", "docked": False, "wifi_ok": True,
+         "wifi_why": "round trip 4 ms, jitter 2 ms, download 312 Mbit/s"},
+        {"link": "wifi", "power": "battery", "docked": False},
+    ]
+
+
+class _AnswerNode:
+    """Just enough of WorkerNode for _note_wifi_check and _start_speed_test (the test itself is not run)."""
+    _wifi_check = None
+    _speed_test_running = False
+    _last_speed_test = float("-inf")
+    _note_wifi_check = worker.WorkerNode._note_wifi_check
+    _start_speed_test = worker.WorkerNode._start_speed_test
+
+    def __init__(self):
+        self.started = 0
+
+    def _run_speed_test(self):
+        self.started += 1
+
+
+def test_the_worker_keeps_the_verdict_and_runs_the_speed_test_it_is_asked_for(monkeypatch):
+    clock = SimpleNamespace(t=1000.0)
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock.t)
+    started = []
+    monkeypatch.setattr(worker.threading, "Thread", lambda target, **_: SimpleNamespace(start=lambda: started.append(target)))
+    node = _AnswerNode()
+    node._note_wifi_check({"wifi_check": {"ok": None, "why": "the link test has not run yet", "speed_test": True}})
+    assert node._wifi_check == {"ok": None, "why": "the link test has not run yet"}
+    assert len(started) == 1 and node._speed_test_running
+    node._speed_test_running = False                       # that test finished
+    node._note_wifi_check({"wifi_check": {"ok": False, "why": "waiting for this machine's download test", "speed_test": True}})
+    assert len(started) == 1, "at most one test every WIFI_SPEED_TEST_MIN_GAP_SECONDS"
+    clock.t += worker.WIFI_SPEED_TEST_MIN_GAP_SECONDS
+    node._note_wifi_check({"wifi_check": {"ok": "yes", "why": 7, "speed_test": True}})
+    assert node._wifi_check == {"ok": None, "why": ""}, "checked, not trusted"
+    assert len(started) == 2
+    node._note_wifi_check({"status": "ok"})
+    assert node._wifi_check is None, "no verdict sent, none kept"

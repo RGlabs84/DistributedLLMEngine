@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.5.3] - 2026-10-30
+
+Pairs with DLNE coordinator **2.6.4** for the Wi-Fi verdict; with an older coordinator the card reads as before.
+Separate chats in the sidebar, a chat that no longer fights your scrolling, and `@dlne` working through long pastes.
+
+### Added
+- **Separate chats in the DLNE Agent sidebar, like VS Code's Chat view.** The header names the chat shown (by its
+  first words); **+** or **New chat** (the old Clear button) starts another and keeps the one before; the **←** arrow
+  lists them all, newest first, to go back to one or delete it. A task keeps running when you switch to another chat,
+  and the list marks it as working; Stop and Send act on the chat shown. Each chat keeps its own conversation and
+  saved task, and the newest 20 are kept. The single chat of 1.5.2 becomes the first one, with its saved task.
+
+### Fixed
+- **`@dlne` "finished" at once on a big pasted log.** Two things, both seen in one run: (1) a paste longer than a
+  message holds (12,000 characters) was cut there, and the agent had no way to see the rest; now the whole paste is
+  kept, secrets hidden, in the extension's private storage, the message carries its first lines and where the rest is,
+  and the agent pages through it with `read_file` without asking you. (2) The model said what it would do next ("Let me
+  read that file…") without calling a tool, and the agent took that as its final answer. Now, once per request, a
+  reply that announces a step it did not take is answered with "take that step, or give your final answer", in
+  `@dlne` and the sidebar alike. (With DLNE Swarm in the model picker, VS Code's own agent runs the steps and reads
+  pastes; the extension cannot change that.)
+
+### Changed
+- **The chat no longer fights you when you scroll up.** It used to jump to the bottom on every streamed word, so a
+  part of the chat you scrolled up to read was pulled away from you. Now it follows the answer only while you are at
+  the bottom; scrolled up, it stays put and offers **↓ Latest** to jump back down. Your own message still brings it
+  to the bottom.
+- **The contribution card says how a Wi-Fi link was judged.** On Wi-Fi and plugged in, the card says whether the
+  link passed the coordinator's test, did not (and why, for example "jitter 34 ms, over 20"), or is still being
+  tested; a GPU whose link passes may share the swarm's big model. On battery it says the GPU never shares the model
+  on battery. The tray app says the same, word for word, from DLNE Donate 1.0.2.
+
+### Fixed
+- **An undocked GPU was said to "run a whole model by itself".** Only a GPU with 8 GB or more does; a smaller one has
+  no job meanwhile. The card now says the GPU does not share the swarm's big model, and the role line says what it
+  does instead.
+
 ## [1.5.2] - 2026-10-28
 
 Pairs with DLNE coordinator **2.6.3**. The agent's commands no longer spill into VS Code's terminal.

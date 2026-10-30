@@ -50,6 +50,11 @@ class Dock:
     link: str = ""              # wired, wifi or cellular
     power: str = ""             # ac or battery
     docked: Optional[bool] = None
+    # On Wi-Fi and mains (2.6.4): whether the worker passed on the coordinator's verdict at all, the verdict
+    # (None while the link is being tested) and a few words on it.
+    wifi_said: bool = False
+    wifi_ok: Optional[bool] = None
+    wifi_why: str = ""
 
 
 @dataclass(frozen=True)
@@ -136,7 +141,9 @@ def parse_dock(output: str) -> Optional[Dock]:
         link = facts.get("link") if facts.get("link") in ("wired", "wifi", "cellular") else ""
         power = facts.get("power") if facts.get("power") in ("ac", "battery") else ""
         docked = facts.get("docked") if isinstance(facts.get("docked"), bool) else None
-        found = Dock(link=link, power=power, docked=docked)
+        wifi_ok = facts.get("wifi_ok") if isinstance(facts.get("wifi_ok"), bool) else None
+        wifi_why = facts.get("wifi_why")[:160] if isinstance(facts.get("wifi_why"), str) else ""
+        found = Dock(link=link, power=power, docked=docked, wifi_said="wifi_ok" in facts, wifi_ok=wifi_ok, wifi_why=wifi_why)
     return found
 
 
@@ -160,13 +167,25 @@ def parse_yield(output: str) -> Optional[Yield]:
 
 def dock_line(dock: Optional[Dock]) -> str:
     """The Settings window's docked line (the extension's dockLine, word for word), "" when unknown."""
-    if dock is None or dock.docked is None:
+    if dock is None:
         return ""
-    if dock.docked:
+    if dock.power == "battery":
+        return "On battery: your GPU never shares the swarm's big model on battery, and may again once plugged in."
+    if dock.docked is True:
         return "Docked (wired and plugged in): your GPU may share the swarm's big model while it stays docked."
-    on = " and ".join(part for part in ("Wi-Fi" if dock.link == "wifi" else "a phone link" if dock.link == "cellular" else "",
-                                         "battery" if dock.power == "battery" else "") if part)
-    return f"Not docked{f' (on {on})' if on else ''}: your GPU runs a whole model by itself until it is docked again."
+    if dock.link == "wifi" and dock.power == "ac" and dock.wifi_said:
+        why = f" ({dock.wifi_why})" if dock.wifi_why else ""
+        if dock.wifi_ok is True:
+            return (f"On Wi-Fi and plugged in, and the link passed its test{why}: "
+                    "your GPU may share the swarm's big model while it keeps passing.")
+        if dock.wifi_ok is False:
+            return (f"On Wi-Fi and plugged in, but the link did not pass its test{why}: "
+                    "your GPU does not share the swarm's big model for now.")
+        return "On Wi-Fi and plugged in: the swarm is testing the link before your GPU may share its big model."
+    if dock.docked is None:
+        return ""
+    on = "Wi-Fi" if dock.link == "wifi" else "a phone link" if dock.link == "cellular" else ""
+    return f"Not docked{f' (on {on})' if on else ''}: your GPU does not share the swarm's big model until it is docked again."
 
 
 def yield_line(state: Optional[Yield]) -> str:

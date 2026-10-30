@@ -15,8 +15,9 @@ const { openChat } = require('./helpers/chat-harness');
 const stub = require('./helpers/vscode-stub');
 const {
   STATE_MAX_AGE_MS, SAVE_EVERY_MS, MAX_SAVED_THREADS, agentStateFile, agentThreadFile, agentThreadsDir, saveAgentState, loadAgentState,
-  deleteAgentState, isThreadId, listAgentThreads, pruneAgentThreads, AgentStateStore,
+  deleteAgentState, isThreadId, listAgentThreads, pruneAgentThreads, AgentStateStore, sidebarSessionsDir,
 } = require('../dist/agent/agentState');
+const { SESSIONS_KEY, MAX_SESSIONS, historyKey } = require('../dist/views/sidebarSessions');
 const { SidebarProvider } = require('../dist/views/sidebarProvider');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'dlne-state-'));
@@ -303,7 +304,12 @@ function openSidebar(context, client = answeringClient()) {
   return { provider, send: (message) => onMessage(message) };
 }
 
-const sidebarFile = (context) => agentStateFile(context, 'sidebar');
+/** The single sidebar chat's file of before 1.5.3, read once to become the first session. */
+const legacySidebarFile = (context) => agentStateFile(context, 'sidebar');
+/** The sessions as the workspace state keeps them (sidebarSessions.ts). */
+const sessionIndex = (context) => context.workspaceState.get(SESSIONS_KEY);
+/** A sidebar session's saved task (1.5.3): the shown one's unless an id is given. */
+const sidebarFile = (context, id = sessionIndex(context).active) => path.join(sidebarSessionsDir(context), `${id}.json`);
 
 test('VS Code chat: a task survives a restart, Continue works, a new thread forgets, /clear deletes the file', async () => {
   stub.reset();
@@ -347,25 +353,100 @@ test('VS Code chat: /clear with no saved task, and a first-ever request, both le
   assert.equal(fs.existsSync(chat.legacyFile()), false, 'the single per-workspace file is not written any more');
 });
 
-test('sidebar: a reload restores the agent with the visible chat, and Clear removes both', async () => {
+test('sidebar: a reload restores the agent with the visible chat, and New chat keeps it in the list', async () => {
   stub.reset();
   const context = fakeContext(tmp());
 
   const first = openSidebar(context);
   await first.provider.handleUserMessage('write a parser');
+  const parser = sessionIndex(context).active;
   const saved = JSON.parse(fs.readFileSync(sidebarFile(context), 'utf8'));
   assert.ok(saved.messages.some((m) => m.content === 'write a parser'));
+  assert.equal(sessionIndex(context).sessions[0].title, 'write a parser', 'the first words name the session');
 
   const reloaded = openSidebar(context);
   assert.equal(reloaded.provider.conversationHistory.length, 2, 'the visible chat came back');
   assert.equal(reloaded.provider.agentLoop.getSessionId(), saved.sessionId, 'and so did the agent');
 
-  await reloaded.send({ type: 'clearChat' });
-  assert.equal(fs.existsSync(sidebarFile(context)), false);
-  assert.equal(context.workspaceState.get('dlne.chatHistory').length, 0);
-  const afterClear = openSidebar(context);
-  assert.equal(afterClear.provider.conversationHistory.length, 0);
-  assert.notEqual(afterClear.provider.agentLoop.getSessionId(), saved.sessionId);
+  await reloaded.send({ type: 'newSession' });
+  assert.notEqual(sessionIndex(context).active, parser, 'a new session is shown');
+  assert.equal(reloaded.provider.conversationHistory.length, 0);
+  assert.notEqual(reloaded.provider.agentLoop.getSessionId(), saved.sessionId);
+  assert.ok(fs.existsSync(sidebarFile(context, parser)), 'the old one keeps its saved task');
+  assert.equal(context.workspaceState.get(historyKey(parser)).length, 2, 'and its chat');
+  await reloaded.send({ type: 'newSession' });
+  assert.equal(sessionIndex(context).sessions.length, 2, 'an empty session is reused, not piled up');
+
+  const again = openSidebar(context);
+  assert.equal(again.provider.conversationHistory.length, 0, 'the new session is the one shown after a reload');
+  await again.send({ type: 'openSession', id: parser });
+  assert.equal(again.provider.conversationHistory.length, 2, 'picked from the list, the old chat is back');
+  assert.equal(again.provider.agentLoop.getSessionId(), saved.sessionId, 'with its agent');
+});
+
+test('sidebar: a deleted session takes its saved task and chat with it; deleting the shown one shows the newest', async () => {
+  stub.reset();
+  const context = fakeContext(tmp());
+  const sidebar = openSidebar(context);
+  await sidebar.provider.handleUserMessage('first task');
+  const first = sessionIndex(context).active;
+  await sidebar.send({ type: 'newSession' });
+  await sidebar.provider.handleUserMessage('second task');
+  const second = sessionIndex(context).active;
+
+  await sidebar.send({ type: 'deleteSession', id: second });
+  assert.equal(fs.existsSync(sidebarFile(context, second)), false);
+  assert.equal(context.workspaceState.get(historyKey(second)), undefined);
+  assert.deepEqual(sessionIndex(context).sessions.map((s) => s.id), [first]);
+  assert.equal(sessionIndex(context).active, first);
+  assert.equal(sidebar.provider.conversationHistory[0].text, 'first task');
+
+  await sidebar.send({ type: 'deleteSession', id: first });
+  assert.equal(sessionIndex(context).sessions.length, 1, 'the last one deleted: an empty one is shown');
+  assert.equal(sidebar.provider.conversationHistory.length, 0);
+  await sidebar.send({ type: 'deleteSession', id: '../../etc/passwd' });
+  assert.equal(sessionIndex(context).sessions.length, 1, 'an id that is not a session is ignored');
+});
+
+test('sidebar: past MAX_SESSIONS the oldest goes, never the one shown', async () => {
+  stub.reset();
+  const context = fakeContext(tmp());
+  const sidebar = openSidebar(context);
+  const ids = [];
+  for (let i = 0; i <= MAX_SESSIONS; i++) {
+    if (i > 0) await sidebar.send({ type: 'newSession' });
+    await sidebar.provider.handleUserMessage(`task ${i}`);
+    ids.push(sessionIndex(context).active);
+    sessionIndex(context).sessions.find((s) => s.id === ids[i]).updated = i;     // a clear order, whatever the clock did
+  }
+  await sidebar.send({ type: 'newSession' });
+  const kept = sessionIndex(context).sessions.map((s) => s.id);
+  assert.equal(kept.length, MAX_SESSIONS);
+  assert.equal(kept.includes(ids[0]) || kept.includes(ids[1]), false, 'the two oldest went');
+  assert.equal(fs.existsSync(sidebarFile(context, ids[0])), false);
+  assert.ok(kept.includes(ids[MAX_SESSIONS]));
+});
+
+test('sidebar: the single chat of before 1.5.3 becomes the first session, its saved task with it', async () => {
+  stub.reset();
+  const context = fakeContext(tmp());
+  const before = openSidebar(context);
+  await before.provider.handleUserMessage('old task');
+  // What 1.5.2 left: the chat under dlne.chatHistory and the saved task in agent-state-sidebar.json.
+  const active = sessionIndex(context).active;
+  fs.renameSync(sidebarFile(context), legacySidebarFile(context));
+  await context.workspaceState.update('dlne.chatHistory', context.workspaceState.get(historyKey(active)));
+  await context.workspaceState.update(SESSIONS_KEY, undefined);
+  await context.workspaceState.update(historyKey(active), undefined);
+  const savedId = JSON.parse(fs.readFileSync(legacySidebarFile(context), 'utf8')).sessionId;
+
+  const after = openSidebar(context);
+  assert.equal(after.provider.conversationHistory.length, 2, 'the chat came over');
+  assert.equal(after.provider.agentLoop.getSessionId(), savedId, 'and the agent');
+  assert.equal(sessionIndex(context).sessions[0].title, 'old task');
+  assert.equal(fs.existsSync(legacySidebarFile(context)), false, 'the old file went');
+  assert.ok(fs.existsSync(sidebarFile(context)));
+  assert.equal(context.workspaceState.get('dlne.chatHistory'), undefined);
 });
 
 test('sidebar: a saved task with no visible chat is dropped, so the page and the agent agree', async () => {
@@ -373,7 +454,7 @@ test('sidebar: a saved task with no visible chat is dropped, so the page and the
   const context = fakeContext(tmp());
   const first = openSidebar(context);
   await first.provider.handleUserMessage('write a parser');
-  await context.workspaceState.update('dlne.chatHistory', []);
+  await context.workspaceState.update(historyKey(sessionIndex(context).active), []);
 
   const reloaded = openSidebar(context);
   assert.equal(fs.existsSync(sidebarFile(context)), false);

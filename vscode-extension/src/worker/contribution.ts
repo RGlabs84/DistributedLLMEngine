@@ -714,8 +714,10 @@ export function parseClock(output: string): number | null {
 /**
  * The line the worker prints (engine/worker.py DOCK_MARKER, 2.5.0) once per change of whether this machine is docked:
  * `DLNE_DOCK: {"link": "wired", "power": "ac", "docked": true}`. A fact the worker could not read is left out, and
- * `docked` only appears when both are known. A docked GPU on the coordinator's LAN shares the swarm's big model; an
- * undocked one runs a whole model by itself (contract section 1).
+ * `docked` only appears when both are known. A docked GPU on the coordinator's LAN may share the swarm's big model; an
+ * undocked one does not (contract section 1). On Wi-Fi and mains (2.6.4) the line also carries the coordinator's
+ * verdict on the link, which decides there instead: `"wifi_ok": true | false | null` (null while it is being tested)
+ * and `"wifi_why"`, a few words on what passed or which limit was missed.
  */
 export const DOCK_MARKER = 'DLNE_DOCK: ';
 
@@ -723,6 +725,9 @@ export interface DockState {
   link?: 'wired' | 'wifi' | 'cellular';
   power?: 'ac' | 'battery';
   docked?: boolean;
+  /** The coordinator's Wi-Fi verdict (2.6.4): null while testing, undefined from a worker that never says. */
+  wifiOk?: boolean | null;
+  wifiWhy?: string;
 }
 
 /** The last docked facts in `output`, or null. Anything malformed is ignored. */
@@ -738,6 +743,8 @@ export function parseDock(output: string): DockState | null {
       if (facts.link === 'wired' || facts.link === 'wifi' || facts.link === 'cellular') state.link = facts.link;
       if (facts.power === 'ac' || facts.power === 'battery') state.power = facts.power;
       if (typeof facts.docked === 'boolean') state.docked = facts.docked;
+      if ('wifi_ok' in facts) state.wifiOk = typeof facts.wifi_ok === 'boolean' ? facts.wifi_ok : null;
+      if (typeof facts.wifi_why === 'string' && facts.wifi_why) state.wifiWhy = facts.wifi_why.slice(0, 160);
       found = state;
     } catch {
       // not a dock line after all
@@ -919,13 +926,23 @@ function memberFacts(detail?: RoleDetail): string {
   return parts.length ? ` (${parts.join(', ')})` : '';
 }
 
-/** The sidebar's docked line (2.5.0): what the worker read, and what it means for the GPU's job. */
+/**
+ * The sidebar's docked line (2.5.0; Wi-Fi and battery 2.6.4): what the worker read, and what it means for sharing the
+ * swarm's big model. The role line says what the GPU does instead. DLNE Donate's dock_line says the same, word for word.
+ */
 export function dockLine(dock?: DockState): string {
-  if (!dock || dock.docked === undefined) return '';
-  if (dock.docked) return 'Docked (wired and plugged in): your GPU may share the swarm\'s big model while it stays docked.';
-  const on = [dock.link === 'wifi' ? 'Wi-Fi' : dock.link === 'cellular' ? 'a phone link' : '',
-              dock.power === 'battery' ? 'battery' : ''].filter(Boolean).join(' and ');
-  return `Not docked${on ? ` (on ${on})` : ''}: your GPU runs a whole model by itself until it is docked again.`;
+  if (!dock) return '';
+  if (dock.power === 'battery') return 'On battery: your GPU never shares the swarm\'s big model on battery, and may again once plugged in.';
+  if (dock.docked === true) return 'Docked (wired and plugged in): your GPU may share the swarm\'s big model while it stays docked.';
+  if (dock.link === 'wifi' && dock.power === 'ac' && dock.wifiOk !== undefined) {
+    const why = dock.wifiWhy ? ` (${dock.wifiWhy})` : '';
+    if (dock.wifiOk === true) return `On Wi-Fi and plugged in, and the link passed its test${why}: your GPU may share the swarm's big model while it keeps passing.`;
+    if (dock.wifiOk === false) return `On Wi-Fi and plugged in, but the link did not pass its test${why}: your GPU does not share the swarm's big model for now.`;
+    return 'On Wi-Fi and plugged in: the swarm is testing the link before your GPU may share its big model.';
+  }
+  if (dock.docked === undefined) return '';
+  const on = dock.link === 'wifi' ? 'Wi-Fi' : dock.link === 'cellular' ? 'a phone link' : '';
+  return `Not docked${on ? ` (on ${on})` : ''}: your GPU does not share the swarm's big model until it is docked again.`;
 }
 
 /** The sidebar's stepping-aside line (2.5.0), "" while the machine is not yielding. */

@@ -7,6 +7,7 @@
 import * as vscode from 'vscode';
 import { REDACTION_MARK, excludedNotice, excludedReason, filePathOf, redactSecrets, redactionNote } from '../privacy';
 import { UriLike, pathForAgent } from './chatPaths';
+import { savePasted } from '../agent/pasted';
 
 /**
  * The most attached text one message carries. The model's context is small (a prompt gets about 15K tokens next to
@@ -246,19 +247,43 @@ async function readAttached(references: readonly unknown[]): Promise<AttachedCon
     }
 
     if (typeof value === 'string') {
-      // Text the Chat view itself put in (a terminal selection, say). The editor's own context is never copied.
+      // Text the Chat view itself put in (a paste, a terminal selection). The editor's own context is never copied.
       if (implicit || value.trim() === '') continue;
       const label = String(reference?.name || reference?.modelDescription || id || 'text');
-      if (room < MIN_ROOM_CHARS) {
-        notes.push(`[Not attached: ${label}. Too much was attached already.]`);
-        result.skipped.push(`${label} was left out: too much was attached to one message.`);
+      const text = redactSecrets(value).text;
+      if (text.length <= room) {
+        const block = `--- ${label} ---\n${text}\n--- end of ${label} ---`;
+        room -= block.length;
+        blocks.push(block);
         continue;
       }
-      const text = redactSecrets(value).text;
-      const cut = text.length > room ? `${text.slice(0, room)}\n[... cut: ${text.length - room} more characters.]` : text;
-      const block = `--- ${label} ---\n${cut}\n--- end of ${label} ---`;
+      // Too long for the message (1.5.3): the whole of it is kept in a file the agent pages through with read_file,
+      // and the message carries its first lines, numbered as read_file prints them, and where the rest is.
+      const saved = savePasted(text);
+      if (!saved) {
+        if (room < MIN_ROOM_CHARS) {
+          notes.push(`[Not attached: ${label}. Too much was attached already.]`);
+          result.skipped.push(`${label} was left out: too much was attached to one message.`);
+          continue;
+        }
+        const kept = room;
+        const block = `--- ${label} ---\n${text.slice(0, kept)}\n[... cut: ${text.length - kept} more characters.]\n--- end of ${label} ---`;
+        room -= block.length;
+        blocks.push(block);
+        result.skipped.push(`${label} was cut to its first ${kept} characters: it could not be kept whole.`);
+        continue;
+      }
+      const lines = text.split(/\r?\n/);
+      if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+      const shown = room >= MIN_ROOM_CHARS ? numbered(lines, 1, room) : [];
+      const where = `[${label} is ${lines.length} lines (${sizeText(text.length)}); all of it is saved at ${saved}. ` +
+        (shown.length > 0
+          ? `Lines 1 to ${shown.length} are below. Read the rest with read_file on that path, from start_line ${shown.length + 1}, a few hundred lines at a time.]`
+          : 'Read it with read_file on that path, a few hundred lines at a time.]');
+      const block = shown.length > 0 ? `--- ${label} (the first ${shown.length} of ${lines.length} lines) ---\n${shown.join('\n')}\n${where}\n--- end of ${label} ---` : where;
       room -= block.length;
-      blocks.push(block);
+      if (shown.length > 0) blocks.push(block); else notes.push(block);
+      result.skipped.push(`${label} is too long to send whole (${lines.length} lines): the agent was given its start and reads the rest from a copy kept by DLNE.`);
       continue;
     }
 

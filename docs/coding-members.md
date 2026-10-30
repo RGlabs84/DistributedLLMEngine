@@ -83,9 +83,46 @@ it is docked: `"link": "wired" | "wifi" | "cellular"`, `"power": "ac" | "battery
 `"docked": true | false` (wired and on mains). `engine/hardware.get_dock_state()` reads them from sysfs
 and `/proc/net/route` (Linux), `GetSystemPowerStatus` and the default route's adapter (Windows), or
 `pmset` and `networksetup` (macOS); a fact it cannot read is left out, `docked` is only said when both
-are known, a virtual machine never claims a link, and a change is reported only after it has held 60 s.
-A companion (the CPU half of a machine) sends none of them. The coordinator uses them in section 1:
-a near GPU shards only while docked; the worker's claim can demote it, never make it near.
+are known, a virtual machine never claims a link, and a change is reported only after it has held 60 s,
+except a change onto battery, which is reported at once (2.6.4: a laptop just unplugged may be shut and
+asleep within the minute, so the drain must start while it is awake). A companion (the CPU half of a
+machine) sends none of them. The coordinator uses them in section 1: a near GPU shards only while
+docked; the worker's claim can demote it, never make it near.
+
+**Wi-Fi and battery (2.6.4, `engine/dock_policy.py`).** The coordinator does not take `docked` as the
+worker says it; it judges the facts:
+
+| Power | Link | Docked |
+| --- | --- | --- |
+| mains | wired | yes |
+| mains | Wi-Fi | only while the link passes its test (below) |
+| battery | any, or unknown | never |
+| any | phone link | never |
+| a fact unknown | | as the worker says; one that says nothing is not held back |
+
+The test of a Wi-Fi link: every probe round (`engine/link_paths.measure_series`, the engine's own path,
+every few minutes) times `WIFI_PROBE_SAMPLES` (20) round trips instead of three. It passes when none is
+lost, the median is at most `AUTO_SWAP_MAX_RTT_MS` (80 ms), the 90th percentile is at most
+`WIFI_MAX_JITTER_MS` (20 ms) above the median, and the node's own download figure is at least
+`WIFI_MIN_DOWNLOAD_MBPS` (100) and under two hours old. Jitter is judged more than speed because a shard
+exchanges a few KB on every token, so a Wi-Fi stall holds up every token; the download matters once, for
+the weights a shard loads. The node measures that figure itself, 16 MB from `/v1/net/probe`, when the
+heartbeat answer asks for it (below), at most every 10 minutes, and reports it to `/worker/link_report`,
+which judges the link again at once. A node's own figure is good enough here because the docked facts only
+ever hold a GPU back: whether it is near is still this coordinator's own round trip, and a dishonest worker
+could already claim to be wired. A GPU the engine runs on is not retested (its tunnel is busy with the
+shard and the shard's own traffic would be timed): the verdict it shards on stands until it leaves Wi-Fi,
+stops answering, or the engine moves off it. A verdict belongs to the Wi-Fi link it was made on: off Wi-Fi
+or onto battery it is dropped, and a return to Wi-Fi is tested afresh. `WIFI_SHARD=false` keeps every
+Wi-Fi GPU out, as before 2.6.4. This coordinator's own GPUs need no test.
+
+A GPU on Wi-Fi and mains finds the verdict in every heartbeat answer:
+`"wifi_check": {"ok": true | false | null, "why": "...", "speed_test": true | false}`; `ok` is null until
+the first test has run, `why` says in a few words what passed or which limit was missed (for example
+`"jitter 34 ms, over 20"`), and `speed_test` asks for the download test (never while the GPU carries a
+shard). While its link is still being tested, for up to the 90 s role grace, a GPU that is not already a
+member is given no new job (`role: null`), so it is not sent to load a whole model it would drop a minute
+later.
 
 **Stepping aside and leaving (2.5.0).** A GPU node that is yielding, undocked, or says
 `"leaving": true` (a graceful stop: the worker sends it instead of vanishing) is left out of every new
@@ -243,8 +280,9 @@ As built:
 - **Restart grace:** a worker whose heartbeat already says `pool: coding` keeps its role after a
   coordinator restart; only an unknown machine waits out the 90 s probe grace.
 - A member-served 200 carries `X-DLNE-Served: member`.
-- **Roles:** a node is given `role: "coding"` only when it is a far GPU, or a near one that says it is off
-  its dock (`docked: false`, 2.5.0), with at least 8 GB, has `coding_ok: true` in its hardware profile, has
+- **Roles:** a node is given `role: "coding"` only when it is a far GPU, or a near one that is off its dock
+  (2.5.0; as the coordinator judges it since 2.6.4, section 2: on battery, or on Wi-Fi without a passing
+  link test), with at least 8 GB, has `coding_ok: true` in its hardware profile, has
   a tier from `choose_tier` (sized on `coding_ram_gb`, section 4), and is not measured farther than
   `CODING_MEMBER_MAX_RTT_MS` (120 ms; one nobody has measured may still be). A near GPU that is docked, or
   does not say, is told `"rpc"`. A GPU that is yielding to its owner is given no new job (`role: null`)
@@ -651,12 +689,15 @@ DLNE_ROLE: coding {"model": "Qwen3.6-35B-A3B-UD-IQ3_S.gguf", "tier": "qwen36-a3b
 
 ```
 DLNE_DOCK: {"link": "wired", "power": "ac", "docked": true}
+DLNE_DOCK: {"link": "wifi", "power": "ac", "docked": false, "wifi_ok": true, "wifi_why": "round trip 4 ms, jitter 2 ms, download 312 Mbit/s"}
 DLNE_YIELD: {"yielding": true, "why": "gpu"}
 ```
 
 (`rpc` = a share of the one big model run on many GPUs; `coding` = a whole coding model answering other
 people's requests; `app` = the phone app's CPU pool. `DLNE_DOCK` (2.5.0) repeats the docked facts of
-section 2 once per change, with `docked` left out while a fact is unknown; `DLNE_YIELD` (2.5.0) says once
+section 2 once per change, with `docked` left out while a fact is unknown; on Wi-Fi and mains (2.6.4) it also
+carries the coordinator's verdict, `wifi_ok` (true, false, or null while the link is being tested) and
+`wifi_why`, which decide there instead of `docked`; `DLNE_YIELD` (2.5.0) says once
 per change whether the machine is stepping aside for its owner's own load and why: `fullscreen`, `gpu` or
 `cpu`, `""` when it is not.) The JSON part is optional and each field is checked
 (`trust_id` is the 32 lower-case hex characters of section 1). `context` (the tokens each request gets),

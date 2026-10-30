@@ -18,6 +18,7 @@ import { SwarmDashboard } from './views/swarmDashboard';
 import { CPU_POOL_HEADLINE, CPU_POOL_PERK, EXTERNAL_WORKER_LINE, ROLE_LABEL, workerStartedNotice } from './worker/contribution';
 import { phoneChatUrl } from './serverUrl';
 import { ToolRegistry } from './agent/tools';
+import { setPastedDir } from './agent/pasted';
 import { undoMemoryChange } from './agent/memory';
 
 function isNewerVersion(current: string, remote: string): boolean {
@@ -140,6 +141,9 @@ export function activate(context: vscode.ExtensionContext) {
   if (context.workspaceState) {
     ToolRegistry.store = context.workspaceState;
   }
+  // A paste too long for one @dlne message is kept whole here, in the extension's own storage (agent/pasted.ts).
+  const storage = context.storageUri ?? context.globalStorageUri;
+  setPastedDir(storage ? path.join(storage.fsPath, 'pasted') : undefined);
 
   const client = new DlneClient();
   const workerManager = new WorkerManager(context);

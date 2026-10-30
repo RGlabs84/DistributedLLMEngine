@@ -10,6 +10,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.6.4] - 2026-10-30
+
+Released with extension 1.5.3. A GPU on Wi-Fi may share the big model when its
+link is good enough, and a laptop that is unplugged steps out of it before it can fall asleep.
+
+### Changed
+- **Wi-Fi no longer rules a GPU out of the shared model by itself** (owner's rule, 2026-10-29). Until now "docked"
+  meant a wired link and mains power, so a GPU on Wi-Fi never shared the model, however good its link: one with 8 GB
+  or more ran a whole model as a coding member, and a smaller one had no job at all. Now the coordinator judges the
+  facts itself (`engine/dock_policy.py`): mains and wired is docked, as before; mains and Wi-Fi is docked while the
+  link passes a test; battery and a phone link never are. The test, every probe round along the engine's own path:
+  20 round trips, none lost, a median within `AUTO_SWAP_MAX_RTT_MS` (80 ms), the 90th percentile within 20 ms of the
+  median, and the machine's own download figure (16 MB from `/v1/net/probe`, asked for in the heartbeat answer) at
+  least 100 Mbit/s. Jitter counts more than speed because a shard exchanges a few KB on every token, so a Wi-Fi
+  stall holds up every token. A GPU the engine runs on is not retested; a verdict is dropped when the machine leaves
+  Wi-Fi. New settings: `WIFI_SHARD` (true; false keeps Wi-Fi out as before), `WIFI_MAX_JITTER_MS` (20),
+  `WIFI_MIN_DOWNLOAD_MBPS` (100), `WIFI_PROBE_SAMPLES` (20). Details: docs/coding-members.md section 2.
+- **Never on battery, and unplugging is noticed at once.** A GPU on battery was already left out, but the worker
+  reported any change only after it had held 60 s, so a laptop unplugged mid-answer kept running its shard on battery
+  for up to about two and a half minutes, and one closed in that time dropped the shard and the answers on it. A
+  change onto battery is now reported at the next heartbeat (about 25 s at most), and the usual drain lets the answers
+  finish while the laptop is awake. Plugging back in still waits out the 60 s.
+- **The heartbeat answer tells a Wi-Fi GPU how its link was judged** (`wifi_check`: passed, failed or still being
+  tested, and why), and the worker's `DLNE_DOCK` line passes it on (`wifi_ok`, `wifi_why`) for the editor and the
+  tray app. While its link is still being tested (up to 90 s), a GPU is given no new job, so it is not sent to load a
+  whole model it would drop again a minute later.
+- **DLNE Donate 1.0.2, in the source** (the tray app; the download on the site stays 1.0.1 until its build is
+  published): its Settings window says how a Wi-Fi link was judged and that a GPU never shares the model on battery,
+  word for word as extension 1.5.3, and no longer says an undocked GPU "runs a whole model by itself" (only one with
+  8 GB or more does).
+
+### Fixed
+- **A link report could not crash the coordinator's log line any more.** `/worker/link_report` wrote the figures a
+  node sent straight into the markup-enabled log; it now logs the numbers the registry kept.
+
 ## [2.6.3] - 2026-10-28
 
 Released with extension 1.5.2. Only the canary changes; everything else is 2.6.2.

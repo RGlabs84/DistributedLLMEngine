@@ -322,5 +322,50 @@ def measure(endpoint: str, *, routes: Optional[LanRoutes] = None,
     return None
 
 
+def _connect_series(host: str, port: int, samples: int) -> Optional[List[Optional[float]]]:
+    from engine.benchmark import measure_rtt_ms
+    try:
+        result = measure_rtt_ms(host, int(port), samples=samples, timeout=CONNECT_TIMEOUT_SECONDS)
+    except (ValueError, OSError):
+        return None
+    return result.get("rtt_series_ms") if result.get("ok") else None
+
+
+def _tunnel_series(host: str, port: int, samples: int) -> Optional[List[Optional[float]]]:
+    from engine.reverse_tunnel import reverse_bridge
+    return reverse_bridge.ping_series(host, int(port), samples, timeout=TUNNEL_PING_TIMEOUT_SECONDS)
+
+
+def measure_series(endpoint: str, samples: int, *, routes: Optional[LanRoutes] = None,
+                   connect: Callable[[str, int, int], Optional[List[Optional[float]]]] = _connect_series,
+                   tunnel: Callable[[str, int, int], Optional[List[Optional[float]]]] = _tunnel_series,
+                   ) -> Optional[Tuple[List[Optional[float]], str]]:
+    """
+    :func:`measure` with every sample kept, for the Wi-Fi test (engine/dock_policy.py, 2.6.4):
+    ``(samples_ms, path)``, None for a sample that went unanswered; None when no path answered at
+    all. The same paths in the same order, so the series times the link the engine would use.
+    Blocking: run it on a thread.
+    """
+    routes = routes if routes is not None else lan_routes
+    host, _, port_text = endpoint.rpartition(":")
+    try:
+        port = int(port_text)
+    except ValueError:
+        return None
+    for lan_ip in routes.offers(host, port):
+        series = connect(lan_ip, port, samples)
+        if series:
+            routes.confirm(host, port, lan_ip)
+            return list(series), "lan"
+    routes.drop(host, port)
+    series = connect(host, port, samples)
+    if series:
+        return list(series), "direct"
+    series = tunnel(host, port, samples)
+    if series:
+        return list(series), "tunnel"
+    return None
+
+
 household = Household()
 lan_routes = LanRoutes()

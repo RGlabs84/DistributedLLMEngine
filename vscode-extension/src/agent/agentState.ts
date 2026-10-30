@@ -290,6 +290,29 @@ export function openAgentStateStore(context: MaybeStateFolders, surface: AgentSu
   return new AgentStateStore(folders && agentStateFile(folders, surface), loop);
 }
 
+/**
+ * The folder of the sidebar's sessions' saved tasks (1.5.3): one file each, apart from the Chat threads' so neither's
+ * housekeeping ever deletes the other's. A session id is a thread id (isThreadId).
+ */
+export function sidebarSessionsDir(context: StateFolders): string {
+  return context.storageUri
+    ? path.join(context.storageUri.fsPath, 'sidebar-sessions')
+    : path.join(context.globalStorageUri.fsPath, 'sidebar-sessions-nofolder');
+}
+
+/** The store for one sidebar session: its own file in sidebarSessionsDir. */
+export function openSidebarSessionStore(context: MaybeStateFolders, sessionId: string, loop: StatefulLoop): AgentStateStore {
+  if (!isThreadId(sessionId)) throw new Error('not a session id');
+  const folders = stateFolders(context);
+  return new AgentStateStore(folders && path.join(sidebarSessionsDir(folders), `${sessionId}.json`), loop);
+}
+
+/** Where the sidebar's single chat kept its saved task before 1.5.3, or undefined with no storage folder. */
+export function legacySidebarStateFile(context: MaybeStateFolders): string | undefined {
+  const folders = stateFolders(context);
+  return folders && agentStateFile(folders, 'sidebar');
+}
+
 /** The store for one Chat thread: its own file, among the threads' (see agentThreadFile). */
 export function openAgentThreadStore(
   context: MaybeStateFolders,

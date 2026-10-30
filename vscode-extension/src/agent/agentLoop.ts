@@ -193,6 +193,30 @@ export const NEXT_STEP_NUDGE = 'Continue with the next step. If the task is done
 export const REPORT_REQUEST = '[DLNE] Your last reply was empty. Do not call any tools now. In a few short lines, tell ' +
   'the user what you did (each change you made and each command that changed something, with its result) and what is left.';
 
+/**
+ * What the model is told, once per run, when its reply announced a next step but called no tool (1.5.3). Such a reply
+ * ended the task: the user saw "Let me read that file to see what we've been through." and a finished run, in a second
+ * (@dlne on a pasted log, 2026-10-30 01:29).
+ */
+export const PROMISE_NUDGE = '[DLNE] Your reply said what you would do next, but it called no tool, so nothing was ' +
+  'done. If there is a next step, take it now with a tool call. If the task is finished, give the user your final answer.';
+
+/**
+ * Whether a reply ends by announcing a step it did not take: its last sentence starts "Let me check…", "I'll read…",
+ * "Now I will run…" and names an action. A closing courtesy ("Let me know if…", "I'll wait for your answer") is not one.
+ */
+export function promisesAStep(reply: string): boolean {
+  const text = reply.trim();
+  if (!text || text.length > 4000) return false;
+  const sentences = text.split(/(?<=[.!?:…])\s+|\n+/).map((s) => s.trim()).filter(Boolean);
+  const last = (sentences[sentences.length - 1] || '').replace(/^[-*>\s]+/, '');
+  const opener = /^(?:(?:ok(?:ay)?|now|next|first|then|alright|great|sure)[,!.]?\s+)*(?:let me|let's|i'll|i will|i'm going to|i am going to|i need to|i'll now|i will now)\s+(.*)$/i.exec(last);
+  if (!opener) return false;
+  const rest = opener[1].toLowerCase();
+  if (/^(?:know|wait|be here|be around|stop here|leave (?:it|that|this)|hand (?:it|this) back)\b/.test(rest)) return false;
+  return /^(?:(?:also|now|first|quickly|then|just|go ahead and)\s+)*(?:check|read|look|open|run|search|inspect|review|examine|start|try|fix|build|write|create|update|edit|install|list|find|see|verify|test|grep|investigate|go through|dig|scan|take a look|have a look|explore|compile|apply|change|add|remove|delete|rebuild|reload|restart|load|fetch|pull|analy[sz]e|compare|trace|debug|patch|make)\b/.test(rest);
+}
+
 /** What the model is told when the limit is reached: report instead of taking another step. */
 export function pausePrompt(maxTurns: number): string {
   return `[DLNE] This request has used its limit of ${maxTurns} steps. Do not call any tools now. ` +
@@ -1022,6 +1046,7 @@ export class AgentLoop {
     let turns = 0;          // replies from the model in this request; a retry after a context overflow is not one
     let pausing = false;    // the limit is reached: this last turn asks for a report, with no tools
     let reporting = false;  // the task ended with an empty reply: this last turn asks for a report, with no tools
+    let promiseNudged = false;  // a reply announced a step without taking it, and was told to (once per run)
     let overflowRetries = 0;
     let dropRetries = 0;    // the current step sent again after the engine dropped it; back to 0 once a reply arrives
     let forceCompaction = false;
@@ -1430,6 +1455,17 @@ export class AgentLoop {
         this.history.push({ role: 'assistant', content: streamedRaw || '' });
         this.history.push({ role: 'user', content: REPORT_REQUEST });
         reporting = true;
+        continue;
+      }
+      // A reply that announces its next step but calls no tool would end the task there, nothing done. Once per run it
+      // is told to take the step or give its answer; a turn that may not call tools (a pause, a report) is left alone.
+      const answered = withoutThinking(streamedRaw || streamResult.content || '');
+      if (!promiseNudged && !pausing && !reporting && streamResult.finishReason !== 'length' && promisesAStep(answered)) {
+        promiseNudged = true;
+        say(`step ${turns}: announced a step without taking it; told to take it`);
+        this.history.push({ role: 'assistant', content: streamedRaw || '' });
+        this.history.push({ role: 'user', content: PROMISE_NUDGE });
+        callbacks.onContentDelta('\n\n');
         continue;
       }
       say(`step ${turns}: answer`);

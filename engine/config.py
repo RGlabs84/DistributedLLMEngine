@@ -23,6 +23,8 @@ import threading
 import time
 from typing import List
 
+from engine.dock_policy import WIFI_DEFAULTS
+
 
 # --------------------------------------------------------------------------------------
 # Locations
@@ -452,6 +454,9 @@ def get_worker_limits() -> dict:
         # laptop off its dock, a worker that says it is leaving) while the answers running on it
         # finish, before the engine is rebuilt without it. A shard that is gone still restarts at once.
         "shard_drain_seconds": 60,
+        # A GPU on Wi-Fi and mains power shards only while its link passes the speed test
+        # (engine/dock_policy.py, 2.6.4): WIFI_SHARD=false keeps every Wi-Fi GPU out, as before 2.6.4.
+        **WIFI_DEFAULTS,
         # How long a gained GPU may wait behind running answers before the engine is rebuilt to
         # take it anyway (only with REBALANCE_ON_JOIN=true).
         "topology_rejoin_max_seconds": 600,
@@ -712,6 +717,20 @@ def get_worker_limits() -> dict:
             except ValueError:
                 value = -1.0
             if low <= value <= high:        # NaN fails both and keeps the default
+                limits[name] = value
+
+    # Wi-Fi sharding (engine/dock_policy.py, 2.6.4). A value out of range keeps the default.
+    if "WIFI_SHARD" in config:
+        limits["wifi_shard"] = _as_bool(config["WIFI_SHARD"])
+    for key, name, cast, low, high in (("WIFI_MAX_JITTER_MS", "wifi_max_jitter_ms", float, 1.0, 1000.0),
+                                       ("WIFI_MIN_DOWNLOAD_MBPS", "wifi_min_download_mbps", float, 1.0, 100000.0),
+                                       ("WIFI_PROBE_SAMPLES", "wifi_probe_samples", int, 5, 100)):
+        if key in config:
+            try:
+                value = cast(config[key])
+            except ValueError:
+                value = None
+            if value is not None and low <= value <= high:     # NaN fails both and keeps the default
                 limits[name] = value
 
     if "SHARD_POLICY" in config:

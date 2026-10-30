@@ -1513,6 +1513,10 @@ _VM_VENDORS = ("qemu", "vmware", "innotek", "virtualbox", "virtual machine", "xe
 _DOCK_TTL_SECONDS: float = 20.0      # Windows and macOS ask a subprocess; sysfs is cheap but needs no faster
 # A change is reported only once it has held this long: a dock replugged, a charger brushed, or
 # a DHCP renew must not move a shard (a role change costs the engine a restart, section 1).
+# Except going onto battery (2.6.4): a GPU never shards on battery, and a laptop just unplugged may
+# be closed and asleep before the minute is out, taking its shard and every answer on it along.
+# That change is reported at once, so the coordinator's drain starts while the machine is still
+# awake; going back onto mains still waits out the hold.
 _DOCK_HOLD_SECONDS: float = 60.0
 
 _dock_lock = threading.Lock()
@@ -1742,7 +1746,8 @@ def get_dock_state() -> Dict[str, str]:
     """
     ``{"link": wired|wifi|cellular|unknown, "power": ac|battery|unknown}`` for the profile. Probed at most
     every _DOCK_TTL_SECONDS; the first reading is reported at once, a later change only after it has held
-    _DOCK_HOLD_SECONDS, so a replugged dock does not move a shard twice. Never raises.
+    _DOCK_HOLD_SECONDS, so a replugged dock does not move a shard twice. A change onto battery is reported
+    at once (2.6.4, see _DOCK_HOLD_SECONDS). Never raises.
     """
     global _dock_cache, _dock_cache_expiry, _dock_reported, _dock_pending, _dock_pending_since
     with _dock_lock:
@@ -1756,6 +1761,8 @@ def get_dock_state() -> Dict[str, str]:
         reading = dict(_dock_cache)
         if _dock_reported is None:
             _dock_reported, _dock_pending = reading, None
+        elif reading.get("power") == "battery" and _dock_reported.get("power") != "battery":
+            _dock_reported, _dock_pending = reading, None      # just unplugged: no hold
         elif reading == _dock_reported:
             _dock_pending = None
         elif reading != _dock_pending:

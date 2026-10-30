@@ -435,9 +435,9 @@ test('Stop on a page that thinks a task runs, when none does, puts it back to id
   });
 });
 
-test('Clear during a task ends it quietly: nothing of it is drawn afterwards, and the page is free when it ends', async () => {
+test('New chat during a task (1.5.3): the task goes on in its own session, the new chat stays clean, and the list says so', async () => {
   const gate = deferred();
-  // This model does not stop at once: its words arrive after the Clear, as a slow reply's would.
+  // This model does not answer at once: its words arrive after the New chat, as a slow reply's would.
   const slow = async (ctx) => {
     await gate.promise;
     ctx.onDelta('late words');
@@ -446,16 +446,93 @@ test('Clear during a task ends it quietly: nothing of it is drawn afterwards, an
   await withSidebar([say('Looking. ', [toolCall('list_directory', { path: '.' })]), slow], {}, async (sb) => {
     send(sb.view, 'build it');
     await until(() => sb.client.calls.length === 2, 'the second step');
-    sb.view.page.clickClear();
-    await until(() => sb.view.posted('cleared').length === 1, 'the extension to clear');
-    assert.equal(sb.view.page.chat(), '', 'the chat is empty');
-    assert.equal(sb.view.page.controls().stopLabel, 'Stopping...', 'the task is still ending');
+    const first = sb.view.posted('sessions').at(-1).active;
+    sb.view.page.clickClear();                                   // the button says "New chat" now
+    await until(() => sb.view.posted('restoreHistory').some((m) => m.session.active !== first), 'the new chat');
+    const fresh = sb.view.posted('restoreHistory').at(-1);
+    assert.equal(sb.view.page.chat(), '', 'the new chat is empty');
+    assert.equal(sb.view.page.controls().send, 'shown', 'and free to use: the task runs in the other session');
+    assert.equal(sb.view.page.el('session-title').textContent, 'New chat');
+    assert.deepEqual(fresh.session.list.map((r) => [r.title, r.running, r.active]),
+      [['New chat', false, true], ['build it', true, false]]);
+
     gate.release();
     await sb.view.idle();
-    assert.equal(sb.view.page.chat(), '', 'what the task said after the Clear is not drawn');
-    assert.equal(sb.view.page.controls().send, 'shown');
-    assert.equal(sb.provider.conversationHistory.length, 0);
+    assert.equal(sb.view.page.chat(), '', 'what the task said is not drawn in the new chat');
+    assert.equal(sb.view.posted('sessions').at(-1).list.find((r) => r.id === first).running, false, 'the list says it ended');
+
+    // Back to it from the list: its row, clicked on the page.
+    sb.view.page.el('sessions-btn').click();
+    assert.equal(sb.view.page.el('session-list').style.display, 'flex');
+    assert.equal(sb.view.page.el('chat-container').style.display, 'none');
+    const row = sb.view.page.el('session-list').children.find((r) => r.children[0].textContent === 'build it');
+    row.click();
+    await sb.view.idle();
+    assert.match(sb.view.page.chat(), /late words/, 'the task as it ended');
+    assert.equal(sb.view.page.el('session-title').textContent, 'build it');
+    assert.equal(sb.view.page.el('chat-container').style.display, 'flex', 'the chat is shown again');
+    assert.equal(sb.provider.conversationHistory.length, 2);
     assert.deepEqual(sb.view.page.errors, []);
+  });
+});
+
+test('the chat follows the answer only while it is at the bottom; scrolled up, it stays put until Latest (1.5.3)', async () => {
+  await withSidebar([say('x')], {}, async (sb) => {
+    const page = createPage(sb.view.webview.html, { toHost: () => {} });
+    const chat = page.el('chat-container');
+    const scrolled = (top) => { chat.scrollTop = top; chat.dispatch('scroll'); };
+    chat.clientHeight = 200;
+    chat.scrollHeight = 1000;
+    page.receive({ type: 'appendUserMessage', text: 'go' });
+    assert.equal(chat.scrollTop, 1000, 'your own message is shown');
+
+    scrolled(300);                                               // the owner scrolls up to read
+    chat.scrollHeight = 1400;
+    page.receive({ type: 'contentDelta', delta: 'more words' });
+    page.receive({ type: 'toolStart', toolName: 'read_file', args: {} });
+    page.flushTimers();
+    assert.equal(chat.scrollTop, 300, 'the chat does not fight the reader');
+    assert.equal(page.el('jump-btn').style.display, 'inline-block', 'Latest is offered');
+
+    page.el('jump-btn').click();
+    assert.equal(chat.scrollTop, 1400);
+    assert.equal(page.el('jump-btn').style.display, 'none');
+    chat.scrollHeight = 1800;
+    page.receive({ type: 'loadingProgress', statusText: 'working' });
+    assert.equal(chat.scrollTop, 1800, 'at the bottom again, it follows again');
+
+    scrolled(500);
+    scrolled(1800 - 200 - 10);                                   // scrolled back down by hand: following again
+    chat.scrollHeight = 2000;
+    page.receive({ type: 'loadingProgress', statusText: 'still working' });
+    assert.equal(chat.scrollTop, 2000);
+    assert.deepEqual(page.errors, []);
+  });
+});
+
+test('Stop and Send act on the chat shown: a task in another session is not touched', async () => {
+  const gate = deferred();
+  const slow = async (ctx) => {
+    await gate.promise;
+    ctx.onDelta('first done');
+    return { content: 'first done', toolCalls: [], finishReason: 'stop' };
+  };
+  await withSidebar([slow, say('second done')], {}, async (sb) => {
+    send(sb.view, 'first task');
+    await until(() => sb.client.calls.length === 1, 'the first task to ask the swarm');
+    const first = sb.view.posted('sessions').at(-1).active;
+    sb.view.page.clickClear();
+    // (Not view.idle(): that waits for the first task too, which is still running, as it should.)
+    await until(() => sb.view.posted('restoreHistory').some((m) => m.session.active !== first), 'the new chat');
+    send(sb.view, 'second task');
+    await until(() => sb.view.posted('turnComplete').length === 1, 'the second task to end');
+    assert.match(sb.view.page.chat(), /second done/);
+    sb.view.page.clickStop();                                   // nothing runs here: the first task is left alone
+    gate.release();
+    await sb.view.idle();
+    assert.equal(sb.view.posted('sessions').at(-1).list.find((r) => r.id === first).title, 'first task');
+    await sb.view.toHost({ type: 'openSession', id: first });
+    assert.match(sb.view.page.chat(), /first done/, 'it ran to its end');
   });
 });
 
@@ -602,7 +679,7 @@ test('A4: the page shows the words it is sent, and a plain sentence for an error
 
 // ---- A5: the two answers the page did not handle ---------------------------------------------------------------
 
-test('A5: Undo reports on its own button, and a cleared chat is cleared on both sides', async () => {
+test('A5: Undo reports on its own button, and a New chat leaves nothing of the old one on the page', async () => {
   await withSidebar([say('x')], {}, async (sb) => {
     const page = sb.view.page;
     // An Undo the extension refuses (it is not a change DLNE made): the button says so.
@@ -618,10 +695,8 @@ test('A5: Undo reports on its own button, and a cleared chat is cleared on both 
     assert.equal(undo.title, 'Cannot undo: that is not a change DLNE made.');
     assert.equal(stub.state.warningMessages.length, 1, 'the toast is still shown');
 
-    // Clear: the page empties itself, the extension forgets, and its answer leaves nothing behind.
-    page.clickClear();
-    await sb.view.idle();
-    assert.equal(sb.view.posted('cleared').length, 1);
+    // A page from before 1.5.3 still understands `cleared`: it empties itself.
+    page.receive({ type: 'cleared' });
     assert.equal(page.chat(), '');
     assert.equal(page.find('undo-btn').length, 0);
   });

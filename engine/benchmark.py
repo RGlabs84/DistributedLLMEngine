@@ -395,14 +395,19 @@ def measure_rtt_ms(host: str, port: int, samples: int = 7,
     the Coordinator right now is a normal state during a network change, not an error.
     """
     timings: List[float] = []
+    # Every sample in order, None for one that failed: the Wi-Fi test judges the spread and the
+    # losses, not only the best (engine/dock_policy.py).
+    series: List[Optional[float]] = []
     last_error = ""
     for _ in range(max(1, samples)):
         started = time.perf_counter()
         try:
             with socket.create_connection((host, int(port)), timeout=timeout):
                 timings.append((time.perf_counter() - started) * 1000.0)
+                series.append(round(timings[-1], 2))
         except Exception as exc:
             last_error = str(exc)
+            series.append(None)
         # No sleep between samples: back-to-back connects are what expose a path that only
         # looks fast when it is idle.
 
@@ -416,12 +421,13 @@ def measure_rtt_ms(host: str, port: int, samples: int = 7,
         "rtt_max_ms": round(max(timings), 2),
         "rtt_samples": len(timings),
         "rtt_lost": max(0, samples - len(timings)),
+        "rtt_series_ms": series,
     }
 
 
 def measure_throughput(base_url: str, token: str = "",
                        payload_bytes: int = DEFAULT_PROBE_BYTES,
-                       timeout: float = 120.0) -> Dict[str, Any]:
+                       timeout: float = 120.0, upload: bool = True) -> Dict[str, Any]:
     """
     Upstream and downstream throughput between this node and the Coordinator.
 
@@ -433,21 +439,26 @@ def measure_throughput(base_url: str, token: str = "",
     Both directions are reported because they are routinely asymmetric on the connections
     contributors actually have, and a node that can receive a model quickly but not return
     activations is a different problem from one that can do neither.
+
+    ``upload=False`` measures the download alone (the Wi-Fi speed test, engine/dock_policy.py: the
+    weights a shard loads are the only bulk transfer, and they come down); ``upload_mbps`` is then None.
     """
     payload_bytes = max(1, min(int(payload_bytes), MAX_PROBE_BYTES))
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     result: Dict[str, Any] = {"ok": False, "probe_bytes": payload_bytes}
+    up_elapsed = 0.0
 
     try:
         with httpx.Client(timeout=httpx.Timeout(timeout, connect=10.0)) as client:
-            blob = b"\0" * payload_bytes
+            if upload:
+                blob = b"\0" * payload_bytes
 
-            started = time.perf_counter()
-            up = client.post(f"{base_url}/v1/net/probe", content=blob, headers=headers)
-            up_elapsed = time.perf_counter() - started
-            if up.status_code != 200:
-                result["detail"] = f"Upstream probe answered HTTP {up.status_code}."
-                return result
+                started = time.perf_counter()
+                up = client.post(f"{base_url}/v1/net/probe", content=blob, headers=headers)
+                up_elapsed = time.perf_counter() - started
+                if up.status_code != 200:
+                    result["detail"] = f"Upstream probe answered HTTP {up.status_code}."
+                    return result
 
             started = time.perf_counter()
             down = client.get(
@@ -466,9 +477,9 @@ def measure_throughput(base_url: str, token: str = "",
     # one they can sanity-check against what they pay for.
     result.update({
         "ok": True,
-        "upload_mbps": round((payload_bytes * 8) / up_elapsed / 1_000_000, 2) if up_elapsed else None,
+        "upload_mbps": round((payload_bytes * 8) / up_elapsed / 1_000_000, 2) if upload and up_elapsed else None,
         "download_mbps": round((received * 8) / down_elapsed / 1_000_000, 2) if down_elapsed else None,
-        "upload_seconds": round(up_elapsed, 3),
+        "upload_seconds": round(up_elapsed, 3) if upload else None,
         "download_seconds": round(down_elapsed, 3),
         "detail": "Throughput measured.",
     })

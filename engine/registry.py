@@ -3,6 +3,7 @@ import math
 import re
 import threading
 import time
+from engine.dock_policy import NOT_TESTED, effective_docked, on_wifi_and_mains
 from engine.logger import log_coordinator, log_warning, log_error
 
 # The longest worker-supplied value that may be interpolated into a log line. A real GPU
@@ -90,15 +91,18 @@ _CLASS_RANK = {"local": 0, "lan": 1, "wan": 2, "unknown": 3}
 _UNMEASURED_RTT_MS = 250.0
 
 
-def stepping_aside(hardware: Any) -> bool:
+def stepping_aside(hardware: Any, wifi_passed: bool = False) -> bool:
     """
     A GPU node that must not carry a shard right now, though it is still here: it is yielding to its
-    owner, it says it is leaving (a graceful stop, 2.5.0), or it is a laptop off its dock (2.5.0). It is
-    left out of every new endpoint plan, and an engine still running on it is rebuilt without it once the
-    answers in flight finish (coordinator._topology_change_is_settled).
+    owner, it says it is leaving (a graceful stop, 2.5.0), or it is off its dock (2.5.0): on battery, on
+    a phone link, or on Wi-Fi without a passing speed test (engine/dock_policy.py, 2.6.4; ``wifi_passed``
+    is this coordinator's verdict, Registry.wifi_passed). It is left out of every new endpoint plan, and
+    an engine still running on it is rebuilt without it once the answers in flight finish
+    (coordinator._topology_change_is_settled).
     """
     profile = _as_profile(hardware)
-    return profile.get("is_yielding") is True or profile.get("leaving") is True or profile.get("docked") is False
+    return (profile.get("is_yielding") is True or profile.get("leaving") is True
+            or effective_docked(profile, wifi_passed) is False)
 
 
 def _endpoint_class(ip: str) -> str:
@@ -216,6 +220,10 @@ class WorkerRegistry:
         # from the node's own report above because a node chooses every number it reports:
         # whether a GPU is near enough to share the coding model is decided by this alone.
         self.link_probes: Dict[str, Dict[str, Any]] = {}
+        # This Coordinator's verdict on each Wi-Fi GPU's link (engine/dock_policy.judge_wifi, 2.6.4), for a
+        # node on Wi-Fi and mains only: dropped the moment it reports anything else, so a verdict never
+        # outlives the link it was made for.
+        self.wifi_checks: Dict[str, Dict[str, Any]] = {}
         # The llama.cpp RPC protocol major this Coordinator's engine speaks (from its signed
         # release), or None when unknown. llama-server ABORTS at startup if any --rpc backend
         # speaks another major, so a mismatched worker must never be routed to: it is left
@@ -387,6 +395,13 @@ class WorkerRegistry:
                 "role": role if role in ("worker", "redundancy", "hybrid") else "worker",
                 "staged_version": str(staged_version),
             }
+            # A Wi-Fi verdict belongs to the Wi-Fi link it was made on: off it (wired again, on battery,
+            # or a fact it can no longer read) the verdict goes, and a return to Wi-Fi is tested afresh.
+            if not on_wifi_and_mains(profile):
+                self.wifi_checks.pop(worker_id, None)
+            elif worker_id not in self.wifi_checks:
+                # On Wi-Fi now and not tested: pending, and ``since`` says for how long (the role answer's grace).
+                self.wifi_checks[worker_id] = {"ok": None, "why": NOT_TESTED, "since": current_time}
 
         for emit, message in pending_logs:
             try:
@@ -485,6 +500,42 @@ class WorkerRegistry:
             if worker_id in self.workers:
                 self.link_probes[worker_id] = {"rtt_ms": rtt, "via": str(via), "measured_at": time.time()}
 
+    def record_wifi_check(self, worker_id: str, verdict: Dict[str, Any]) -> None:
+        """File this Coordinator's verdict on a registered node's Wi-Fi link (engine/dock_policy.judge_wifi)."""
+        if not worker_id or not isinstance(verdict, dict):
+            return
+        with self._lock:
+            data = self.workers.get(worker_id)
+            if data is not None and on_wifi_and_mains(data.get("hardware")):
+                previous = self.wifi_checks.get(worker_id, {})
+                self.wifi_checks[worker_id] = dict(verdict, since=previous.get("since", time.time()))
+
+    def get_wifi_check(self, worker_id: str) -> Dict[str, Any]:
+        """The last Wi-Fi verdict on a node, or ``{}`` when it has none (not on Wi-Fi, or not tested yet)."""
+        with self._lock:
+            return dict(self.wifi_checks.get(worker_id, {}))
+
+    def wifi_passed(self, worker_id: str) -> bool:
+        """
+        Whether a node's Wi-Fi link passed its last test. This Coordinator's own machine always passes: the
+        engine reaches its own GPUs without a network. The verdict carries no age limit of its own: the
+        link probe renews it every few minutes, and a node it cannot reach at all is far anyway
+        (coordinator._coding_worker_is_near).
+        """
+        with self._lock:
+            data = self.workers.get(worker_id) or {}
+            if data and _endpoint_class(data.get("ip", "")) == "local":
+                return True
+            return self.wifi_checks.get(worker_id, {}).get("ok") is True
+
+    def worker_stepping_aside(self, worker_id: str, hardware: Any) -> bool:
+        """:func:`stepping_aside` for a registered node, with this Coordinator's Wi-Fi verdict on it."""
+        return stepping_aside(hardware, self.wifi_passed(worker_id))
+
+    def effective_docked(self, worker_id: str, hardware: Any) -> Optional[bool]:
+        """engine/dock_policy.effective_docked for a registered node, with this Coordinator's Wi-Fi verdict on it."""
+        return effective_docked(_as_profile(hardware), self.wifi_passed(worker_id))
+
     def endpoint_is_draining(self, endpoint: str) -> bool:
         """
         Whether ``endpoint`` is a registered GPU node that is stepping aside (yielding, leaving or undocked). It
@@ -492,9 +543,9 @@ class WorkerRegistry:
         rebuilt without it; a node that is not registered any more is gone, and the engine is already broken.
         """
         with self._lock:
-            for data in self.workers.values():
+            for w_id, data in self.workers.items():
                 if f"{data.get('ip')}:{data.get('port')}" == endpoint:
-                    return stepping_aside(data.get("hardware"))
+                    return self.worker_stepping_aside(w_id, data.get("hardware"))
         return False
 
     def registered_at(self, worker_id: str) -> float:
@@ -541,6 +592,7 @@ class WorkerRegistry:
                 # machine that has left the cluster.
                 self.link_measurements.pop(w_id, None)
                 self.link_probes.pop(w_id, None)
+                self.wifi_checks.pop(w_id, None)
                 try:
                     log_error(f"Worker {ip} timed out (Sudden Disconnect). Removing from active pool.")
                 except Exception:
@@ -557,7 +609,7 @@ class WorkerRegistry:
                 has_gpu = _gpu_section(hardware).get("has_gpu", False)
 
                 # Exclude a GPU worker that is stepping aside, and one whose RPC protocol cannot serve.
-                if not (has_gpu and stepping_aside(hardware)) and self.rpc_compatible(hardware):
+                if not (has_gpu and self.worker_stepping_aside(w_id, hardware)) and self.rpc_compatible(hardware):
                     endpoints.append(f"{data['ip']}:{data['port']}")
 
             # Sorted, not just deduped: callers compare this list against the
@@ -609,7 +661,7 @@ class WorkerRegistry:
                 hardware = data.get("hardware", {})
                 gpu_info = _gpu_section(hardware)
                 has_gpu = gpu_info.get("has_gpu", False)
-                if has_gpu and stepping_aside(hardware):
+                if has_gpu and self.worker_stepping_aside(w_id, hardware):
                     continue  # Handed back to its owner, leaving, or off its dock. Same rule as the endpoint getter.
                 if not self.rpc_compatible(hardware):
                     continue  # Would abort llama-server at startup.

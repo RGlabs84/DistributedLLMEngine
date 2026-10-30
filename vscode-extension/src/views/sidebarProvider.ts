@@ -3,7 +3,11 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import * as os from 'os';
 import { AgentLoop, AgentRunOutcome, workspaceContextBlock } from '../agent/agentLoop';
-import { AgentStateStore, openAgentStateStore } from '../agent/agentState';
+import { AgentStateStore, legacySidebarStateFile, openSidebarSessionStore } from '../agent/agentState';
+import {
+  LEGACY_HISTORY_KEY, NEW_SESSION_TITLE, SESSIONS_KEY, SessionIndex, byRecent, historyKey, newSession, readIndex,
+  sessionRows, sessionTitle, sessionsToDrop,
+} from './sidebarSessions';
 import { DlneClient } from '../client/dlneClient';
 import { swarmModelLine } from '../client/modelChoice';
 import { QueueUpdate, queueDetail, queueHeadline } from '../client/queue';
@@ -109,25 +113,38 @@ function recordEvent(events: PageEvent[], event: PageEvent): void {
   }
 }
 
-export class SidebarProvider implements vscode.WebviewViewProvider {
-  private _view?: vscode.WebviewView;
-  private agentLoop: AgentLoop;
-  private conversationHistory: ChatMessageItem[] = [];
+/**
+ * One sidebar session (1.5.3): a conversation of its own, like a thread of VS Code's Chat view. It is made when it is
+ * first shown or run, and stays in memory after that, so a task keeps running when another session is shown.
+ */
+interface Session {
+  id: string;
+  loop: AgentLoop;
   /** The agent's conversation as saved on disk (docs/agent-memory.md section 8). */
-  private savedTask: AgentStateStore;
+  store: AgentStateStore;
+  /** The chat as the page draws it. */
+  history: ChatMessageItem[];
   /**
    * Whether a task is running. Starting a task stops the one before it (AgentLoop.run), so a message never starts
-   * one while another runs: this is the host's own word on it, whatever a page believes.
+   * one while another runs in the same session: this is the host's own word on it, whatever a page believes.
    */
-  private running = false;
-  /** Stop was pressed (or the chat cleared) and the task has not ended yet: it ends when its step does. */
-  private stopping = false;
+  running: boolean;
+  /** Stop was pressed (or the session deleted) and the task has not ended yet: it ends when its step does. */
+  stopping: boolean;
   /**
-   * The latest task as the page was told it, with the place of its first line in conversationHistory. It is kept after
-   * the task ends (a Continue button, an error line) until the next task or a Clear, so a page that was away, or was
-   * made again, can be shown exactly what the other one saw.
+   * The latest task as the page was told it, with the place of its first line in `history`. It is kept after the task
+   * ends (a Continue button, an error line) until the next task, so a page that was away, made again, or showing
+   * another session at the time, is shown exactly what it would have seen.
    */
-  private turn: { index: number; events: PageEvent[] } | null = null;
+  turn: { index: number; events: PageEvent[] } | null;
+}
+
+export class SidebarProvider implements vscode.WebviewViewProvider {
+  private _view?: vscode.WebviewView;
+  /** Which sessions there are and the one shown (sidebarSessions.ts), as saved in the workspace state. */
+  private index: SessionIndex;
+  /** The sessions made so far in this window, by id. */
+  private readonly open = new Map<string, Session>();
   /** The page may have missed some of the chat (it was hidden, or gone, while the task went on): it is redrawn on show. */
   private chatStale = false;
 
@@ -137,23 +154,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     private readonly workerManager: WorkerManager,
     private readonly context?: vscode.ExtensionContext
   ) {
-    // Persistent memory (AGENTS.md and the memory files) goes with every request: docs/agent-memory.md section 7.
-    this.agentLoop = new AgentLoop(client, { contextProvider: workspaceContextBlock });
-
-    // Load persisted history
-    if (this.context) {
-      const saved = this.context.workspaceState.get<ChatMessageItem[]>('dlne.chatHistory');
-      if (saved && Array.isArray(saved)) {
-        this.conversationHistory = saved;
-      }
-    }
-
-    // The agent's own memory of the task comes back with the visible chat, so a reload carries on where it was.
-    // A saved task with no chat to show for it is dropped: the page and the agent must agree on what happened.
-    this.savedTask = openAgentStateStore(this.context, 'sidebar', this.agentLoop);
-    if (this.savedTask.load() && this.conversationHistory.length === 0) {
-      this.agentLoop.clearHistory();
-      this.savedTask.clear();
+    const saved = readIndex(this.context?.workspaceState.get(SESSIONS_KEY));
+    if (saved) {
+      this.index = saved;
+    } else {
+      // The first start of 1.5.3: the one chat of before becomes the first session, its saved task with it.
+      const first = newSession(Date.now());
+      const legacy = this.context?.workspaceState.get<ChatMessageItem[]>(LEGACY_HISTORY_KEY);
+      const history = Array.isArray(legacy) ? legacy : [];
+      first.title = sessionTitle(history.find((item) => item.role === 'user')?.text);
+      this.index = { active: first.id, sessions: [first] };
+      if (history.length > 0) void this.context?.workspaceState.update(historyKey(first.id), history);
+      const session = this.session(first.id, legacySidebarStateFile(this.context));
+      if (session.history.length === 0) this.forgetTask(session);
+      void this.context?.workspaceState.update(LEGACY_HISTORY_KEY, undefined);
+      this.saveIndex();
     }
 
     this.workerManager.onStatusChange((status) => {
@@ -265,12 +280,140 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     return queue ? { headline: queueHeadline(queue), detail: queueDetail(queue) } : null;
   }
 
-  private saveHistory() {
+  // ---- sessions ------------------------------------------------------------------------------------------------------
+
+  /**
+   * The session with this id, made the first time it is asked for: its chat from the workspace state, its saved task
+   * from its own file (or, once, from `adopt`: the single chat's file of before 1.5.3). The agent's memory of the task
+   * comes back with the visible chat, so a reload carries on where it was; a saved task with no chat to show for it is
+   * dropped, because the page and the agent must agree on what happened.
+   */
+  private session(id: string, adopt?: string): Session {
+    const known = this.open.get(id);
+    if (known) return known;
+    // Persistent memory (AGENTS.md and the memory files) goes with every request: docs/agent-memory.md section 7.
+    const loop = new AgentLoop(this.client, { contextProvider: workspaceContextBlock });
+    const saved = this.context?.workspaceState.get<ChatMessageItem[]>(historyKey(id));
+    const session: Session = {
+      id, loop, store: openSidebarSessionStore(this.context, id, loop), history: Array.isArray(saved) ? saved : [],
+      running: false, stopping: false, turn: null,
+    };
+    this.open.set(id, session);
+    const loaded = adopt ? session.store.adopt(adopt) : session.store.load();
+    if (loaded && session.history.length === 0) this.forgetTask(session);
+    return session;
+  }
+
+  /** The session the sidebar shows. */
+  private get active(): Session {
+    return this.session(this.index.active);
+  }
+
+  /** The shown session's chat and agent, as the single chat of before 1.5.3 had them (the tests read these). */
+  get conversationHistory(): ChatMessageItem[] {
+    return this.active.history;
+  }
+  get agentLoop(): AgentLoop {
+    return this.active.loop;
+  }
+
+  private forgetTask(session: Session): void {
+    session.loop.clearHistory();
+    session.store.clear();
+  }
+
+  private saveIndex(): void {
+    void this.context?.workspaceState.update(SESSIONS_KEY, this.index);
+  }
+
+  /** Keeps the session's chat (its last 40 entries) and moves it to the top of the list. */
+  private saveHistory(session: Session) {
     if (this.context) {
       // Keep at most last 40 turns to avoid workspaceState bloat
-      const trimmed = this.conversationHistory.slice(-40);
-      this.context.workspaceState.update('dlne.chatHistory', trimmed);
+      void this.context.workspaceState.update(historyKey(session.id), session.history.slice(-40));
     }
+    const meta = this.index.sessions.find((s) => s.id === session.id);
+    if (meta) {
+      meta.updated = Date.now();
+      this.saveIndex();
+    }
+  }
+
+  private runningIds(): Set<string> {
+    return new Set([...this.open.values()].filter((s) => s.running).map((s) => s.id));
+  }
+
+  /** The session list and the shown session's title, for the page's header and its list of sessions. */
+  private sessionsMessage(): PageEvent {
+    const rows = sessionRows(this.index, this.runningIds());
+    return { type: 'sessions', active: this.index.active, title: rows.find((r) => r.active)?.title ?? NEW_SESSION_TITLE, list: rows };
+  }
+
+  private postSessions(): void {
+    this.post(this.sessionsMessage());
+  }
+
+  /** Shows another session: the page draws its chat, and its task as far as it has gone, from the start. */
+  private showSession(id: string): void {
+    if (!this.index.sessions.some((s) => s.id === id) || id === this.index.active) {
+      this.postSessions();
+      return;
+    }
+    this.index.active = id;
+    this.saveIndex();
+    this.syncPage();
+  }
+
+  /**
+   * New chat: the one shown is kept in the list and an empty one is shown. One that is still empty is reused rather
+   * than piling up empty sessions. Housekeeping then lets the oldest go past MAX_SESSIONS (never a running one).
+   */
+  private newChat(): void {
+    const current = this.active;
+    if (current.history.length === 0 && !current.running) {
+      this.syncPage();
+      return;
+    }
+    const meta = newSession(Date.now());
+    this.index.sessions.push(meta);
+    this.index.active = meta.id;
+    for (const id of sessionsToDrop(this.index, this.runningIds())) this.dropSession(id);
+    this.saveIndex();
+    this.syncPage();
+  }
+
+  /** The trash button of a row: a running session is not deleted (the page offers no button for one). */
+  private deleteSession(id: string): void {
+    const meta = this.index.sessions.find((s) => s.id === id);
+    if (!meta || this.open.get(id)?.running) {
+      this.postSessions();
+      return;
+    }
+    this.dropSession(id);
+    if (this.index.active === id) {
+      const next = byRecent(this.index.sessions)[0];
+      if (next) {
+        this.index.active = next.id;
+      } else {
+        const fresh = newSession(Date.now());
+        this.index.sessions.push(fresh);
+        this.index.active = fresh.id;
+      }
+      this.saveIndex();
+      this.syncPage();
+    } else {
+      this.saveIndex();
+      this.postSessions();
+    }
+  }
+
+  /** Forgets a session: its saved task, its chat and its place in the list. */
+  private dropSession(id: string): void {
+    const session = this.session(id);
+    this.forgetTask(session);
+    this.open.delete(id);
+    void this.context?.workspaceState.update(historyKey(id), undefined);
+    this.index.sessions = this.index.sessions.filter((s) => s.id !== id);
   }
 
   resolveWebviewView(
@@ -347,26 +490,31 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           break;
         }
         case 'abortTask': {
-          if (this.running) {
+          const session = this.active;
+          if (session.running) {
             // The task is over when its step is: a message sent before that would start a second one over it, so the
             // page keeps showing it (as stopping) and gets its end-of-turn message from the task itself.
-            this.stopping = true;
-            this.agentLoop.abort();
-            this.emit({ type: 'stopping' });
+            session.stopping = true;
+            session.loop.abort();
+            this.emit(session, { type: 'stopping' });
           } else {
             // Nothing is running, so this page was behind: it goes back to idle.
             this.post({ type: 'taskAborted' }, true);
           }
           break;
         }
+        // New chat (1.5.3); 'clearChat' is what a page from before 1.5.3 still sends for its Clear button.
+        case 'newSession':
         case 'clearChat': {
-          this.conversationHistory = [];
-          this.turn = null;
-          this.saveHistory();
-          this.agentLoop.clearHistory();   // also stops a task that is running
-          this.savedTask.clear();
-          if (this.running) this.stopping = true;
-          this.post({ type: 'cleared' }, true);
+          this.newChat();
+          break;
+        }
+        case 'openSession': {
+          if (typeof data.id === 'string') this.showSession(data.id);
+          break;
+        }
+        case 'deleteSession': {
+          if (typeof data.id === 'string') this.deleteSession(data.id);
           break;
         }
         case 'toggleWorker': {
@@ -433,7 +581,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private async handleUserMessage(text: string) {
     if (typeof text !== 'string' || !text.trim()) return;
 
-    if (this.running) {
+    // The session shown when the message was sent: the task stays its own if another session is shown meanwhile.
+    const session = this.active;
+    if (session.running) {
       // Starting a task stops the one before it, so a message never starts one over a live task. The page keeps Send
       // out of reach while a task runs; this is for a page that lost track of it. It is shown the task again, and gets
       // its words back to send once the task is over.
@@ -441,48 +591,53 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       this.post({ type: 'refused', text });
       return;
     }
-    this.running = true;
-    this.stopping = false;
+    session.running = true;
+    session.stopping = false;
     let outcome: AgentRunOutcome | undefined;
     try {
-      outcome = await this.runTask(text);
+      outcome = await this.runTask(session, text);
     } catch (err) {
       // A throw out of the run: a tool call that failed outside the tool's own handling, a broken callback. The task
       // is over, and the page is told why in words.
-      this.emit({
+      this.emit(session, {
         type: 'error',
         error: `The task stopped because of an unexpected error: ${describeError(err).replace(/[\s.]+$/, '')}. ` +
           'Everything so far is kept: say continue to try again.',
       });
     } finally {
-      this.running = false;
-      this.stopping = false;
+      session.running = false;
+      session.stopping = false;
       try {
-        this.saveHistory();
-        this.savedTask.flush();
+        this.saveHistory(session);
+        session.store.flush();
       } catch {
         // The chat is still shown; the next save tries again.
       }
       // `paused`: the run stopped at its turn limit; the page offers a Continue button.
-      this.emit({ type: 'turnComplete', paused: outcome === 'paused' });
+      this.emit(session, { type: 'turnComplete', paused: outcome === 'paused' });
+      this.postSessions();
     }
   }
 
-  /** The agent's run for one message, drawing it on the page as it goes. */
-  private runTask(text: string): Promise<AgentRunOutcome> {
+  /** The agent's run for one message, drawing it on the page as it goes (while its session is the one shown). */
+  private runTask(session: Session, text: string): Promise<AgentRunOutcome> {
     // The new turn comes first, so whatever follows (even an error) belongs to it and not to the one before.
-    const turn = { index: this.conversationHistory.length, events: [] as PageEvent[] };
-    this.turn = turn;
+    const turn = { index: session.history.length, events: [] as PageEvent[] };
+    session.turn = turn;
 
     const userMsg: ChatMessageItem = {
       id: 'msg-' + Date.now() + '-u',
       role: 'user',
       text
     };
-    this.conversationHistory.push(userMsg);
-    this.saveHistory();
+    session.history.push(userMsg);
+    // The first thing asked names the session.
+    const meta = this.index.sessions.find((s) => s.id === session.id);
+    if (meta && meta.title === NEW_SESSION_TITLE) meta.title = sessionTitle(text);
+    this.saveHistory(session);
 
-    this.emit({ type: 'appendUserMessage', text });
+    this.emit(session, { type: 'appendUserMessage', text });
+    this.postSessions();
 
     const assistantMsg: ChatMessageItem = {
       id: 'msg-' + Date.now() + '-a',
@@ -491,23 +646,23 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       thinking: '',
       toolCalls: []
     };
-    this.conversationHistory.push(assistantMsg);
+    session.history.push(assistantMsg);
 
-    // A Clear while the task is stopping drops its turn: from then on it adds nothing to what the page shows.
+    // Only this task's turn is drawn: nothing a finished turn's late callback says reaches the page.
     const show = (event: PageEvent) => {
-      if (this.turn === turn) this.emit(event);
+      if (session.turn === turn) this.emit(session, event);
     };
 
     const maxTurns = vscode.workspace.getConfiguration('dlne').get<number>('agent.maxTurns');
-    return this.agentLoop.run(text, {
-      onStateChanged: (urgent) => this.savedTask.changed(urgent),
+    return session.loop.run(text, {
+      onStateChanged: (urgent) => session.store.changed(urgent),
       onLoadingProgress: (statusText) => show({ type: 'loadingProgress', statusText }),
       // The sidebar shows the look back after the answer; VS Code's Chat view does not (see onReviewProgress).
       onReviewProgress: (statusText) => show({ type: 'loadingProgress', statusText }),
       // While every coding slot is taken: where this request stands, in a banner that stays in view. It is the state of
       // the moment (a page shown later is told it with the chat), so it is not part of what is played back.
       onQueue: (queue) => {
-        if (this.turn === turn) this.post({ type: 'queue', queue: this._queueView(queue) });
+        if (session.turn === turn && session.id === this.index.active) this.post({ type: 'queue', queue: this._queueView(queue) });
       },
       onThinkingDelta: (delta) => {
         assistantMsg.thinking = (assistantMsg.thinking || '') + delta;
@@ -526,7 +681,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         if (assistantMsg.toolCalls && assistantMsg.toolCalls.length > 0) {
           assistantMsg.toolCalls[assistantMsg.toolCalls.length - 1].result = result;
         }
-        this.saveHistory();
+        this.saveHistory(session);
         show({ type: 'toolEnd', result });
       },
       // Text, not the error itself: an Error is JSON'd to nothing on its way to the page.
@@ -556,32 +711,38 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Tells the page something about the task, and writes it down so a page that was away can be told it again. */
-  private emit(event: PageEvent): void {
-    if (this.turn) recordEvent(this.turn.events, event);
-    this.post(event, true);
+  /**
+   * Tells the page something about a session's task, and writes it down so a page that was away, or that shows the
+   * session later, can be told it again. Only the session shown is drawn as it happens.
+   */
+  private emit(session: Session, event: PageEvent): void {
+    if (session.turn) recordEvent(session.turn.events, event);
+    if (session.id === this.index.active) this.post(event, true);
   }
 
   /**
-   * What the page needs to show everything as it is now: the older chat from the saved history, the latest task
-   * played back step by step (so a task in progress, a Continue button or an error line is there as it was), whether
-   * a task is running, and the card's state. The page draws all of it again from this, so it is also how a page
-   * that VS Code made anew finds its way back.
+   * What the page needs to show everything as it is now: the shown session's older chat from its saved history, its
+   * latest task played back step by step (so a task in progress, a Continue button or an error line is there as it
+   * was), whether that task is running, the list of sessions, and the card's state. The page draws all of it again
+   * from this, so it is also how a page that VS Code made anew, or one that switched sessions, finds its way back.
    */
   private restoreMessage(): PageEvent {
     const workerStatus = this.workerManager.getStatus();
-    const turn = this.turn;
+    const session = this.active;
+    const turn = session.turn;
     return {
       type: 'restoreHistory',
-      history: historyForPage(turn ? this.conversationHistory.slice(0, turn.index) : this.conversationHistory),
+      session: this.sessionsMessage(),
+      history: historyForPage(turn ? session.history.slice(0, turn.index) : session.history),
       workerStatus,
       workerCopy: contributionCopy(workerStatus),
       workerRole: roleCopy(workerStatus),
       donate: this._donateModel(workerStatus),
       modelLine: this._modelLine(),
-      queue: this._queueView(this.client.currentQueue?.()),
+      // The queue is the swarm's answer to this window's latest request: it is shown with a session that is waiting.
+      queue: session.running ? this._queueView(this.client.currentQueue?.()) : null,
       autoApprove: ToolRegistry.autoApproveAllOn(),
-      run: { busy: this.running, stopping: this.stopping, events: turn ? turn.events : [] }
+      run: { busy: session.running, stopping: session.stopping, events: turn ? turn.events : [] }
     };
   }
 
@@ -605,7 +766,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'workerStatus', status, copy: contributionCopy(status), role: roleCopy(status), donate: this._donateModel(status) });
     this.post({ type: 'modelLine', text: this._modelLine() });
     this.post({ type: 'autoApprove', on: ToolRegistry.autoApproveAllOn() });
-    this.post({ type: 'queue', queue: this._queueView(this.client.currentQueue?.()) });
+    this.post({ type: 'queue', queue: this.active.running ? this._queueView(this.client.currentQueue?.()) : null });
+    this.postSessions();
   }
 
   /**
@@ -826,6 +988,83 @@ ${DONATE_CSS}
       flex-direction: column;
       gap: 12px;
       padding-bottom: 8px;
+    }
+    /* The sessions (1.5.3): a header like VS Code's Chat view, and the list behind its back arrow. */
+    .session-bar {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 26px;
+    }
+    .session-title {
+      flex: 1;
+      min-width: 0;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    button.icon-btn {
+      flex-shrink: 0;
+      padding: 2px 8px;
+      min-width: 26px;
+      background: transparent;
+      color: var(--vscode-foreground);
+    }
+    button.icon-btn:hover {
+      background-color: var(--vscode-toolbar-hoverBackground, rgba(90, 93, 94, 0.31));
+    }
+    #session-list {
+      flex: 1;
+      min-height: 140px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .session-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .session-row:hover {
+      background-color: var(--vscode-list-hoverBackground);
+    }
+    .session-row.active {
+      background-color: var(--vscode-list-inactiveSelectionBackground);
+    }
+    .session-name {
+      flex: 1;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .session-when {
+      flex-shrink: 0;
+      font-size: 0.85em;
+      opacity: 0.7;
+    }
+    .session-running {
+      flex-shrink: 0;
+      font-size: 0.85em;
+      color: var(--vscode-charts-green, #3fb950);
+    }
+    /* Shown while the chat is scrolled up: the chat no longer follows the answer until it is clicked. */
+    #jump-btn {
+      align-self: center;
+      flex-shrink: 0;
+      margin-top: -34px;
+      position: relative;
+      z-index: 1;
+      font-size: 0.85em;
+      padding: 3px 10px;
+      border-radius: 12px;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
     }
     .message {
       padding: 10px 12px;
@@ -1197,12 +1436,21 @@ ${DONATE_CSS}
     </div>
   </details>
 
+  <div class="session-bar" id="session-bar">
+    <button class="secondary icon-btn" id="sessions-btn" title="All chats" aria-label="All chats">&#8592;</button>
+    <span class="session-title" id="session-title">New chat</span>
+    <button class="secondary icon-btn" id="new-session-btn" title="New chat" aria-label="New chat">+</button>
+  </div>
+
+  <div id="session-list" role="list" style="display:none"></div>
+
   <div id="chat-container">
     <div class="message assistant" id="welcome-msg">
       <strong><img class="logo" src="${logoSrc}" alt="" width="24" height="24">DLNE Code Assistant</strong>
       <div class="assistant-body">Connected to cluster. Ready for autonomous coding, refactoring, and test verification.</div>
     </div>
   </div>
+  <button class="secondary" id="jump-btn" style="display:none" title="Scroll to the latest">&#8595; Latest</button>
 
   <div class="queue-banner" id="queue-banner" role="status" aria-live="polite" style="display:none">
     <div class="queue-headline" id="queue-headline"></div>
@@ -1216,7 +1464,7 @@ ${DONATE_CSS}
       <span class="model-line" id="model-line" title="The swarm picks the model from the GPUs available; there is nothing to choose.">${modelLine}</span>
       <div class="btn-group-right">
         <button class="secondary toggle" id="auto-btn" aria-pressed="false" title="Off: the agent asks before it edits files or runs a command. On: every action runs without asking (edits anywhere, every command), from its next step, until you turn it off. The same switch as the status bar's DLNE: Auto/Ask and the setting dlne.autoApproveAll. The agent's next step can come from a volunteer's machine.">Auto: off</button>
-        <button class="secondary" id="clear-btn">Clear</button>
+        <button class="secondary" id="clear-btn" title="Start a new chat; this one stays in the list behind the back arrow">New chat</button>
         <button class="secondary" id="stop-btn" style="display:none;">Stop</button>
         <button id="send-btn">Send</button>
       </div>
@@ -1236,6 +1484,104 @@ ${DONATE_CSS}
     const clearBtn = document.getElementById('clear-btn');
     const autoBtn = document.getElementById('auto-btn');
     const busyHint = document.getElementById('busy-hint');
+    const jumpBtn = document.getElementById('jump-btn');
+    const inputContainer = document.getElementById('input-container');
+    const sessionsBtn = document.getElementById('sessions-btn');
+    const newSessionBtn = document.getElementById('new-session-btn');
+    const sessionTitleEl = document.getElementById('session-title');
+    const sessionList = document.getElementById('session-list');
+
+    // The chat follows the answer only while it is scrolled to the bottom (1.5.3). Scrolled up to read something, it
+    // stays where it is while the task goes on, and "Latest" brings it back down; scrolling to the bottom does too.
+    let followLatest = true;
+    function atBottom() {
+      return chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight < 40;
+    }
+    chatContainer.addEventListener('scroll', () => {
+      followLatest = atBottom();
+      if (followLatest) jumpBtn.style.display = 'none';
+    });
+    // Called whenever the chat grew. \`force\`: the user's own message, or a chat drawn anew, always shows its end.
+    function keepUp(force) {
+      if (force) followLatest = true;
+      if (followLatest) {
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+        jumpBtn.style.display = 'none';
+      } else if (!listShown) {
+        jumpBtn.style.display = 'inline-block';
+      }
+    }
+    jumpBtn.addEventListener('click', () => keepUp(true));
+
+    // ---- sessions (1.5.3): the header names the chat shown; its back arrow lists them all, newest first -----------
+    let currentSessionId = null;
+    let listShown = false;
+    function showList(on) {
+      listShown = on;
+      sessionList.style.display = on ? 'flex' : 'none';
+      chatContainer.style.display = on ? 'none' : 'flex';
+      inputContainer.style.display = on ? 'none' : '';
+      jumpBtn.style.display = 'none';
+      sessionsBtn.title = on ? 'Back to the chat' : 'All chats';
+      sessionsBtn.setAttribute('aria-label', sessionsBtn.title);
+      if (!on) keepUp(false);
+    }
+    function whenText(ms) {
+      const minutes = Math.round((Date.now() - ms) / 60000);
+      if (!(minutes >= 1)) return 'now';
+      if (minutes < 60) return minutes + ' min';
+      const hours = Math.round(minutes / 60);
+      if (hours < 24) return hours + ' h';
+      return Math.round(hours / 24) + ' d';
+    }
+    // Every title is drawn as text: it is the user's own first words, never markup.
+    function applySessions(info) {
+      if (!info) return;
+      sessionTitleEl.textContent = typeof info.title === 'string' ? info.title : 'New chat';
+      sessionList.innerHTML = '';
+      (Array.isArray(info.list) ? info.list : []).forEach((row) => {
+        const item = document.createElement('div');
+        item.className = 'session-row' + (row.active ? ' active' : '');
+        item.setAttribute('role', 'listitem');
+        const name = document.createElement('span');
+        name.className = 'session-name';
+        name.textContent = String(row.title);
+        item.appendChild(name);
+        if (row.running) {
+          const live = document.createElement('span');
+          live.className = 'session-running';
+          live.textContent = '● working';
+          item.appendChild(live);
+        }
+        const when = document.createElement('span');
+        when.className = 'session-when';
+        when.textContent = whenText(Number(row.updated));
+        item.appendChild(when);
+        item.addEventListener('click', () => {
+          showList(false);
+          vscode.postMessage({ type: 'openSession', id: row.id });
+        });
+        // A running chat cannot be deleted: Stop it first.
+        if (!row.running) {
+          const del = document.createElement('button');
+          del.className = 'secondary icon-btn session-delete';
+          del.title = 'Delete this chat';
+          del.textContent = '🗑';
+          del.addEventListener('click', (e) => {
+            if (e && e.stopPropagation) e.stopPropagation();
+            vscode.postMessage({ type: 'deleteSession', id: row.id });
+          });
+          item.appendChild(del);
+        }
+        sessionList.appendChild(item);
+      });
+    }
+    sessionsBtn.addEventListener('click', () => showList(!listShown));
+    function startNewChat() {
+      showList(false);
+      vscode.postMessage({ type: 'newSession' });
+    }
+    newSessionBtn.addEventListener('click', startNewChat);
 
     function showAutoApprove(on) {
       autoBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
@@ -1349,7 +1695,7 @@ ${DONATE_CSS}
       if (currentContentElem) {
         currentContentElem.innerHTML = renderMarkdown(currentContentRaw);
         addCopyButtons(currentContentElem);
-        chatContainer.scrollTop = chatContainer.scrollHeight;
+        keepUp();
       }
     }
 
@@ -1375,10 +1721,20 @@ ${DONATE_CSS}
     if (previousState && previousState.donateOpen === false) {
       contribCard.open = false;
     }
+    // The session that chat was (the extension's account, restoreHistory, follows at once and says which is shown).
+    if (previousState && typeof previousState.sessionId === 'string') {
+      currentSessionId = previousState.sessionId;
+    }
+    if (previousState && typeof previousState.sessionTitle === 'string') {
+      sessionTitleEl.textContent = previousState.sessionTitle;
+    }
 
     function saveWebviewState() {
       if (replaying) return;
-      vscode.setState({ chatHtml: chatContainer.innerHTML, donateOpen: contribCard.open });
+      vscode.setState({
+        chatHtml: chatContainer.innerHTML, donateOpen: contribCard.open,
+        sessionId: currentSessionId, sessionTitle: sessionTitleEl.textContent,
+      });
     }
     contribCard.addEventListener('toggle', saveWebviewState);
 
@@ -1418,14 +1774,9 @@ ${DONATE_CSS}
       vscode.postMessage({ type: 'abortTask' });
     });
 
-    clearBtn.addEventListener('click', () => {
-      vscode.postMessage({ type: 'clearChat' });
-      resetRun();
-      chatContainer.innerHTML = '';
-      // Clearing also stops a task that is running; it ends when its step does.
-      if (busy) setBusy(true, true);
-      saveWebviewState();
-    });
+    // New chat (it was Clear before 1.5.3): the chat shown stays in the list, a task in it keeps running, and the
+    // extension answers with the new, empty chat (restoreHistory).
+    clearBtn.addEventListener('click', startNewChat);
 
     promptInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
@@ -1623,10 +1974,17 @@ ${DONATE_CSS}
           showQueue(msg.queue);
           // The extension's whole account of the chat: older turns from the saved history, the latest one played back
           // step by step (run.events), so a task in progress, a Continue button or an error line is there as it was.
-          // It replaces whatever this page was showing: the page may have missed part of it while it was hidden.
+          // It replaces whatever this page was showing: the page may have missed part of it while it was hidden. Another
+          // session than the one drawn (1.5.3: a New chat, a chat picked from the list) is drawn even when it is empty.
           const run = msg.run || {};
           const events = Array.isArray(run.events) ? run.events : [];
-          if ((msg.history && msg.history.length > 0) || events.length > 0) {
+          const session = msg.session || null;
+          const switched = !!session && session.active !== currentSessionId;
+          if (session) {
+            applySessions(session);
+            currentSessionId = session.active;
+          }
+          if (switched || (msg.history && msg.history.length > 0) || events.length > 0) {
             resetRun();
             chatContainer.innerHTML = '';
             (msg.history || []).forEach(renderHistoryItem);
@@ -1636,10 +1994,18 @@ ${DONATE_CSS}
             } finally {
               replaying = false;
             }
-            chatContainer.scrollTop = chatContainer.scrollHeight;
-            saveWebviewState();
+            keepUp(true);
           }
+          if (switched && listShown) showList(false);
+          saveWebviewState();
           setBusy(run.busy === true, run.stopping === true);
+          break;
+        }
+
+        case 'sessions': {
+          // The list and the shown chat's title changed (a title set, a task started or ended, a chat deleted).
+          applySessions(msg);
+          saveWebviewState();
           break;
         }
 
@@ -1653,7 +2019,7 @@ ${DONATE_CSS}
           div.className = 'message user';
           div.textContent = msg.text;
           chatContainer.appendChild(div);
-          chatContainer.scrollTop = chatContainer.scrollHeight;
+          keepUp(true);     // your own message: the chat shows it, and follows the answer from there
 
           currentAssistantMsg = document.createElement('div');
           currentAssistantMsg.className = 'message assistant';
@@ -1679,7 +2045,7 @@ ${DONATE_CSS}
               currentAssistantMsg.appendChild(activePillElem);
             }
             activePillElem.textContent = msg.statusText;
-            chatContainer.scrollTop = chatContainer.scrollHeight;
+            keepUp();
           }
           break;
         }
@@ -1712,7 +2078,7 @@ ${DONATE_CSS}
           }
           if (currentThinkingElem) {
             currentThinkingElem.textContent += msg.delta;
-            chatContainer.scrollTop = chatContainer.scrollHeight;
+            keepUp();
           }
           break;
         }
@@ -1759,7 +2125,7 @@ ${DONATE_CSS}
             activePillElem.className = 'tool-pill';
             activePillElem.textContent = '🔧 Executing ' + msg.toolName + '...';
             currentAssistantMsg.appendChild(activePillElem);
-            chatContainer.scrollTop = chatContainer.scrollHeight;
+            keepUp();
           }
           break;
         }
@@ -1792,7 +2158,7 @@ ${DONATE_CSS}
               pill.appendChild(undoBtn);
             }
           }
-          chatContainer.scrollTop = chatContainer.scrollHeight;
+          keepUp();
           saveWebviewState();
           break;
         }
@@ -1819,7 +2185,7 @@ ${DONATE_CSS}
             });
             continueBtn = button;
             currentAssistantMsg.appendChild(button);
-            chatContainer.scrollTop = chatContainer.scrollHeight;
+            keepUp();
           }
           // The end of the task, and the only thing that frees Send again.
           setBusy(false);

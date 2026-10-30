@@ -136,9 +136,12 @@ def test_dock_and_yield_lines_and_the_members_figures():
     dock = markers.parse_dock('DLNE_DOCK: {"link": "wired", "power": "ac", "docked": true}\n')
     assert dock == markers.Dock(link="wired", power="ac", docked=True)
     assert markers.dock_line(dock).startswith("Docked (wired and plugged in)")
-    undocked = markers.parse_dock('DLNE_DOCK: {"link": "wifi", "power": "battery", "docked": false}\n')
-    assert markers.dock_line(undocked) == ("Not docked (on Wi-Fi and battery): your GPU runs a whole model by itself "
-                                           "until it is docked again.")
+    battery = markers.parse_dock('DLNE_DOCK: {"link": "wifi", "power": "battery", "docked": false}\n')
+    assert markers.dock_line(battery) == ("On battery: your GPU never shares the swarm's big model on battery, "
+                                          "and may again once plugged in.")
+    phone = markers.parse_dock('DLNE_DOCK: {"link": "cellular", "power": "ac", "docked": false}\n')
+    assert markers.dock_line(phone) == ("Not docked (on a phone link): your GPU does not share the swarm's big model "
+                                        "until it is docked again.")
     assert markers.parse_dock('DLNE_DOCK: {"power": "ac"}\n') == markers.Dock(power="ac")
     assert markers.dock_line(markers.Dock(power="ac")) == "", "nothing claimed while a fact is unknown"
     assert markers.parse_dock("DLNE_DOCK: junk\n") is None
@@ -153,3 +156,24 @@ def test_dock_and_yield_lines_and_the_members_figures():
     reader = markers.OutputReader()
     assert "dock" in reader.feed('DLNE_DOCK: {"docked": true}\n') and reader.feed('DLNE_DOCK: {"docked": true}\n') == {}
     assert reader.feed('DLNE_YIELD: {"yielding": true, "why": "cpu"}\n')["yield"].why == "cpu"
+
+
+def test_the_wifi_verdict_in_the_dock_line_matches_the_extension():
+    """2.6.4: on Wi-Fi and mains the coordinator's verdict decides; the words are the extension's dockLine's."""
+    passed = markers.parse_dock('DLNE_DOCK: {"link": "wifi", "power": "ac", "docked": false, "wifi_ok": true, '
+                                '"wifi_why": "round trip 4 ms, jitter 2 ms, download 312 Mbit/s"}\n')
+    assert markers.dock_line(passed) == ("On Wi-Fi and plugged in, and the link passed its test (round trip 4 ms, "
+                                         "jitter 2 ms, download 312 Mbit/s): your GPU may share the swarm's big "
+                                         "model while it keeps passing.")
+    failed = markers.parse_dock('DLNE_DOCK: {"link": "wifi", "power": "ac", "docked": false, "wifi_ok": false, '
+                                '"wifi_why": "jitter 34 ms, over 20"}\n')
+    assert markers.dock_line(failed) == ("On Wi-Fi and plugged in, but the link did not pass its test (jitter 34 ms, "
+                                         "over 20): your GPU does not share the swarm's big model for now.")
+    testing = markers.parse_dock('DLNE_DOCK: {"link": "wifi", "power": "ac", "docked": false, "wifi_ok": null}\n')
+    assert testing.wifi_said and testing.wifi_ok is None
+    assert markers.dock_line(testing) == ("On Wi-Fi and plugged in: the swarm is testing the link before your GPU may "
+                                          "share its big model.")
+    older = markers.parse_dock('DLNE_DOCK: {"link": "wifi", "power": "ac", "docked": false}\n')
+    assert markers.dock_line(older) == ("Not docked (on Wi-Fi): your GPU does not share the swarm's big model until "
+                                        "it is docked again."), "a worker from before 2.6.4"
+    assert markers.parse_dock('DLNE_DOCK: {"wifi_ok": "yes", "wifi_why": 3}\n') == markers.Dock(wifi_said=True)

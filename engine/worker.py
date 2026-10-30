@@ -40,6 +40,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 from engine.logger import log_worker, log_error, log_system, log_warning
 from engine.hardware import get_hardware_profile, _hidden_process_kwargs, yield_reason as hardware_yield_reason
+from engine.dock_policy import WIFI_SPEED_TEST_BYTES, WIFI_SPEED_TEST_MIN_GAP_SECONDS, on_wifi_and_mains
 from engine.downloader import download_and_extract_engine, explain_dll_not_found, is_dll_not_found
 from engine.version import VERSION
 from engine.config import get_base_dir, get_worker_limits
@@ -126,7 +127,9 @@ REFUSAL_MARKER = "DLNE_REFUSAL: "
 ROLE_MARKER = "DLNE_ROLE: "
 # Whether this machine is docked (a wired link and mains power, engine/hardware.get_dock_state), printed
 # once per change for the editor and the tray app: 'DLNE_DOCK: {"link": "wired", "power": "ac", "docked": true}'.
-# "docked" is left out while either fact is unknown. A companion stays quiet: the GPU half says it.
+# "docked" is left out while either fact is unknown. On Wi-Fi and mains (2.6.4) the line also carries the
+# coordinator's verdict on the link, which decides there instead: '"wifi_ok": true|false|null, "wifi_why": "..."'
+# (null while the link is being tested). A companion stays quiet: the GPU half says it.
 DOCK_MARKER = "DLNE_DOCK: "
 # Whether this machine is yielding to its owner's own load, printed once per change for the editor and the
 # tray app: 'DLNE_YIELD: {"yielding": true, "why": "gpu"}' (why: fullscreen, gpu or cpu; "" when not).
@@ -347,6 +350,11 @@ class WorkerNode:
         self._leave_deadline = 0.0
         self._yield_since: Optional[float] = None
         self._vram_freed_for_owner = False
+        # On Wi-Fi and mains (2.6.4): the coordinator's verdict on this machine's link, {"ok", "why"} from the
+        # heartbeat answer's ``wifi_check`` (None when it sent none), and the download test it asks for.
+        self._wifi_check: Optional[Dict[str, Any]] = None
+        self._speed_test_running = False
+        self._last_speed_test = float("-inf")
         # The RPC protocol the running ggml-rpc-server announced, e.g. "8.0.1" ("" = unknown).
         self.rpc_proto = ""
         # Set when this node serves the CPU pool (no usable GPU) instead of running an RPC
@@ -512,6 +520,7 @@ class WorkerNode:
         yield that has outlasted the drain hands the GPU back to its owner by restarting the RPC server, which
         frees the weights the engine had loaded into it (the port stays, for the return).
         """
+        self._note_wifi_check(answer)
         draining = isinstance(answer, dict) and answer.get("draining") is True
         now = time.monotonic()
         if self._leaving and (not draining or now >= self._leave_deadline):
@@ -528,6 +537,53 @@ class WorkerNode:
               and now - self._yield_since >= LEAVE_GRACE_SECONDS):
             self._vram_freed_for_owner = True
             self._restart_rpc_server_for_owner()
+
+    def _note_wifi_check(self, answer: Any) -> None:
+        """
+        Keep the coordinator's verdict on this machine's Wi-Fi link (the answer's ``wifi_check``, 2.6.4) for
+        DOCK_MARKER, and run the download test when the coordinator asks for one (``speed_test``).
+        """
+        wifi = answer.get("wifi_check") if isinstance(answer, dict) else None
+        if not isinstance(wifi, dict):
+            self._wifi_check = None
+            return
+        ok, why = wifi.get("ok"), wifi.get("why")
+        self._wifi_check = {"ok": ok if isinstance(ok, bool) else None,
+                            "why": why[:160] if isinstance(why, str) else ""}
+        if wifi.get("speed_test") is True:
+            self._start_speed_test()
+
+    def _start_speed_test(self) -> None:
+        """One download test at a time, and at most every WIFI_SPEED_TEST_MIN_GAP_SECONDS, on its own thread."""
+        now = time.monotonic()
+        if self._speed_test_running or now - self._last_speed_test < WIFI_SPEED_TEST_MIN_GAP_SECONDS:
+            return
+        self._speed_test_running, self._last_speed_test = True, now
+        threading.Thread(target=self._run_speed_test, name="dlne-wifi-speed-test", daemon=True).start()
+
+    def _run_speed_test(self) -> None:
+        """
+        Time a download of WIFI_SPEED_TEST_BYTES from the coordinator's /v1/net/probe and report it to
+        /worker/link_report, where the coordinator judges this machine's Wi-Fi link with it
+        (engine/dock_policy.py). Download only: the weights a shard loads are the one bulk transfer, and
+        they come down. A failure is logged and the coordinator asks again later.
+        """
+        from engine.benchmark import measure_throughput   # lazily: it pulls in the WireGuard module
+        base = self.coordinator_url.rstrip("/")
+        try:
+            result = measure_throughput(base, self.access_token, payload_bytes=WIFI_SPEED_TEST_BYTES,
+                                        timeout=60.0, upload=False)
+            download = result.get("download_mbps")
+            if not result.get("ok") or not isinstance(download, (int, float)):
+                log_warning(f"Wi-Fi speed test failed: {result.get('detail', 'no figure')}")
+                return
+            httpx.post(f"{base}/worker/link_report", json={"measurement": {"download_mbps": download}},
+                       headers={"Authorization": f"Bearer {self.access_token}"}, timeout=10.0).raise_for_status()
+            log_worker(f"Wi-Fi speed test: {download:.0f} Mbit/s down from the coordinator.")
+        except Exception as exc:  # noqa: BLE001 - a failed test only means the coordinator asks again
+            log_warning(f"Wi-Fi speed test could not be reported: {type(exc).__name__}: {exc}")
+        finally:
+            self._speed_test_running = False
 
     def _restart_rpc_server_for_owner(self) -> None:
         """Stop and start ggml-rpc-server so the owner gets the VRAM back; nothing else about the node changes."""
@@ -1039,6 +1095,11 @@ class WorkerNode:
             return
         profile = self.hardware_profile if isinstance(self.hardware_profile, dict) else {}
         facts = {k: profile[k] for k in ("link", "power", "docked") if k in profile}
+        # On Wi-Fi and mains the coordinator's verdict decides instead of "docked" (2.6.4): "wifi_ok" true, false,
+        # or null while the link is being tested, and "wifi_why" in a few words.
+        if on_wifi_and_mains(profile):
+            check = self._wifi_check or {}
+            facts.update(wifi_ok=check.get("ok"), wifi_why=check.get("why", ""))
         if not facts or facts == getattr(self, "_dock_announced", None):
             return
         self._dock_announced = facts
@@ -1449,6 +1510,7 @@ class WorkerNode:
                             answer = {}
                         self._follow_assignment(answer)
                         self._after_answer(answer)
+                        self._report_dock()     # again: the answer may have brought a new Wi-Fi verdict
                         self._announce_role()
                         if self.verbose_heartbeats:
                             log_worker(f"Heartbeat OK | Status: {status_msg}")

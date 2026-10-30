@@ -10,8 +10,9 @@ machine, so ordinary home internet is enough, and **each member adds about two m
 the same time.
 
 - **Who qualifies:** a GPU with 8 GB of memory or more that is not on the coordinator's own fast network
-  (a GPU that is, and is docked, on a wired link and mains power, still joins the shared big model, as before;
-  a laptop off its dock is a member like a far GPU), and about 22 GB of GPU memory plus free
+  (a GPU that is, and is docked, still joins the shared big model, as before: on mains power and on a wired
+  link, or on Wi-Fi whose link passes the coordinator's test, 2.6.4; a laptop on battery or off its dock is a
+  member like a far GPU), and about 22 GB of GPU memory plus free
   system memory together for the first version (for example an 8 GB GPU with 14 GB of RAM free). The model
   is held whole: GPU memory first, the rest in system RAM. When a machine joins, it is timed on reading a
   prompt and writing an answer; one under the speed floors is not sent work.

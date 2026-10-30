@@ -1044,7 +1044,9 @@ def assign_role(hardware: Any, near: Optional[bool], tiers: List[Dict[str, Any]]
 
     * no GPU (or already a CPU pool member): ``"app"``, today's behaviour;
     * a GPU close to the coordinator (``near``) that is docked, or does not say (2.5.0, ``docked``):
-      ``"rpc"``, part of the sharded engine; one that says it is off its dock is judged like a far GPU;
+      ``"rpc"``, part of the sharded engine; one that is off its dock is judged like a far GPU. The
+      coordinator passes ``docked`` as it judges it (engine/dock_policy.py, 2.6.4: on battery never,
+      on Wi-Fi while its link passes the test), not as the worker reported it;
     * a GPU that is yielding to its owner right now: ``None``, no new job (it keeps the one it has);
     * a far GPU with at least 8 GB: ``"coding"``, with the biggest tier it can hold whole
       (engine/coding_member_select.choose_tier) and how many requests at once to open it for
@@ -1070,7 +1072,7 @@ def assign_role(hardware: Any, near: Optional[bool], tiers: List[Dict[str, Any]]
         return None, None, None      # stepping aside for its owner (2.5.0): no new job now; what it has, it keeps
     if near and hardware.get("docked") is not False:
         return "rpc", None, None     # a LAN GPU that is docked (or cannot say) shares the big model
-    # Near but off its dock (Wi-Fi or battery, 2.5.0): a shard that may leave any minute would take every
+    # Near but off its dock (battery, or Wi-Fi without a passing test, 2.6.4): a shard that may leave any minute would take every
     # user's answer with it, so it is treated like a far GPU below: a whole model of its own, or nothing.
     if vram < MIN_CODING_VRAM_GB or hardware.get("coding_ok", True) is not True:
         return None, None, None      # too small, or the worker says it cannot run a coding member (coding_ok)

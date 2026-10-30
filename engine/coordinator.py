@@ -67,7 +67,8 @@ from engine.inference_manager import (
     is_retryable_start_failure,
 )
 from engine.logger import log_coordinator, log_error, log_warning
-from engine.registry import WorkerRegistry, is_app_member, is_coding_member, safe_log_text, stepping_aside
+from engine.registry import WorkerRegistry, is_app_member, is_coding_member, safe_log_text
+from engine import dock_policy
 from engine.app_pool import (ENGINE_KEY, EngineLane, LocalAppServer, Member, PICTURE_MADE_REPLY, PICTURE_REFUSED_REPLY,
                              Picture, RESTARTING_NOTICE, app_pool, has_photos, photo_notice, with_pictures)
 from engine.contributor_networks import ContributorBook
@@ -1499,10 +1500,18 @@ async def worker_heartbeat(request: Request, payload: HeartbeatPayload):
     # when its owner stops it. While it steps aside (yielding to its owner, off its dock, or leaving) the
     # engine is being rebuilt without it, after the answers running on it finish (SHARD_DRAIN_SECONDS),
     # and the answer says ``draining``; the node keeps its RPC server up until that key is gone.
-    if f"{client_ip}:{payload.port}" in set(manager.current_endpoints):
+    carrying = f"{client_ip}:{payload.port}" in set(manager.current_endpoints)
+    if carrying:
         answer["shard"] = True
-        if stepping_aside(payload.hardware):
+        if registry.worker_stepping_aside(payload.worker_id, payload.hardware):
             answer["draining"] = True
+
+    # A GPU on Wi-Fi and mains is told how its link is judged (engine/dock_policy.py, 2.6.4), so the editor and
+    # the tray app can say why it does or does not share the model, and asked for a download test when there is
+    # no fresh one. Not while it carries a shard: its link is busy with the shard, and the verdict it shards on stands.
+    wifi = _wifi_check_answer(payload.worker_id, client_ip, payload.hardware, carrying)
+    if wifi is not None:
+        answer["wifi_check"] = wifi
 
     # With coding members on, every worker is also told what to be (engine/coding_router.assign_role).
     # Off, the answer is exactly what it always was.
@@ -2067,11 +2076,23 @@ async def worker_link_report(request: Request):
     })
     await asyncio.to_thread(benchmark.append_record, record)
 
+    # A Wi-Fi GPU's verdict waits for this figure ("waiting for this machine's download test"): judge it now,
+    # against the round trips the last test took, rather than at the next probe minutes later (2.6.4).
+    check = registry.get_wifi_check(worker_id)
+    if check.get("samples_ms"):
+        limits = get_worker_limits()
+        _file_wifi_verdict(worker_id, dock_policy.judge_wifi(
+            check["samples_ms"], registry.get_link_measurement(worker_id), max_rtt_ms=_max_shared_rtt(),
+            limits=limits, now=time.time()))
+
+    # The figures as the registry kept them (coerced to numbers), never the raw report: these go into a
+    # markup-enabled logger, and a node chose every one of them.
+    kept = registry.get_link_measurement(worker_id)
+    parts = [f"{kept[key]:g} {unit}" for key, unit in (("rtt_min_ms", "ms RTT"), ("download_mbps", "Mbps down"),
+                                                        ("upload_mbps", "Mbps up")) if key in kept]
     log_coordinator(
         f"Link report from {safe_log_text(worker_id.split('-')[0][:4].upper(), max_chars=8)}: "
-        f"{measurement.get('rtt_min_ms')} ms RTT, "
-        f"{measurement.get('download_mbps')} Mbps down, "
-        f"{measurement.get('upload_mbps')} Mbps up."
+        f"{', '.join(parts) or 'no figures'}."
     )
     return {"ok": True}
 
@@ -4149,8 +4170,9 @@ def _coding_gpu_workers(include_members: bool = False) -> List[Dict[str, Any]]:
     """
     The GPU workers the coding pool can use, the same ones registry.get_total_vram_gb() adds
     up, each as ``{"worker_id", "endpoint", "vram_gb", "class", "docked", "member"}``. ``class`` is
-    engine/benchmark.classify_endpoint's: "local" is this machine. ``docked`` is the worker's own
-    word (True, False, or None when it could not say); ``member`` marks a coding member, listed
+    engine/benchmark.classify_endpoint's: "local" is this machine. ``docked`` is the worker's facts as
+    this coordinator judges them (engine/dock_policy.py: True, False, or None when it could not say;
+    on Wi-Fi, docked while its link passes the test); ``member`` marks a coding member, listed
     only with ``include_members`` (the link probe measures them too, so a member that is near and
     docked can be called back into the shared engine instead of staying a member for good).
     """
@@ -4172,7 +4194,7 @@ def _coding_gpu_workers(include_members: bool = False) -> List[Dict[str, Any]]:
             "endpoint": endpoint,
             "vram_gb": _as_number(gpu.get("vram_total_gb", 0.0)),
             "class": benchmark.classify_endpoint(endpoint),
-            "docked": hardware.get("docked"),
+            "docked": registry.effective_docked(worker_id, hardware),
             "member": member,
         })
     return workers
@@ -4230,7 +4252,8 @@ def _coding_pool() -> Dict[str, float]:
     GPUs (AUTO_SWAP_MAX_RTT_MS), ``far_vram_gb`` the rest, which is reported but never used.
     """
     max_rtt = _max_shared_rtt()
-    # A laptop off its dock (Wi-Fi or battery) is left out: it must not unlock a model it may leave with.
+    # A laptop off its dock (on battery, or on Wi-Fi without a passing link test) is left out: it must not
+    # unlock a model it may leave with.
     workers = [w for w in _coding_gpu_workers() if w.get("docked") is not False]
     pool = split_pool_by_distance(workers, lambda w: _coding_worker_is_near(w, max_rtt))
     pool["sysram_gb"] = registry.get_total_sysram_gb()
@@ -4242,12 +4265,68 @@ def _coding_pool() -> Dict[str, float]:
 _probe_paths: Dict[str, str] = {}
 
 
+def _wifi_worker_at(endpoint: str) -> Optional[str]:
+    """The id of the worker registered at ``endpoint`` when it is on Wi-Fi and mains, else None."""
+    for worker_id, data in registry.snapshot().items():
+        if (f"{data.get('ip', '')}:{data.get('port', '')}" == endpoint
+                and dock_policy.on_wifi_and_mains(data.get("hardware"))):
+            return worker_id
+    return None
+
+
+def _file_wifi_verdict(worker_id: str, verdict: Dict[str, Any]) -> None:
+    """Store a Wi-Fi verdict, and say so in the log when it changes whether the GPU may shard."""
+    previous = registry.get_wifi_check(worker_id)
+    registry.record_wifi_check(worker_id, verdict)
+    if previous.get("ok") is not verdict.get("ok"):
+        outcome = "passed" if verdict.get("ok") else "did not pass"
+        log_coordinator(f"Wi-Fi GPU {safe_log_text(worker_id.split('-')[0][:8])} {outcome} its link test "
+                        f"({safe_log_text(verdict.get('why', ''))}).")
+
+
+def _wifi_check_answer(worker_id: str, ip: str, hardware: Any, carrying: bool) -> Optional[Dict[str, Any]]:
+    """
+    ``wifi_check`` for a heartbeat answer (2.6.4): ``{"ok": True | False | None, "why", "speed_test"}`` for a
+    volunteer GPU on Wi-Fi and mains, None for anyone else. ``ok`` None means not tested yet. ``speed_test``
+    asks the worker to measure its download (engine/worker.py) when there is no fresh figure and it carries
+    no shard; the worker reports it to /worker/link_report, which judges it at once.
+    """
+    if not dock_policy.on_wifi_and_mains(hardware) or is_local_ip(ip) or is_app_member(hardware):
+        return None
+    if _as_number(gpu_section(hardware).get("vram_total_gb", 0)) <= 0:
+        return None
+    if not get_worker_limits().get("wifi_shard", True):
+        return {"ok": False, "why": "this coordinator keeps Wi-Fi GPUs out of the shared model", "speed_test": False}
+    check = registry.get_wifi_check(worker_id)
+    fresh = dock_policy.fresh_download(registry.get_link_measurement(worker_id), time.time())
+    return {"ok": check.get("ok"), "why": str(check.get("why", dock_policy.NOT_TESTED)),
+            "speed_test": not carrying and fresh is None}
+
+
 def _probe_rpc_rtt(endpoint: str) -> Optional[float]:
     """
     Round trip to a volunteer's GPU along the path the engine will use (engine/link_paths.measure):
     its household LAN address, its own address, or its reverse tunnel. None when none answered.
     Blocking; run on a thread.
+
+    A GPU on Wi-Fi and mains is timed WIFI_PROBE_SAMPLES times instead of three, and the series is
+    judged (engine/dock_policy.judge_wifi, 2.6.4): its verdict decides whether the GPU may shard. Not
+    while the engine runs on it: the shard's own traffic would be timed, the verdict it was given
+    stands, and only the usual three samples are taken.
     """
+    limits = get_worker_limits()
+    worker_id = _wifi_worker_at(endpoint) if limits.get("wifi_shard", True) else None
+    if worker_id is not None and endpoint not in set(manager.current_endpoints or []):
+        measured_series = link_paths.measure_series(endpoint, int(limits.get("wifi_probe_samples", 20)))
+        if measured_series is None:
+            return None
+        samples, path = measured_series
+        _probe_paths[endpoint] = path
+        _file_wifi_verdict(worker_id, dock_policy.judge_wifi(
+            samples, registry.get_link_measurement(worker_id), max_rtt_ms=_max_shared_rtt(),
+            limits=limits, now=time.time()))
+        answered = [s for s in samples if isinstance(s, (int, float))]
+        return min(answered) if answered else None
     measured = link_paths.measure(endpoint)
     if measured is None:
         return None
@@ -5950,7 +6029,20 @@ def _coding_role_answer(worker_id: str, ip: str, port: Any, hardware: Dict[str, 
     if is_gpu and hardware.get("pool") != "coding" and f"{ip}:{port}" in set(manager.current_endpoints or []):
         return {"role": "rpc", "coding_tier": None}
     near = _coding_role_near(worker_id, ip, port, settled=hardware.get("pool") == "coding") if is_gpu else True
-    role, tier, slots = coding_members_lib.assign_role(hardware, near, _coding_ladder(),
+    # Docked as this coordinator judges it (engine/dock_policy.py, 2.6.4): on battery never, on Wi-Fi while
+    # its link passes the test. assign_role reads it from the profile, so the judged value goes there.
+    docked = registry.effective_docked(worker_id, hardware)
+    judged = dict(hardware, docked=docked) if docked is not None else hardware
+    # A GPU whose Wi-Fi link is still being tested gets no new job for ROLE_GRACE_SECONDS: told "coding" now, it
+    # would load a whole model only to drop it when the test passes a minute later. A member keeps its job.
+    if (is_gpu and near is not None and hardware.get("pool") != "coding" and not is_local_ip(ip)
+            and dock_policy.on_wifi_and_mains(hardware) and get_worker_limits().get("wifi_shard", True)):
+        check = registry.get_wifi_check(worker_id)
+        since = check.get("since")
+        if (not dock_policy.verdict_settled(check) and isinstance(since, (int, float))
+                and time.time() - since < coding_members_lib.ROLE_GRACE_SECONDS):
+            near = None
+    role, tier, slots = coding_members_lib.assign_role(judged, near, _coding_ladder(),
                                                        rtt_ms=_fresh_probe_rtt(worker_id), max_member_rtt_ms=_max_member_rtt())
     answer = {"role": role, "coding_tier": tier}
     if tier is not None:

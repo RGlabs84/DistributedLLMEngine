@@ -30,7 +30,7 @@ import socket
 import struct
 import threading
 import time
-from typing import Any, Callable, Deque, Dict, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from fastapi import WebSocket, WebSocketDisconnect
 from engine.logger import log_coordinator, log_warning, log_error
@@ -408,6 +408,39 @@ class ReverseRpcBridgeManager:
             if rtt is not None:
                 best = rtt if best is None else min(best, rtt)
         return best
+
+    def ping_series(self, ip: str, port: int, samples: int, timeout: float = 2.0) -> Optional[List[Optional[float]]]:
+        """
+        Every round trip of ``samples`` pings through the tunnel of the worker registered at ``ip:port``, in
+        order, None for one that went unanswered (the Wi-Fi test, engine/dock_policy.py). None instead of a
+        list under the same conditions as :meth:`measure_rtt_ms`: no tunnel, a worker that does not answer
+        pings, or a tunnel busy with a bulk transfer, whose pings would time the transfer, not the link.
+
+        Blocking: call it from a thread, never from the event loop the tunnels run on.
+        """
+        with self._lock:
+            relay_port = self._by_ip_port.get((ip, port))
+            session = next((s for s in self._by_worker_id.values()
+                            if relay_port is not None and s.relay_port == relay_port), None)
+        if session is None or session.closed or session.loop is None or session.moving_data():
+            return None
+        try:
+            if asyncio.get_running_loop() is session.loop:
+                return None
+        except RuntimeError:
+            pass
+        series: List[Optional[float]] = []
+        for _ in range(max(1, samples)):
+            pending = asyncio.run_coroutine_threadsafe(session.ping(timeout), session.loop)
+            try:
+                rtt = pending.result(timeout + 1.0)
+            except Exception:
+                pending.cancel()
+                rtt = None
+            if rtt is None and not series:
+                return None     # the first ping went unanswered: an older worker, or a dead link
+            series.append(rtt)
+        return series
 
     def reset_load_counters(self) -> None:
         with self._lock:

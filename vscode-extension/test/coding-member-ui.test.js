@@ -413,6 +413,26 @@ test('DLNE_DOCK: wired and plugged in, or not, with unknown facts left out', () 
   assert.deepEqual(c.parseDock('DLNE_DOCK: {"docked": true}\nDLNE_DOCK: {"docked": false}'), { docked: false }, 'the last one wins');
 });
 
+test('DLNE_DOCK on Wi-Fi and mains carries the coordinator\'s verdict on the link (2.6.4)', () => {
+  assert.deepEqual(c.parseDock('DLNE_DOCK: {"link": "wifi", "power": "ac", "docked": false, "wifi_ok": true, "wifi_why": "round trip 4 ms, jitter 2 ms, download 312 Mbit/s"}'),
+    { link: 'wifi', power: 'ac', docked: false, wifiOk: true, wifiWhy: 'round trip 4 ms, jitter 2 ms, download 312 Mbit/s' });
+  assert.deepEqual(c.parseDock('DLNE_DOCK: {"link": "wifi", "power": "ac", "docked": false, "wifi_ok": null, "wifi_why": ""}'),
+    { link: 'wifi', power: 'ac', docked: false, wifiOk: null }, 'null while testing; an empty why is left out');
+  assert.deepEqual(c.parseDock('DLNE_DOCK: {"link": "wifi", "power": "ac", "wifi_ok": "yes"}'),
+    { link: 'wifi', power: 'ac', wifiOk: null }, 'checked, not trusted');
+  assert.equal(c.parseDock(`DLNE_DOCK: {"wifi_ok": false, "wifi_why": "${'x'.repeat(400)}"}`).wifiWhy.length, 160);
+
+  const on = (wifiOk, wifiWhy) => c.dockLine({ link: 'wifi', power: 'ac', docked: false, wifiOk, wifiWhy });
+  assert.equal(on(true, 'round trip 4 ms, jitter 2 ms, download 312 Mbit/s'),
+    'On Wi-Fi and plugged in, and the link passed its test (round trip 4 ms, jitter 2 ms, download 312 Mbit/s): your GPU may share the swarm\'s big model while it keeps passing.');
+  assert.equal(on(false, 'jitter 34 ms, over 20'),
+    'On Wi-Fi and plugged in, but the link did not pass its test (jitter 34 ms, over 20): your GPU does not share the swarm\'s big model for now.');
+  assert.equal(on(null), 'On Wi-Fi and plugged in: the swarm is testing the link before your GPU may share its big model.');
+  assert.equal(c.dockLine({ link: 'wifi', power: 'ac', docked: false }),
+    'Not docked (on Wi-Fi): your GPU does not share the swarm\'s big model until it is docked again.', 'a worker from before 2.6.4');
+  assert.match(c.dockLine({ power: 'battery' }), /^On battery:/, 'battery is said even when the link is unknown');
+});
+
 test('DLNE_YIELD: stepping aside and why', () => {
   assert.deepEqual(c.parseYield('DLNE_YIELD: {"yielding": true, "why": "gpu"}'), { yielding: true, why: 'gpu' });
   assert.deepEqual(c.parseYield('DLNE_YIELD: {"yielding": false, "why": ""}'), { yielding: false, why: '' });
@@ -431,8 +451,10 @@ test('DLNE_ROLE carries the member\'s own figures (2.5.0), checked like the rest
 test('the card says whether the machine is docked and when it steps aside', () => {
   const docked = c.roleCopy(view('contributing', 'rpc', undefined, { dock: { link: 'wired', power: 'ac', docked: true } }));
   assert.match(docked.roleHtml, /Docked \(wired and plugged in\): your GPU may share the swarm's big model/);
-  const undocked = c.roleCopy(view('contributing', 'coding', { slots: 1 }, { dock: { link: 'wifi', power: 'battery', docked: false } }));
-  assert.match(undocked.roleHtml, /Not docked \(on Wi-Fi and battery\): your GPU runs a whole model by itself/);
+  const battery = c.roleCopy(view('contributing', 'coding', { slots: 1 }, { dock: { link: 'wifi', power: 'battery', docked: false } }));
+  assert.match(battery.roleHtml, /On battery: your GPU never shares the swarm's big model on battery, and may again once plugged in\./);
+  const phone = c.roleCopy(view('contributing', 'coding', { slots: 1 }, { dock: { link: 'cellular', power: 'ac', docked: false } }));
+  assert.match(phone.roleHtml, /Not docked \(on a phone link\): your GPU does not share the swarm's big model until it is docked again\./);
   const unknown = c.roleCopy(view('contributing', 'rpc', undefined, { dock: { power: 'ac' } }));
   assert.doesNotMatch(unknown.roleHtml, /docked/i, 'nothing claimed while a fact is unknown');
   const yielding = c.roleCopy(view('contributing', 'rpc', undefined, { yielding: { yielding: true, why: 'fullscreen' } }));

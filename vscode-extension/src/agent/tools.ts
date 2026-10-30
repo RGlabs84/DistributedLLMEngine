@@ -11,6 +11,7 @@ import { ToolDefinition } from '../client/dlneClient';
 import { MemoryChange, MemoryMode, checkRemember, memoryMode, rememberFact, riskyFact } from './memory';
 import { ImageApi, ImageArgs, prepareImageArgs, runImageJob, savedText } from './imageTool';
 import { REDACTION_MARK, excludedNotice, excludedReason, isExcludedFile, redactSecrets, redactionNote } from '../privacy';
+import { isPastedFile } from './pasted';
 
 export interface ToolCallResult {
   tool_call_id?: string;
@@ -440,6 +441,8 @@ export class ToolRegistry {
         const target = resolvePath(root, args.path || '.');
         const inside = insideWorkspace(root, target);
         if (inside && autoReads) return null;
+        // A paste the user made, kept whole by DLNE because it was too long to send (pasted.ts): read like the workspace.
+        if (name === 'read_file' && autoReads && isPastedFile(target)) return null;
         req = {
           tool: name,
           summary: `${name === 'read_file' ? 'read' : 'list'} ${inside ? path.relative(root!, target) || '.' : target}${inside ? '' : ' (outside your workspace)'}`,
