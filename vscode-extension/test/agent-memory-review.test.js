@@ -18,6 +18,10 @@ process.env.USERPROFILE = FAKE_HOME;
 process.on('exit', () => fs.rmSync(FAKE_HOME, { recursive: true, force: true }));
 
 const stub = require('./helpers/vscode-stub');
+
+// 2.7.0: the memory sizes depend on the coding context (memoryCaps). These tests use TheWall's 131,072, where every
+// file loads its full 32,000 characters; the limit on the three together has its own test.
+require('../dist/agent/memory').setMemoryContextTokens(131072);
 const { loadMemory, renderContextBlock, rememberFact, checkRemember } = require('../dist/agent/memory');
 const { ToolRegistry } = require('../dist/agent/tools');
 const { AgentLoop, WORKING_MEMORY_OPEN } = require('../dist/agent/agentLoop');
@@ -148,7 +152,7 @@ test('a memory file far past its cap is read only in part, and remember calls it
   world((w) => {
     const file = w.write(path.join(w.root, '.dlne', 'memory.md'), '- x\n'.repeat(20000)); // 80,000 bytes
     const loaded = loadMemory(w.root, w.options).project.text;
-    assert.ok(loaded.length < 8200);
+    assert.ok(loaded.length < 32_200);
     const result = rememberFact('project', 'One more.', w.root, w.options);
     assert.equal(result.ok, false);
     assert.match(result.message, /full/);

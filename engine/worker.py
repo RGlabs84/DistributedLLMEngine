@@ -42,6 +42,7 @@ from engine.logger import log_worker, log_error, log_system, log_warning
 from engine.hardware import get_hardware_profile, _hidden_process_kwargs, yield_reason as hardware_yield_reason
 from engine.dock_policy import WIFI_SPEED_TEST_BYTES, WIFI_SPEED_TEST_MIN_GAP_SECONDS, on_wifi_and_mains
 from engine.downloader import download_and_extract_engine, explain_dll_not_found, is_dll_not_found
+from engine.engine_flavour import EngineFlavour, requested_flavour
 from engine.version import VERSION
 from engine.config import get_base_dir, get_worker_limits
 from engine.authn import sign_heartbeat
@@ -330,7 +331,7 @@ class WorkerNode:
     def __init__(self, coordinator_url: str, rpc_ip: str = "0.0.0.0", rpc_port: int = 50052,
                  verbose_heartbeats: bool = True, role: str = "worker", companion_of: str = "",
                  companion_ram_gb: float = 0.0, companion_threads: int = 0,
-                 companion_gate: Optional[threading.Event] = None):
+                 companion_gate: Optional[threading.Event] = None, engine_flavour: Optional[EngineFlavour] = None):
         self.coordinator_url = coordinator_url
         # "Both" (engine/companion.py): a companion node is the CPU half of a GPU machine, a second worker
         # identity in the same process that serves the phone pool with ``companion_ram_gb`` of RAM and
@@ -342,6 +343,9 @@ class WorkerNode:
         self.companion_gate = companion_gate
         self._companion_started = time.monotonic()
         self.hardware_profile = self._probe_hardware()
+        # Vulkan or CUDA engine (2.7.0, engine/engine_flavour.py). The editor or the tray asks with DLNE_ENGINE_FLAVOR;
+        # a "both" machine's CPU half shares its GPU half's, so the machine has one engine flavour and one set of markers.
+        self.engine_flavour = engine_flavour or self._make_engine_flavour(role)
         self.rpc_process = None
         # A graceful stop under way (``leaving`` in the profile; request_shutdown), and a yield's age, for
         # handing the GPU back to its owner when the coordinator has moved off this shard (_after_answer).
@@ -458,6 +462,30 @@ class WorkerNode:
     # ----------------------------------------------------------------------------------
     # Shutdown coordination
     # ----------------------------------------------------------------------------------
+
+    def _make_engine_flavour(self, role: str) -> EngineFlavour:
+        """
+        This process's engine flavour: what DLNE_ENGINE_FLAVOR asks for, if this machine could use it at all. A
+        node that will not use a GPU (no GPU, or the owner's MAX_GPU limit says CPU only) has no use for CUDA, and
+        the coordinator's own hybrid worker follows its host's install (EngineFlavour turns that one to Vulkan).
+        """
+        profile = self.hardware_profile if isinstance(self.hardware_profile, dict) else {}
+        gpu = profile.get("gpu") if isinstance(profile.get("gpu"), dict) else {}
+        try:
+            cpu_only = str(get_worker_limits().get("allowed_gpu_indices", "-1")).lower() == "none"
+        except Exception:  # noqa: BLE001 - an unreadable limit is no limit, as everywhere else
+            cpu_only = False
+        asked = requested_flavour() if gpu.get("has_gpu") and not cpu_only else "vulkan"
+        return EngineFlavour(get_base_dir(), asked, self._fetch_engine, hybrid=role == "hybrid")
+
+    def _fetch_engine(self, flavour: str) -> Optional[str]:
+        """The ggml-rpc-server of ``flavour``. Vulkan is asked the way it always was, so an engine from before the
+        flavours (and a test's stand-in for it) is called exactly as before; CUDA passes ``flavour`` (a downloader
+        that does not know it raises TypeError, which EngineFlavour reads as "no CUDA engine here")."""
+        url = None if self.role == "hybrid" else self.coordinator_url
+        if flavour == "cuda":
+            return download_and_extract_engine("worker", coordinator_url=url, flavour="cuda")
+        return download_and_extract_engine("worker", coordinator_url=url)
 
     def request_shutdown(self, exit_code: int = 0, reason: str = "", leave_first: bool = True) -> None:
         """
@@ -677,6 +705,10 @@ class WorkerNode:
             # Whether this machine may be a coding member (the owner allows it, CODING_MEMBER_ALLOWED, and it
             # has a GPU): the coordinator assigns the job only to nodes that say yes.
             hardware = {**hardware, "coding_ok": not self._coding_refusal()}
+            # Which llama.cpp engine runs here (2.7.0): "vulkan" or "cuda". A display fact only (never compared the
+            # way the version is); the coordinator keeps it with the member and counts it in its status.
+            flavour = getattr(self, "engine_flavour", None)
+            hardware["engine_flavour"] = flavour.confirmed if flavour is not None else "vulkan"
             # The RAM a coding model may use, which is not ram_gb (that is what the RPC node lends, MAX_RAM_GB).
             coding_ram = self._coding_ram_gb()
             if coding_ram is not None:
@@ -769,9 +801,13 @@ class WorkerNode:
         from engine.downloader import fetch_verified_manifest
         from engine.hardware import get_cpu_cores
 
-        # Same signed engine zip as an RPC node; llama-server ships in it beside ggml-rpc-server.
-        download_and_extract_engine(
-            "worker", coordinator_url=None if self.role == "hybrid" else self.coordinator_url)
+        # Same signed engine zip as an RPC node; llama-server ships in it beside ggml-rpc-server. On a machine that
+        # runs the CUDA engine the phone pool's CPU half uses those files too (it hides the GPU from them, see AppMember).
+        self.engine_flavour.acquire()
+        if not self.companion_of:
+            # A CPU-only node's engine is the Vulkan build run on the CPU: say so, and drop CUDA files it may hold. (The
+            # CPU half of a "both" machine leaves that to its GPU half: the engine it shares is not proven yet.)
+            self.engine_flavour.confirm()
 
         cache: Dict[str, Any] = {"at": 0.0, "tiers": []}
 
@@ -789,7 +825,7 @@ class WorkerNode:
         # The heartbeat names this port, and the tunnel carries the coordinator to it. A node that
         # joined as something else keeps the port its tunnel already dials.
         port = self.rpc_port if keep_port else APP_PORT
-        self.app_member = AppMember(get_base_dir(), tiers, threads=threads, port=port)
+        self.app_member = AppMember(get_base_dir(), tiers, threads=threads, port=port, engine=self.engine_flavour)
         self.rpc_port = port
         if self.companion_of:
             log_worker(f"This machine's CPU also serves the phone app's pool, with {self.companion_ram_gb:g} GB of RAM and "
@@ -813,9 +849,10 @@ class WorkerNode:
         from engine.coding_member import CodingMember
         from engine.downloader import fetch_verified_manifest
 
-        # llama-server ships in the signed engine zip beside ggml-rpc-server, as for the CPU pool.
-        download_and_extract_engine(
-            "worker", coordinator_url=None if self.role == "hybrid" else self.coordinator_url)
+        # llama-server ships in the signed engine zip beside ggml-rpc-server, as for the CPU pool. The CUDA engine
+        # (2.7.0) is chosen here and checked before it starts; the member itself falls back to Vulkan through
+        # ``engine`` if its server will not run (CodingMember._cuda_fell_back).
+        self.engine_flavour.acquire()
 
         cache: Dict[str, Any] = {"at": 0.0, "tiers": []}
 
@@ -836,6 +873,7 @@ class WorkerNode:
             limits_provider=get_worker_limits,
             resources_provider=self._coding_resources,
             start_gate=self._companion_gate,
+            engine=self.engine_flavour,
         )
         if not member.start():
             return False
@@ -1029,6 +1067,7 @@ class WorkerNode:
                 self.coordinator_url, rpc_ip=self.rpc_ip, verbose_heartbeats=False, role="worker",
                 companion_of=self.worker_id, companion_ram_gb=self._companion_lent,
                 companion_threads=self._thread_split[0] if self._thread_split else 0, companion_gate=gate,
+                engine_flavour=self.engine_flavour,
             )
             with self._role_lock:
                 if self._stopped:
@@ -1357,9 +1396,9 @@ class WorkerNode:
         shutdown request.
         """
         # A worker on the coordinator's own host ("hybrid") uses the build the release installer
-        # put there; any other worker follows the coordinator's signed release.
-        binary_path = download_and_extract_engine(
-            "worker", coordinator_url=None if self.role == "hybrid" else self.coordinator_url)
+        # put there; any other worker follows the coordinator's signed release. The flavour (2.7.0, CUDA or
+        # Vulkan) is chosen here: CUDA where the machine may and its start-up check passes, otherwise Vulkan.
+        binary_path = self.engine_flavour.acquire()
         if not binary_path:
             log_error("Could not obtain ggml-rpc-server. Exiting.")
             return False
@@ -1417,18 +1456,32 @@ class WorkerNode:
             )
             log_worker("RPC Server started successfully.")
             self.rpc_proto = read_rpc_banner(log_path, banner_offset, self.rpc_process)
+            if self.engine_flavour.running == "cuda" and not self.rpc_proto:
+                # A CUDA server that never announced itself (it died, or hung on the driver): Vulkan instead.
+                return self._rpc_server_on_vulkan("the CUDA RPC server did not start")
             if self.rpc_proto:
                 log_worker(f"ggml-rpc-server speaks RPC protocol {self.rpc_proto}.")
             else:
                 log_warning("Could not read the ggml-rpc-server protocol version; the Coordinator "
                             "will not route to this node until it can.")
+            # It runs: say which engine, and drop the other flavour's files (engine/engine_flavour.py).
+            self.engine_flavour.confirm()
             return True
         except Exception as e:
             log_error(f"Failed to start RPC server: {e}")
+            if self.engine_flavour.running == "cuda":
+                return self._rpc_server_on_vulkan(f"the CUDA RPC server would not start ({type(e).__name__})")
             # Without this the node used to keep heartbeating with rpc_process = None, so
             # the crash check below never fired and the cluster kept routing tensors to an
             # RPC endpoint that was never listening.
             return False
+
+    def _rpc_server_on_vulkan(self, reason: str) -> bool:
+        """The CUDA RPC server did not run: stop what is left of it, remember why (never tried again in this process)
+        and start the Vulkan one. Reaches start_rpc_server once more, which now gets the Vulkan engine."""
+        self._stop_rpc_server()
+        self.engine_flavour.fall_back(reason)
+        return self.start_rpc_server()
 
     # ----------------------------------------------------------------------------------
     # Heartbeat
@@ -1648,6 +1701,11 @@ class WorkerNode:
         """
         self.is_running = True
         self._stop_on_termination_signal()
+
+        # May this machine use the CUDA engine? Said before any engine is downloaded, so the editor can show it
+        # (and ask for consent) whatever happens next. A companion leaves it to its GPU half.
+        if not self.companion_of:
+            self.engine_flavour.announce_capability()
 
         started = self.start_app_member() if self._serves_cpu_pool() else self.start_rpc_server()
         if not started:

@@ -251,6 +251,13 @@ SPEC_DEFAULTS = {
 # slot, as always), or q8_0 / q4_0 / f16 to fix it whatever the slot size. The owner's rule for TheWall is that q8_0 is
 # never lowered, and TheWall's 2 x 131,072 lanes sit exactly on the line where auto would switch to q4_0.
 ENGINE_KV_TYPES = ("auto", "q8_0", "q4_0", "f16")
+#
+# ENGINE_FLAVOR (2.7) says which llama.cpp build the coordinator's own engine is: vulkan (the default, and what TheWall
+# runs), cuda (llama.cpp's official CUDA 13 build, for a host with an NVIDIA card of Turing or newer and a 580-series
+# driver or later), or auto (cuda exactly where a worker would be allowed it, else vulkan). The CUDA build is a 600 MB
+# download the release host keeps beside the code; if it cannot be installed or will not start, the engine runs on
+# Vulkan and says why in the log. Anything else spelled here is vulkan: a typo must not start a different engine.
+ENGINE_FLAVORS = ("auto", "vulkan", "cuda")
 ENGINE_DEFAULTS = {
     "engine_context": 0,
     "engine_slots": 0,
@@ -260,6 +267,7 @@ ENGINE_DEFAULTS = {
     "media_gpu": "",
     "media_gpu_shared": False,
     "engine_kv_type": "auto",
+    "engine_flavor": "vulkan",
     "engine_mmproj": "",
     "engine_image_max_tokens": 1024,
     "image_input_per_hour": 30,
@@ -947,6 +955,10 @@ def get_worker_limits() -> dict:
         kv_type = config["ENGINE_KV_TYPE"].strip().lower()
         # Anything else keeps auto: a typo must not start an engine on a cache type nobody chose.
         limits["engine_kv_type"] = kv_type if kv_type in ENGINE_KV_TYPES else "auto"
+
+    if "ENGINE_FLAVOR" in config:
+        flavor = config["ENGINE_FLAVOR"].strip().lower()
+        limits["engine_flavor"] = flavor if flavor in ENGINE_FLAVORS else "vulkan"
 
     if "ENGINE_MMPROJ" in config:
         limits["engine_mmproj"] = config["ENGINE_MMPROJ"].strip()

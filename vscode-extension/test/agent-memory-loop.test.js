@@ -77,27 +77,37 @@ function recorder() {
 const agentRequests = (client) => client.requests.filter((r) => r.tools.length > 0);
 const notesRequests = (client) => client.requests.filter((r) => String(r.messages[r.messages.length - 1].content).includes('<dlne_compact>'));
 
-test('a first request is the system prompt and the user\'s words, with every tool, remember last', async () => {
+test('a first request is the system prompt and the user\'s words, with every tool, the skill tools after remember', async () => {
   const client = scriptedClient([{ content: 'Hello.' }]);
   const { callbacks } = recorder();
   assert.equal(await new AgentLoop(client).run('hi there', callbacks), 'done');
   const [req] = client.requests;
   assert.deepEqual(req.messages, [{ role: 'system', content: AGENT_SYSTEM_PROMPT }, { role: 'user', content: 'hi there' }]);
-  assert.equal(req.tools.length, 8);
-  assert.equal(req.tools[7], 'remember');
+  assert.equal(req.tools.length, 10);
+  assert.deepEqual(req.tools.slice(7), ['remember', 'use_skill', 'save_skill']);
 });
 
-test('the <dlne_context> block, when there is one, is message 1, and it is refreshed for each request', async () => {
-  let memory = '<dlne_context>\nStanding notes.\n## Project memory (.dlne/memory.md)\n- one\n</dlne_context>';
-  const client = scriptedClient([{ content: 'A.' }, { content: 'B.' }]);
-  const loop = new AgentLoop(client, { contextProvider: () => memory });
+test('the <dlne_context> block, when there is one, is message 1, read once per conversation and again after a Clear', async () => {
+  // 2.7.0: read for every request, a fact saved mid-conversation changed the prompt's first tokens and the engine read
+  // the whole conversation again (minutes at 90k tokens). The fact is in the conversation already, as remember's result.
+  const before = '<dlne_context>\nStanding notes.\n## Project memory (.dlne/memory.md)\n- one\n</dlne_context>';
+  let memory = before;
+  let reads = 0;
+  const client = scriptedClient([{ content: 'A.' }, { content: 'B.' }, { content: 'C.' }]);
+  const loop = new AgentLoop(client, { contextProvider: () => { reads++; return memory; } });
   const { callbacks } = recorder();
   await loop.run('first', callbacks);
   memory = memory.replace('- one', '- one\n- two');
   await loop.run('second', callbacks);
-  assert.equal(client.requests[0].messages[1].content, '<dlne_context>\nStanding notes.\n## Project memory (.dlne/memory.md)\n- one\n</dlne_context>');
-  assert.match(client.requests[1].messages[1].content, /- two/);
+  assert.equal(client.requests[0].messages[1].content, before);
+  assert.equal(client.requests[1].messages[1].content, before, 'the same conversation keeps the block it started with');
   assert.equal(client.requests[1].messages[2].content, 'first', 'the conversation follows the context block');
+  assert.equal(reads, 1);
+
+  loop.clearHistory();
+  await loop.run('third', callbacks);
+  assert.match(client.requests[2].messages[1].content, /- two/, 'a new conversation reads the files as they are now');
+  assert.equal(reads, 2);
 });
 
 test('a context provider that throws, or gives nothing, adds no message and never stops the agent', async () => {
@@ -384,7 +394,7 @@ test('a long task ends with a look back: only remember runs, and nothing of it s
   turns.push({ content: 'All done.' });
   turns.push((req) => {
     assert.equal(req.messages.at(-1).content, REFLECT_REQUEST);
-    assert.equal(req.tools.length, 8, 'the same tools as every request');
+    assert.equal(req.tools.length, 10, 'the same tools as every request');
     return { toolCalls: [
       { id: 'r1', name: 'remember', arguments: JSON.stringify({ fact: 'Tests run with make test.', scope: 'project' }) },
       { id: 'r2', name: 'read_file', arguments: JSON.stringify({ path: 'sneaky.ts' }) },
@@ -597,7 +607,7 @@ test('the look back sends the Memory 2 request, and shares the task\'s remember 
   assert.equal(await new AgentLoop(client, { log: (line) => log.push(line) }).run('do it', callbacks, { reflect: true }), 'done');
   assert.equal(sent, [
     '<dlne_reflect>',
-    'The task is finished. Save, with remember, what a later session in this project would otherwise have to rediscover: how to build, test or run it (exact commands), where things live, the conventions its code follows, and any correction or preference the user gave. Look at Project memory first: update a fact that is now wrong or incomplete (its id in replaces) instead of adding another, and remove one that no longer holds. One fact per call; usually one to three changes are worth making. Skip details that mattered only for this task. If there is truly nothing new, reply with just: nothing.',
+    'The task is finished. Save, with remember, what a later session in this project would otherwise have to rediscover: how to build, test or run it (exact commands), where things live, the conventions its code follows, and any correction or preference the user gave. Look at Project memory first: update a fact that is now wrong or incomplete (its id in replaces) instead of adding another, and remove one that no longer holds. One fact per call; usually one to three changes are worth making. Skip details that mattered only for this task. If you worked out a procedure that is likely to be needed again, save it with save_skill, short and step by step, after a look at Skills for one of yours to update instead. If there is truly nothing new, reply with just: nothing.',
     '</dlne_reflect>',
   ].join('\n'));
   assert.deepEqual(remembered(), ['bad one', 'bad two', 'bad three']);

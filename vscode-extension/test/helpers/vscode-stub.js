@@ -18,6 +18,7 @@ const state = {
   statusBarItems: [],
   commands: [],          // [id, ...args] for every vscode.commands.executeCommand()
   clipboard: undefined,  // the last text written through vscode.env.clipboard
+  configListeners: [],   // what was handed to workspace.onDidChangeConfiguration
 };
 
 function reset() {
@@ -41,6 +42,13 @@ function reset() {
   state.commands = [];
   state.clipboard = undefined;
   state.opened = [];
+  state.configListeners = [];
+}
+
+/** Tells the listeners of workspace.onDidChangeConfiguration that these settings (full names, "dlne.ownGpu") changed. */
+function fireConfigChange(...keys) {
+  const event = { affectsConfiguration: (key) => keys.some((k) => k === key || k.startsWith(`${key}.`)) };
+  [...state.configListeners].forEach((fn) => fn(event));
 }
 
 class EventEmitter {
@@ -56,6 +64,17 @@ class EventEmitter {
   }
   dispose() {
     this.listeners = [];
+  }
+}
+
+class Disposable {
+  constructor(callOnDispose) {
+    this.callOnDispose = callOnDispose;
+  }
+  dispose() {
+    const call = this.callOnDispose;
+    this.callOnDispose = undefined;
+    if (call) call();
   }
 }
 
@@ -82,6 +101,7 @@ class InlineCompletionItem {
 
 const vscode = {
   EventEmitter,
+  Disposable,
   Position,
   Range,
   InlineCompletionItem,
@@ -120,6 +140,10 @@ const vscode = {
   },
   workspace: {
     workspaceFolders: undefined,
+    onDidChangeConfiguration(listener) {
+      state.configListeners.push(listener);
+      return new Disposable(() => { state.configListeners = state.configListeners.filter((fn) => fn !== listener); });
+    },
     getConfiguration(section) {
       return {
         get(key, fallback) {
@@ -184,4 +208,4 @@ Module._load = function patched(request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 
-module.exports = { vscode, state, reset };
+module.exports = { vscode, state, reset, fireConfigChange };

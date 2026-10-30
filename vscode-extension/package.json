@@ -2,7 +2,7 @@
   "name": "dlne-code-assistant",
   "displayName": "DLNE Coding Assistant: Free AI Agent",
   "description": "A free AI coding agent and autocomplete, running on GPUs its users share. 100 free chats, no account or API key.",
-  "version": "1.5.4",
+  "version": "1.6.0",
   "publisher": "dlne",
   "license": "MIT",
   "repository": {
@@ -242,6 +242,18 @@
           "default": "faster",
           "description": "When this computer is a coding member: \"faster\" lets your requests go to whichever answers sooner (usually the swarm's own engine); \"smarter\" sends them to your own GPU whenever it runs a smarter model than the swarm's engine, even if it writes more slowly. Your privacy setting still decides first."
         },
+        "dlne.worker.engine": {
+          "type": "string",
+          "scope": "application",
+          "enum": ["auto", "vulkan", "cuda"],
+          "enumDescriptions": [
+            "Vulkan until you say yes to the CUDA question, then CUDA on an NVIDIA GPU that can run it (Turing, RTX 20 / GTX 16, or newer, with a recent driver). Every other computer stays on Vulkan.",
+            "Always the Vulkan engine. It works on every GPU and is a small download.",
+            "The CUDA engine, about 40% faster on a supported NVIDIA GPU, in a one-time download of about 600 MB. You are asked first. A computer that cannot run it uses Vulkan, and the panel says why."
+          ],
+          "default": "auto",
+          "description": "Which engine this computer's worker runs on: Vulkan (every GPU) or CUDA (a supported NVIDIA GPU, faster). A change restarts the worker once it has finished the work it is doing."
+        },
         "dlne.worker.allowedGpus": {
           "type": "string",
           "scope": "application",
@@ -306,6 +318,12 @@
           "minimum": 10,
           "maximum": 500,
           "markdownDescription": "How many steps (model turns, usually one tool call each) the agent may take for one request. At the limit it stops, says what it has done and what is left, and offers **Continue**, which carries on with everything it has read. A long run holds one of the swarm's shared coding slots the whole time."
+        },
+        "dlne.agent.unlimitedTurns": {
+          "type": "boolean",
+          "scope": "application",
+          "default": true,
+          "markdownDescription": "For API-key holders: let the agent keep going with no limit on steps for one request. It only takes effect when the server confirms your API key; with no key, or an older server, the **Max Turns** limit above applies as before. **Stop** and the loop check still end a run. Turn this off to keep the step limit."
         },
         "dlne.agent.memory": {
           "type": "string",

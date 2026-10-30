@@ -6,14 +6,17 @@ import threading
 import time
 from typing import Any, Callable, List, Optional
 
-from . import COORDINATOR_URL, PUBLIC_NETWORK_KEY, autostart, bundled, netstatus, paths, settings as settings_store, tiers
-from .worker import Status, WorkerController
+from . import (COORDINATOR_URL, __version__, PUBLIC_NETWORK_KEY, autostart, bundled, engine_flavour, netstatus, paths, settings as settings_store,
+               tiers, updater, vscode_first)
+from .worker import STOPPING, Status, WorkerController
 
 
 class Model:
     def __init__(self, home: str = "", hardware: Optional[tiers.Hardware] = None, base_url: str = COORDINATOR_URL,
                  select: Any = None, controller_factory: Optional[Callable[..., WorkerController]] = None,
-                 fetch_info: bool = True):
+                 fetch_info: bool = True, editor_present: Optional[Callable[[], bool]] = None,
+                 other_worker: Optional[Callable[[], bool]] = None, now: Callable[[], float] = time.time,
+                 clock: Callable[[], float] = time.monotonic, updates: Optional[updater.UpdateManager] = None):
         self.home = home or paths.app_data_dir()
         paths.ensure_private_dir(self.home)
         if hardware is None:
@@ -36,6 +39,19 @@ class Model:
         self.controller: WorkerController = factory(
             self.home, lambda: self.settings, lambda: self.hardware, base_url=base_url, network_key=PUBLIC_NETWORK_KEY,
             on_change=self._status_changed, log=self._log)
+        self._now = now
+        # VS Code first (vscode_first.py): the check reads ~/.dlne/editor.json unless a test hands in its own.
+        self.vscode_first = vscode_first.VsCodeFirst(
+            editor_present or (lambda: vscode_first.read_presence(paths.editor_presence_path(), time.time())),
+            is_running=lambda: self.controller.status().running, is_stopping=lambda: self.controller.status().state == STOPPING,
+            stop=self.stop, start=self._resume_donating, on_change=self._paused_changed,
+            # A test that names its own editor file gets no scan of the real computer for workers either.
+            other_worker=other_worker or (vscode_first.other_worker_running if editor_present is None else (lambda: False)),
+            clock=clock)
+        # DLNE Donate updates itself (updater.py). Like the swarm fetch below it is off for a model built with fetch_info=False.
+        self.updates = updates or updater.UpdateManager(self.home, auto=lambda: self.settings.auto_update, clock=now, log=self._log,
+                                                        on_change=self._notify,
+                                                        enabled=fetch_info and not os.environ.get(updater.OFF_ENV))
         self._fetching = False
         self._fetched_at = float("-inf")
         if fetch_info:
@@ -92,9 +108,53 @@ class Model:
             return tiers.describe(self.settings, self.hardware, self.swarm.coding_tiers, self.swarm.app_tiers, self.select,
                                   self.swarm.app_sizes)
 
+    # ---- the engine flavour and the CUDA question (engine_flavour.py) ------------------------------
+
+    def cuda_question_due(self) -> bool:
+        """Whether the window should ask the CUDA question now (once; again after "Not now" and three days)."""
+        s = self.settings
+        return bool(s.gpu_enabled and not self.paused
+                    and engine_flavour.question_due(s.engine, s.cuda_consent, s.cuda_later_ms, self.status().cuda, self._now()))
+
+    def answer_cuda(self, answer: str, choosing_cuda: bool = False) -> tiers.Settings:
+        """Record the answer to the CUDA question. Use CUDA makes a running worker restart on the CUDA engine."""
+        return self.update(**engine_flavour.answer_changes(answer, self._now(), choosing_cuda, self.settings.engine))
+
+    def choose_engine(self, value: str, ask: Callable[[], str]) -> tiers.Settings:
+        """
+        The owner picked an engine in the Settings window. Choosing CUDA before agreeing to the download asks the question
+        first (``ask`` shows it and returns the answer): only Use CUDA turns it on, the other answers leave the setting as it was.
+        """
+        if value == "cuda" and self.settings.cuda_consent != "yes":
+            return self.answer_cuda(ask(), choosing_cuda=True)
+        return self.update(engine=engine_flavour.clean_engine(value))
+
+    # ---- VS Code first ---------------------------------------------------------------------------
+
+    @property
+    def paused(self) -> bool:
+        return self.vscode_first.paused
+
+    def check_editor(self, force: bool = False) -> None:
+        """Look for DLNE in VS Code (every ten seconds at most): pause the worker while it is open, resume when it is gone."""
+        self.vscode_first.tick(force)
+
+    def _paused_changed(self, reason: str) -> None:
+        self._log({vscode_first.EDITOR: "DLNE in VS Code is using this computer: the worker is paused.",
+                   vscode_first.WORKER: "VS Code is closed but its DLNE worker still runs: this app waits for it to end.",
+                   }.get(reason, "This computer is free again."))
+        self.controller.set_paused(bool(reason), reason)
+
+    def _resume_donating(self) -> bool:
+        """The editor is gone and the owner was donating: do it again. True once there is nothing left to try."""
+        return self.donate() or not self.describe().can_donate
+
     # ---- donating ----------------------------------------------------------------------------------
 
     def donate(self) -> bool:
+        if self.paused:
+            self.vscode_first.want_donating()      # started by itself (resume at launch) while VS Code is open: later
+            return False
         if not self.describe().can_donate:
             return False
         settings_store.save(self.settings, os.path.join(self.home, "settings.json"))
@@ -138,11 +198,15 @@ class Model:
 
     def _write_state(self, status: Status) -> None:
         data = {
-            "state": status.state, "message": status.message, "role": status.role.role if status.role else "",
+            # "version" is this app's own (the extension tells a 1.1.0+ app, which pauses for VS Code, from an older one by it).
+            # While paused for VS Code the state is "paused" once the worker has gone; until then it is still "stopping" (the
+            # extension waits for a worker that is leaving), and "paused": true says why in both.
+            "version": __version__, "state": "paused" if status.paused and not status.running else status.state, "message": status.message, "role": status.role.role if status.role else "",
             "model": status.role.model if status.role else "", "also_cpu": status.also_cpu, "error": status.error,
             "engine_version": status.engine_version, "devices": status.devices, "pid": os.getpid(),
             "verification_failed": status.verification_failed, "clock_notice": status.clock_notice,
             "refusal": status.refusal, "activity": status.activity,
+            "paused": status.paused, "engine_flavour": status.engine.flavour if status.engine else "",
         }
         path = paths.state_path(self.home)
         scratch = f"{path}.{os.getpid()}.tmp"

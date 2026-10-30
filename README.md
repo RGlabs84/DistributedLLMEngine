@@ -28,6 +28,15 @@ Live status, the current model and the free-chat allowance are on the website, n
 
 [What each way of chatting is, and when to use it](vscode-extension/README.md#chatting-with-dlne).
 
+**The agent remembers and learns skills.** DLNE's agent keeps short facts about your project between chats, and it
+saves **skills**: step-by-step procedures it worked out (how to release this project, how its tests run), as
+`SKILL.md` files in `.dlne/skills/` in the project or in `~/.dlne/skills/` for every project. Only their names and one-line
+descriptions go into the prompt; the agent loads a skill's steps when a task fits. You can read, edit and write
+them too, and each one the agent saves shows in the chat with an Undo. The agent can also **see pictures**: paste,
+drop or attach a screenshot in the DLNE Agent panel, or let it open one with `view_image`. The swarm's own engine
+reads them (never a volunteer's machine), and only while it can; old pictures drop out of the conversation as it grows. Nothing is trained: it reads and writes
+files. [The details](docs/agent-memory.md) (the `dlne.agent.memory` setting turns it off or makes it ask first).
+
 **Privacy, honestly.** To answer you, a machine has to read your question and the code sent with it. DLNE
 removes secrets in the editor first. It never reads files such as `.env` or `*.pem`, anything `.gitignore`
 ignores, or anything in `.dlneignore`, when you use `@dlne` or the sidebar. (VS Code's own agent on DLNE Swarm is

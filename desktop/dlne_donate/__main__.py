@@ -9,6 +9,8 @@
     DLNE-Donate --hardware      print what this computer can give, as JSON, and exit
     DLNE-Donate --run-worker <engine folder> -- <worker args>
                                 internal: how the app runs the verified engine's worker in a child process
+    DLNE-Donate --finish-update <pid> <app> [args]
+                                internal (Windows): the new exe waits for <pid> to exit, replaces <app> with itself, starts it
 """
 
 import json
@@ -29,6 +31,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("usage: --run-worker <engine folder> -- <worker args>", file=sys.stderr)
             return 2
         return run_worker_process(argv[1], argv[3:])
+
+    if argv[:1] == ["--finish-update"]:
+        # Nothing but the update step: no window, no tray (updater.py).
+        if len(argv) < 3 or not argv[1].isdigit():
+            print("usage: --finish-update <pid> <app> [args]", file=sys.stderr)
+            return 2
+        from . import updater, vscode_first
+        return updater.finish_update(int(argv[1]), sys.executable, argv[2], argv[3:], vscode_first.process_alive)
 
     from . import APP_NAME, __version__
 

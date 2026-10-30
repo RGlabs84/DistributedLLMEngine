@@ -144,6 +144,45 @@ def test_binary_compatibility(binary_path: str, _allow_dependency_install: bool 
 
 RPC_RECORD = ".dlne_rpc_bin.json"   # shared with the VS Code extension, which writes the same record
 
+# Engine flavours (2.7). "vulkan" is the engine as it always was, in <base>/bin. "cuda" is llama.cpp's official CUDA 13
+# build of the same tag, signed into the release as cuda_<platform>_*, and it lives in a folder of its own,
+# <base>/bin-cuda, with a record of its own: both can sit on a disk while a machine switches, and installing one never
+# touches the other. Anything but "cuda" means vulkan (the contract: missing or unknown is vulkan).
+CUDA_RECORD = ".dlne_cuda_bin.json"
+ENGINE_DIRS = {"vulkan": "bin", "cuda": "bin-cuda"}
+_MIN_FREE_FOR_CUDA = 2.3   # the zip, then the files out of it, and some room; times the signed size
+
+
+def normalize_flavour(value: Any) -> str:
+    return "cuda" if isinstance(value, str) and value.strip().lower() == "cuda" else "vulkan"
+
+
+def engine_dir(base_dir: str, flavour: str = "vulkan") -> str:
+    """The folder a flavour's engine programs are in."""
+    return os.path.join(base_dir, ENGINE_DIRS[normalize_flavour(flavour)])
+
+
+def remove_engine_flavour(base_dir: str, flavour: str) -> bool:
+    """
+    Delete one flavour's engine and its record, to give the disk back after a switch (the caller does this once the
+    other flavour is running). Returns True when something was removed. A folder that is a symlink is never followed
+    or removed: on the coordinator's host ``bin`` points at the release's own build and is not a download.
+    """
+    flavour = normalize_flavour(flavour)
+    folder = engine_dir(base_dir, flavour)
+    removed = False
+    if os.path.isdir(folder) and not os.path.islink(folder):
+        shutil.rmtree(folder, ignore_errors=True)
+        removed = True
+    record = os.path.join(base_dir, CUDA_RECORD if flavour == "cuda" else RPC_RECORD)
+    if os.path.isfile(record):
+        try:
+            os.remove(record)
+            removed = True
+        except OSError:
+            pass
+    return removed
+
 
 def fetch_verified_manifest(coord_url: str, urlopen=urllib.request.urlopen) -> dict:
     """The coordinator's release manifest, verified against the baked-in release key."""
@@ -158,11 +197,81 @@ def fetch_verified_manifest(coord_url: str, urlopen=urllib.request.urlopen) -> d
     return manifest
 
 
-def sync_rpc_bin(coord_url: str, base_dir: str, platform_key: str, urlopen=urllib.request.urlopen) -> bool:
+def _install_cuda_zip(zip_path: str, base_dir: str) -> None:
+    """
+    Unpack a verified CUDA zip (bin/<flat name> entries) into <base>/bin-cuda. It is unpacked beside the old folder
+    and swapped in, so a failed unpack leaves what was installed as it was and a running engine is never half-replaced.
+    """
+    target = engine_dir(base_dir, "cuda")
+    staging = f"{target}.new"
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging)
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                name = info.filename[len("bin/"):]    # check_cuda_bin has proved every entry is bin/<flat name>
+                with zf.open(info) as src, open(os.path.join(staging, name), "wb") as out:
+                    shutil.copyfileobj(src, out, 1024 * 1024)
+        if not sys.platform.startswith("win"):
+            for name in os.listdir(staging):
+                if name in ("ggml-rpc-server", "llama-server"):
+                    os.chmod(os.path.join(staging, name), 0o755)
+        shutil.rmtree(target, ignore_errors=True)
+        os.replace(staging, target)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def sync_local_cuda_bin(base_dir: str, platform_key: str) -> bool:
+    """
+    The coordinator's own host (2.7): install the CUDA engine from the zip the release installer put beside the code
+    (<base>/cuda-bin-<platform>.zip), checked against the signed manifest in <base>/release.json. Nothing is
+    downloaded. Returns True when it installed one, False when the installed one is already it; raises ReleaseError
+    when the release signs no CUDA engine for this platform or the zip is not the signed one.
+    """
+    import json
+    from engine import release
+
+    manifest = release.load_manifest(os.path.join(base_dir, release.MANIFEST_NAME))
+    ok, reason = release.verify_manifest(manifest) if manifest is not None else (False, "there is no release manifest here")
+    if not ok:
+        raise release.ReleaseError(f"this install's release failed verification ({reason})")
+    sha = manifest.get(release.cuda_field(platform_key, "sha256"))
+    if sha is None:
+        raise release.ReleaseError(f"this install's signed release has no CUDA engine for {platform_key}")
+    exe = "llama-server.exe" if platform_key.startswith("win") else "llama-server"
+    try:
+        with open(os.path.join(base_dir, CUDA_RECORD), "r", encoding="utf-8") as handle:
+            if json.load(handle).get("sha256") == sha and os.path.exists(os.path.join(engine_dir(base_dir, "cuda"), exe)):
+                return False
+    except (OSError, ValueError, AttributeError):
+        pass
+    zip_path = os.path.join(base_dir, release.cuda_zip_name(platform_key))
+    ok, reason = release.verify_cuda_bin(manifest, platform_key, zip_path)
+    if not ok:
+        raise release.ReleaseError(reason)
+    release.check_cuda_bin(zip_path)
+    _install_cuda_zip(zip_path, base_dir)
+    with open(os.path.join(base_dir, CUDA_RECORD), "w", encoding="utf-8") as handle:
+        json.dump({"sha256": sha, "llama_build": manifest.get("llama_build"), "rpc_proto": manifest.get("rpc_proto"),
+                   "cuda_version": manifest.get("cuda_version")}, handle)
+    log_success(f"Installed the CUDA {manifest.get('cuda_version')} engine (llama.cpp {manifest.get('llama_build')}).")
+    return True
+
+
+def sync_rpc_bin(coord_url: str, base_dir: str, platform_key: str, urlopen=urllib.request.urlopen,
+                 flavour: str = "vulkan") -> bool:
     """
     Make ``base_dir``/bin hold the ggml-rpc-server build the coordinator's signed release names
     for this platform. Returns True when it installed one, False when the installed one is
     already it.
+
+    ``flavour="cuda"`` (2.7) does the same for the CUDA engine the release signs as cuda_<platform>_*: it is fetched
+    from /v1/download/cuda-bin/<platform>, held to the same checks, and installed in <base>/bin-cuda with
+    its own record, leaving ``bin`` exactly as it was.
 
     These are executables the worker runs, so "the coordinator served it" is not enough: the
     manifest must verify against the baked-in release key, the zip must have exactly the
@@ -174,30 +283,50 @@ def sync_rpc_bin(coord_url: str, base_dir: str, platform_key: str, urlopen=urlli
     import json
     from engine import release
 
+    cuda = normalize_flavour(flavour) == "cuda"
+    field = release.cuda_field if cuda else release.rpc_field
     manifest = fetch_verified_manifest(coord_url, urlopen)
-    sha = manifest.get(release.rpc_field(platform_key, "sha256"))
+    sha = manifest.get(field(platform_key, "sha256"))
     if sha is None:
-        raise release.ReleaseError(f"the coordinator's signed release has no RPC build for {platform_key}")
+        raise release.ReleaseError(f"the coordinator's signed release has no {'CUDA engine' if cuda else 'RPC build'} for {platform_key}")
 
-    record_path = os.path.join(base_dir, RPC_RECORD)
+    record_path = os.path.join(base_dir, CUDA_RECORD if cuda else RPC_RECORD)
     exe = "ggml-rpc-server.exe" if platform_key.startswith("win") else "ggml-rpc-server"
     try:
         with open(record_path, "r", encoding="utf-8") as handle:
-            if json.load(handle).get("sha256") == sha and os.path.exists(os.path.join(base_dir, "bin", exe)):
+            if json.load(handle).get("sha256") == sha and os.path.exists(os.path.join(engine_dir(base_dir, flavour), exe)):
                 return False
     except (OSError, ValueError, AttributeError):
         pass
 
-    zip_dest = os.path.join(base_dir, "rpc-bin.zip.download")
-    size_mb = manifest[release.rpc_field(platform_key, "size")] // (1024 * 1024)
-    log_system(f"Downloading the signed llama.cpp {manifest.get('llama_build')} RPC engine for {platform_key} ({size_mb} MB)...")
+    zip_dest = os.path.join(base_dir, "cuda-bin.zip.download" if cuda else "rpc-bin.zip.download")
+    size = manifest[field(platform_key, "size")]
+    size_mb = size // (1024 * 1024)
+    if cuda:
+        # 600 MB, then the same again unpacked: say so before starting rather than after an hour of download.
+        free = shutil.disk_usage(base_dir).free
+        if free < size * _MIN_FREE_FOR_CUDA:
+            raise release.ReleaseError(f"not enough free disk space for the CUDA engine: it needs about "
+                                       f"{int(size * _MIN_FREE_FOR_CUDA) // (1024 * 1024)} MB and {free // (1024 * 1024)} MB are free")
+    log_system(f"Downloading the signed llama.cpp {manifest.get('llama_build')} {'CUDA ' + str(manifest.get('cuda_version')) if cuda else 'RPC'} "
+               f"engine for {platform_key} ({size_mb} MB)...")
     try:
-        with urlopen(f"{coord_url}/v1/download/rpc-bin/{platform_key}", timeout=120) as response, open(zip_dest, "wb") as out:
+        with urlopen(f"{coord_url}/v1/download/{'cuda-bin' if cuda else 'rpc-bin'}/{platform_key}", timeout=120) as response, \
+                open(zip_dest, "wb") as out:
             for chunk in iter(lambda: response.read(1024 * 1024), b""):
                 out.write(chunk)
-        ok, reason = release.verify_rpc_bin(manifest, platform_key, zip_dest)
+        ok, reason = (release.verify_cuda_bin if cuda else release.verify_rpc_bin)(manifest, platform_key, zip_dest)
         if not ok:
             raise release.ReleaseError(reason)
+        if cuda:
+            release.check_cuda_bin(zip_dest)
+            _install_cuda_zip(zip_dest, base_dir)
+            with open(record_path, "w", encoding="utf-8") as handle:
+                json.dump({"sha256": sha, "llama_build": manifest.get("llama_build"), "rpc_proto": manifest.get("rpc_proto"),
+                           "cuda_version": manifest.get("cuda_version")}, handle)
+            log_success(f"Installed the CUDA {manifest.get('cuda_version')} engine (llama.cpp {manifest.get('llama_build')}, "
+                        f"RPC {manifest.get('rpc_proto')}).")
+            return True
         release.check_rpc_bin(zip_dest)
         with zipfile.ZipFile(zip_dest, "r") as zf:
             zf.extractall(base_dir)   # every entry is bin/<flat name>, checked just above
@@ -218,12 +347,56 @@ def sync_rpc_bin(coord_url: str, base_dir: str, platform_key: str, urlopen=urlli
             pass
 
 
-def download_and_extract_engine(role: str, coordinator_url: Optional[str] = None):
+def _download_cuda_engine(role: str, coordinator_url: Optional[str], base_dir: str, os_name: str, ext: str,
+                          target_bin_base: str, allowed_gpu: str) -> Optional[str]:
+    """
+    The flavour="cuda" half of download_and_extract_engine: install the CUDA engine the signed release names for
+    this platform into <base>/bin-cuda (from the coordinator, or on the coordinator's own host from the zip beside
+    the code) and return the program, or None when this machine cannot have it. It never falls back to the Vulkan
+    folder by itself: whoever asked for CUDA decides what a "no" means (the worker starts Vulkan and says why).
+    """
+    global _last_failure
+    from engine import release
+
+    if allowed_gpu == 'none':
+        log_system("CUDA engine skipped: this worker is set to CPU only.")
+        return None
+    platform_key = release.host_cuda_platform()
+    if platform_key is None:
+        log_error(f"DLNE ships no CUDA engine for {platform.system()} {platform.machine()}.")
+        return None
+    try:
+        if role != "coordinator" and coordinator_url:
+            sync_rpc_bin(coordinator_url.rstrip("/"), base_dir, platform_key, flavour="cuda")
+        else:
+            sync_local_cuda_bin(base_dir, platform_key)
+    except Exception as sync_err:  # noqa: BLE001 - an installed CUDA engine keeps working offline
+        log_error(f"Could not update the CUDA engine: {sync_err}")
+    target_path = os.path.join(engine_dir(base_dir, "cuda"), target_bin_base + ext)
+    if not os.path.exists(target_path):
+        log_error(f"The CUDA engine is not installed ({target_path} is missing).")
+        return None
+    if os_name != "Windows":
+        try:
+            os.chmod(target_path, 0o755)
+        except Exception:
+            pass
+    if test_binary_compatibility(target_path):
+        log_system(f"Selected hardware-compatible engine binary: {os.path.basename(target_path)} (CUDA {release.CUDA_VERSION})")
+        return target_path
+    log_system(f"Capability mismatch for the CUDA {os.path.basename(target_path)}.")
+    return None
+
+
+def download_and_extract_engine(role: str, coordinator_url: Optional[str] = None, flavour: str = "vulkan"):
     """
     Locates the highest CPU-tier bundled llama.cpp engine binary available in the bin directory.
     role: 'coordinator' (needs llama-server) or 'worker' (needs ggml-rpc-server)
     coordinator_url: for a worker that is not on the coordinator's host, where to fetch the
     signed ggml-rpc-server build from (see sync_rpc_bin).
+    flavour: 'vulkan' (the default; exactly the engine as before) or 'cuda' (2.7): the signed CUDA 13 build in
+    <base>/bin-cuda, fetched, verified and unpacked on first use. Anything but 'cuda' is vulkan. A CUDA request
+    that cannot be met returns None and never hands back the Vulkan engine in its place.
     """
     global _last_failure
     _last_failure = ""
@@ -253,6 +426,9 @@ def download_and_extract_engine(role: str, coordinator_url: Optional[str] = None
     
     from engine.config import get_base_dir
     base_dir = get_base_dir()
+
+    if normalize_flavour(flavour) == "cuda":
+        return _download_cuda_engine(role, coordinator_url, base_dir, os_name, ext, target_bin_base, allowed_gpu)
 
     # A plain worker follows the coordinator's signed release: when it names a new llama.cpp
     # build for this platform, install it before looking. Not on the coordinator's own host
@@ -305,6 +481,80 @@ def download_and_extract_engine(role: str, coordinator_url: Optional[str] = None
         log_error(f"FATAL: Could not locate a compatible bundled binary for '{target_bin_base}'. "
                   "Check the lines above for the reason (an engine that crashes with an illegal instruction needs a CPU with AVX2).")
     return None
+
+
+# --------------------------------------------------------------------------------------
+# The coordinator's own engine flavour (ENGINE_FLAVOR, 2.7)
+# --------------------------------------------------------------------------------------
+
+# What this process settled on for its own engine: "" until the first resolution, then "vulkan" or "cuda". The status
+# endpoint reads it (engine_flavour), and so does engine_build_is_vulkan, so both describe the engine that really runs.
+_coordinator_flavour = ""
+
+
+def cuda_allowed_here():
+    """
+    (allowed, reason) for this host running the CUDA engine: an NVIDIA GPU of compute capability 7.5 or newer and a
+    driver of the 580 series or later, which engine.hardware.cuda_capability() reads from nvidia-smi (the same
+    answer a worker gets). ``allowed`` is None when that detection is not available here at all, which callers treat
+    as "cannot tell" (auto then stays on Vulkan; an operator's explicit ``cuda`` is trusted).
+    """
+    from engine import release
+
+    if release.host_cuda_platform() is None:
+        return False, f"DLNE ships no CUDA engine for {platform.system()} {platform.machine()}"
+    try:
+        from engine import hardware
+        detect = getattr(hardware, "cuda_capability", None)
+        if detect is None:
+            return None, "this build cannot check for CUDA"
+        info = detect()
+    except Exception as exc:  # noqa: BLE001 - a failed check is "no", never a crash of the engine start
+        return False, f"the CUDA check failed ({type(exc).__name__})"
+    if not isinstance(info, dict):
+        return False, "the CUDA check gave no answer"
+    return bool(info.get("capable")), str(info.get("reason") or "")
+
+
+def resolve_engine_flavour(setting: Any) -> str:
+    """
+    ENGINE_FLAVOR as the engine it means: "vulkan" or "cuda". ``vulkan`` is vulkan; ``auto`` is cuda only where this
+    host may run it; ``cuda`` is cuda unless the host plainly cannot (then it says so and runs Vulkan, rather than
+    download 600 MB for an engine with no card to run on). Anything else is vulkan.
+    """
+    setting = str(setting or "vulkan").strip().lower()
+    if setting not in ("auto", "cuda"):
+        return "vulkan"
+    allowed, reason = cuda_allowed_here()
+    if allowed:
+        return "cuda"
+    if allowed is None and setting == "cuda":
+        return "cuda"
+    if setting == "cuda":
+        log_warning(f"ENGINE_FLAVOR=cuda, but this host cannot run the CUDA engine ({reason}); using Vulkan.")
+    return "vulkan"
+
+
+def coordinator_engine_flavour() -> str:
+    """
+    The flavour of the coordinator's own engine: what was last chosen for it, or (before any engine start) what
+    ENGINE_FLAVOR resolves to. Decided once per process, so a status poll never runs nvidia-smi.
+    """
+    global _coordinator_flavour
+    if not _coordinator_flavour:
+        try:
+            from engine.config import get_worker_limits
+            setting = get_worker_limits().get("engine_flavor", "vulkan")
+        except Exception:  # noqa: BLE001 - an unreadable config is the default
+            setting = "vulkan"
+        _coordinator_flavour = resolve_engine_flavour(setting)
+    return _coordinator_flavour
+
+
+def set_coordinator_engine_flavour(flavour: str) -> None:
+    """Record the flavour the coordinator's engine actually started with (after a fall back, Vulkan)."""
+    global _coordinator_flavour
+    _coordinator_flavour = normalize_flavour(flavour)
 
 
 # ======================================================================================

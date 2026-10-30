@@ -8,6 +8,7 @@
  * test) is not an instance of the ones this extension sees.
  */
 import type { ChatMessage, ToolDefinition } from './dlneClient';
+import { PictureAttachment, pictureFromBytes, withoutOldPictures } from './pictures';
 
 /** A message as VS Code gives it to a provider (vscode.LanguageModelChatRequestMessage, without the import). */
 export interface RequestMessage {
@@ -29,13 +30,13 @@ const ROLE_ASSISTANT = 2;
  */
 const ROLE_SYSTEM = 3;
 
-/** What the swarm counts for each image (the coordinator's engine_image_max_tokens). Images are refused today. */
+/** What the swarm counts for each image (the coordinator's engine_image_max_tokens). */
 export const IMAGE_TOKENS = 1024;
 /** Each message's own framing (role markers and the like), in characters: the figure the agent's estimate uses too. */
 const MESSAGE_FRAMING_CHARS = 16;
 
 export const IMAGE_REFUSED =
-  'DLNE Swarm cannot read images yet. Take the image out of the request, or pick a model that can.';
+  'DLNE Swarm cannot read images right now (the swarm\'s engine has no way to see them). Take the image out of the request, or pick a model that can.';
 
 /**
  * A request the swarm cannot take as it is, with the reason in plain words (an image today). Nothing was sent. It has
@@ -69,7 +70,7 @@ const decode = (data: ArrayBufferView): string => Buffer.from(data.buffer, data.
  * refused. Data that is text counts as text. A part holding a structured value (prompt-tsx) is read as its JSON.
  * Anything else, thinking and cache markers included, is left out.
  */
-function textOfParts(parts: ReadonlyArray<unknown>): string {
+function textOfParts(parts: ReadonlyArray<unknown>, onImage?: (part: Loose) => void): string {
   let text = '';
   for (const raw of parts) {
     const p = asPart(raw);
@@ -77,8 +78,12 @@ function textOfParts(parts: ReadonlyArray<unknown>): string {
     if (typeof p.value === 'string') {
       text += p.value;
     } else if (isData(p)) {
-      if (isImage(p)) throw new UnsupportedRequest(IMAGE_REFUSED);
-      if (isTextData(p)) text += decode(p.data);
+      if (isImage(p)) {
+        if (!onImage) throw new UnsupportedRequest(IMAGE_REFUSED);
+        onImage(p);
+      } else if (isTextData(p)) {
+        text += decode(p.data);
+      }
     } else if (p.value !== null && typeof p.value === 'object' && !Array.isArray(p.value)) {
       try {
         text += JSON.stringify(p.value);
@@ -111,8 +116,9 @@ function argumentsOf(input: unknown): string {
  * - An image is refused (UnsupportedRequest): the model does not read them, and leaving it out without a word would
  *   have the model answer as if it had seen it.
  */
-export function toOpenAiMessages(messages: ReadonlyArray<RequestMessage>): ChatMessage[] {
+export function toOpenAiMessages(messages: ReadonlyArray<RequestMessage>, options: { vision?: boolean } = {}): ChatMessage[] {
   const system: string[] = [];
+  let userTurns = 0;
   const out: ChatMessage[] = [];
   const toolNames = new Map<string, string>(); // call id -> tool name, so its result can say which tool answered
 
@@ -148,12 +154,23 @@ export function toOpenAiMessages(messages: ReadonlyArray<RequestMessage>): ChatM
           rest.push(raw);
         }
       }
-      const content = textOfParts(rest);
-      if (content) out.push({ role: 'user', content });
+      // A picture in a user message goes with it while the swarm's engine can read pictures (4d); a tool result's, or
+      // an assistant's, never does.
+      const images: PictureAttachment[] = [];
+      const content = textOfParts(rest, options.vision ? (part) => {
+        const checked = pictureFromBytes(`picture ${images.length + 1}`, new Uint8Array(part.data.buffer, part.data.byteOffset, part.data.byteLength));
+        if (!checked.ok) throw new UnsupportedRequest(`DLNE Swarm could not take picture ${images.length + 1}: ${checked.error}.`);
+        images.push(checked.picture);
+      } : undefined);
+      if (content || images.length > 0) {
+        userTurns++;
+        out.push(images.length > 0 ? { role: 'user', content, images, pictureTurn: userTurns } : { role: 'user', content });
+      }
     }
   }
   if (system.length > 0) out.unshift({ role: 'system', content: system.join('\n\n') });
-  return out;
+  // The server takes MAX_PICTURES a request, all messages together, and a picture of an old turn is a note.
+  return out.some((m) => m.images && m.images.length > 0) ? withoutOldPictures(out, userTurns) : out;
 }
 
 /** The tools VS Code offers, as the swarm's request names them. A tool with no schema takes no arguments. */
@@ -177,7 +194,7 @@ export function toOpenAiTools(tools: ReadonlyArray<RequestTool> | undefined): To
 export function chatChars(messages: ReadonlyArray<ChatMessage>, tools: ReadonlyArray<ToolDefinition>): number {
   let chars = tools.length > 0 ? JSON.stringify(tools).length : 0;
   for (const m of messages) {
-    chars += (m.content?.length ?? 0) + MESSAGE_FRAMING_CHARS;
+    chars += (m.content?.length ?? 0) + MESSAGE_FRAMING_CHARS + (m.images?.length ?? 0) * IMAGE_TOKENS * 3;
     for (const tc of m.tool_calls ?? []) {
       chars += (tc.function?.name?.length ?? 0) + (tc.function?.arguments?.length ?? 0) + MESSAGE_FRAMING_CHARS;
     }

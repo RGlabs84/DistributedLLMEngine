@@ -36,6 +36,7 @@ import {
   DEFAULT_CHARS_PER_TOKEN, ENGINE_DROP_RETRIES, contextTokensFrom, engineDropWaitMs, isOverflowAlert, isOverflowError,
   promptBudgetFor,
 } from '../agent/agentLoop';
+import { visionOffered } from './pictures';
 import { checkHistory, loopNote, loopStopError, loopStopNote, loopSummary } from '../agent/loopGuard';
 import { logOnce } from '../log';
 import { redactText } from '../privacy';
@@ -92,7 +93,7 @@ type Status = ReturnType<DlneClient['lastKnownClusterStatus']>;
 
 /** What the entry shows of the status: if this changes, VS Code is told to ask again. */
 function signatureOf(status: Status | undefined): string {
-  return `${contextTokensFrom(status)}|${activeModelName(status) ?? ''}`;
+  return `${contextTokensFrom(status)}|${activeModelName(status) ?? ''}|${visionOffered(status) ? 'vision' : ''}`;
 }
 
 /** A pause that a Stop cuts short. */
@@ -213,7 +214,8 @@ export class DlneChatModelProvider implements vscode.LanguageModelChatProvider {
       // The prompt gets what the agent loop gives its own: the reply's room and a margin are kept back from the context.
       maxInputTokens: promptBudgetFor(contextTokensFrom(status)),
       maxOutputTokens: AGENT_MAX_TOKENS,
-      capabilities: { toolCalling: true, imageInput: false },
+      // Pictures are read while the coordinator says its engine can (capabilities.vision); a coding member cannot.
+      capabilities: { toolCalling: true, imageInput: visionOffered(status) },
     }];
   }
 
@@ -254,7 +256,8 @@ export class DlneChatModelProvider implements vscode.LanguageModelChatProvider {
     // An image is refused here, before anything is sent. What VS Code's tools read is held back where the privacy rules say so
     // (the contents of an excluded file become the usual notice), then secrets are hidden, in the tool list as well.
     const workspace = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
-    const body = this.checkedForLoop(scrub(withoutExcludedFiles(toOpenAiMessages(messages), workspace)));
+    const vision = visionOffered(this.client.lastKnownClusterStatus?.() ?? null);
+    const body = this.checkedForLoop(scrub(withoutExcludedFiles(toOpenAiMessages(messages, { vision }), workspace)));
     const tools = redactedTools(toOpenAiTools(options.tools));
     const offered = new Set(tools.map((tool) => tool.function.name));
     const sessionId = this.sessionFor(options.modelOptions);

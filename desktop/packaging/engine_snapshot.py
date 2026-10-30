@@ -15,7 +15,7 @@ import sys
 from typing import List, Tuple
 
 # Copied from the repository's engine/ as they are.
-ENGINE_FILES = ("__init__.py", "config.py", "hardware.py", "coding_member_select.py", "release.py")
+ENGINE_FILES = ("__init__.py", "config.py", "dock_policy.py", "hardware.py", "coding_member_select.py", "release.py")
 
 # Not the engine's file: a quiet stand-in kept in packaging/snapshot_engine/, taking the engine file's place in the snapshot.
 # engine/logger.py prints with Rich and opens a log file next to the executable, neither of which the tray process wants.

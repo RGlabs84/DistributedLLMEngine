@@ -426,14 +426,18 @@ def test_the_coordinator_serves_no_download_of_it():
 def test_the_three_pins_are_the_contracts_and_the_runtime_checks_the_same_names_and_sizes():
     pins = {p["role"]: p for p in fetch.load_pins()}
     assert set(pins) == {"diffusion", "vae", "llm"}
-    assert pins["diffusion"]["url"] == ("https://huggingface.co/leejet/Z-Image-Turbo-GGUF/resolve/"
-                                        "c61c0e422dc8b541b7548cf33a4ef8302b0f8085/z_image_turbo-Q4_K.gguf")
+    # FLUX.2 [klein] 4B since 2.6.6.
+    assert pins["diffusion"]["file"] == "flux-2-klein-4b-Q4_0.gguf"
+    assert pins["diffusion"]["url"] == ("https://huggingface.co/leejet/FLUX.2-klein-4B-GGUF/resolve/"
+                                        "3b1f5a9dc3abb32238b053aeb3d823c30afdacbd/flux-2-klein-4b-Q4_0.gguf")
     assert (pins["diffusion"]["size"], pins["diffusion"]["sha256"]) == (
-        3864250304, "14b375ab4f226bc5378f68f37e899ef3c2242b8541e61e2bc1aff40976086fbd")
-    assert pins["vae"]["url"] == ("https://huggingface.co/Comfy-Org/Z-Image-Turbo/resolve/"
-                                  "6fc90a3b1b653e935a0d175e260736de25b84df5/split_files/vae/ae.safetensors")
+        2460378560, "d1023499ef3f2f82ff7c50e6778495195c1b6cc34835741778868428111f9ff4")
+    # The full-encoder VAE, saved under a name of its own (sd-server refuses the small decoder alone).
+    assert pins["vae"]["file"] == "flux2-full-encoder-small-decoder.safetensors"
+    assert pins["vae"]["url"] == ("https://huggingface.co/black-forest-labs/FLUX.2-small-decoder/resolve/"
+                                  "a3efc24f613ef42d9428af62fdbd6f5fd8856c4a/full_encoder_small_decoder.safetensors")
     assert (pins["vae"]["size"], pins["vae"]["sha256"]) == (
-        335304388, "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38")
+        249519092, "ea4273f02d1fafbf8e1d1c2cf6018ed8748652eb0bf34f2dd91171f16f15ab62")
     for role, pin in pins.items():
         assert image_member.MODEL_FILES[role] == (pin["file"], pin["size"])
         assert len(pin["sha256"]) == 64 and "/resolve/" in pin["url"] and len(pin["url"].split("/resolve/")[1].split("/")[0]) == 40

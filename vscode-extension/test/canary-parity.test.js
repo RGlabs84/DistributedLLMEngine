@@ -89,8 +89,8 @@ import ast, json, random, sys
 tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
 values = {"_AGENT_SYSTEM_PROMPT", "_AGENT_TOOLS", "_PROJECTS", "CONTEXT_OPEN", "CONTEXT_INTRO", "CONTEXT_HEADINGS",
           "CONTEXT_CLOSE", "CONTEXT_SHARE", "_CONTEXT_AGENTS", "_CONTEXT_PROJECT", "_CONTEXT_USER", "_CONTEXT_SECTIONS",
-          "_MEMORY_STYLES"}
-code = {"_tool", "_context_message", "_Sample", "fact_key", "fact_id", "fact_ids", "_memory_section"}
+          "_MEMORY_STYLES", "_IMAGE_TOOL", "_IMAGE_PROMPT_LINE", "_IMAGE_PROMPT_MARKER", "_VIEW_IMAGE_TOOL", "_VIEW_IMAGE_PROMPT_LINE"}
+code = {"_tool", "_context_message", "_Sample", "fact_key", "fact_id", "fact_ids", "_memory_section", "agent_system_prompt", "agent_tools"}
 keep = []
 for node in tree.body:
     if isinstance(node, (ast.Import, ast.ImportFrom)) and (getattr(node, "module", None) or node.names[0].name) in ("typing", "random", "dataclasses", "hashlib", "re"):
@@ -115,6 +115,8 @@ for seed in range(int(sys.argv[2])):
     blocks.append({"lang": lang, "project": project, "path": langs[lang], "content": ns["_context_message"](sample, project, r)})
 print(json.dumps({
     "prompt": ns["_AGENT_SYSTEM_PROMPT"], "tools": ns["_AGENT_TOOLS"], "projects": ns["_PROJECTS"],
+    "prompt_both": ns["agent_system_prompt"](True, True), "tools_both": ns["agent_tools"](True, True),
+    "view_tool": ns["_VIEW_IMAGE_TOOL"], "view_line": ns["_VIEW_IMAGE_PROMPT_LINE"],
     "open": ns["CONTEXT_OPEN"], "intro": ns["CONTEXT_INTRO"], "headings": ns["CONTEXT_HEADINGS"], "close": ns["CONTEXT_CLOSE"],
     "share": ns["CONTEXT_SHARE"], "agents": ns["_CONTEXT_AGENTS"], "project_lines": ns["_CONTEXT_PROJECT"],
     "user_lines": ns["_CONTEXT_USER"], "blocks": blocks,
@@ -191,17 +193,43 @@ test('the contract\'s system prompt is word for word the canary\'s _AGENT_SYSTEM
 // 2. The tools
 // ---------------------------------------------------------------------------------------------
 
-test('the contract\'s remember tool is the last entry of ToolRegistry.getToolDefinitions()', () => {
+test('the contract\'s remember tool is the eighth entry of ToolRegistry.getToolDefinitions()', () => {
   const doc = JSON.parse(fromDoc('REMEMBER_TOOL'));
   const tools = ToolRegistry.getToolDefinitions();
-  assert.equal(tools.length, 8, 'the seven tools of today plus remember');
-  assert.deepEqual(tools[tools.length - 1], doc);
+  assert.equal(tools.length, 10, 'the seven tools of today plus remember, use_skill and save_skill');
+  assert.deepEqual(tools[7], doc);
 });
 
-test('the contract\'s remember tool is the last entry of the canary\'s _AGENT_TOOLS', () => {
+test('the contract\'s remember tool is the eighth entry of the canary\'s _AGENT_TOOLS', () => {
   const doc = JSON.parse(fromDoc('REMEMBER_TOOL'));
-  assert.equal(canary.tools.length, 8);
-  assert.deepEqual(canary.tools[canary.tools.length - 1], doc);
+  assert.equal(canary.tools.length, 10);
+  assert.deepEqual(canary.tools[7], doc);
+});
+
+test('the contract\'s skill tools are the ninth and tenth entries of the extension\'s tool list and of the canary\'s, key order included', () => {
+  const docs = [JSON.parse(fromDoc('USE_SKILL_TOOL')), JSON.parse(fromDoc('SAVE_SKILL_TOOL'))];
+  const tools = ToolRegistry.getToolDefinitions();
+  assert.deepEqual(tools.slice(8), docs);
+  assert.deepEqual(canary.tools.slice(8), docs);
+  // the engine's cache sees bytes: the keys come in the same order too
+  assert.equal(JSON.stringify(tools.slice(8)), JSON.stringify(docs));
+  assert.equal(JSON.stringify(canary.tools.slice(8)), JSON.stringify(docs));
+  assert.deepEqual(docs.map((t) => t.function.name), ['use_skill', 'save_skill']);
+  assert.deepEqual(docs[1].function.parameters.required, ['name', 'description', 'instructions', 'scope']);
+});
+
+test('the contract\'s view_image tool is the canary\'s and the extension\'s, key order included, and the lists with it agree', () => {
+  const { viewImageToolDefinition, VIEW_IMAGE_PROMPT_LINE, withViewImageLine } = require('../dist/agent/viewImage');
+  const { imageToolDefinition, withImageLine } = require('../dist/agent/imageTool');
+  const doc = JSON.parse(fromDoc('VIEW_IMAGE_TOOL'));
+  assert.deepEqual(viewImageToolDefinition(), doc);
+  assert.equal(JSON.stringify(viewImageToolDefinition()), JSON.stringify(doc));
+  assert.equal(JSON.stringify(canary.view_tool), JSON.stringify(doc));
+  assert.equal(canary.view_line, VIEW_IMAGE_PROMPT_LINE);
+  // generate_image, then view_image, last; and the prompt gains the two lines in that order
+  const own = JSON.parse(JSON.stringify([...ToolRegistry.getToolDefinitions(), imageToolDefinition(), viewImageToolDefinition()]));
+  assert.equal(JSON.stringify(canary.tools_both), JSON.stringify(own));
+  assert.equal(canary.prompt_both, withViewImageLine(withImageLine(AGENT_SYSTEM_PROMPT)));
 });
 
 test('the canary\'s whole tool list is the extension\'s, in the same order', () => {

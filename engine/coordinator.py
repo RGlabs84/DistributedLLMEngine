@@ -78,7 +78,7 @@ from engine.swarm_clock import CLOCK_HEADER
 from engine.throughput import POOL_CODING, POOL_PHONE, StreamTokenCounter, completion_tokens, throughput
 from engine import coding_router as coding_members_lib
 from engine.coding_router import coding_router
-from engine.downloader import download_and_extract_engine, download_verified
+from engine.downloader import download_and_extract_engine, download_verified, coordinator_engine_flavour
 from engine.version import VERSION
 from engine import release as release_lib
 from engine import coding_ladder, coding_speed
@@ -1567,6 +1567,41 @@ def check_contrib_clause(request: Request):
 # Model catalogue
 # ======================================================================================
 
+def caller_tier(request: Request) -> str:
+    """
+    Which tier this caller is on, the same answer NonContribBlockerMiddleware gives a chat request
+    (``request.state.dlne_tier``), worked out without spending anything: no trial chat is charged and no window
+    is counted. ``host``, ``key``, ``gpu``, ``cpu``, ``trial`` or ``open`` (the contribution rule is off).
+    A contributor that fails the floors the middleware refuses for is ``trial``: it holds no standing.
+    """
+    limits = get_worker_limits()
+    if not limits.get("enforce_contrib_clause", True):
+        return "open"
+    client_ip = get_client_ip(request)
+    if is_local_ip(client_ip):
+        return "host"
+    token = get_request_token(request)
+    if token and api_key_manager.verify_key(token):
+        return "key"
+    worker = registry.find_by_token(token) if token else None
+    if not worker or cpu_node_shortfalls(worker.get("hardware", {}), limits):
+        return "trial"
+    if _as_number(gpu_section(worker.get("hardware", {})).get("vram_total_gb", 0)) > 0 and _gpu_keeps_perks(worker, limits):
+        return "gpu"
+    return "cpu"
+
+
+@app.get("/v1/me")
+async def get_me(request: Request):
+    """
+    ``GET /v1/me`` -> ``{"tier": "key"}``: who the coordinator takes this caller to be (one of host, key, gpu, cpu,
+    trial, open), so the extension can tell whether a key holder's unlimited agent turns apply
+    (docs/release-2.7-contract.md). Authenticated like every request (the decoy-key tripwire sees it in the
+    middleware), but it costs nothing: a trial caller is told "trial" and keeps every chat. Nothing else is returned.
+    """
+    return JSONResponse({"tier": caller_tier(request)}, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/v1/models")
 async def get_models(request: Request):
     """
@@ -1665,6 +1700,21 @@ async def download_rpc_bin(platform: str):
     if os.path.exists(zip_path):
         return FileResponse(zip_path, filename=release_lib.rpc_zip_name(platform), media_type="application/zip")
     raise HTTPException(status_code=404, detail="RPC binary archive not found")
+
+
+@app.get("/v1/download/cuda-bin/{platform}")
+async def download_cuda_bin(platform: str):
+    """
+    Serves the CUDA engine (2.7) for one platform (win-x64, linux-x64): llama.cpp's CUDA 13 build with NVIDIA's
+    runtime beside it, about 600 MB. Its size and SHA-256 are signed into /v1/release as cuda_<platform>_*, which is
+    what a node checks; the file is the one the release installer put beside the code.
+    """
+    if platform not in release_lib.CUDA_PLATFORMS:
+        raise HTTPException(status_code=404, detail="No CUDA engine for that platform.")
+    zip_path = os.path.join(get_base_dir(), release_lib.cuda_zip_name(platform))
+    if os.path.exists(zip_path):
+        return FileResponse(zip_path, filename=release_lib.cuda_zip_name(platform), media_type="application/zip")
+    raise HTTPException(status_code=404, detail="CUDA engine archive not found")
 
 
 @app.get("/v1/download/rpc-bin")
@@ -1907,6 +1957,7 @@ async def admin_stats(request: Request):
             "active_model": global_active_model,
             "running_models": manager.get_active_model_names(),
             "workers": registry.count(),
+            "engine_flavours": registry.engine_flavour_counts(),    # workers on each llama.cpp engine (2.7.0)
             "total_vram_gb": registry.get_total_vram_gb(),
             "total_sysram_gb": registry.get_total_sysram_gb(),
             "in_flight_requests": active_inference_requests,
@@ -2188,7 +2239,19 @@ def _fim_engine_slots() -> int:
     return max(FIM_ENGINE_SLOTS, int(coding_gate.stats().get("slots") or 0))
 
 
-def _pin_lane(body: Dict[str, Any], snapshot: Optional[Dict[str, Any]], short: bool = False) -> Optional[int]:
+def _session_lane_key(request: Optional[Request]) -> Optional[str]:
+    """
+    What a coding conversation's lane is remembered under: the HMAC tag of its ``X-DLNE-Session`` (one random
+    UUID per conversation, engine/chat_privacy.chat_tag), never the id itself; None without a well-formed one.
+    """
+    if request is None:
+        return None
+    session = clean_chat_id(request.headers.get("x-dlne-session"))
+    return f"code:{chat_tag(session)}" if session else None
+
+
+def _pin_lane(body: Dict[str, Any], snapshot: Optional[Dict[str, Any]], short: bool = False,
+              key: Optional[str] = None) -> Optional[int]:
     """
     Names the engine slot (lane) a coding or autocomplete request runs on, once the engine has phone lanes.
     Left to llama-server a request goes to whichever idle slot matches its prompt best, a phone's lane
@@ -2196,11 +2259,21 @@ def _pin_lane(body: Dict[str, Any], snapshot: Optional[Dict[str, Any]], short: b
     lane taken from ``lane_book`` (the caller gives it back, with the same ``short``), or None with ``body``
     untouched while the engine has no phone lanes, so every body reaches it exactly as it always did.
     ``short``: autocomplete, which the book counts apart from a chat (engine/priority.LaneBook).
+
+    A chat goes back to the lane its conversation used last (``key``, :func:`_session_lane_key`) when no chat is
+    on it, as a phone's chat does: that lane still holds its cached prompt. Otherwise it takes the lane a chat
+    used longest ago. Before 2.7.0 every idle chat took lane 0, so two conversations taking turns (two editors)
+    made the engine read each one's whole prompt again, minutes at 90k tokens.
     """
     if int((snapshot or {}).get("phone_slots") or 0) <= 0:
         return None
     body.pop("id_slot", None)
-    lane = lane_book.take(0, int(snapshot.get("dynamic_slots") or 1), short=short)
+    count = int(snapshot.get("dynamic_slots") or 1)
+    if short:
+        lane = lane_book.take(0, count, short=True)
+    else:
+        lane = lane_book.take(0, count, prefer=lane_affinity.lane_for(key), spread=True)
+        lane_affinity.remember(key, lane)
     body["id_slot"] = lane
     return lane
 
@@ -2816,7 +2889,7 @@ async def _chat_completions_impl(request: Request, slot_held: bool = False):
                 dynamic_slots = model_data.get("dynamic_slots", 4)
                 slot_context = safe_context // dynamic_slots
                 coding_gate.resize(dynamic_slots)
-        coding_lane = _pin_lane(body, model_data)
+        coding_lane = _pin_lane(body, model_data, key=_session_lane_key(request))
 
         # Estimate tokens in the messages and truncate if they exceed (slot_context - 100)
         messages = body.get("messages", [])
@@ -3510,6 +3583,9 @@ async def get_cluster_status(request: Request):
         "is_swapping_models": is_swapping_models,
         "model_loading": loading_telemetry,
         "server_version": VERSION,
+        # Which llama.cpp build the coordinator's own engine is (2.7): "vulkan" or "cuda". Display only (the version
+        # above stays one plain number): a client shows "2.7.0+cuda" from the two.
+        "engine_flavour": coordinator_engine_flavour(),
         # Automatic model switching (engine/auto_swap.py): {enabled, state, target, detail},
         # state one of off|steady|waiting|downloading|swapping|cooldown|held, detail a sentence
         # such as "Switching to X in 6 min if the pool keeps 24 GB." "held" (2.6.2) is the flap breaker: the
@@ -6685,6 +6761,11 @@ async def _image_offered() -> bool:
     return (await _image_available())[0]
 
 
+async def _vision_offered() -> bool:
+    """capabilities.vision, for the canaries (the extension then offers view_image, and its requests carry the tool)."""
+    return await _engine_vision(manager.get_active_model_names())
+
+
 def _image_unavailable_detail() -> str:
     restarting = get_worker_limits().get("image_gen_enabled", False) and (
         is_swapping_models or is_recalculating_queue or not manager.get_active_model_names())
@@ -6803,9 +6884,9 @@ def _create_image_job(request: Request, kind: str, raw: Any, size: Any) -> Job |
     """
     Everything a picture request goes through before it is queued, in one place for POST /v1/app/images, POST /v1/images
     and the phone chat's create_image tool (:func:`_chat_picture`): the description is cleaned and measured, the size
-    checked (None is the default), the term list, the charge (:func:`_charge_phone_image`, or the coding gate for the IDE),
-    the hourly cap and the queue. The queued :class:`Job`, or the refusal, which costs nothing. The caller has checked
-    that pictures can be made.
+    checked (None is the default, an old client's size is drawn at today's size of its shape), the term list, the charge
+    (:func:`_charge_phone_image`, or the coding gate for the IDE), the hourly cap and the queue. The queued :class:`Job`,
+    or the refusal, which costs nothing. The caller has checked that pictures can be made.
     """
     if isinstance(raw, str) and len(raw) > image_policy.MAX_RAW_PROMPT_CHARS:
         return _ImageRefusal(400, "prompt_too_long", f"Keep the description under {image_policy.MAX_PROMPT_CHARS} characters.")
@@ -6814,9 +6895,11 @@ def _create_image_job(request: Request, kind: str, raw: Any, size: Any) -> Job |
         return _ImageRefusal(400, "prompt_empty", "Describe the picture you'd like.")
     if len(prompt) > image_policy.MAX_PROMPT_CHARS:
         return _ImageRefusal(400, "prompt_too_long", f"Keep the description under {image_policy.MAX_PROMPT_CHARS} characters.")
-    size = image_policy.DEFAULT_SIZE if size is None else size
-    if not isinstance(size, str) or size not in image_policy.SIZES:
+    # An old client's size (2.6.1 to 2.6.5) is drawn at today's size of its shape; the job carries the size drawn.
+    drawn = image_policy.drawn_size(size)
+    if drawn is None:
         return _ImageRefusal(400, "bad_size", "The size must be one of: " + ", ".join(image_policy.SIZES) + ".")
+    size = drawn
     refusal = image_policy.check_terms(prompt)
     if refusal is not None:
         log_coordinator(f"Image request refused by the term list: {image_policy.prompt_tag(prompt)} {refusal.category}.")
@@ -6824,6 +6907,9 @@ def _create_image_job(request: Request, kind: str, raw: Any, size: Any) -> Job |
 
     network = trial_identity(get_client_ip(request))
     refund: Optional[Callable[[], None]] = None
+    # A picture from the IDE waits in the queue by its caller's tier, as a coding chat does; the phone's are everyone's.
+    priority = tier_priority(getattr(request.state, "dlne_tier", None) or caller_tier(request)) if kind == "ide" \
+        else tier_priority(None)
     if kind == "ide":
         check_contrib_clause(request)           # raises the 403 wall; for a trial caller it spent one chat, which is this picture's
         if hasattr(request.state, "starter_quota_remaining"):
@@ -6833,7 +6919,7 @@ def _create_image_job(request: Request, kind: str, raw: Any, size: Any) -> Job |
         if refused is not None:
             return refused
     try:
-        return image_service.submit(network, kind, prompt, size, refund)
+        return image_service.submit(network, kind, prompt, size, refund, priority)
     except Rejected as exc:
         if refund is not None:
             refund()
@@ -6855,7 +6941,8 @@ async def _images_create(request: Request, kind: str) -> JSONResponse:
     made = _create_image_job(request, kind, body.get("prompt"), body.get("size"))
     if isinstance(made, _ImageRefusal):
         return made.response()
-    return JSONResponse({"id": made.id, "status": made.status, "position": image_service.position_of(made),
+    # ``size`` is the size that will be drawn: for an old client's size, not the one it sent (2.6.6).
+    return JSONResponse({"id": made.id, "status": made.status, "size": made.size, "position": image_service.position_of(made),
                          "eta_seconds": image_service.eta_of(made)}, status_code=202, headers={"Cache-Control": "no-store"})
 
 
@@ -6975,7 +7062,7 @@ async def startup_event():
     # while CODING_MEMBERS_ENABLED is off, so this does nothing until the owner turns members on.
     _auto_swap_tasks.append(spawn_background_task(
         canary.CanaryScheduler(_canary_members, _canary_forward, trusted=_canary_trusted,
-                               image_generation=_image_offered).run(),
+                               image_generation=_image_offered, vision=_vision_offered).run(),
         "coding-canaries"))
 
 

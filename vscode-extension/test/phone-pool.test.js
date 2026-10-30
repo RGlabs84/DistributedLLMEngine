@@ -402,10 +402,12 @@ test('packaging refuses a version whose CHANGELOG entry has no date', () => {
 test('no text in the extension says contributors get unlimited chats or that a CPU runs the coding model', () => {
   const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
     e.isDirectory() ? walk(path.join(dir, e.name)) : e.name.endsWith('.ts') ? [path.join(dir, e.name)] : []);
-  const offenders = walk(path.join(ROOT, 'src')).filter((file) => /unlimited/i.test(fs.readFileSync(file, 'utf8')));
+  // (2.7.0: an API-key holder's "unlimited turns" is an agent setting, not a promise to contributors.)
+  const promise = /unlimited(?![ _-]?(agent[ _-])?turns)/i;
+  const offenders = walk(path.join(ROOT, 'src')).filter((file) => promise.test(fs.readFileSync(file, 'utf8')));
   assert.deepEqual(offenders, []);
   const settings = JSON.stringify(pkg.contributes);
-  assert.doesNotMatch(settings, /unlimited/i);
+  assert.doesNotMatch(settings, promise);
   // The settings page says what a CPU is for, and no longer promises a fixed 12 GB offer.
   const props = pkg.contributes.configuration.properties;
   assert.match(props['dlne.worker.device'].description, /a CPU powers the DLNE phone app/);

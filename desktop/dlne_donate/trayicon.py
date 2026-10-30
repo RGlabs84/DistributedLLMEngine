@@ -4,7 +4,7 @@ import threading
 import webbrowser
 from typing import Any, Callable, Optional
 
-from . import WEBSITE_URL, bundled
+from . import APP_NAME, WEBSITE_URL, __version__, bundled
 from . import worker as worker_mod
 
 BADGE = {
@@ -37,12 +37,19 @@ def make_icon(state: str, size: int = 64) -> Any:
     return image
 
 
+def version_line(status: worker_mod.Status) -> str:
+    """The menu's version line: this app's version, and the engine's with its flavour (``2.7.0+cuda``) once it is known."""
+    engine = f" · engine {status.version_label}" if status.version_label else ""
+    return f"{APP_NAME} {__version__}{engine}"
+
+
 class Tray:
     """The pystray icon. Everything it does is handed to ``actions``; it never touches the worker or the window itself."""
 
     def __init__(self, status: Callable[[], worker_mod.Status], autostart_enabled: Callable[[], bool], actions: dict,
-                 donate_enabled: Callable[[], bool] = lambda: True):
+                 donate_enabled: Callable[[], bool] = lambda: True, update_label: Callable[[], str] = lambda: ""):
         self._status = status
+        self._update_label = update_label       # "Update DLNE Donate to 1.2.0" while a newer version is known, else ""
         self._autostart_enabled = autostart_enabled
         self._actions = actions
         self._donate_enabled = donate_enabled
@@ -70,10 +77,12 @@ class Tray:
             menu = pystray.Menu(
                 pystray.MenuItem(self._toggle_label, self._toggle_clicked, enabled=self._toggle_enabled),
                 pystray.MenuItem("Settings…", self._call("settings"), default=True),
+                pystray.MenuItem(lambda _i: self._update_label(), self._call("update"), visible=lambda _i: bool(self._update_label())),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Start with my computer", self._call("autostart"), checked=lambda _i: self._autostart_enabled()),
                 pystray.MenuItem("Open the DLNE website", lambda _i, _it=None: webbrowser.open(WEBSITE_URL)),
                 pystray.Menu.SEPARATOR,
+                pystray.MenuItem(lambda _i: version_line(self._status()), None, enabled=False),
                 pystray.MenuItem("Quit", self._call("quit")),
             )
             status = self._status()
@@ -104,12 +113,18 @@ class Tray:
                 self._last_title = status.tooltip
             # The menu is rebuilt only when something it shows changed, not every second: a menu that is open while it is
             # rebuilt would have a label that no longer matches what a click is taken to mean.
-            key = (status.running, self._autostart_enabled(), self._toggle_enabled())
+            key = (status.running, self._autostart_enabled(), self._toggle_enabled(), version_line(status), self._update_label())
             if key != self._last_menu_key:
                 self._last_menu_key = key
                 icon.update_menu()
         except Exception:  # noqa: BLE001 - a broken tray never stops donating
             pass
+
+    def notify(self, message: str, title: str = "DLNE Donate") -> None:
+        """A tray notification (a desktop without notification support shows nothing; the window's own line says the same)."""
+        icon = self.icon
+        if icon is not None:
+            _quietly(lambda: icon.notify(message, title))
 
     def visible(self) -> bool:
         """

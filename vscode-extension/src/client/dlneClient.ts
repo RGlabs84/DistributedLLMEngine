@@ -8,6 +8,7 @@ import {
 } from './pipeline';
 import { QueueInfo, QueueUpdate, parseCodingQueue, parseQueueInfo, queueFromBody, queueProgressLine } from './queue';
 import { RouteLookup, rerouteReason } from './route';
+import { PictureAttachment, wireMessages } from './pictures';
 import { editorSessionId } from './session';
 import { DEFAULT_WAIT_TIMING, WaitTiming, WaitWatcher } from './waitWatcher';
 import * as fs from 'fs';
@@ -58,7 +59,7 @@ export interface ClusterStatus {
    */
   policy?: { coding_context_tokens?: number; coding_context_tokens_max?: number; [rule: string]: unknown };
   /** What this coordinator offers beyond chat (2.6.1); `image_generation` gates the agent's generate_image tool. */
-  capabilities?: { image_generation?: boolean; [capability: string]: unknown };
+  capabilities?: { image_generation?: boolean; vision?: boolean; [capability: string]: unknown };
   /** While image generation is on: its queue and the estimate per size (informational; the tool polls the job). */
   image_generation?: { queue?: number; busy?: boolean; eta_seconds?: Record<string, number>; sizes?: string[]; default_size?: string };
 }
@@ -136,6 +137,13 @@ export function promptTokensOf(chunk: any): number | undefined {
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string | null;
+  /**
+   * Pictures the user (or view_image) put in this message (4d). They are not part of `content`: the request writes them as
+   * `image_url` parts (wireMessages), and every count of the message's text stays on a plain string.
+   */
+  images?: PictureAttachment[];
+  /** The user turn the pictures belong to; older ones stop being sent (withoutOldPictures). Never sent. */
+  pictureTurn?: number;
   name?: string;
   tool_call_id?: string;
   tool_calls?: Array<{
@@ -188,6 +196,8 @@ const OLD_DROP_ALERT = '[System Alert: Node disconnected mid-response.]';
 export class ServerRefusal extends Error {
   /** Set when the coordinator answered a sealed request with `dlne_reroute` (its reason): ask for a new route. */
   public reroute?: string;
+  /** The refusal's `code` when the body carries one (a refused picture: `image_too_large`, `image_quota`, ...). */
+  public code?: string;
 
   constructor(public readonly status: number | undefined, message: string) {
     super(message);
@@ -251,6 +261,16 @@ export interface CompletionOutcome {
 function isMemberFailure(err: any): boolean {
   return err instanceof MemberAnswerError
     || (err instanceof ServerRefusal && ([404, 410, 421, 502, 504].includes(err.status ?? 0) || err.reroute !== undefined));
+}
+
+/** The `code` of a refusal's body (engine/media.py: `image_input_unavailable`, `image_quota`, ...), or undefined. */
+export function serverErrorCode(body: string): string | undefined {
+  try {
+    const parsed = JSON.parse(body);
+    return parsed && typeof parsed.code === 'string' && /^[a-z_]{1,40}$/.test(parsed.code) ? parsed.code : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function serverErrorMessage(status: number | undefined, body: string): string {
@@ -479,6 +499,14 @@ export class DlneClient {
     });
   }
 
+  /**
+   * GET /v1/me (2.7.0): the tier the coordinator gives this client's credential, asked with the headers of a chat
+   * request (agent/keyTier.ts keeps the answer). A coordinator from before 2.7.0 answers 404. Never throws.
+   */
+  whoAmI(): Promise<ImageReply> {
+    return this.imageRequest('GET', '/v1/me');
+  }
+
   async getClusterStatus(): Promise<ClusterStatus | null> {
     const res = await this.getClusterStatusDetailed();
     return res.data || null;
@@ -567,7 +595,7 @@ export class DlneClient {
     const sessionId = options.sessionId ?? editorSessionId();
 
     const payload: Record<string, any> = {
-      messages,
+      messages: wireMessages(messages),
       stream: true,
       temperature: 0.2,
       max_tokens: AGENT_MAX_TOKENS
@@ -911,7 +939,9 @@ export class DlneClient {
             } else if (res.statusCode === 503) {
               resolve({ content: '', toolCalls: [], stillLoading: true });
             } else {
-              reject(new ServerRefusal(res.statusCode, serverErrorMessage(res.statusCode, text)));
+              const refusal = new ServerRefusal(res.statusCode, serverErrorMessage(res.statusCode, text));
+              refusal.code = serverErrorCode(text);
+              reject(refusal);
             }
           });
           return;

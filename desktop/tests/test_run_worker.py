@@ -11,7 +11,8 @@ from conftest import DESKTOP, REPO
 def make_engine(tmp_path, body):
     root = tmp_path / "engine-root"
     (root / "engine").mkdir(parents=True)
-    shutil.copy(REPO / "engine" / "config.py", root / "engine" / "config.py")
+    for name in ("config.py", "dock_policy.py"):          # engine/config.py imports engine.dock_policy (2.6.4)
+        shutil.copy(REPO / "engine" / name, root / "engine" / name)
     (root / "engine" / "__init__.py").write_text("")
     (root / "dlne_server.py").write_text(body, encoding="utf-8")
     return root

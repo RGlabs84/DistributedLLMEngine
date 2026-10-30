@@ -96,9 +96,9 @@ def test_system_prompt_is_the_one_the_agent_sends():
 def test_tool_list_matches_tools_ts():
     src = read_ts("agent", "tools.ts")
     ts_tools = ts_array_to_python(src, "static getToolDefinitions(): ToolDefinition[] {\n    return [")
-    assert len(ts_tools) == len(cp.TOOLS) == 8
+    assert len(ts_tools) == len(cp.TOOLS) == 10
     assert [t["function"]["name"] for t in ts_tools] == [t["function"]["name"] for t in cp.TOOLS]
-    assert cp.TOOLS[-1]["function"]["name"] == "remember"
+    assert [t["function"]["name"] for t in cp.TOOLS][-3:] == ["remember", "use_skill", "save_skill"]
     for mine, theirs in zip(cp.TOOLS, ts_tools):
         assert mine == theirs, mine["function"]["name"]        # name, description, every parameter, required
     assert json.dumps(cp.TOOLS) == json.dumps(ts_tools)        # and in the same key order: the cached prefix is bytes
@@ -143,7 +143,7 @@ def test_compaction_constants_match_the_agent_loop():
     for name in ("DEFAULT_CONTEXT_TOKENS", "CONTEXT_SAFETY_TOKENS", "MIN_PROMPT_BUDGET", "DEFAULT_CHARS_PER_TOKEN", "USER_WORDS_MAX_CHARS",
                  "FIRST_WORDS_MAX_CHARS", "NOTES_MAX_CHARS", "TAIL_SHARE", "TAIL_RESULT_MAX_CHARS", "TAIL_ARGUMENT_MAX_CHARS", "HUGE_MESSAGE_CHARS"):
         assert getattr(cp, name) == ts_number(name), name
-    assert cp.DEFAULT_CHARS_PER_TOKEN == 3.0 and cp.TAIL_SHARE == 0.35
+    assert cp.DEFAULT_CHARS_PER_TOKEN == 3.0 and cp.TAIL_SHARE == 0.2
     assert cp.AGENT_MAX_TOKENS == ts_number("AGENT_MAX_TOKENS", read_ts("client", "dlneClient.ts"))
     assert cp.LEDGER_MAX_CHARS == ts_number("LEDGER_MAX_CHARS", read_ts("agent", "ledger.ts"))
     assert cp.CONTEXT_PROMPT_SHARE == ts_number("CONTEXT_PROMPT_SHARE") == 0.72
@@ -391,8 +391,8 @@ def test_a_newest_turn_over_its_share_is_slimmed():
     assert json.loads(assistant["tool_calls"][0]["function"]["arguments"]) == {
         "path": "big.ts", "content": "[… 5000 characters, left out to make room; the file on disk has them]"}
     assert assistant["tool_calls"][1] == {"id": "r", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "x.ts"}'}}
-    # share 2,100 tokens, two results: resultMax = floor(2100 * 3.0 * 0.8 / 2) = 2520 -> first 1,512 and last 630 characters
-    assert read["content"] == "1: " + "r" * 1509 + "\n[… 6861 characters cut]\n" + "r" * 630
+    # share 1,200 tokens, two results: resultMax = floor(1200 * 3.0 * 0.8 / 2) = 1440 -> first 864 and last 360 characters
+    assert read["content"] == "1: " + "r" * 861 + "\n[… 7779 characters cut]\n" + "r" * 360
     assert written["content"].startswith("Successfully created")
     assert mem.history[0]["role"] == "assistant"
 
@@ -404,10 +404,10 @@ def test_each_result_of_a_big_turn_gets_an_equal_part_of_the_room():
         mem.history = [{"role": "user", "content": "go"}, {"role": "assistant", "content": "", "tool_calls": calls}] + \
                       [{"role": "tool", "tool_call_id": f"c{i}", "name": "read_file", "content": "t" * chars} for i in range(n_results)]
         return [m["content"] for m in mem.select_tail(6000)[1:]]
-    twelve = big_turn(12, 6000)                      # floor(2100 * 3 * 0.8 / 12) = 420 -> the floor of 800
+    twelve = big_turn(12, 6000)                      # floor(1200 * 3 * 0.8 / 12) = 240 -> the floor of 800
     assert all(c == "t" * 480 + "\n[… 5320 characters cut]\n" + "t" * 200 for c in twelve)
-    one = big_turn(1, 20000)                         # the room would be 5,040: the cap of 4,000 -> first 2,400, last 1,000
-    assert one == ["t" * 2400 + "\n[… 16600 characters cut]\n" + "t" * 1000]
+    one = big_turn(1, 20000)                         # the room is 2,880, under the cap of 4,000 -> first 1,728, last 720
+    assert one == ["t" * 1728 + "\n[… 17552 characters cut]\n" + "t" * 720]
     fits = big_turn(2, 1000)                         # 2,000 characters is under the share: untouched
     assert fits == ["t" * 1000] * 2
 
@@ -687,7 +687,7 @@ class NotesEngine(FakeEngine):
         NotesEngine.seen.append(body)
         text = "<think>t</think>### Goal\nlook at a.ts" if "tools" not in body else "done"
         chunks = [{"choices": [{"delta": {"content": text}}]},
-                  {"choices": [{"delta": {}, "finish_reason": "stop"}], "timings": {"prompt_n": 900, "cache_n": 0, "prompt_ms": 50.0, "predicted_n": 5, "predicted_ms": 10.0}}]
+                  {"choices": [{"delta": {}, "finish_reason": "stop"}], "timings": {"prompt_n": 2000, "cache_n": 0, "prompt_ms": 50.0, "predicted_n": 5, "predicted_ms": 10.0}}]
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()

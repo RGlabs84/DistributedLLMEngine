@@ -54,6 +54,8 @@ const SEARCH_MISS = 'No matches found for';
 // and the same with "for you". The ids came with Memory 2; a task saved by 1.5.3 holds the lines without them.
 const REMEMBER_LINE = /^📝 (Remembered|Updated|Forgot) for (this project|you)(?: \[[0-9a-f]{4,8}\](?: → \[[0-9a-f]{4,8}\])?)?: (.*)$/;
 const ALREADY_REMEMBERED = 'Already remembered:';
+// What `save_skill` says (skills.ts): 📘 Skill saved|updated|removed for this project|you: <name>
+const SKILL_LINE = /^📘 Skill (saved|updated|removed) for (this project|you): (.*)$/;
 const FAILED_PREFIX = 'Tool execution failed: ';
 /** What `capOutput` puts between the head and the tail of an output it shortened. */
 const TRUNCATION_MARK = /\n\n\.\.\. \[Output truncated: \d+ characters omitted[^\]]*\] \.\.\.\n\n/;
@@ -273,6 +275,7 @@ export class Ledger {
       case 'list_directory': return this.noteListing(a, result, output);
       case 'get_workspace_diagnostics': return this.noteDiagnostics(a, result, output);
       case 'remember': return this.noteRemember(output);
+      case 'save_skill': return this.noteSkill(output);
       default:
         // A tool this ledger has no section for: only its failure is worth keeping.
         if (result?.is_error) this.fail(`${name} failed: ${firstLine(output)}`);
@@ -499,6 +502,17 @@ export class Ledger {
     // A fact that was already in the memory is neither saved now nor a failure: nothing to record.
     if (output.startsWith(ALREADY_REMEMBERED)) return;
     this.fail(`remember did not save: ${firstLine(output)}`);
+  }
+
+  private noteSkill(output: string): void {
+    const line = SKILL_LINE.exec(output.split('\n')[0].trim());
+    if (line) {
+      this.noteRemembered({ scope: line[2] === 'you' ? 'user' : 'project', fact: clip(`skill ${line[3]} ${line[1]}`, FACT_CHARS) });
+      return;
+    }
+    // An unchanged skill is neither saved now nor a failure.
+    if (output.startsWith('Already saved:')) return;
+    this.fail(`save_skill did not save: ${firstLine(output)}`);
   }
 
   private noteRemembered(entry: RememberedEntry): void {

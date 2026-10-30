@@ -172,8 +172,8 @@ SAMPLING = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1
 IMAGE_TOOL_NAME = "create_image"
 IMAGE_TOOL = {"type": "function", "function": {
     "name": IMAGE_TOOL_NAME,
-    "description": ("Create a new picture from a description. It is shown to the user below your reply about a minute "
-                    "and a half later. Use it whenever the user asks for a picture, image, drawing, painting, "
+    "description": ("Create a new picture from a description. It is shown to the user below your reply in under a "
+                    "minute. Use it whenever the user asks for a picture, image, drawing, painting, "
                     "illustration, photo-like scene, wallpaper, logo, icon, poster or art of something."),
     "parameters": {"type": "object", "properties": {
         "prompt": {"type": "string",
@@ -185,7 +185,7 @@ IMAGE_TOOL = {"type": "function", "function": {
         "required": ["prompt"]}}}
 IMAGE_INSTRUCTIONS = (" You can create pictures with the create_image tool: when the user asks for a picture of "
                       "something, call it with a detailed description instead of describing a picture in words. The "
-                      "picture appears below your reply about a minute and a half later, so reply in one short "
+                      "picture appears below your reply in under a minute, so reply in one short "
                       "sentence. You cannot change or edit a photo the user sent; offer to create a new picture from "
                       "a description instead.")
 # The apps end a reply that made a picture with "[Picture created: <description>]" in the history they send (Android

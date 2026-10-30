@@ -57,6 +57,36 @@ _RPC_MEMBER_RE = re.compile(
 _PROTO_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _BUILD_RE = re.compile(r"^b\d+$")
 
+# The CUDA engine (2.7): llama.cpp's official CUDA 13.4 build of the same tag, packaged by scripts/package_llama.py as
+# cuda-bin-<platform>.zip for the two platforms the owner chose (Linux and Windows on x64; Maxwell, Pascal and Volta
+# stay on Vulkan). Same layout and rules as an RPC zip (bin/<name>, flat, an allowlist of names), plus llama.cpp's CUDA
+# backend and NVIDIA's runtime libraries next to the programs, so the loader finds them with $ORIGIN or beside the .exe.
+# The signed manifest names each by cuda_<platform>_sha256 / cuda_<platform>_size, and ``cuda_version``. Optional, like
+# the RPC fields, so the manifest stays schema 1 and a worker from before 2.7 verifies the signature and ignores them.
+# The Vulkan assets and their fields are untouched: a CUDA machine and a Vulkan machine join the same swarm, because
+# both are the same llama.cpp tag and so the same RPC protocol (rpc_proto).
+CUDA_PLATFORMS = ("win-x64", "linux-x64")
+CUDA_VERSION = "13.4"
+# The oldest NVIDIA driver (its major number, the "580 series") that runs the CUDA 13 engine, and the Turing line below
+# which a card cannot. Source: NVIDIA's CUDA Toolkit 13.4 release notes, section 2.2 "CUDA Driver"
+# (https://docs.nvidia.com/cuda/archive/13.4.1/cuda-toolkit-release-notes/index.html): "Existing CUDA 13.x applications
+# run on drivers >=580 under CUDA minor version compatibility" (Table "Minimum Required Driver Version for CUDA Minor
+# Version Compatibility": CTK 13.x, driver >= 580, no upper bound). The notes name no per-OS number for 13.4 (the
+# per-OS table stops at 12.9; Linux 13.0 GA was >=580.65.06) and say CUDA 13.4's NEW features need R615, which a plain
+# llama.cpp build does not use; so the series, 580, is the whole rule on Linux and Windows, as the 2.7 contract says.
+CUDA_MIN_DRIVER = 580
+CUDA_MIN_COMPUTE_CAPABILITY = (7, 5)    # Turing: RTX 20 / GTX 16 and later (the CUDA 13 toolkit dropped older ones)
+_CUDA_MEMBER_RE = re.compile(
+    r"^bin/(ggml-rpc-server(\.exe)?|llama-server(\.exe)?"
+    r"|(lib)?ggml[A-Za-z0-9_.-]*\.(dll|so(\.[0-9.]+)?|dylib)"
+    r"|(lib)?(llama|llama-common|llama-server-impl|mtmd)(\.[0-9]+)*\.(dll|dylib|so(\.[0-9]+)*)"
+    r"|libomp\.dll|LICENSE"
+    r"|vcruntime140(_1)?\.dll|msvcp140\.dll"
+    # NVIDIA's runtime, the files of llama.cpp's cudart-* archive: libcudart / libcublas / libcublasLt (.so.13) on
+    # Linux, cudart64_13 / cublas64_13 / cublasLt64_13 (.dll) on Windows. Only the CUDA 13 names.
+    r"|libcudart\.so\.13|libcublas(Lt)?\.so\.13|cudart64_13\.dll|cublas(Lt)?64_13\.dll)$"
+)
+
 # The image engine (2.6.1): stable-diffusion.cpp's sd-server, which only the coordinator runs, on its media card. A
 # release that ships it signs ``sd_build`` (the upstream build, like "master-1017-be48649") and the size and SHA-256 of
 # ``server-sd.tar.gz`` (server_sd_sha256 / server_sd_size), and scripts/release_apply.py unpacks it into <root>/bin-sd/.
@@ -72,6 +102,15 @@ def rpc_zip_name(platform: str) -> str:
 def rpc_field(platform: str, what: str) -> str:
     """``rpc_field("win-x64", "sha256") == "rpc_win_x64_sha256"``."""
     return f"rpc_{platform.replace('-', '_')}_{what}"
+
+
+def cuda_zip_name(platform: str) -> str:
+    return f"cuda-bin-{platform}.zip"
+
+
+def cuda_field(platform: str, what: str) -> str:
+    """``cuda_field("linux-x64", "sha256") == "cuda_linux_x64_sha256"``."""
+    return f"cuda_{platform.replace('-', '_')}_{what}"
 
 
 def proto_major(proto: Any) -> Optional[int]:
@@ -285,6 +324,37 @@ def check_rpc_bin(path: str) -> None:
         raise ReleaseError(f"{label} contains files a release never ships: {', '.join(unexpected[:5])}")
     if not any(name in (f"bin/{exe}" for exe in RPC_EXECUTABLES) for name in names):
         raise ReleaseError(f"{label} has no bin/ggml-rpc-server.")
+
+
+def cuda_members(names: List[str]) -> List[str]:
+    """Names in a CUDA zip that it may not contain (empty when every entry is allowed)."""
+    return [name for name in names if not _CUDA_MEMBER_RE.match(name)]
+
+
+def check_cuda_bin(path: str) -> None:
+    """
+    A CUDA zip is a readable zip holding both servers, the CUDA backend and NVIDIA's runtime under bin/, nothing else.
+    A zip without the runtime would start nothing on a machine that has only the driver, so that is refused here too.
+    """
+    label = os.path.basename(path)
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = [info.filename for info in archive.infolist() if not info.is_dir()]
+            if archive.testzip() is not None:
+                raise ReleaseError(f"{label} is corrupt.")
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ReleaseError(f"{label} is not a readable zip ({type(exc).__name__}).") from exc
+    unexpected = cuda_members(names)
+    if unexpected:
+        raise ReleaseError(f"{label} contains files a release never ships: {', '.join(unexpected[:5])}")
+    present = {name[len("bin/"):] for name in names}
+    for what, options in (("ggml-rpc-server", RPC_EXECUTABLES), ("llama-server", APP_SERVER_EXECUTABLES)):
+        if not present.intersection(options):
+            raise ReleaseError(f"{label} has no bin/{what}.")
+    if not any(re.match(r"^(lib)?ggml-cuda\.(so|dll)$", name) for name in present):
+        raise ReleaseError(f"{label} has no CUDA backend (ggml-cuda).")
+    if not any(re.match(r"^(libcudart\.so\.13|cudart64_13\.dll)$", name) for name in present):
+        raise ReleaseError(f"{label} has no CUDA runtime (cudart) beside the programs.")
 
 
 # ---------------------------------------------------------------------------------------
@@ -590,7 +660,8 @@ def make_manifest(version: str, archive_path: str, git_commit: str, built_at: st
                   rpc_proto: Optional[str] = None, server_llama: Optional[str] = None,
                   app_models: Optional[List[Dict[str, Any]]] = None,
                   coding_models: Optional[List[Dict[str, Any]]] = None,
-                  sd_build: Optional[str] = None, server_sd: Optional[str] = None) -> Dict[str, Any]:
+                  sd_build: Optional[str] = None, server_sd: Optional[str] = None,
+                  cuda_zips: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """
     The unsigned manifest for ``archive_path``. Every string is validated as printable ASCII.
 
@@ -601,7 +672,8 @@ def make_manifest(version: str, archive_path: str, git_commit: str, built_at: st
     "b11838") and ``rpc_proto`` (its RPC protocol, e.g. "8.0.1"). ``server_llama`` is the
     upstream Linux build the coordinator itself runs, installed by release_apply.
     ``app_models`` and ``coding_models`` are the tier lists of scripts/app_models.json and
-    scripts/coding_models.json.
+    scripts/coding_models.json. ``cuda_zips`` maps platform -> CUDA zip (2.7); they are signed as ``cuda_version`` and
+    cuda_<platform>_sha256 / _size beside the Vulkan ones, which stay exactly as they were.
     """
     parse_version(version)
     manifest: Dict[str, Any] = {
@@ -614,7 +686,7 @@ def make_manifest(version: str, archive_path: str, git_commit: str, built_at: st
         "built_at": built_at,
         "notes": notes,
     }
-    if rpc_zips or server_llama:
+    if rpc_zips or server_llama or cuda_zips:
         if not (isinstance(llama_build, str) and _BUILD_RE.fullmatch(llama_build)):
             raise ReleaseError("Binaries need the llama.cpp build they come from, like b11838.")
         if proto_major(rpc_proto) is None:
@@ -627,6 +699,14 @@ def make_manifest(version: str, archive_path: str, git_commit: str, built_at: st
         check_rpc_bin(path)
         manifest[rpc_field(platform, "sha256")] = sha256_file(path)
         manifest[rpc_field(platform, "size")] = os.path.getsize(path)
+    if cuda_zips:
+        manifest["cuda_version"] = CUDA_VERSION
+        for platform, path in sorted(cuda_zips.items()):
+            if platform not in CUDA_PLATFORMS:
+                raise ReleaseError(f"Unknown CUDA platform {platform!r}; expected one of {', '.join(CUDA_PLATFORMS)}.")
+            check_cuda_bin(path)
+            manifest[cuda_field(platform, "sha256")] = sha256_file(path)
+            manifest[cuda_field(platform, "size")] = os.path.getsize(path)
     if server_llama is not None:
         manifest["server_llama_sha256"] = sha256_file(server_llama)
         manifest["server_llama_size"] = os.path.getsize(server_llama)
@@ -728,6 +808,21 @@ def verify_manifest(manifest: Any, pubkey_hex: Optional[str] = None) -> Tuple[bo
                 return (False, f"the manifest has no valid {sha_key}")
             if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
                 return (False, f"the manifest has no valid {size_key}")
+    # The CUDA assets (2.7), checked like the RPC zips, and only when the manifest names any. They ride on the same
+    # llama_build / rpc_proto below, which is what makes a CUDA worker's engine speak the Vulkan ones' protocol.
+    cuda_named = [p for p in CUDA_PLATFORMS if cuda_field(p, "sha256") in manifest or cuda_field(p, "size") in manifest]
+    if cuda_named or "cuda_version" in manifest:
+        has_binaries = True
+        if manifest.get("cuda_version") != CUDA_VERSION:
+            return (False, "the manifest has no valid cuda_version")
+        if not cuda_named:
+            return (False, "the manifest names a CUDA version but no CUDA build")
+        for platform in cuda_named:
+            sha, size = manifest.get(cuda_field(platform, "sha256")), manifest.get(cuda_field(platform, "size"))
+            if not isinstance(sha, str) or not _SHA256_RE.fullmatch(sha):
+                return (False, f"the manifest has no valid {cuda_field(platform, 'sha256')}")
+            if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+                return (False, f"the manifest has no valid {cuda_field(platform, 'size')}")
     if has_binaries or "llama_build" in manifest or "rpc_proto" in manifest:
         build = manifest.get("llama_build")
         if not isinstance(build, str) or not _BUILD_RE.fullmatch(build):
@@ -800,6 +895,12 @@ def verify_rpc_bin(manifest: Dict[str, Any], platform: str, path: str) -> Tuple[
                          f"the release does not sign RPC binaries for {platform}", "RPC archive")
 
 
+def verify_cuda_bin(manifest: Dict[str, Any], platform: str, path: str) -> Tuple[bool, str]:
+    """The CUDA zip on disk is the one the (already verified) manifest names for ``platform``."""
+    return _verify_asset(manifest, cuda_field(platform, "sha256"), cuda_field(platform, "size"), path,
+                         f"the release does not sign a CUDA engine for {platform}", "CUDA archive")
+
+
 def verify_server_llama(manifest: Dict[str, Any], path: str) -> Tuple[bool, str]:
     """The coordinator's llama.cpp build on disk is the one the (verified) manifest names."""
     return _verify_asset(manifest, "server_llama_sha256", "server_llama_size", path,
@@ -837,6 +938,12 @@ def host_rpc_platform(system: Optional[str] = None, machine: Optional[str] = Non
     os_key = {"Windows": "win", "Linux": "linux", "Darwin": "macos"}.get(system)
     key = f"{os_key}-{arch}" if os_key and arch else None
     return key if key in RPC_PLATFORMS else None
+
+
+def host_cuda_platform(system: Optional[str] = None, machine: Optional[str] = None) -> Optional[str]:
+    """This machine's CUDA platform key, or None when DLNE ships no CUDA engine for it (anything but x64 Linux/Windows)."""
+    key = host_rpc_platform(system, machine)
+    return key if key in CUDA_PLATFORMS else None
 
 
 def load_manifest(path: str) -> Optional[Dict[str, Any]]:

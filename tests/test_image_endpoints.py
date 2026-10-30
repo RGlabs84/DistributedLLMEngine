@@ -129,9 +129,10 @@ async def test_the_status_offers_images_with_the_contracts_block(engine, images,
     async with client(LOCAL) as c:
         status = (await c.get("/v1/cluster/status")).json()
     assert status["capabilities"] == {"vision": True, "image_generation": True}
-    assert status["image_generation"] == {"queue": 0, "busy": False, "eta_seconds": {"768x768": 80, "1024x1024": 153},
-                                          "sizes": ["768x768", "1024x1024", "768x1024", "1024x768"],
-                                          "default_size": "768x768", "per_hour": 6}
+    assert status["image_generation"] == {"queue": 0, "busy": False,
+                                          "eta_seconds": {"512x512": 26, "512x768": 31, "768x512": 31},
+                                          "sizes": ["512x512", "512x768", "768x512"],
+                                          "default_size": "512x512", "per_hour": 6}
 
 
 @pytest.mark.anyio
@@ -242,30 +243,51 @@ async def test_while_paused_the_canaries_look_like_a_server_without_pictures(pau
 @pytest.mark.anyio
 async def test_a_phone_makes_a_picture_end_to_end(images):
     async with client() as c:
-        created = await post(c, body={"prompt": "a red fox <lora:x:1> in the snow", "size": "1024x768",
+        created = await post(c, body={"prompt": "a red fox <lora:x:1> in the snow", "size": "768x512",
                                       "chat_id": "3f2b9c1e-6a47-4d52-9a0e-1b7c5d8e2f41"})
         assert created.status_code == 202
         body = created.json()
-        assert set(body) == {"id", "status", "position", "eta_seconds"} and body["status"] == "queued"
-        assert body["position"] == 1 and body["eta_seconds"] >= 100
+        assert set(body) == {"id", "status", "size", "position", "eta_seconds"} and body["status"] == "queued"
+        assert body["size"] == "768x512" and body["position"] == 1 and body["eta_seconds"] >= 23
         assert created.headers["cache-control"] == "no-store"
 
         done = await finished(c, "/v1/app/images", body["id"])
 
     assert done["status"] == "completed" and set(done) == {"id", "status", "elapsed_seconds", "image"}
     image = done["image"]
-    assert (image["width"], image["height"]) == (1024, 768) and isinstance(image["seed"], int)
+    assert (image["width"], image["height"]) == (768, 512) and isinstance(image["seed"], int)
     png = base64.b64decode(image["b64_png"])
     assert png.startswith(b"\x89PNG") and b"parameters" not in png and b"secret" not in png
     assert images.member.calls[0]["prompt"] == "a red fox in the snow"           # cleaned: the tag block is gone
 
 
 @pytest.mark.anyio
-async def test_the_default_size_is_768(images):
+async def test_the_default_size_is_512_square(images):
     async with client() as c:
         created = await post(c)
+        assert created.json()["size"] == "512x512"
         await finished(c, "/v1/app/images", created.json()["id"])
-    assert (images.member.calls[0]["width"], images.member.calls[0]["height"]) == (768, 768)
+    assert (images.member.calls[0]["width"], images.member.calls[0]["height"]) == (512, 512)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", ["/v1/app/images", "/v1/images"])
+@pytest.mark.parametrize("sent, drawn", [
+    ("512x512", (512, 512)), ("512x768", (512, 768)), ("768x512", (768, 512)),
+    # 2.6.1 to 2.6.5's sizes, which extension 1.5.4 and older pages still send: drawn at the size of their shape.
+    ("768x768", (512, 512)), ("1024x1024", (512, 512)), ("768x1024", (512, 768)), ("1024x768", (768, 512)),
+])
+async def test_an_old_clients_size_is_drawn_by_its_shape_and_the_answers_say_what_was_drawn(images, path, sent, drawn):
+    async with client() as c:
+        created = await post(c, path, {"prompt": "a red fox", "size": sent})
+        assert created.status_code == 202
+        size = "x".join(str(n) for n in drawn)
+        assert created.json()["size"] == size
+        done = await finished(c, path, created.json()["id"])
+    assert (done["image"]["width"], done["image"]["height"]) == drawn
+    assert (images.member.calls[0]["width"], images.member.calls[0]["height"]) == drawn
+    (job,) = images.service._jobs.values()
+    assert (job.size, job.width, job.height) == (size, *drawn)
 
 
 @pytest.mark.anyio
@@ -276,15 +298,19 @@ async def test_the_default_size_is_768(images):
     ({"prompt": 5}, "prompt_empty"),
     ({"prompt": "x" * 1001}, "prompt_too_long"),
     ({"prompt": "x" * 5000}, "prompt_too_long"),
-    ({"prompt": "a fox", "size": "512x512"}, "bad_size"),
+    ({"prompt": "a fox", "size": "256x256"}, "bad_size"),
+    ({"prompt": "a fox", "size": "512X512"}, "bad_size"),
     ({"prompt": "a fox", "size": 768}, "bad_size"),
     ({"prompt": "a fox", "size": "1920x1080"}, "bad_size"),
+    ({"prompt": "a fox", "size": "1024x1024 "}, "bad_size"),
 ])
 async def test_bad_requests_get_a_400_with_a_code_and_cost_nothing(images, body, code):
     async with client() as c:
         reply = await c.post("/v1/app/images", json=body)
     assert reply.status_code == 400 and reply.json()["code"] == code and reply.json()["detail"]
     assert images.quota.summary(5)["chats_used"] == 0 and images.service.status_block()["queue"] == 0
+    if code == "bad_size":                         # it names only today's sizes, never the old ones it still takes
+        assert reply.json()["detail"] == "The size must be one of: 512x512, 512x768, 768x512."
 
 
 @pytest.mark.anyio
@@ -489,9 +515,9 @@ async def test_a_job_turned_away_by_the_hourly_cap_or_a_full_queue_is_not_charge
 async def test_the_ide_makes_a_picture_through_the_same_gate_as_chat(images):
     async with client() as c:
         created = await post(c, "/v1/images", {"prompt": "an icon of a leaf", "chat_id": "ignored"})
-        assert created.status_code == 202 and set(created.json()) == {"id", "status", "position", "eta_seconds"}
+        assert created.status_code == 202 and set(created.json()) == {"id", "status", "size", "position", "eta_seconds"}
         done = await finished(c, "/v1/images", created.json()["id"])
-    assert done["status"] == "completed" and done["image"]["width"] == 768
+    assert done["status"] == "completed" and done["image"]["width"] == 512
     assert images.judge.calls[0][0] == "ide"                     # its checks take a coding slot, not a phone lane
     assert images.quota.summary(5)["chats_used"] == 1            # create passed check_contrib_clause: one trial chat
 
@@ -523,6 +549,32 @@ async def test_the_host_and_keys_are_not_charged_on_the_ide_side_either(images, 
         assert (await post(local, "/v1/images")).status_code == 202
         assert (await post(keyed, "/v1/images")).status_code == 202
     assert images.quota.summary(5)["chats_used"] == 0
+
+
+@pytest.mark.anyio
+async def test_a_key_holders_ide_picture_waits_ahead_of_a_trials_but_a_phones_is_everyones(images, monkeypatch):
+    """2.7.0: the picture queue goes by tier. The running picture is never pre-empted."""
+    monkeypatch.setattr(coordinator.api_key_manager, "verify_key", lambda token: token == "good-key")
+    images.limits["image_queue_max"] = 3
+    images.member.hold, images.member.release = True, asyncio.Event()
+    async with client(OTHER) as trial, client(REMOTE) as phone, client(("192.0.2.77", 40002), {"Authorization": "Bearer good-key"}) as keyed:
+        running = (await post(trial, "/v1/images")).json()
+        for _ in range(500):
+            if images.service.active is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert images.service.active is not None
+        waiting_trial = (await post(trial, "/v1/images")).json()
+        waiting_phone = (await post(phone, "/v1/app/images")).json()
+        key = (await post(keyed, "/v1/images")).json()
+        # behind the running picture only; the trial's and the phone's wait behind the key holder, in the order they came
+        assert (await keyed.get(f"/v1/images/{key['id']}")).json()["position"] == 2
+        assert (await trial.get(f"/v1/images/{waiting_trial['id']}")).json()["position"] == 3
+        assert (await phone.get(f"/v1/app/images/{waiting_phone['id']}")).json()["position"] == 4
+        assert (await trial.get(f"/v1/images/{running['id']}")).json()["status"] != "queued"
+        images.member.release.set()
+        for c, path, made in ((keyed, "/v1/images", key), (trial, "/v1/images", waiting_trial), (phone, "/v1/app/images", waiting_phone)):
+            assert (await finished(c, path, made["id"]))["status"] == "completed"
 
 
 @pytest.mark.anyio

@@ -13,13 +13,15 @@ import { fixDiagnostics, openChat, openChatPanel } from './views/chatEntry';
 import { registerDlneChatModel } from './client/modelProvider';
 import { ClusterStatusBar } from './statusbar/clusterStatusBar';
 import { WorkerManager } from './worker/workerManager';
+import { EditorPresence } from './worker/editorPresence';
 import { forgetSudoPassword } from './agent/askpass';
 import { SwarmDashboard } from './views/swarmDashboard';
 import { CPU_POOL_HEADLINE, CPU_POOL_PERK, EXTERNAL_WORKER_LINE, ROLE_LABEL, workerStartedNotice } from './worker/contribution';
 import { phoneChatUrl } from './serverUrl';
 import { ToolRegistry } from './agent/tools';
 import { setPastedDir } from './agent/pasted';
-import { undoMemoryChange } from './agent/memory';
+import { bindKeyTierClient } from './agent/keyTier';
+import { undoChange } from './agent/skills';
 
 function isNewerVersion(current: string, remote: string): boolean {
   const cParts = current.split('.').map((n) => parseInt(n, 10) || 0);
@@ -145,6 +147,12 @@ export function activate(context: vscode.ExtensionContext) {
   const storage = context.storageUri ?? context.globalStorageUri;
   setPastedDir(storage ? path.join(storage.fsPath, 'pasted') : undefined);
 
+  // VS Code first (4b): the DLNE Donate tray pauses its worker while this file says an editor is here. Written before the
+  // worker manager looks at the machine, so the tray hears of this editor as early as it can.
+  const presence = new EditorPresence(String(context.extension?.packageJSON?.version ?? ''));
+  presence.start();
+  context.subscriptions.push({ dispose: () => presence.stop() });
+
   const client = new DlneClient();
   const workerManager = new WorkerManager(context);
 
@@ -154,6 +162,8 @@ export function activate(context: vscode.ExtensionContext) {
   );
   client.setWorkerManager(workerManager);
   context.subscriptions.push(workerManager);
+  // Who the coordinator says this key is (/v1/me), asked through this same client (agent/keyTier.ts).
+  context.subscriptions.push(bindKeyTierClient(client));
 
   // 1. Status Bar
   const statusBar = new ClusterStatusBar(client, workerManager);
@@ -369,10 +379,10 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   // The Undo button next to a memory change in VS Code's chat (docs/agent-memory.md 7.6). Not in the command
-  // palette: it only makes sense with the change the button carries, which undoMemoryChange checks.
+  // palette: it only makes sense with the change the button carries, which undoChange checks.
   context.subscriptions.push(
     vscode.commands.registerCommand('dlne.memory.undo', (change: unknown) => {
-      const undone = undoMemoryChange(change);
+      const undone = undoChange(change);
       if (undone.ok) vscode.window.showInformationMessage(`DLNE: ${undone.message}`);
       else vscode.window.showWarningMessage(`DLNE: ${undone.message}`);
     })

@@ -588,3 +588,60 @@ export function trayWorkerRunning(
   if (stateFileSaysDonating(platform, probe, env, home)) return true;
   return platform === 'linux' && probe.run('pgrep', ['-f', TRAY_WORKER_PATTERN]) !== null;
 }
+
+// ---------------------------------------------------------------------------------------------
+// VS Code first (2.7.0, docs/release-2.7-contract.md section 4b): the tray pauses while the editor is open
+// ---------------------------------------------------------------------------------------------
+
+/** The first DLNE Donate that watches ~/.dlne/editor.json and pauses its worker for an open editor. */
+export const TRAY_PAUSING_VERSION = '1.1.0';
+
+/** `version` is at least `minimum`, both dotted numbers ("1.1.0", "1.10"); false for anything else. */
+export function versionAtLeast(version: unknown, minimum: string): boolean {
+  if (typeof version !== 'string' || !/^\d{1,4}(?:\.\d{1,4}){0,3}$/.test(version)) return false;
+  const have = version.split('.').map(Number);
+  const need = minimum.split('.').map(Number);
+  for (let i = 0; i < Math.max(have.length, need.length); i++) {
+    const a = have[i] ?? 0;
+    const b = need[i] ?? 0;
+    if (a !== b) return a > b;
+  }
+  return true;
+}
+
+/** What the tray's state.json says about handing the computer over to the editor. */
+export interface TrayHandover {
+  /** The tray knows the presence file (its state.json names a version of 1.1.0 or later), or it is leaving anyway. */
+  canPause: boolean;
+  /** The tray says it is paused (state "paused", or `"paused": true`). */
+  paused: boolean;
+}
+
+/** The handover facts in a state.json text; nothing known (a tray from before 1.1.0, no file) cannot pause. */
+export function parseTrayHandover(text: string | null): TrayHandover {
+  const none: TrayHandover = { canPause: false, paused: false };
+  if (!text) return none;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return none;
+  }
+  if (!isObject(raw)) return none;
+  const paused = raw.state === 'paused' || raw.paused === true;
+  // A tray that is stopping is leaving anyway, whatever its age: waiting for it costs nothing.
+  const canPause = paused || versionAtLeast(raw.version, TRAY_PAUSING_VERSION) || raw.state === 'stopping';
+  return { canPause, paused };
+}
+
+/** The tray's handover facts, read from its state.json on this computer. */
+export function trayHandover(
+  platform: string = process.platform,
+  probe: TrayProbe = realTrayProbe,
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = os.homedir()
+): TrayHandover {
+  if (platform !== 'win32' && platform !== 'linux') return { canPause: false, paused: false };
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  return parseTrayHandover(probe.readText(paths.join(trayAppDataDir(platform, env, home), 'state.json')));
+}

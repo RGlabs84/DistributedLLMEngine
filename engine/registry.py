@@ -440,6 +440,18 @@ class WorkerRegistry:
         with self._lock:
             return sum(1 for data in self.workers.values() if not is_companion(data.get("hardware", {})))
 
+    def engine_flavour_counts(self) -> Dict[str, int]:
+        """How many registered workers run each llama.cpp engine (2.7.0): ``{"vulkan": n, "cuda": n}``, the companion
+        half of a machine not counted again. A worker that does not say (older than 2.7) runs Vulkan. Counts only."""
+        counts = {"vulkan": 0, "cuda": 0}
+        with self._lock:
+            for data in self.workers.values():
+                hardware = _as_profile(data.get("hardware", {}))
+                if is_companion(hardware):
+                    continue
+                counts["cuda" if hardware.get("engine_flavour") == "cuda" else "vulkan"] += 1
+        return counts
+
     def find_by_token(self, token: str) -> Any:
         """
         Returns the worker registered with ``token``, or None.
@@ -827,7 +839,9 @@ class WorkerRegistry:
                 count = count if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 64 else 1
                 rows.append({"worker_id": worker_id, "endpoint": f"{data.get('ip')}:{data.get('port')}",
                              "pool": "coding" if is_coding_member(hardware) else None,
-                             "gpus": count, "vram_gb": vram})
+                             "gpus": count, "vram_gb": vram,
+                             # The llama.cpp engine it runs (2.7.0); a node that does not say runs Vulkan.
+                             "engine_flavour": "cuda" if hardware.get("engine_flavour") == "cuda" else "vulkan"})
         return rows
 
     def coding_members(self) -> List[Dict[str, Any]]:

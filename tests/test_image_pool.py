@@ -13,6 +13,7 @@ import pytest
 from engine import image_policy, media
 from engine.image_member import Cancelled, MemberError
 from engine.image_pool import ENGINE_RESTARTING, ImageService, JudgeUnavailable, Rejected, SEED_ETA_SECONDS
+from engine.priority import tier_priority
 from tests.image_fakes import sd_png
 
 YES = '{"allowed": true, "category": "none"}'
@@ -100,8 +101,8 @@ def env():
     return e
 
 
-def submit(e, owner=A, kind="app", prompt="a red fox", size="768x768", refund=True):
-    return e.service.submit(owner, kind, prompt, size, (lambda: e.refunds.append(prompt)) if refund else None)
+def submit(e, owner=A, kind="app", prompt="a red fox", size="512x512", refund=True, **kwargs):
+    return e.service.submit(owner, kind, prompt, size, (lambda: e.refunds.append(prompt)) if refund else None, **kwargs)
 
 
 async def until(predicate, timeout=5.0):
@@ -122,16 +123,16 @@ async def done(e, job):
 
 @pytest.mark.anyio
 async def test_a_job_runs_the_checks_draws_strips_and_completes(env):
-    job = submit(env, prompt="the secret prompt", size="1024x768")
+    job = submit(env, prompt="the secret prompt", size="768x512")
     assert job.status == "queued"
     view = await done(env, job)
 
     assert view["status"] == "completed" and "error" not in view
     image = view["image"]
-    assert (image["width"], image["height"], image["seed"]) == (1024, 768, job.seed)
+    assert (image["width"], image["height"], image["seed"]) == (768, 512, job.seed)
     png = base64.b64decode(image["b64_png"])
     assert png.startswith(b"\x89PNG") and b"secret" not in png and b"parameters" not in png     # metadata stripped
-    assert env.member.calls == [{"prompt": "the secret prompt", "width": 1024, "height": 768, "seed": job.seed}]
+    assert env.member.calls == [{"prompt": "the secret prompt", "width": 768, "height": 512, "seed": job.seed}]
     assert job.prompt is None                                       # not kept once the picture is drawn
 
 
@@ -195,13 +196,50 @@ async def test_jobs_run_one_at_a_time_in_the_order_they_came(env):
 
 
 @pytest.mark.anyio
+async def test_a_waiting_key_holders_job_runs_before_a_trials_and_the_running_one_is_not_preempted(env):
+    env.member.hold, env.member.release = True, asyncio.Event()
+    env.limits["image_queue_max"] = 6
+    env.limits["image_per_hour"] = 60
+    running = submit(env, owner="10.0.0.1", prompt="running", priority=tier_priority("trial"))
+    await until(lambda: running.status == "generating")
+    trial_early = submit(env, owner="10.0.0.2", prompt="trial early", priority=tier_priority("trial"))
+    cpu = submit(env, owner="10.0.0.3", prompt="cpu", priority=tier_priority("cpu"))
+    key = submit(env, owner="10.0.0.4", prompt="key", priority=tier_priority("key"))
+    host = submit(env, owner="10.0.0.5", prompt="host", priority=tier_priority("host"))
+    gpu = submit(env, owner="10.0.0.6", prompt="gpu", priority=tier_priority("gpu"))
+    assert running.status == "generating"                    # nobody pre-empts a running job
+    # places: key, host and gpu share the first tier and keep their arrival order, then cpu, then the trial
+    assert [env.service.view(j)["position"] for j in (key, host, gpu, cpu, trial_early)] == [2, 3, 4, 5, 6]
+    env.member.release.set()
+    for job in (running, key, host, gpu, cpu, trial_early):
+        await done(env, job)
+    assert [c["prompt"] for c in env.member.calls] == ["running", "key", "host", "gpu", "cpu", "trial early"]
+
+
+@pytest.mark.anyio
+async def test_jobs_of_one_tier_keep_their_arrival_order_and_a_job_without_a_tier_is_last(env):
+    env.member.hold, env.member.release = True, asyncio.Event()
+    env.limits["image_queue_max"] = 6
+    env.limits["image_per_hour"] = 60
+    running = submit(env, owner="10.0.0.1", prompt="running")
+    await until(lambda: running.status == "generating")
+    plain = submit(env, owner="10.0.0.2", prompt="plain")
+    keys = [submit(env, owner=f"10.0.1.{i}", prompt=f"key{i}", priority=tier_priority("key")) for i in range(2)]
+    plain_late = submit(env, owner="10.0.0.3", prompt="plain late")
+    env.member.release.set()
+    for job in (running, plain, *keys, plain_late):
+        await done(env, job)
+    assert [c["prompt"] for c in env.member.calls] == ["running", "key0", "key1", "plain", "plain late"]
+
+
+@pytest.mark.anyio
 async def test_a_queued_job_knows_its_place_and_roughly_how_long(env):
     env.member.hold, env.member.release = True, asyncio.Event()
     first, second, third = (submit(env, owner=f"10.0.0.{i}") for i in range(3))
     await until(lambda: first.status == "generating")
     assert env.service.view(second)["position"] == 2 and env.service.view(third)["position"] == 3
     assert "position" not in env.service.view(first)
-    # the second waits out the first (80 s measured), then its own 80 s; the third waits for both
+    # the second waits out the first (18 s measured), then its own 18 s; the third waits for both
     assert env.service.view(second)["eta_seconds"] > env.service.view(first)["eta_seconds"] - 1
     assert env.service.view(third)["eta_seconds"] > env.service.view(second)["eta_seconds"]
     env.member.release.set()
@@ -463,19 +501,21 @@ async def test_an_idle_worker_gives_the_engine_its_idle_check(env):
 # --- estimates and the status block -----------------------------------------------------------------------------
 
 def test_estimates_start_at_the_measured_figures(env):
-    assert env.service.eta("768x768") == 80 and env.service.eta("1024x1024") == 153
-    assert env.service.eta("768x1024") == env.service.eta("1024x768") == SEED_ETA_SECONDS["768x1024"]
-    assert 80 < SEED_ETA_SECONDS["768x1024"] < 153
+    # FLUX.2 [klein] 4B on the RX 580 with its prompt reader on the card too (2026-10-30): 26 s square, 31 s the others.
+    assert SEED_ETA_SECONDS == {"512x512": 26, "512x768": 31, "768x512": 31}
+    assert set(SEED_ETA_SECONDS) == set(image_policy.SIZES)
+    assert env.service.eta("512x512") == 26 and env.service.eta("512x768") == env.service.eta("768x512") == 31
+    assert env.service.eta("an unknown size") == 26                  # the default size's figure
 
 
 def test_estimates_follow_the_median_of_real_jobs_per_size(env):
-    for seconds in (100, 90, 500, 95, 92):
-        env.service._samples["768x768"].append(seconds)
-    assert env.service.eta("768x768") == 95                           # one slow outlier does not move it
-    assert env.service.eta("1024x1024") == 153                        # other sizes keep their own
+    for seconds in (20, 18, 100, 19, 17):
+        env.service._samples["512x512"].append(seconds)
+    assert env.service.eta("512x512") == 19                           # one slow outlier does not move it
+    assert env.service.eta("768x512") == 31                           # other sizes keep their own
     for seconds in range(9):
-        env.service._samples["768x768"].append(60)                    # only the last nine count
-    assert env.service.eta("768x768") == 60
+        env.service._samples["512x512"].append(15)                    # only the last nine count
+    assert env.service.eta("512x512") == 15
 
 
 @pytest.mark.anyio
@@ -486,14 +526,14 @@ async def test_real_jobs_feed_the_estimate(env):
     env.clock.t += 40
     env.member.release.set()
     await done(env, job)
-    assert env.service.eta("768x768") == 40
+    assert env.service.eta("512x512") == 40
 
 
 @pytest.mark.anyio
 async def test_the_status_block_has_exactly_the_contracts_fields(env):
     block = env.service.status_block()
-    assert block == {"queue": 0, "busy": False, "eta_seconds": {"768x768": 80, "1024x1024": 153},
-                     "sizes": ["768x768", "1024x1024", "768x1024", "1024x768"], "default_size": "768x768", "per_hour": 4}
+    assert block == {"queue": 0, "busy": False, "eta_seconds": {"512x512": 26, "512x768": 31, "768x512": 31},
+                     "sizes": ["512x512", "512x768", "768x512"], "default_size": "512x512", "per_hour": 4}
     env.limits["image_per_hour"] = 9
     assert env.service.status_block()["per_hour"] == 9                # read live, never typed
     env.member.hold, env.member.release = True, asyncio.Event()

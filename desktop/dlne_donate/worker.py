@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional
 
-from . import COORDINATOR_URL, PUBLIC_NETWORK_KEY, configfile, installer, markers, paths, tiers
+from . import COORDINATOR_URL, PUBLIC_NETWORK_KEY, configfile, engine_flavour, installer, markers, paths, tiers
 
 # Two automatic re-syncs within ten minutes (the extension's rule); after that a mismatch is reported, not looped on.
 MAX_VERSION_RESTARTS = 2
@@ -68,6 +68,15 @@ class Status:
     verification_failed: bool = False     # the release could not be verified: nothing was installed or run
     engine_version: str = ""
     devices: str = ""                     # "GPU", "CPU" or "GPU and CPU"
+    cuda: Optional[markers.Cuda] = None   # may this computer run CUDA? from the worker's DLNE_CUDA line (2.7.0); kept between runs
+    engine: Optional[markers.EngineRun] = None    # the engine flavour that runs now, from DLNE_ENGINE (2.7.0)
+    paused: bool = False                  # the worker is held back (2.7.0): DLNE in VS Code is using this computer ...
+    pause_reason: str = ""                # ... "editor", or "worker": VS Code is closed but its worker still runs
+
+    @property
+    def version_label(self) -> str:
+        """The engine's version with its flavour as build metadata, ``2.7.0+cuda`` (display only); just the version until the flavour is known."""
+        return engine_flavour.flavour_label(self.engine_version, self.engine.flavour if self.engine else "")
 
     @property
     def running(self) -> bool:
@@ -76,6 +85,8 @@ class Status:
     @property
     def tooltip(self) -> str:
         """The tray icon's hover text: what it is doing, in one or two short lines."""
+        if self.paused:
+            return fit_tooltip(f"DLNE Donate\n{engine_flavour.paused_text(self.pause_reason)}")
         if self.state == DONATING:
             doing = markers.role_title(self.role) if self.role else "Joined the swarm"
             if self.also_cpu:
@@ -84,7 +95,8 @@ class Status:
                 doing += " · stepping aside for you"
             if self.activity.startswith("Downloading"):
                 doing += f"\n{self.activity}"
-            return fit_tooltip(f"DLNE Donate: donating\n{doing}")
+            on = f" ({self.engine.flavour.upper() if self.engine.flavour == 'cuda' else 'Vulkan'})" if self.engine else ""
+            return fit_tooltip(f"DLNE Donate: donating{on}\n{doing}")
         if self.state == ERROR:
             return fit_tooltip(f"DLNE Donate: problem\n{self.error or self.message}")
         if self.state in (PREPARING, STARTING):
@@ -109,9 +121,13 @@ def worker_command(engine: "installer.VerifiedEngine", coordinator_url: str) -> 
     return base + ["--run-worker", engine.root, "--", "worker", "--coordinator", coordinator_url]
 
 
-def worker_environment(extra_vulkan_indices: str = "") -> Dict[str, str]:
-    """The environment of the worker: this app's own, plus the settings the extension also sets for the GPU backends."""
+def worker_environment(extra_vulkan_indices: str = "", flavour: str = "vulkan") -> Dict[str, str]:
+    """
+    The environment of the worker: this app's own, plus the settings the extension also sets for the GPU backends.
+    ``flavour`` is the engine flavour already resolved (vulkan or cuda); the worker reads it as DLNE_ENGINE_FLAVOR.
+    """
     env = dict(os.environ)
+    env["DLNE_ENGINE_FLAVOR"] = flavour if flavour in markers.ENGINE_FLAVOURS else "vulkan"
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env[PARENT_ENV] = str(os.getpid())
@@ -264,6 +280,9 @@ class WorkerController:
         self._restarts: List[float] = []
         self._engine: Optional[installer.VerifiedEngine] = None
         self._devices: Optional[tuple] = None     # (GPU lent, CPU lent) as they were when this donation started
+        self._flavour_started: Optional[str] = None     # the flavour the running worker was started with (or fell back to)
+        self._flavour_restart = False                   # the worker is being ended to start it again on another flavour
+        self._cuda_failed: Optional[tuple] = None       # (engine setting, engine version) for which CUDA failed its start-up check
 
     def devices_changed(self) -> bool:
         """The owner switched the GPU or the CPU on or off after donating began: that applies the next time they donate."""
@@ -296,13 +315,16 @@ class WorkerController:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return False
+            if self._status.paused:
+                return False                 # VS Code is using this computer: the window and the tray say so
             self._stop.clear()
+            self._flavour_restart = False
             self._restarts = []
             settings = self._get_settings()
             hardware = self._get_hardware()
             self._devices = (bool(settings.gpu_enabled and hardware.has_gpu), bool(settings.cpu_enabled))
             self._status = Status(state=PREPARING, message="Checking the swarm's version...",
-                                  devices=tiers.device_summary(settings, hardware))
+                                  devices=tiers.device_summary(settings, hardware), cuda=self._status.cuda)
             self._thread = threading.Thread(target=self._session, name="donate-session", daemon=True)
             thread = self._thread
         self._on_change(self.status())
@@ -327,6 +349,36 @@ class WorkerController:
         if wait and thread is not None:
             thread.join(timeout)
 
+    def set_paused(self, paused: bool, reason: str = "editor") -> None:
+        """VS Code first (vscode_first.py): the window and the tooltip say why the worker is held back, and nothing starts."""
+        reason = reason if paused else ""
+        status = self.status()
+        if (status.paused, status.pause_reason) != (paused, reason):
+            self._set(paused=paused, pause_reason=reason)
+
+    # ---- the engine flavour ------------------------------------------------------------------------
+
+    def wanted_flavour(self) -> str:
+        """The flavour the worker should run now: the engine setting and the owner's consent, resolved like the extension does it."""
+        settings = self._get_settings()
+        failed = self._cuda_failed is not None and self._cuda_failed == (settings.engine, self.status().engine_version)
+        lends_gpu = bool(settings.gpu_enabled and self._get_hardware().has_gpu)       # a CPU-only donor runs no GPU engine
+        return engine_flavour.resolve_flavour(settings.engine, settings.cuda_consent, self.status().cuda, failed, lends_gpu)
+
+    def _switch_flavour_if_needed(self) -> None:
+        """The setting, the consent or what the worker said about CUDA changed: restart a running worker on the flavour that now applies."""
+        with self._lock:
+            process, started = self._process, self._flavour_started
+            if process is None or started is None or self._stop.is_set() or self._flavour_restart:
+                return
+            wanted = self.wanted_flavour()
+            if wanted == started:
+                return
+            self._flavour_restart = True
+        self._log(f"The engine changes from {started} to {wanted}: restarting the worker.")
+        self._set(state=STOPPING, message=f"Switching to the {'CUDA' if wanted == 'cuda' else 'Vulkan'} engine...", progress=None)
+        threading.Thread(target=self._terminate, args=(process,), name="donate-flavour", daemon=True).start()
+
     def _terminate(self, process: Any) -> None:
         grace = STOP_GRACE_WINDOWS_S if sys.platform == "win32" else STOP_GRACE_S
         terminate_tree(process, grace, self.engine_dir)
@@ -347,6 +399,10 @@ class WorkerController:
                 code = self._run_worker(engine)
                 if self._stop.is_set():
                     break
+                if self._flavour_restart:
+                    self._flavour_restart = False
+                    self._set(state=PREPARING, message="Switching the engine...", role=None, also_cpu=False)
+                    continue
                 if code == markers.VERSION_MISMATCH_EXIT_CODE:
                     now = time.monotonic()
                     self._restarts = [t for t in self._restarts if now - t < VERSION_RESTART_WINDOW_S]
@@ -370,7 +426,7 @@ class WorkerController:
                 self._process = None
                 if self._status.state != ERROR:
                     self._status = replace(self._status, state=IDLE, message="Not donating.", role=None, also_cpu=False,
-                                           progress=None)
+                                           progress=None, engine=None)
             self._on_change(self.status())
 
     def _fail(self, message: str, verification: bool = False) -> None:
@@ -431,26 +487,30 @@ class WorkerController:
             return False
 
     def apply_settings(self) -> None:
-        """A slider moved. Rewrite config.txt; a running worker picks the new limits up by itself."""
+        """A slider moved or the engine setting changed. Rewrite config.txt (a running worker picks the new limits up by itself); a new flavour restarts the worker."""
         if self._engine is not None:
             self.write_config(self._engine)
             with self._lock:
                 running = self._thread is not None and self._thread.is_alive()
             if running:
                 self._set(devices=tiers.device_summary(self._get_settings(), self._get_hardware()))
+        self._switch_flavour_if_needed()
 
     def _run_worker(self, engine: "installer.VerifiedEngine") -> Optional[int]:
         command = worker_command(engine, self.base_url)
-        env = worker_environment(self._vulkan_indices() if self._get_settings().gpu_enabled else "")
+        flavour = self.wanted_flavour()
+        # Vulkan's device order matters only to the Vulkan engine.
+        env = worker_environment(self._vulkan_indices() if self._get_settings().gpu_enabled and flavour == "vulkan" else "", flavour)
         flags: Dict[str, Any] = {}
         if sys.platform == "win32":
             flags["creationflags"] = 0x08000000 | 0x00000200      # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         else:
             flags["start_new_session"] = True
-        self._log("Starting the worker: " + " ".join(command[:-2] + ["<coordinator>"]))
+        self._log(f"Starting the worker ({flavour} engine): " + " ".join(command[:-2] + ["<coordinator>"]))
         self._needs_vcredist = False
+        self._flavour_started = flavour
         self._set(state=STARTING, message="Joining the swarm...", progress=None, role=None, also_cpu=False, refusal="",
-                  activity="")
+                  activity="", engine=None)
         try:
             process = self._spawn(command, cwd=engine.root, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT, **flags)
@@ -468,6 +528,7 @@ class WorkerController:
         pump.join(timeout=3)
         with self._lock:
             self._process = None
+            self._flavour_started = None
         self._log(f"The worker exited with code {code}.")
         return code
 
@@ -496,6 +557,14 @@ class WorkerController:
                 updates["dock"] = changed["dock"]
             if "yield" in changed:
                 updates["yielding"] = changed["yield"]
+            if "cuda" in changed:
+                updates["cuda"] = changed["cuda"]
+            if "engine" in changed:
+                updates["engine"] = changed["engine"]
+                self._flavour_started = changed["engine"].flavour       # what really runs, after a fall-back too
+                if changed["engine"].flavour == "vulkan" and changed["engine"].fallback:
+                    # No new try of CUDA until the engine setting or the engine version changes.
+                    self._cuda_failed = (self._get_settings().engine, self.status().engine_version)
             if "activity" in changed:
                 updates["activity"] = changed["activity"].text
                 updates["progress"] = changed["activity"].fraction
@@ -506,6 +575,8 @@ class WorkerController:
                 updates["message"] = "Donating."
             if updates:
                 self._set(**updates)
+            if "cuda" in changed:
+                self._switch_flavour_if_needed()
 
 
 # --------------------------------------------------------------------------------------------------

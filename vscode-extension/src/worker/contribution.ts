@@ -449,6 +449,12 @@ export const TRAY_WORKER_LINE = 'Donating from the DLNE Donate tray app, with it
 export const TRAY_WORKER_STOP = 'To stop it, click Stop donating in DLNE Donate (its tray icon or its window).';
 export const TRAY_WORKER_TEXT = `${TRAY_WORKER_LINE} ${TRAY_WORKER_STOP} Then you can donate from VS Code with your settings here.`;
 
+/**
+ * 2.7.0, VS Code first (docs/release-2.7-contract.md section 4b): while VS Code with DLNE is open, the DLNE Donate tray
+ * (1.1.0 and later) pauses its worker, so nothing donates this computer until it is started here.
+ */
+export const TRAY_PAUSED_TEXT = 'DLNE Donate is paused while VS Code is open; Start here to donate';
+
 /** The toast when the worker starts. */
 export function workerStartedNotice(cpuPool: boolean): string {
   return cpuPool
@@ -480,6 +486,10 @@ export interface ContributionView {
   yielding?: YieldState;
   /** A newer signed compute engine than the installed one is published by the coordinator (2.5.0). */
   engineUpdate?: { installed: string | null; available: string };
+  /** The engine flavour the running worker says it uses (its DLNE_ENGINE line, 2.7.0). */
+  engineFlavour?: 'vulkan' | 'cuda';
+  /** The DLNE Donate tray paused itself for this editor and nothing runs here yet (TRAY_PAUSED_TEXT). */
+  trayPaused?: boolean;
 }
 
 /** The sidebar's contribution card: two HTML lines and the button. */
@@ -506,6 +516,11 @@ export function engineButtonCopy(st: Pick<ContributionView, 'engineUpdate'>): { 
 /** A device name from the driver goes into the sidebar's HTML. */
 function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/** The line in front of an idle card's rule while the DLNE Donate tray is paused for this editor; '' otherwise. */
+function trayPausedHtml(st: ContributionView): string {
+  return st.trayPaused ? `⏸ <strong>${escapeHtml(TRAY_PAUSED_TEXT)}</strong><br>` : '';
 }
 
 export function contributionCopy(st: ContributionView): ContributionCopy {
@@ -538,12 +553,12 @@ export function contributionCopy(st: ContributionView): ContributionCopy {
         ? `✅ <strong>Active:</strong> ${st.vramContributedGb} GB of RAM lent, at low priority on half your cores. You get ${CPU_POOL_PERK}.`
         : starting
         ? '⏳ Joining the CPU pool...'
-        : `<strong>You get:</strong> ${CPU_POOL_PERK}.`,
+        : `${trayPausedHtml(st)}<strong>You get:</strong> ${CPU_POOL_PERK}.`,
       buttonText: buttonText('⚡ Power the DLNE Phone App'),
       engineButton,
     };
   }
-  const apiTag = st.gpu.api ? st.gpu.api.toUpperCase() : 'VULKAN';
+  const apiTag = (st.engineFlavour ?? st.gpu.api ?? 'vulkan').toUpperCase() || 'VULKAN';
   return {
     deviceHtml: `<strong>${apiTag} GPU:</strong> ${st.gpu.name || 'Local GPU'} (${st.gpu.vramTotalGb || 8} GB)`,
     ruleHtml: active
@@ -551,7 +566,7 @@ export function contributionCopy(st: ContributionView): ContributionCopy {
         (st.alsoCpu ? `<br>📱 <strong>Also:</strong> ${ALSO_CPU_LINE}` : '')
       : starting
       ? '⏳ Connecting local worker to cluster coordinator...'
-      : '<strong>Core Rule:</strong> You must give compute to receive compute.',
+      : `${trayPausedHtml(st)}<strong>Core Rule:</strong> You must give compute to receive compute.`,
     buttonText: buttonText('⚡ Contribute Local GPU'),
     engineButton,
   };
@@ -572,6 +587,7 @@ export function contributionTooltip(st: ContributionView): string[] {
         ? `Local Contribution: CPU POOL (${st.vramContributedGb}GB of RAM, low priority, half your cores)`
         : 'Local Contribution: IDLE (your CPU can power the DLNE phone app)',
       `${CPU_POOL_HEADLINE}. You get ${CPU_POOL_PERK}.`,
+      ...(st.trayPaused && !active ? [TRAY_PAUSED_TEXT] : []),
     ];
   }
   const api = st.gpu.api.toUpperCase();
@@ -589,6 +605,7 @@ export function contributionTooltip(st: ContributionView): string[] {
   if (active && st.alsoCpu) {
     lines.push(`Also: ${ROLE_LABEL.app}. ${ALSO_CPU_LINE}`);
   }
+  if (st.trayPaused && !active) lines.push(TRAY_PAUSED_TEXT);
   return lines;
 }
 
@@ -778,6 +795,78 @@ export function parseYield(output: string): YieldState | null {
       found = { yielding: facts.yielding, why };
     } catch {
       // not a yield line after all
+    }
+  }
+  return found;
+}
+
+/**
+ * The line the worker prints (2.7.0, docs/release-2.7-contract.md section 7) before any engine download, once at start
+ * and again on change: whether this computer may run the CUDA engine.
+ * `DLNE_CUDA: {"capable": true, "reason": "", "gpu": "NVIDIA GeForce RTX 4070 Laptop GPU", "compute_cap": "8.9", "driver": "615.78"}`
+ * `reason` is plain words when `capable` is false ("no NVIDIA GPU", "this GPU is older than Turing ...").
+ */
+export const CUDA_MARKER = 'DLNE_CUDA: ';
+
+export interface CudaProbe {
+  capable: boolean;
+  /** Why not, in plain words; "" when it may. */
+  reason: string;
+  /** The GPU's name; "" when there is none. */
+  gpu: string;
+  computeCap: string;
+  driver: string;
+}
+
+/** The last CUDA facts in `output`, or null. A line without a boolean `capable` is ignored. */
+export function parseCudaProbe(output: string): CudaProbe | null {
+  let found: CudaProbe | null = null;
+  const text = (value: unknown, max: number) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
+  for (const line of output.split(/\r?\n/)) {
+    const at = line.indexOf(CUDA_MARKER);
+    if (at === -1) continue;
+    try {
+      const facts = JSON.parse(line.slice(at + CUDA_MARKER.length).trim());
+      if (!facts || typeof facts !== 'object' || typeof facts.capable !== 'boolean') continue;
+      found = {
+        capable: facts.capable,
+        reason: facts.capable ? '' : text(facts.reason, 200),
+        gpu: text(facts.gpu, 120),
+        computeCap: text(facts.compute_cap, 16),
+        driver: text(facts.driver, 32),
+      };
+    } catch {
+      // not a CUDA line after all
+    }
+  }
+  return found;
+}
+
+/**
+ * The line the worker prints once its engine runs: `DLNE_ENGINE: {"flavour": "cuda", "fallback": ""}`, or
+ * `{"flavour": "vulkan", "fallback": "<why CUDA could not start>"}` after a fall-back to Vulkan.
+ */
+export const ENGINE_MARKER = 'DLNE_ENGINE: ';
+
+export interface EngineReport {
+  flavour: 'vulkan' | 'cuda';
+  /** Why CUDA could not start and Vulkan runs instead; "" when it did not fall back. */
+  fallback: string;
+}
+
+/** The last engine report in `output`, or null. A flavour that is neither vulkan nor cuda is ignored. */
+export function parseEngineReport(output: string): EngineReport | null {
+  let found: EngineReport | null = null;
+  for (const line of output.split(/\r?\n/)) {
+    const at = line.indexOf(ENGINE_MARKER);
+    if (at === -1) continue;
+    try {
+      const facts = JSON.parse(line.slice(at + ENGINE_MARKER.length).trim());
+      if (!facts || (facts.flavour !== 'vulkan' && facts.flavour !== 'cuda')) continue;
+      const fallback = typeof facts.fallback === 'string' ? facts.fallback.trim().slice(0, 300) : '';
+      found = { flavour: facts.flavour, fallback: facts.flavour === 'cuda' ? '' : fallback };
+    } catch {
+      // not an engine line after all
     }
   }
   return found;

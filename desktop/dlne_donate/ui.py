@@ -17,7 +17,7 @@ from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 from typing import Any, Callable, List, Optional
 
-from . import WEBSITE_URL, bundled, markers, tiers
+from . import WEBSITE_URL, bundled, engine_flavour, markers, tiers, updater
 from . import worker as worker_mod
 from .model import Model
 
@@ -45,10 +45,12 @@ def icon_photo(size: int = 48) -> Optional[tk.PhotoImage]:
 
 
 class SettingsWindow:
-    def __init__(self, root: tk.Tk, model: Model, on_quit: Callable[[], None], window_only: bool = False):
+    def __init__(self, root: tk.Tk, model: Model, on_quit: Callable[[], None], window_only: bool = False,
+                 on_update: Callable[[], None] = lambda: None):
         self.root = root
         self.model = model
         self.on_quit = on_quit
+        self.on_update = on_update          # "Update now" (the app downloads, checks and swaps)
         self.window_only = window_only
         self._commit_job: Optional[str] = None
         self._building = True
@@ -186,30 +188,63 @@ class SettingsWindow:
 
         ttk.Separator(outer).grid(row=8, column=0, sticky="ew", pady=8)
 
+        # ---- the graphics engine (2.7.0): Auto / Vulkan / CUDA, and what runs now ----
+        self.engine_frame = ttk.Frame(outer)
+        self.engine_frame.grid(row=9, column=0, sticky="ew")
+        ttk.Label(self.engine_frame, text="Graphics engine", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        choices = ttk.Frame(self.engine_frame)
+        choices.grid(row=1, column=0, sticky="w")
+        self.engine_var = tk.StringVar(value="auto")
+        self.engine_radios = {}
+        for column, (value, label) in enumerate((("auto", "Auto"), ("vulkan", "Vulkan"), ("cuda", "CUDA"))):
+            radio = ttk.Radiobutton(choices, text=label, value=value, variable=self.engine_var, command=self._on_engine)
+            radio.grid(row=0, column=column, padx=(0, 14))
+            self.engine_radios[value] = radio
+        self.engine_note = ttk.Label(self.engine_frame, text="", style="Hint.TLabel", wraplength=WRAP, justify="left")
+        self.engine_note.grid(row=2, column=0, sticky="w", pady=(2, 0))
+        self.engine_frame.columnconfigure(0, weight=1)
+        self.engine_rule = ttk.Separator(outer)
+        self.engine_rule.grid(row=10, column=0, sticky="ew", pady=8)
+
         # ---- the live line ----
         self.live = ttk.Label(outer, text="", style="Live.TLabel", wraplength=WRAP, justify="left")
-        self.live.grid(row=9, column=0, sticky="w")
+        self.live.grid(row=11, column=0, sticky="w")
         self.warn = ttk.Label(outer, text="", style="Warn.TLabel", wraplength=WRAP, justify="left")
-        self.warn.grid(row=10, column=0, sticky="w", pady=(4, 0))
+        self.warn.grid(row=12, column=0, sticky="w", pady=(4, 0))
         self.detail = ttk.Label(outer, text="", style="Hint.TLabel", wraplength=WRAP, justify="left")
-        self.detail.grid(row=11, column=0, sticky="w", pady=(4, 0))
+        self.detail.grid(row=13, column=0, sticky="w", pady=(4, 0))
 
         bottom = self.bottom
+        # ---- a newer DLNE Donate (4a): "DLNE Donate 1.2.0 is available", Update now / Later; hidden while there is none ----
+        self.update_frame = ttk.Frame(bottom)
+        self.update_frame.grid(row=0, column=0, sticky="ew", pady=(8, 0))
+        self.update_label = ttk.Label(self.update_frame, text="", style="Live.TLabel", wraplength=WRAP, justify="left")
+        self.update_label.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.update_buttons = ttk.Frame(self.update_frame)
+        self.update_buttons.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.update_now_button = ttk.Button(self.update_buttons, text=updater.UPDATE_NOW, command=self._on_update_now)
+        self.update_now_button.grid(row=0, column=0, padx=(0, 8))
+        self.update_later_button = ttk.Button(self.update_buttons, text=updater.LATER, command=self._on_update_later)
+        self.update_later_button.grid(row=0, column=1)
+        self.update_frame.grid_remove()
+
         self.button = ttk.Button(bottom, text="Donate", style="Big.TButton", command=self._on_button)
-        self.button.grid(row=0, column=0, sticky="ew", pady=(10, 6))
+        self.button.grid(row=1, column=0, sticky="ew", pady=(10, 6))
         self.progress = ttk.Progressbar(bottom, mode="determinate", maximum=100)
-        self.progress.grid(row=1, column=0, sticky="ew")
+        self.progress.grid(row=2, column=0, sticky="ew")
         self.progress.grid_remove()
 
         foot = ttk.Frame(bottom)
-        foot.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        foot.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         self.autostart_var = tk.BooleanVar()
         ttk.Checkbutton(foot, text="Start with my computer", variable=self.autostart_var, command=self._on_autostart).grid(row=0, column=0, sticky="w")
         self.resume_var = tk.BooleanVar()
         ttk.Checkbutton(foot, text="Start donating when the app starts", variable=self.resume_var, command=self._on_resume).grid(row=1, column=0, sticky="w")
+        self.auto_update_var = tk.BooleanVar()
+        ttk.Checkbutton(foot, text="Update automatically", variable=self.auto_update_var, command=self._on_auto_update).grid(row=2, column=0, sticky="w")
         self.quit_button = ttk.Button(foot, text="Quit", command=self.on_quit)
         if self.window_only:
-            self.quit_button.grid(row=0, column=1, rowspan=2, padx=(30, 0))
+            self.quit_button.grid(row=0, column=1, rowspan=3, padx=(30, 0))
         foot.columnconfigure(0, weight=1)
         bottom.columnconfigure(0, weight=1)
         outer.columnconfigure(0, weight=1)
@@ -276,17 +311,85 @@ class SettingsWindow:
             extra.append(status.clock_notice)
         self._show_text(self.detail, "\n".join(extra))
 
+        self._show_engine(s, status)
         self._show_status(status, desc.machine_blocker)
-        if status.running:
+        if status.paused:
+            self.button.configure(text="Donate", state="disabled")        # DLNE in VS Code is using this computer
+        elif status.running:
             self.button.configure(text="Stop donating", state="disabled" if status.state == worker_mod.STOPPING else "normal")
         else:
             self.button.configure(text="Donate", state="normal" if desc.can_donate else "disabled")
         self.autostart_var.set(model.autostart_enabled())
         self.resume_var.set(s.resume_donating)
+        self.auto_update_var.set(s.auto_update)
+        self._show_update(model.updates.view())
         self._building = False
         self._refit_if_content_changed()
 
+    def _show_update(self, view: updater.View) -> None:
+        """The newer-version line: the question while idle, the progress while downloading, the reason when a download was refused."""
+        if not view.visible:
+            self.update_frame.grid_remove()
+            return
+        self.update_frame.grid()
+        lines = [view.status_line, view.notes if view.version and not view.busy else "", view.note]
+        self._show_text(self.update_label, "\n".join(line for line in lines if line))
+        if view.version and view.busy not in ("downloading", "installing"):
+            self.update_buttons.grid()
+            self.update_now_button.configure(text=updater.UPDATE_NOW if view.can_update_now else "Get it from the DLNE page")
+        else:
+            self.update_buttons.grid_remove()
+
+    def _show_engine(self, s: tiers.Settings, status: worker_mod.Status) -> None:
+        """The engine choice: CUDA greyed out with its reason when this computer cannot use it, and what runs now."""
+        shown = self.model.hardware.has_gpu          # the engine matters to a GPU that is lent
+        for widget in (self.engine_frame, self.engine_rule):
+            if shown:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        self.engine_var.set(s.engine)
+        may_use, why = engine_flavour.cuda_choice(status.cuda)
+        self.engine_radios["cuda"].state(["!disabled"] if may_use else ["disabled"])
+        lines = [engine_flavour.engine_line(status.engine)]
+        if not may_use:
+            lines.append(f"CUDA is greyed out: {why}.")
+        self._show_text(self.engine_note, "\n".join(line for line in lines if line))
+
+    def ask_cuda(self) -> str:
+        """The CUDA question, in a window of its own over this one. Returns "use", "later" or "never"; closing it is "Not now"."""
+        answer = {"value": engine_flavour.ANSWER_LATER}
+        dialog = tk.Toplevel(self.win)
+        dialog.title(engine_flavour.QUESTION_TITLE)
+        dialog.resizable(False, False)
+        dialog.transient(self.win)
+        body = ttk.Frame(dialog, padding=(16, 14, 16, 12))
+        body.grid(row=0, column=0)
+        ttk.Label(body, text=engine_flavour.QUESTION_TEXT, wraplength=WRAP - 20, justify="left").grid(row=0, column=0, columnspan=3, sticky="w")
+        buttons = ttk.Frame(body)
+        buttons.grid(row=1, column=0, columnspan=3, sticky="e", pady=(14, 0))
+
+        def choose(value: str) -> None:
+            answer["value"] = value
+            dialog.destroy()
+
+        for column, value in enumerate((engine_flavour.ANSWER_USE, engine_flavour.ANSWER_LATER, engine_flavour.ANSWER_NEVER)):
+            ttk.Button(buttons, text=engine_flavour.ANSWER_LABELS[value], command=lambda v=value: choose(v)).grid(row=0, column=column, padx=(8, 0))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose(engine_flavour.ANSWER_LATER))
+        try:
+            dialog.grab_set()
+        except tk.TclError:
+            pass
+        dialog.focus_force()
+        self.win.wait_window(dialog)
+        return answer["value"]
+
     def _show_status(self, status: worker_mod.Status, machine_blocker: str = "") -> None:
+        if status.paused:
+            self.dot.itemconfigure(self._dot_item, fill=STATE_COLORS[worker_mod.PREPARING])
+            self.status_text.configure(text=engine_flavour.paused_text(status.pause_reason), style="TLabel")
+            self.progress.grid_remove()
+            return
         self.dot.itemconfigure(self._dot_item, fill=STATE_COLORS.get(status.state, STATE_COLORS[worker_mod.IDLE]))
         if status.state == worker_mod.DONATING:
             text = "Donating: " + (markers.role_title(status.role) if status.role else "joined the swarm")
@@ -410,9 +513,27 @@ class SettingsWindow:
         if not self._building:
             self.model.update(gpu_enabled=bool(self.gpu_var.get()))
 
+    def _on_engine(self) -> None:
+        if self._building:
+            return
+        self.model.choose_engine(self.engine_var.get(), self.ask_cuda)
+        self.refresh()                      # a "Not now" leaves the setting as it was: the buttons follow it
+
     def _on_cpu_toggle(self) -> None:
         if not self._building:
             self.model.update(cpu_enabled=bool(self.cpu_var.get()))
+
+    def _on_update_now(self) -> None:
+        self.on_update()
+        self.refresh()
+
+    def _on_update_later(self) -> None:
+        self.model.updates.later()
+        self.refresh()
+
+    def _on_auto_update(self) -> None:
+        if not self._building:
+            self.model.update(auto_update=bool(self.auto_update_var.get()))
 
     def _on_resume(self) -> None:
         if not self._building:

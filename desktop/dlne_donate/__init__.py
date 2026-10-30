@@ -7,7 +7,7 @@ the swarm made of this machine. Nothing here talks to anyone but the coordinator
 download hosts, and nothing runs that has not been verified against the maintainer's Ed25519 key.
 """
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 APP_NAME = "DLNE Donate"
 APP_ID = "dlne-donate"

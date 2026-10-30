@@ -11,6 +11,10 @@ const os = require('node:os');
 const path = require('node:path');
 
 const stub = require('./helpers/vscode-stub');
+
+// 2.7.0: the memory sizes depend on the coding context (memoryCaps). These tests use TheWall's 131,072, where every
+// file loads its full 32,000 characters; the limit on the three together has its own test.
+require('../dist/agent/memory').setMemoryContextTokens(131072);
 const { generator, pem } = require('./helpers/fake-secrets');
 const crypto = require('node:crypto');
 const {
@@ -54,7 +58,7 @@ function world(body) {
 // The header a new project file starts with, copied from the contract.
 const PROJECT_HEADER =
   '# DLNE memory\n\n' +
-  '<!-- What the DLNE agent remembers about this project. It reads this file at the start of every request and sends it, ' +
+  '<!-- What the DLNE agent remembers about this project. It reads this file at the start of every conversation and sends it, ' +
   "with the rest of the prompt, to the DLNE swarm (the coordinator or a volunteer's coding member). " +
   'Add, edit or delete lines freely; keep secrets out. -->\n\n';
 
@@ -132,13 +136,13 @@ test('a file the privacy rules exclude is not loaded, and not written', () =>
 
 test('the caps cut a long file and say how much was cut', () =>
   world((w) => {
-    w.write('AGENTS.md', 'a'.repeat(8_000 + 123));
-    w.write('.dlne/memory.md', 'b'.repeat(8_000));
-    w.write('.dlne/memory.md', 'c'.repeat(4_000 + 7), w.home);
+    w.write('AGENTS.md', 'a'.repeat(32_000 + 123));
+    w.write('.dlne/memory.md', 'b'.repeat(32_000));
+    w.write('.dlne/memory.md', 'c'.repeat(32_000 + 7), w.home);
     const sources = loadMemory(w.root, w.options);
-    assert.equal(sources.instructions.text, 'a'.repeat(8_000) + '\n[… 123 characters cut: the file is longer than DLNE loads]');
-    assert.equal(sources.project.text, 'b'.repeat(8_000), 'exactly at the cap is not cut');
-    assert.equal(sources.user.text, 'c'.repeat(4_000) + '\n[… 7 characters cut: the file is longer than DLNE loads]');
+    assert.equal(sources.instructions.text, 'a'.repeat(32_000) + '\n[… 123 characters cut: the file is longer than DLNE loads]');
+    assert.equal(sources.project.text, 'b'.repeat(32_000), 'exactly at the cap is not cut');
+    assert.equal(sources.user.text, 'c'.repeat(32_000) + '\n[… 7 characters cut: the file is longer than DLNE loads]');
   }));
 
 test('a directory, an unreadable path and a missing home folder are simply absent, and loading never throws', () =>
@@ -288,7 +292,7 @@ test('the fact is cleaned: newlines become spaces and the ends are trimmed', () 
     assert.match(fs.readFileSync(w.projectFile, 'utf8'), /\n- Build with make, then run \.\/test and look\. <!-- dlne -->\n$/);
   }));
 
-test('a fact is not empty, and one over 500 characters is written as several lines', () =>
+test('a fact is not empty, and one over 1,000 characters is written as several lines', () =>
   world((w) => {
     for (const empty of ['', '   ', '\n\n']) {
       assert.equal(rememberFact('project', empty, w.root, w.options).ok, false);
@@ -296,10 +300,10 @@ test('a fact is not empty, and one over 500 characters is written as several lin
     assert.equal(rememberFact('project', undefined, w.root, w.options).ok, false);
     assert.equal(rememberFact('project', 42, w.root, w.options).ok, false);
     assert.equal(fs.existsSync(w.projectFile), false, 'nothing written for a refused fact');
-    const single = rememberFact('project', 'y'.repeat(500), w.root, w.options);
+    const single = rememberFact('project', 'y'.repeat(1000), w.root, w.options);
     assert.equal(single.ok, true);
     assert.ok(!Array.isArray(single.change), 'one line, one change');
-    const long = rememberFact('project', 'x'.repeat(501), w.root, w.options);
+    const long = rememberFact('project', 'x'.repeat(1001), w.root, w.options);
     assert.equal(long.ok, true);
     assert.equal(long.change.length, 2);
     assert.match(long.message, /saved as these 2 facts, one after the other\. That is expected: nothing more to do\.$/);
@@ -335,25 +339,25 @@ test('a fact holding a secret is refused and nothing is written', () =>
     assert.equal(fs.existsSync(w.userFile), false);
   }));
 
-test('a file that would pass its load cap is full: the project\'s at 8,000, the user\'s at 4,000', () =>
+test('a file that would pass its load cap is full: the project\'s and the user\'s at 32,000', () =>
   world((w) => {
-    w.write('.dlne/memory.md', 'x'.repeat(7_900));
+    w.write('.dlne/memory.md', 'x'.repeat(31_900));
     const full = rememberFact('project', 'y'.repeat(150), w.root, w.options);
     assert.equal(full.ok, false);
     // All of it is the user's: the agent has nothing of its own to shorten, so only the user can make room.
-    assert.equal(full.message, 'The project memory is full (7900 of 8000 characters), so nothing was saved. ' +
+    assert.equal(full.message, 'The project memory is full (31900 of 32000 characters), so nothing was saved. ' +
       'None of it was saved by DLNE, so ask the user to tidy it.');
-    assert.equal(fs.readFileSync(w.projectFile, 'utf8'), 'x'.repeat(7_900), 'untouched');
-    // 7,900 + a line break + "- [xxxx] " + 50 = 7,960: it fits, ids counted.
+    assert.equal(fs.readFileSync(w.projectFile, 'utf8'), 'x'.repeat(31_900), 'untouched');
+    // 31,900 + a line break + "- [xxxx] " + 50 = 31,960: it fits, ids counted.
     assert.equal(rememberFact('project', 'y'.repeat(50), w.root, w.options).ok, true, 'a smaller one still fits');
 
-    w.write('.dlne/memory.md', 'x'.repeat(3_900), w.home);
+    w.write('.dlne/memory.md', 'x'.repeat(31_900), w.home);
     assert.equal(rememberFact('user', 'y'.repeat(150), w.root, w.options).ok, false);
   }));
 
 test('comments in a file do not count toward its cap', () =>
   world((w) => {
-    w.write('.dlne/memory.md', '<!-- ' + 'c'.repeat(9_000) + ' -->\n- a fact\n');
+    w.write('.dlne/memory.md', '<!-- ' + 'c'.repeat(33_000) + ' -->\n- a fact\n');
     assert.equal(rememberFact('project', 'Another fact.', w.root, w.options).ok, true);
   }));
 
@@ -447,11 +451,11 @@ test('loading shows the id on the agent\'s lines only, and the cap counts it', (
     w.write('.dlne/memory.md', mine('Prefers short answers.') + '\n', w.home);
     assert.equal(loadMemory(w.root, w.options).user.text, `- [${idOf('Prefers short answers.')}] Prefers short answers.`);
 
-    // 380 facts of 17 characters: 7,599 without ids, past 8,000 with them, so the loaded text is cut.
-    const many = Array.from({ length: 380 }, (_, n) => mine(`Fact ${String(n).padStart(3, '0')} is here.`));
+    // 1,500 facts of 18 characters: 31,499 without ids, past 32,000 with them, so the loaded text is cut.
+    const many = Array.from({ length: 1500 }, (_, n) => mine(`Fact ${String(n).padStart(4, '0')} is here.`));
     seed(w, many);
     const text = loadMemory(w.root, w.options).project.text;
-    assert.ok(many.map((l) => l.replace(' <!-- dlne -->', '')).join('\n').length <= 8_000);
+    assert.ok(many.map((l) => l.replace(' <!-- dlne -->', '')).join('\n').length <= 32_000);
     assert.match(text, /\n\[… \d+ characters cut: the file is longer than DLNE loads\]$/);
   }));
 
@@ -575,13 +579,13 @@ test('several facts holding the quote: each listed with its id', () =>
 test('a full file refuses growth, listing the agent\'s facts largest first, but an update that shrinks it is allowed', () =>
   world((w) => {
     const [a, b, c] = ['a'.repeat(300), 'b'.repeat(500), 'c'.repeat(100)];
-    seed(w, ['x'.repeat(7_000), mine(a), mine(b), mine(c)]);
+    seed(w, ['x'.repeat(31_000), mine(a), mine(b), mine(c)]);
     const used = loadMemory(w.root, w.options).project.text.length;
-    assert.ok(used > 7_900 && used <= 8_000, String(used));
+    assert.ok(used > 31_900 && used <= 32_000, String(used));
 
     const grow = rememberFact('project', 'A new fact of a hundred characters, give or take, which there is no room left for at all.', w.root, w.options);
     assert.equal(grow.ok, false);
-    assert.equal(grow.message, `The project memory is full (${used} of 8000 characters), so nothing was saved. ` +
+    assert.equal(grow.message, `The project memory is full (${used} of 32000 characters), so nothing was saved. ` +
       'Make room first: merge or shorten facts with replaces, or remove ones that no longer matter. Yours, largest first: ' +
       `[${idOf(b)}] (500 chars) "${'b'.repeat(50)}…"; [${idOf(a)}] (300 chars) "${'a'.repeat(50)}…"; [${idOf(c)}] (100 chars) "${'c'.repeat(50)}…"`);
 
@@ -594,9 +598,9 @@ test('a full file refuses growth, listing the agent\'s facts largest first, but 
 test('a file the user filled past the cap by hand: shrinking and removing still work, growing does not', () =>
   world((w) => {
     const fact = 'd'.repeat(200);
-    seed(w, ['x'.repeat(8_100), mine(fact)]);
+    seed(w, ['x'.repeat(32_100), mine(fact)]);
     assert.match(loadMemory(w.root, w.options).project.text, /characters cut/);
-    assert.match(rememberFact('project', 'A new fact.', w.root, w.options).message, /^The project memory is full \(\d+ of 8000 characters\)/);
+    assert.match(rememberFact('project', 'A new fact.', w.root, w.options).message, /^The project memory is full \(\d+ of 32000 characters\)/);
     assert.match(rememberFact('project', 'd'.repeat(201), w.root, w.options, idOf(fact)).message, /^The project memory is full/, 'one character more');
     assert.equal(rememberFact('project', 'e'.repeat(200), w.root, w.options, idOf(fact)).ok, true, 'the same size is allowed');
     assert.equal(rememberFact('project', 'e'.repeat(120), w.root, w.options, idOf('e'.repeat(200))).ok, true, 'smaller is allowed');
@@ -619,14 +623,14 @@ test('the messages carry ids: saved, updated, forgot, and a fact saved in parts'
     assert.equal(forgot.message, `📝 Forgot for this project [${idOf('Source is in lib/.')}]: Source is in lib/.`);
     assert.deepEqual(forgot.ids, []);
 
-    // Two sentences of about 300 and 240 characters: together over 500, so each is a part of its own.
-    const one = `First half of a long note: ${'alpha beta gamma delta '.repeat(12).trim()}.`;
-    const two = `Second half: ${'epsilon zeta eta theta '.repeat(10).trim()}.`;
+    // Two sentences of about 580 and 470 characters: together over 1,000, so each is a part of its own.
+    const one = `First half of a long note: ${'alpha beta gamma delta '.repeat(24).trim()}.`;
+    const two = `Second half: ${'epsilon zeta eta theta '.repeat(20).trim()}.`;
     const parts = rememberFact('project', `${one} ${two}`, w.root, w.options);
     assert.equal(parts.message, [
       `📝 Remembered for this project [${idOf(one)}]: ${one}`,
       `📝 Remembered for this project [${idOf(two)}]: ${two}`,
-      'It is over 500 characters, so it was saved as these 2 facts, one after the other. That is expected: nothing more to do.',
+      'It is over 1000 characters, so it was saved as these 2 facts, one after the other. That is expected: nothing more to do.',
     ].join('\n'));
     assert.deepEqual(parts.ids, [idOf(one), idOf(two)]);
 
@@ -677,4 +681,37 @@ test('AGENTS.md git-ignored: not loaded, since it keeps every rule', () =>
     w.write('.gitignore', 'AGENTS.md\n');
     w.write('AGENTS.md', 'private instructions');
     assert.equal(loadMemory(w.root, w.options).instructions, undefined);
+  }));
+
+test('every memory file holds 32,000 characters; on a small context the three together load about a third of the prompt (2.7.0)', () =>
+  world((w) => {
+    const { memoryCaps, setMemoryContextTokens } = require('../dist/agent/memory');
+    const each = { instructions: 32000, project: 32000, user: 32000 };
+    assert.deepEqual(memoryCaps(32768), { ...each, total: 24576 });
+    assert.deepEqual(memoryCaps(64128), { ...each, total: 48096 }, 'TheWall at four lanes');
+    assert.deepEqual(memoryCaps(131072), { ...each, total: 96000 }, 'everything');
+    for (const tokens of [4096, NaN, -1, 0]) assert.equal(memoryCaps(tokens).total, tokens === 4096 ? 20000 : 24576, String(tokens));
+
+    w.write('AGENTS.md', 'a'.repeat(20_000));
+    w.write('.dlne/memory.md', 'b'.repeat(20_000));
+    w.write('.dlne/memory.md', 'c'.repeat(100), w.home);
+    setMemoryContextTokens(32768);
+    try {
+      const small = loadMemory(w.root, w.options);
+      assert.equal(small.instructions.text, 'a'.repeat(20_000), 'AGENTS.md first, whole');
+      assert.equal(small.project.text, 'b'.repeat(4_576) + '\n[… 15424 characters cut: the file is longer than DLNE loads]', 'the rest of 24,576');
+      assert.equal(small.user, undefined, 'no room left');
+    } finally {
+      setMemoryContextTokens(131072);
+    }
+    const big = loadMemory(w.root, w.options);
+    assert.equal(big.project.text, 'b'.repeat(20_000));
+    assert.equal(big.user.text, 'c'.repeat(100));
+    // Saving always has the full 32,000, whatever this machine loads.
+    setMemoryContextTokens(32768);
+    try {
+      assert.equal(rememberFact('project', 'Still fits.', w.root, w.options).ok, true);
+    } finally {
+      setMemoryContextTokens(131072);
+    }
   }));

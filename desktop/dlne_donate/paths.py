@@ -46,6 +46,21 @@ def log_path(home: str = "") -> str:
     return os.path.join(home or app_data_dir(), "donate.log")
 
 
+# Tests name the presence file here; otherwise it is the user's real ~/.dlne/editor.json.
+EDITOR_FILE_ENV = "DLNE_DONATE_EDITOR_FILE"
+
+
+def editor_presence_path() -> str:
+    """
+    The file the DLNE extension keeps while VS Code runs (``{"pid", "updated", "version"}``). It lives in the user's home, not in
+    this app's folder, because the extension writes it: ``~/.dlne/editor.json`` on every system (``%USERPROFILE%`` on Windows).
+    """
+    override = os.environ.get(EDITOR_FILE_ENV)
+    if override:
+        return os.path.abspath(override)
+    return os.path.join(os.path.expanduser("~"), ".dlne", "editor.json")
+
+
 def ensure_private_dir(path: str) -> str:
     """Create ``path`` (and parents); on POSIX the folder is for this user only."""
     os.makedirs(path, exist_ok=True)

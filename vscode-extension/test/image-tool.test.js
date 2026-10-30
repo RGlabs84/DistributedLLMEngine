@@ -442,5 +442,5 @@ test('the agent loop knows the tool: an inline call is recognised, and the saved
   const loop = fs.readFileSync(path.join(__dirname, '..', 'src', 'agent', 'agentLoop.ts'), 'utf8');
   assert.match(loop, /VALID_TOOLS = new Set\([\s\S]*IMAGE_TOOL_NAME/);
   assert.match(loop, /MACHINE_CHANGING_TOOLS = new Set\([^)]*IMAGE_TOOL_NAME/);
-  assert.match(loop, /remember\|generate_image\)"/);
+  assert.match(loop, /remember\|use_skill\|save_skill\|generate_image\|view_image\)"/);
 });

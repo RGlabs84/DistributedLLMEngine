@@ -1823,3 +1823,130 @@ def get_hardware_profile() -> Dict[str, Any]:
     if dock["link"] != "unknown" and dock["power"] != "unknown":
         profile["docked"] = dock["link"] == "wired" and dock["power"] == "ac"
     return profile
+
+
+# ======================================================================================
+# May this machine run the CUDA engine? (2.7.0, docs/release-2.7-contract.md section 1)
+# ======================================================================================
+#
+# The CUDA build is llama.cpp's official CUDA 13 build. It needs an NVIDIA GPU of compute capability 7.5 or newer
+# (Turing: RTX 20 / GTX 16 and later; Maxwell, Pascal and Volta stay on Vulkan) and a driver new enough for CUDA 13.
+# Both facts come from one nvidia-smi call. The answer is plain words for the editor and the tray to show, so a
+# greyed-out "CUDA" always says why.
+
+# The oldest driver the CUDA 13 engine runs on, as nvidia-smi prints it (major.minor, a third part is ignored): 580 for
+# Linux and Windows alike, from NVIDIA's CUDA 13.4 release notes (Table 3). The same figure is engine.release.CUDA_MIN_DRIVER
+# (packaging); it is repeated here so this module needs no import of the release code.
+CUDA13_MIN_DRIVER = "580"
+
+# Compute capability 7.5 is Turing, the oldest generation CUDA 13 still builds kernels for.
+CUDA_MIN_COMPUTE_CAP = (7, 5)
+
+_CUDA_PROBE_TIMEOUT_SECONDS = 8.0
+
+# Where nvidia-smi lives on Windows when it is not on PATH (the driver installs it in System32; older drivers use
+# the NVSMI folder).
+_WINDOWS_NVIDIA_SMI = (
+    r"C:\Windows\System32\nvidia-smi.exe",
+    r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+)
+
+# One probe per process: the card and its driver do not change while the worker runs (a driver update needs a
+# restart of the worker anyway), and the answer is asked for by the start-up, the heartbeat and the status.
+_cuda_capability_cache: Optional[Dict[str, Any]] = None
+_cuda_capability_lock = threading.Lock()
+
+
+def _version_tuple(text: Any) -> Tuple[int, ...]:
+    """'615.78.08' -> (615, 78, 8); () when there is no number in it."""
+    parts = re.findall(r"\d+", str(text or ""))
+    return tuple(int(p) for p in parts[:3])
+
+
+def _find_nvidia_smi() -> Optional[str]:
+    """The nvidia-smi to run: the one on PATH, else (Windows) the places the driver puts it, else None."""
+    import shutil
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    if platform.system() == "Windows":
+        for candidate in _WINDOWS_NVIDIA_SMI:
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
+def _query_nvidia_smi(fields: str) -> Optional[List[str]]:
+    """The csv lines nvidia-smi prints for ``fields`` (one per GPU), or None when it is missing, fails or hangs."""
+    binary = _find_nvidia_smi()
+    if binary is None:
+        return None
+    try:
+        result = subprocess.run([binary, f"--query-gpu={fields}", "--format=csv,noheader"],
+                                capture_output=True, text=True, timeout=_CUDA_PROBE_TIMEOUT_SECONDS,
+                                **_hidden_process_kwargs())
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def _read_nvidia_gpus() -> Optional[List[Dict[str, str]]]:
+    """Every NVIDIA GPU as {"name", "compute_cap", "driver"}, or None when nvidia-smi gives nothing usable. A driver
+    old enough not to know the ``compute_cap`` field is asked again for name and driver alone, with the capability
+    left empty, so the reason can still name the driver."""
+    lines = _query_nvidia_smi("name,compute_cap,driver_version")
+    with_cap = lines is not None
+    if lines is None:
+        lines = _query_nvidia_smi("name,driver_version")
+    gpus: List[Dict[str, str]] = []
+    for line in lines or []:
+        # From the right: a GPU name may itself hold a comma, the other fields never do.
+        parts = [p.strip() for p in line.rsplit(",", 2 if with_cap else 1)]
+        if len(parts) != (3 if with_cap else 2):
+            continue
+        gpus.append({"name": parts[0], "compute_cap": parts[1] if with_cap else "", "driver": parts[-1]})
+    return gpus or None
+
+
+def _judge_cuda(gpus: Optional[List[Dict[str, str]]]) -> Dict[str, Any]:
+    """The ``DLNE_CUDA`` answer for what nvidia-smi listed (separate from the probe so it is testable)."""
+    if not gpus:
+        return {"capable": False, "reason": "no NVIDIA GPU", "gpu": "", "compute_cap": "", "driver": ""}
+    # Several GPUs: the newest architecture is the one the CUDA engine would be worth running on.
+    best = max(gpus, key=lambda g: _version_tuple(g["compute_cap"]))
+    answer = {"capable": False, "reason": "", "gpu": best["name"], "compute_cap": best["compute_cap"],
+              "driver": best["driver"]}
+    cap, driver = _version_tuple(best["compute_cap"]), _version_tuple(best["driver"])
+    if not cap:
+        answer["reason"] = "this GPU's compute capability could not be read (its driver is probably too old)"
+    elif cap[:2] < CUDA_MIN_COMPUTE_CAP:
+        answer["reason"] = f"this GPU is older than Turing (compute capability {best['compute_cap']})"
+    elif not driver or driver < _version_tuple(CUDA13_MIN_DRIVER):
+        answer["reason"] = (f"driver {best['driver'] or 'unknown'} is older than CUDA 13 needs "
+                            f"({CUDA13_MIN_DRIVER} or later)")
+    else:
+        answer["capable"] = True
+    return answer
+
+
+def cuda_capability(refresh: bool = False) -> Dict[str, Any]:
+    """
+    May this machine run the CUDA engine, and why not if it may not.
+
+    ``{"capable": bool, "reason": str, "gpu": str, "compute_cap": str, "driver": str}``: capable only for an NVIDIA
+    GPU of compute capability 7.5 or newer and a driver of at least CUDA13_MIN_DRIVER. ``reason`` is empty when
+    capable, otherwise plain words ("no NVIDIA GPU", "this GPU is older than Turing (compute capability 6.1)",
+    "driver 572.16 is older than CUDA 13 needs (580 or later)"). With several GPUs the one with the newest
+    compute capability is judged. Never raises; read once per process (``refresh`` asks again).
+    """
+    global _cuda_capability_cache
+    with _cuda_capability_lock:
+        if _cuda_capability_cache is None or refresh:
+            try:
+                _cuda_capability_cache = _judge_cuda(_read_nvidia_gpus())
+            except Exception as exc:  # noqa: BLE001 - a probe that breaks means "not capable", never a crash
+                _cuda_capability_cache = {"capable": False, "reason": f"the NVIDIA GPU could not be read ({type(exc).__name__})",
+                                          "gpu": "", "compute_cap": "", "driver": ""}
+        return dict(_cuda_capability_cache)

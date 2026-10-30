@@ -169,6 +169,9 @@ class CodingMember:
     # has since this coordinator started. Canaries do not count: they would keep a member "active"
     # forever. engine/canary.py sends them only to members active in the last 2 h.
     last_served_at: Optional[float] = None
+    # Which llama.cpp engine the member runs (2.7.0, "vulkan" or "cuda"): a display fact from its heartbeat profile, never
+    # compared like the version, and a member that does not say (older than 2.7) runs Vulkan.
+    engine_flavour: str = "vulkan"
 
     @property
     def key(self) -> str:
@@ -494,6 +497,8 @@ class CodingRouter:
                 floors_met=bool(coding_member_select.meets_floor(decode, prefill, limits)),
                 trust_id=trust_id,
                 last_served_at=self._last_served.get(trust_id) if trust_id else None,
+                engine_flavour=("cuda" if isinstance(record.get("hardware"), dict)
+                                and record["hardware"].get("engine_flavour") == "cuda" else "vulkan"),
             ))
         return found
 

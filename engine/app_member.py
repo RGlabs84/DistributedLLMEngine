@@ -133,7 +133,10 @@ def restore_priority(pid: int, saved: Optional[Dict[str, Any]]) -> bool:
 
 class AppMember:
     def __init__(self, base_dir: str, tiers_loader: Callable[[], List[Dict[str, Any]]],
-                 threads: int, port: int = APP_PORT, urlopen=urllib.request.urlopen) -> None:
+                 threads: int, port: int = APP_PORT, urlopen=urllib.request.urlopen, engine: Optional[Any] = None) -> None:
+        # ``engine`` is the worker's engine.engine_flavour.EngineFlavour: where the engine files are on a machine that
+        # runs the CUDA engine (2.7.0). None: the install's bin/ folder, as before.
+        self.engine = engine
         self.base_dir = base_dir
         self.tiers_loader = tiers_loader
         self.threads = max(1, threads)
@@ -454,8 +457,9 @@ class AppMember:
 
     # --------------------------------------------------------------------- server
     def _binary(self) -> Optional[str]:
+        bin_dir = self.engine.bin_dir() if self.engine is not None else os.path.join(self.base_dir, "bin")
         for name in ("llama-server.exe", "llama-server"):
-            candidate = os.path.join(self.base_dir, "bin", name)
+            candidate = os.path.join(bin_dir, name)
             if os.path.exists(candidate):
                 if not name.endswith(".exe"):
                     try:
@@ -479,7 +483,8 @@ class AppMember:
         log_dir = os.path.join(self.base_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
         self._log = open(os.path.join(log_dir, "app_server.log"), "a")
-        env = dict(os.environ, GGML_VK_VISIBLE_DEVICES="")
+        # The phone pool runs on the CPU: Vulkan is hidden from it, and so is CUDA (the engine may be the CUDA build).
+        env = dict(os.environ, GGML_VK_VISIBLE_DEVICES="", CUDA_VISIBLE_DEVICES="")
         light = self._light if light is None else light
         # Below normal priority: the owner's own programs come first on their machine.
         flags = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)

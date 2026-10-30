@@ -166,24 +166,39 @@ class LaneBook:
     def __init__(self) -> None:
         self._uses: Dict[int, int] = {}      # every hold, chat or short
         self._short: Dict[int, int] = {}     # the short ones among them
+        self._chat_clock = 0
+        self._last_chat: Dict[int, int] = {}  # lane -> when a spreading chat last took it (see take)
 
-    def take(self, first: int, count: int, *, short: bool = False, prefer: Optional[int] = None) -> int:
+    def take(self, first: int, count: int, *, short: bool = False, prefer: Optional[int] = None,
+             spread: bool = False) -> int:
         """
         A lane of ``first .. first+count-1``, now counted as used; give it back with :meth:`give` (same ``short``).
         A chat gets the lane with the fewest chats on it, then the fewest short holds, then the lowest index. A
         short hold gets the one with the fewest chats, then the fewest holds of any kind. ``prefer`` (a lane this
         chat used before, for its cache) is taken when it is in range and no chat is on it.
+
+        ``spread`` (coding chats, 2.7.0): among equally free lanes the one a spreading chat used longest ago wins
+        over the lowest index. Each lane holds the cached prompt of the chat that used it last, so a new or
+        returning chat that cannot have its own lane takes the stalest one instead of always lane 0: two
+        conversations taking turns then keep a lane each, and neither makes the engine read the other's whole
+        prompt again.
         """
         lanes = range(first, first + max(1, count))
         if prefer in lanes and self._chats(prefer) == 0:
             lane = prefer
         elif short:
             lane = min(lanes, key=lambda index: (self._chats(index), self._uses.get(index, 0), index))
+        elif spread:
+            lane = min(lanes, key=lambda index: (self._chats(index), self._short.get(index, 0),
+                                                 self._last_chat.get(index, -1), index))
         else:
             lane = min(lanes, key=lambda index: (self._chats(index), self._short.get(index, 0), index))
         self._uses[lane] = self._uses.get(lane, 0) + 1
         if short:
             self._short[lane] = self._short.get(lane, 0) + 1
+        elif spread:
+            self._chat_clock += 1
+            self._last_chat[lane] = self._chat_clock
         return lane
 
     def give(self, lane: int, *, short: bool = False) -> None:

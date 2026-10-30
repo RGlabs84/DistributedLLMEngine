@@ -11,6 +11,9 @@ The llama.cpp binaries are not built from this repository: scripts/package_llama
 pinned upstream build into release_dist/assets/llama/ (an RPC zip per platform, the server's
 own build, build.json). Every release signs that folder into the manifest (or --binaries DIR),
 and deploy refuses to ship a release without it unless told --no-binaries.
+Since 2.7 the same folder also holds the CUDA engine (cuda-bin-<platform>.zip for win-x64 and linux-x64, about 600 MB
+each; package_llama.py --no-cuda leaves it out): it is signed into the manifest as cuda_<platform>_sha256 / _size and
+served at /v1/download/cuda-bin/<platform>. A deploy sends a CUDA zip only when the host does not hold that exact file.
 The image engine (stable-diffusion.cpp's sd-server, 2.6.1) is packaged the same way by scripts/package_sd.py into
 release_dist/assets/sd/ (or --sd-assets DIR). It is optional: a release is signed with it when that folder holds a
 build, and without it everything else is unchanged. --no-binaries leaves it out too.
@@ -72,7 +75,8 @@ def load_sd_assets(directory: str, required: bool = False) -> Optional[Dict]:
 def load_binaries(directory: str) -> Dict:
     """
     The packaged llama.cpp binaries in ``directory`` (see scripts/package_llama.py):
-    {"llama_build", "rpc_proto", "rpc_zips": {platform: path}, "server_llama": path}.
+    {"llama_build", "rpc_proto", "rpc_zips": {platform: path}, "server_llama": path}, and "cuda_zips":
+    {platform: path} when the folder was packaged with the CUDA engine (2.7; build.json then has a "cuda" entry).
     """
     try:
         with open(os.path.join(directory, "build.json"), "r", encoding="utf-8") as handle:
@@ -81,14 +85,21 @@ def load_binaries(directory: str) -> Dict:
         raise CliError(f"No packaged llama.cpp build in {directory} ({type(exc).__name__}). "
                        "Run scripts/package_llama.py <build> first.") from exc
     zips = {p: os.path.join(directory, release.rpc_zip_name(p)) for p in release.RPC_PLATFORMS}
-    missing = [os.path.basename(z) for z in zips.values() if not os.path.isfile(z)]
+    # A CUDA engine is optional: a folder packaged with --no-cuda signs a release exactly as before. When build.json
+    # says it was packaged, every platform it names must be there.
+    cuda = info.get("cuda") if isinstance(info.get("cuda"), dict) else {}
+    cuda_zips = {p: os.path.join(directory, release.cuda_zip_name(p)) for p in (cuda.get("zips") or {})}
+    missing = [os.path.basename(z) for z in list(zips.values()) + list(cuda_zips.values()) if not os.path.isfile(z)]
     server = os.path.join(directory, str(info.get("server_llama", "")))
     if not info.get("server_llama") or not os.path.isfile(server):
         missing.append(str(info.get("server_llama") or "the server build"))
     if missing:
         raise CliError(f"{directory} is incomplete; missing: {', '.join(missing)}.")
-    return {"llama_build": info.get("llama_build"), "rpc_proto": info.get("rpc_proto"),
-            "rpc_zips": zips, "server_llama": server}
+    found = {"llama_build": info.get("llama_build"), "rpc_proto": info.get("rpc_proto"),
+             "rpc_zips": zips, "server_llama": server}
+    if cuda_zips:
+        found["cuda_zips"] = cuda_zips
+    return found
 APPLY_SCRIPT = os.path.join(REPO_ROOT, "scripts", "release_apply.py")
 
 
@@ -202,7 +213,8 @@ def build_release(repo: str, out_dir: str, key_pem: bytes, notes: str, allow_dir
                                          rpc_proto=b.get("rpc_proto"), server_llama=b.get("server_llama"),
                                          app_models=load_app_models(repo),
                                          coding_models=load_coding_models(repo),
-                                         sd_build=b.get("sd_build"), server_sd=b.get("server_sd"))
+                                         sd_build=b.get("sd_build"), server_sd=b.get("server_sd"),
+                                         cuda_zips=b.get("cuda_zips"))
     except release.ReleaseError as exc:
         raise CliError(str(exc)) from exc
     signed = release.sign_manifest(manifest, key_pem)
@@ -217,6 +229,10 @@ def build_release(repo: str, out_dir: str, key_pem: bytes, notes: str, allow_dir
         ok, reason = release.verify_rpc_bin(signed, platform, path)
         if not ok:
             raise CliError(f"The {platform} RPC archive does not match the manifest just built ({reason}).")
+    for platform, path in sorted(((binaries or {}).get("cuda_zips") or {}).items()):
+        ok, reason = release.verify_cuda_bin(signed, platform, path)
+        if not ok:
+            raise CliError(f"The {platform} CUDA archive does not match the manifest just built ({reason}).")
     if binaries:
         ok, reason = release.verify_server_llama(signed, binaries["server_llama"])
         if not ok:
@@ -293,6 +309,16 @@ def deploy(repo: str, remote, key_pem: bytes, notes: str, allow_dirty: bool = Fa
         for platform, path in sorted(binaries["rpc_zips"].items()):
             remote.put(path, f"{incoming}/{release.rpc_zip_name(platform)}")
             expected[release.rpc_zip_name(platform)] = manifest[release.rpc_field(platform, "sha256")]
+        for platform, path in sorted((binaries.get("cuda_zips") or {}).items()):
+            # About 600 MB each: sent only when the host does not already hold exactly this file (a release that
+            # changes the code but not the engine uploads nothing). release_apply then uses the installed copy.
+            digest = manifest[release.cuda_field(platform, "sha256")]
+            code, out = remote.run(f"sha256sum {remote.root}/{release.cuda_zip_name(platform)}")
+            if code == 0 and out.split()[:1] == [digest]:
+                log(f"The coordinator host already holds the {platform} CUDA engine; not sending it again.")
+                continue
+            remote.put(path, f"{incoming}/{release.cuda_zip_name(platform)}")
+            expected[release.cuda_zip_name(platform)] = digest
         remote.put(binaries["server_llama"], f"{incoming}/{SERVER_LLAMA_UPLOAD}")
         expected[SERVER_LLAMA_UPLOAD] = manifest["server_llama_sha256"]
         if binaries.get("server_sd"):
@@ -406,6 +432,10 @@ def cmd_build(args) -> int:
         for platform in release.RPC_PLATFORMS:
             print(f"    {release.rpc_zip_name(platform)}  sha256 {m[release.rpc_field(platform, 'sha256')]}")
         print(f"    server build  sha256 {m['server_llama_sha256']}")
+        for platform in release.CUDA_PLATFORMS:
+            if release.cuda_field(platform, "sha256") in m:
+                print(f"    CUDA {m['cuda_version']}  {release.cuda_zip_name(platform)}  "
+                      f"sha256 {m[release.cuda_field(platform, 'sha256')]}")
         if "sd_build" in m:
             print(f"  image engine {m['sd_build']}  sha256 {m['server_sd_sha256']}")
     print(f"  signed manifest {built['manifest_path']}")

@@ -1,21 +1,21 @@
 {
-  "_comment": "The three model files image generation (2.6.1) loads, pinned to a Hugging Face revision and checked by size and SHA-256 (scripts/fetch_image_models.py). All three are ungated. The text encoder is not listed twice: 'from_app_models' names the CPU pool tier in scripts/app_models.json whose url, sha256 and size are used. engine/image_member.py MODEL_FILES holds the names and sizes the coordinator checks at run time; tests/test_image_models.py keeps the two in step.",
+  "_comment": "The three model files image generation loads (since 2.6.6 FLUX.2 [klein] 4B), pinned to a Hugging Face revision and checked by size and SHA-256 (scripts/fetch_image_models.py). All three are ungated (Apache-2.0). The VAE must be the full-encoder file: sd-server refuses the small decoder on its own. The text encoder is not listed twice: 'from_app_models' names the CPU pool tier in scripts/app_models.json whose url, sha256 and size are used. engine/image_member.py MODEL_FILES holds the names and sizes the coordinator checks at run time; tests/test_image_packaging.py keeps the two in step.",
   "models": [
     {
       "role": "diffusion",
-      "name": "Z-Image-Turbo Q4_K",
-      "file": "z_image_turbo-Q4_K.gguf",
-      "url": "https://huggingface.co/leejet/Z-Image-Turbo-GGUF/resolve/c61c0e422dc8b541b7548cf33a4ef8302b0f8085/z_image_turbo-Q4_K.gguf",
-      "sha256": "14b375ab4f226bc5378f68f37e899ef3c2242b8541e61e2bc1aff40976086fbd",
-      "size": 3864250304
+      "name": "FLUX.2 [klein] 4B Q4_0",
+      "file": "flux-2-klein-4b-Q4_0.gguf",
+      "url": "https://huggingface.co/leejet/FLUX.2-klein-4B-GGUF/resolve/3b1f5a9dc3abb32238b053aeb3d823c30afdacbd/flux-2-klein-4b-Q4_0.gguf",
+      "sha256": "d1023499ef3f2f82ff7c50e6778495195c1b6cc34835741778868428111f9ff4",
+      "size": 2460378560
     },
     {
       "role": "vae",
-      "name": "Z-Image-Turbo VAE",
-      "file": "ae.safetensors",
-      "url": "https://huggingface.co/Comfy-Org/Z-Image-Turbo/resolve/6fc90a3b1b653e935a0d175e260736de25b84df5/split_files/vae/ae.safetensors",
-      "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
-      "size": 335304388
+      "name": "FLUX.2 VAE (full encoder, small decoder)",
+      "file": "flux2-full-encoder-small-decoder.safetensors",
+      "url": "https://huggingface.co/black-forest-labs/FLUX.2-small-decoder/resolve/a3efc24f613ef42d9428af62fdbd6f5fd8856c4a/full_encoder_small_decoder.safetensors",
+      "sha256": "ea4273f02d1fafbf8e1d1c2cf6018ed8748652eb0bf34f2dd91171f16f15ab62",
+      "size": 249519092
     },
     {
       "role": "llm",

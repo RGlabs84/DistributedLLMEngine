@@ -1,8 +1,10 @@
 """
 Image jobs (2.6.1): who asked for what, in what order, and what became of it.
 
-A job is created by an endpoint (engine/coordinator.py), waits in one FIFO queue, and is then taken by one worker that
-runs it, alone, through the whole pipeline. Each step can end it, and each ending is a status the client reads:
+A job is created by an endpoint (engine/coordinator.py), waits in one queue, and is then taken by one worker that
+runs it, alone, through the whole pipeline. The queue goes by tier, as the coding engine's does (engine/priority.py):
+a waiting job of a host, an API-key holder or a GPU contributor runs before a waiting trial caller's, and jobs of one
+tier run in the order they came. A running job is never pre-empted. Each step can end it, and each ending is a status the client reads:
 
     queued -> checking -> generating -> reviewing -> completed
                  |            |             |
@@ -34,14 +36,15 @@ from engine import image_policy, media
 from engine.config import get_worker_limits
 from engine.image_member import Cancelled, ImageMember, MemberError, UNAVAILABLE
 from engine.logger import log_coordinator, log_error, log_warning
+from engine.priority import LOWEST_PRIORITY
 
 QUEUED, CHECKING, GENERATING, REVIEWING = "queued", "checking", "generating", "reviewing"
 COMPLETED, REFUSED, FAILED, CANCELLED, EXPIRED = "completed", "refused", "failed", "cancelled", "expired"
 TERMINAL = frozenset({COMPLETED, REFUSED, FAILED, CANCELLED, EXPIRED})
 
-# The seconds a picture takes on the RX 580 with the model kept loaded (measured on TheWall, 2026-10-28), until real
-# jobs give a better figure. The two sizes in between are placed by their pixel count.
-SEED_ETA_SECONDS = {"768x768": 80, "1024x1024": 153, "768x1024": 111, "1024x768": 111}
+# The seconds a picture takes on the RX 580 with the model kept loaded, until real jobs give a better figure.
+# FLUX.2 [klein] 4B, measured on TheWall on 2026-10-30: 17.5 s for the square, 22.5 s for portrait and landscape.
+SEED_ETA_SECONDS = {"512x512": 26, "512x768": 31, "768x512": 31}
 MEDIAN_OF = 9                   # the last this many real jobs of a size
 HOUSEKEEPING_SECONDS = 30.0     # how often an idle worker looks at expiry and the idle unload
 
@@ -88,6 +91,7 @@ class Job:
     refund: Optional[Callable[[], None]] = None      # gives back what the job cost the caller beyond the hourly cap
     stamp: Optional[float] = None                    # its place in the owner's hourly count
     tag: str = ""                   # what a log may say about the prompt
+    priority: int = LOWEST_PRIORITY  # the caller's tier (engine/priority.tier_priority): lower runs first
 
 
 class _Hourly:
@@ -158,16 +162,18 @@ class ImageService:
     def status_block(self) -> Dict[str, Any]:
         """The ``image_generation`` block of /v1/cluster/status (counts and estimates only; nothing names a network)."""
         return {"queue": len(self._pending), "busy": self.active is not None,
-                "eta_seconds": {"768x768": self.eta("768x768"), "1024x1024": self.eta("1024x1024")},
+                "eta_seconds": {size: self.eta(size) for size in image_policy.SIZES},
                 "sizes": list(image_policy.SIZES), "default_size": image_policy.DEFAULT_SIZE,
                 "per_hour": int(self._limits().get("image_per_hour", 6))}
 
     # ------------------------------------------------------------------ the front door
     def submit(self, owner: str, kind: str, prompt: str, size: str,
-               refund: Optional[Callable[[], None]] = None) -> Job:
+               refund: Optional[Callable[[], None]] = None, priority: int = LOWEST_PRIORITY) -> Job:
         """
         Queue a job for a cleaned, term-checked prompt. Raises :class:`Rejected` when the queue is full or the network has
         used its hour. ``refund`` is called once if the job ends without a picture through no fault of the prompt.
+        ``priority`` is the caller's tier as a number (engine/priority.tier_priority); the job waits behind every queued
+        job of the same or a better tier and ahead of every worse one.
         """
         limits = self._limits()
         now = self._clock()
@@ -182,13 +188,21 @@ class ImageService:
         width, height = image_policy.SIZES[size]
         job = Job(id=secrets.token_urlsafe(16), owner=owner, kind=kind, size=size, width=width, height=height,
                   seed=secrets.randbelow(2 ** 31), prompt=prompt, created=now, refund=refund, stamp=value,
-                  tag=image_policy.prompt_tag(prompt))
+                  tag=image_policy.prompt_tag(prompt), priority=int(priority))
         self._jobs[job.id] = job
-        self._pending.append(job)
+        self._queue(job)
         self._ensure_worker()
         self._wake.set()
         log_coordinator(f"Image job queued: {job.tag} {size}, {kind}.")
         return job
+
+    def _queue(self, job: Job) -> None:
+        """Put ``job`` behind every queued job of its tier or a better one and ahead of the worse ones. The queue stays
+        sorted this way, so the worker, the places and the estimates all just read it front to back."""
+        index = len(self._pending)
+        while index > 0 and self._pending[index - 1].priority > job.priority:
+            index -= 1
+        self._pending.insert(index, job)
 
     def get(self, owner: str, kind: str, job_id: str) -> Optional[Job]:
         """The job, only for the network and the endpoint family that created it."""

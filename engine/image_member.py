@@ -1,7 +1,7 @@
 """
 The image engine (2.6.1): stable-diffusion.cpp's ``sd-server`` as a child of the coordinator, on the media card only.
 
-    start     lazily, on the first job (about 24 s cold); never while the media card has less than 5.6 GiB free
+    start     lazily, on the first job (about 16 s cold); never while the media card has less than 3.6 GiB free
     run       one job at a time through the native /sdcpp/v1 API: submit, poll, cancel. The request body is built
               HERE from the prompt, a size and a seed; nothing a client sent is ever passed on
     unload    after IMAGE_IDLE_UNLOAD_MINUTES with no job (0: never)
@@ -44,21 +44,27 @@ SD_BINARY = "sd-server"
 
 # The three model files (scripts/image_models.json pins them with their sha256; scripts/fetch_image_models.py
 # downloads and verifies them). Here only the names and exact sizes: a file of any other size is not the pinned one.
-# The text encoder is the CPU pool's qwen3-4b (scripts/app_models.json).
+# Since 2.6.6 the picture model is FLUX.2 [klein] 4B. Its VAE is the file with the full encoder and the small decoder:
+# sd-server will not load the small decoder alone. The text encoder is the CPU pool's qwen3-4b (scripts/app_models.json).
 MODEL_FILES: Dict[str, Tuple[str, int]] = {
-    "diffusion": ("z_image_turbo-Q4_K.gguf", 3_864_250_304),
-    "vae": ("ae.safetensors", 335_304_388),
+    "diffusion": ("flux-2-klein-4b-Q4_0.gguf", 2_460_378_560),
+    "vae": ("flux2-full-encoder-small-decoder.safetensors", 249_519_092),
     "llm": ("Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf", 2_497_280_736),
 }
 DEFAULT_MODEL_SUBDIR = os.path.join("models", "image")
 
-MIN_FREE_VRAM_GB = 5.6                    # what loading the three models takes on the card (measured: 4.85 GiB idle, 6.45 peak)
+# What a picture takes on the card, with room to spare. Measured on TheWall's RX 580 (2026-10-30), the whole picture
+# stack on the card (the owner's layout): the card peaked at 5.7 GB, of which about 985 MiB is the vision projector, so
+# klein with its prompt reader peaks near 4.7 GiB.
+MIN_FREE_VRAM_GB = 5.1
 FAILURES_BEFORE_COOLDOWN = 3
 COOLDOWN_SECONDS = 30 * 60
-READY_TIMEOUT_SECONDS = 180.0             # cold start is about 24 s; this is for a slow disk
+READY_TIMEOUT_SECONDS = 180.0             # cold start is about 16 s; this is for a slow disk
 CANCEL_WAIT_SECONDS = 30.0                # sd stops at its next step; past this the process is replaced
 POLL_FAILURES_ALLOWED = 3                 # job polls that fail in a row (process alive) before the job is given up
-STEPS, TXT_CFG = 8, 1.0                   # Z-Image-Turbo's settings (measured on TheWall)
+# klein is distilled for four steps and no guidance. Measured on TheWall with the prompt reader on the CPU:
+# 512x512 in 17.5 s, 512x768 and 768x512 in 22.5 s.
+STEPS, TXT_CFG = 4, 1.0
 # Why nothing is drawn while the coding model has layers on the media card (for the log, like the other reasons).
 MEDIA_CARD_SHARED_REASON = "the media card is shared with the coding model (MEDIA_GPU_SHARED)"
 
@@ -229,7 +235,7 @@ class ImageMember:
         if not self._media_spec(limits):
             return "MEDIA_GPU is not set (or the engine is not a Vulkan build)"
         if limits.get("media_gpu_shared", False):
-            # The coding model has layers on the card; sd-server needs it to itself (5.6 GiB free, and its time).
+            # The coding model has layers on the card; sd-server needs it to itself (3.6 GiB free, and its time).
             return MEDIA_CARD_SHARED_REASON
         binary = self.binary()
         if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
@@ -311,9 +317,11 @@ class ImageMember:
             raise MemberError(UNAVAILABLE, "The graphics card doesn't have enough free memory for images right now. Try again in a few minutes.")
         paths = self.model_paths(limits)
         self.port = self._free_port()
+        # The whole picture stack runs on the media card, the prompt reader (te) too: the owner's layout (2026-10-30)
+        # keeps the CPU's cores for the coding model. On the CPU the reader was faster (17.5 and 22.5 s, not 26 and 31).
         command = [self.binary(), "--listen-ip", "127.0.0.1", "--listen-port", str(self.port),
                    "--diffusion-model", paths["diffusion"], "--vae", paths["vae"], "--llm", paths["llm"],
-                   "--backend", "te=cpu", "-t", str(int(limits.get("image_threads", 4))),
+                   "-t", str(int(limits.get("image_threads", 4))),
                    "--cfg-scale", str(TXT_CFG), "--steps", str(STEPS), "--eager-load"]
         mask = limits.get("image_cpu_mask") or ""
         if mask:

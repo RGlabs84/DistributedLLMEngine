@@ -17,9 +17,11 @@ import {
   isRpcExecutablePlatform, takeCompleteLines, EXTERNAL_WORKER_LINE, EXTERNAL_WORKER_TEXT, orphanRpcStopCommand,
   WORKER_STOP_GRACE_MS, LEAVING_TEXT, workerStopGraceMs,
   MAX_CPU_THREADS_KEY, maxCpuThreadsConfigUpdate, parseClock, clockMessage, TRAY_WORKER_LINE, TRAY_WORKER_TEXT,
-  VCREDIST_MESSAGE, VCREDIST_URL, parseVcredistNeeded, parseDock, parseYield, DockState, YieldState} from './contribution';
+  VCREDIST_MESSAGE, VCREDIST_URL, parseVcredistNeeded, parseDock, parseYield, DockState, YieldState,
+  WORKER_LEAVE_GRACE_MS, WORKER_LEAVE_MARGIN_MS} from './contribution';
 import { DonateChoice, DonateMachine, DonateSettings, readDonateSettings, settingsToWrite } from './donatePanel';
-import { trayWorkerRunning } from './trayApp';
+import { TrayHandover, trayHandover, trayWorkerRunning } from './trayApp';
+import { EngineFlavour, EngineFlavourController, attachEngineFlavour } from './engineFlavour';
 
 /** Remembered in the editor's global state: the GPU owner has been told what lending a GPU means. */
 const LEND_NOTICE_KEY = 'dlne.lendGpuNoticeSeen';
@@ -70,6 +72,15 @@ const OWN_WORKER_KEY = 'dlne.worker.ownPid';
  * starting one here: two windows starting one each would fight over the port.
  */
 const ADOPTED_RESTART_GRACE_MS = 30000;
+/**
+ * VS Code first (contract section 4b): a DLNE Donate tray from 1.1.0 pauses its worker while this editor is open. It looks
+ * at the presence file every 10 s and then lets its worker finish the work it carries (the same 90 s plus margin a Stop
+ * waits), so the editor waits that long, and one more poll, before it gives up and steps back as it always did.
+ */
+const TRAY_HANDOVER_WAIT_MS = WORKER_LEAVE_GRACE_MS + WORKER_LEAVE_MARGIN_MS + 15_000;
+const TRAY_HANDOVER_POLL_MS = 1000;
+/** Shown while the editor waits for the tray's worker to go. */
+const TRAY_HANDOVER_TEXT = 'Waiting for DLNE Donate to pause...';
 
 function processAlive(pid: number): boolean {
   try {
@@ -172,6 +183,13 @@ export interface WorkerStatus {
   trayApp?: boolean;
   /** The settings this editor's running worker was started with, so the sidebar can tell when a change needs a restart. */
   startedWith?: DonateSettings;
+  /** The engine flavour this editor's running worker says it uses (a DLNE_ENGINE line, 2.7.0); display only. */
+  engineFlavour?: EngineFlavour;
+  /**
+   * The DLNE Donate tray paused itself for this editor and nothing runs here: the panel and the status line say
+   * "DLNE Donate is paused while VS Code is open; Start here to donate" (contribution.ts TRAY_PAUSED_TEXT). Undefined otherwise.
+   */
+  trayPaused?: boolean;
   /** Whether this machine is docked (wired and on mains), from the worker's last DLNE_DOCK line (2.5.0). */
   dock?: DockState;
   /** Whether this machine is stepping aside for its owner's own load, from the last DLNE_YIELD line (2.5.0). */
@@ -217,6 +235,9 @@ export class WorkerManager {
     private options: { releasePublicKeyHex?: string } = {}
   ) {
     this.outputChannel = vscode.window.createOutputChannel('DLNE Compute Worker');
+    this.engineFlavour = attachEngineFlavour(context?.globalState);
+    this.engineFlavour.onRestartNeeded = () => void this.restartForFlavour();
+    this.engineListener = this.engineFlavour.onChanged(() => this.emitChange());
     // Synchronous immediate detection so initial UI render accurately reflects contributing state. A worker that is
     // already running was not started by this editor: it is described as such, never from the settings here.
     this.adoptedPid = this.ownWorkerFromBefore();
@@ -246,6 +267,22 @@ export class WorkerManager {
   }
 
   private settingListener: vscode.Disposable | undefined;
+
+  /** Which engine flavour the worker is started with, and what it says it runs (2.7.0, engineFlavour.ts). */
+  private engineFlavour: EngineFlavourController;
+  private engineListener: vscode.Disposable | undefined;
+  /** A restart for a changed flavour is under way (one at a time). */
+  private flavourRestarting = false;
+  /** The editor is waiting for the tray's worker to go (startWorker), and a Stop asked it to give up. */
+  private handoverWaiting = false;
+  private handoverCancelled = false;
+  /** The wait and its poll, here so a test can shorten them. */
+  private trayWaitMs = TRAY_HANDOVER_WAIT_MS;
+  private trayPollMs = TRAY_HANDOVER_POLL_MS;
+  /** The tray's worker went (or is paused) for this editor, and has not come back: the tray is "paused while VS Code is open". */
+  private trayHandedOver = false;
+  /** The last refresh saw a tray worker that pauses for editors. */
+  private sawPausableTray = false;
 
   /**
    * Write `dlne.worker.allowCodingMember` into the installed engine's config.txt as
@@ -358,7 +395,9 @@ export class WorkerManager {
 
     // Only auto-resume if the user explicitly enabled worker.autoStart
     const autoStart = vscode.workspace.getConfiguration('dlne').get<boolean>('worker.autoStart', false);
-    if (autoStart && this.currentState !== 'contributing' && this.currentState !== 'starting') {
+    // A tray worker that is about to pause for this editor (4b) does not stand in the way of the editor's own start.
+    const trayLeaving = this.externalWorker && this.trayWorker && this.readTrayHandover().canPause;
+    if (autoStart && (trayLeaving || (this.currentState !== 'contributing' && this.currentState !== 'starting'))) {
       this.outputChannel.appendLine('[DLNE] Auto-resuming compute worker on startup...');
       this.startWorker().catch(() => {});
     }
@@ -442,6 +481,9 @@ export class WorkerManager {
     if (running && this.dock) status.dock = this.dock;
     if (running && this.yielding) status.yielding = this.yielding;
     if (this.engineUpdate) status.engineUpdate = this.engineUpdate;
+    const flavour = this.engineFlavour.getState().running;
+    if (running && flavour) status.engineFlavour = flavour;
+    if (!running && this.trayPausedNow) status.trayPaused = true;
     return status;
   }
 
@@ -482,6 +524,8 @@ export class WorkerManager {
       }
     }
     this.lastRefusal = parseRefusal(text) ?? this.lastRefusal;
+    // DLNE_CUDA and DLNE_ENGINE feed the flavour (the question about CUDA is asked from there, once).
+    this.engineFlavour.noteOutput(text);
     const assignment = parseRole(text);
     if (assignment) {
       this.applyRole(assignment);
@@ -688,6 +732,63 @@ export class WorkerManager {
     return trayWorkerRunning();
   }
 
+  /** What the tray's state.json says about pausing for an editor (trayApp.ts trayHandover). */
+  private readTrayHandover(): TrayHandover {
+    return trayHandover();
+  }
+
+  /** The tray is paused for this editor and nothing else runs here (the status the panel words as TRAY_PAUSED_TEXT). */
+  private get trayPausedNow(): boolean {
+    return this.trayHandedOver || this.trayStatePaused;
+  }
+  private trayStatePaused = false;
+
+  /**
+   * Called by every poll that found nothing running: a tray worker that pauses for editors was there and is gone, or its
+   * own state says it is paused, so the computer donates nothing until the owner starts it here.
+   */
+  private noteTrayHandover(trayActive: boolean): void {
+    const before = this.trayPausedNow;
+    const handover = this.readTrayHandover();
+    this.trayStatePaused = !trayActive && handover.paused;
+    if (trayActive) {
+      this.trayHandedOver = false;
+      this.sawPausableTray = handover.canPause;
+    } else if (this.sawPausableTray) {
+      this.trayHandedOver = true;
+      this.sawPausableTray = false;
+    }
+    if (before !== this.trayPausedNow) this.emitChange();
+  }
+
+  /**
+   * The tray's worker is still running and will pause for this editor (its presence-file check, up to ten seconds, and
+   * then the time its worker needs to leave). Resolves true when it is gone, false when it is not (a tray that never
+   * pauses, or a Stop here that cancelled the wait): the caller steps back as it always did.
+   */
+  private async waitForTrayToPause(): Promise<boolean> {
+    this.handoverWaiting = true;
+    this.handoverCancelled = false;
+    this.externalWorker = false;
+    this.trayWorker = false;
+    this.currentState = 'starting';
+    this.statusMessage = TRAY_HANDOVER_TEXT;
+    this.outputChannel.appendLine('[DLNE] DLNE Donate is donating this computer; waiting for it to pause for VS Code...');
+    this.emitChange();
+    try {
+      const giveUp = Date.now() + this.trayWaitMs;
+      while (this.isTrayWorkerActive()) {
+        if (this.disposed || this.handoverCancelled || Date.now() >= giveUp) return false;
+        await new Promise((resolve) => setTimeout(resolve, this.trayPollMs));
+      }
+      this.trayHandedOver = true;
+      this.sawPausableTray = false;
+      return true;
+    } finally {
+      this.handoverWaiting = false;
+    }
+  }
+
   private ownWorkerFromBefore(): number | null {
     const pid = this.context?.globalState?.get<number>(OWN_WORKER_KEY);
     return typeof pid === 'number' && pid > 0 && isDlneWorkerProcess(pid) ? pid : null;
@@ -695,7 +796,7 @@ export class WorkerManager {
 
   public async refreshWorkerState(): Promise<WorkerStatus> {
     // A worker being stopped (a leaving one takes up to 90 s) is still our own, not one "started outside VS Code".
-    if (this.stopping) {
+    if (this.stopping || this.handoverWaiting) {
       return this.getStatus();
     }
     // This editor's own worker, starting or running: what it says is the status. (Requiring 'contributing' here let a
@@ -758,6 +859,7 @@ export class WorkerManager {
         }
       }
     }
+    this.noteTrayHandover(trayActive);
 
     return this.getStatus();
   }
@@ -1422,6 +1524,17 @@ export class WorkerManager {
       this.markContributing();
       return true;
     }
+    // VS Code first (4b): a tray from 1.1.0 pauses for this editor, so the editor waits for its worker to go and then
+    // starts its own. A tray from before that knows nothing of the editor: it is stepped back from, as it always was.
+    if (this.handoverWaiting) return true;
+    if (this.isTrayWorkerActive() && this.readTrayHandover().canPause && !(await this.waitForTrayToPause())) {
+      this.currentState = 'idle';
+      if (this.disposed || this.handoverCancelled) {
+        this.statusMessage = 'Worker stopped.';
+        this.emitChange();
+        return false;
+      }
+    }
     // A worker started outside VS Code (a systemd service, a terminal, the DLNE Donate tray app) is running: a second
     // one would fight it for the port or donate the same computer twice, and that one does not use the settings here.
     // Say so; Stop Contributing stops it (the tray app's is stopped in the app).
@@ -1535,8 +1648,12 @@ export class WorkerManager {
 
     try {
       const cwd = path.dirname(scriptPath);
+      // The flavour is settled here, from the setting and the owner's answer, so the worker is told one of the two words.
+      const flavour = this.engineFlavour.beginStart(plan.cpuOnly === true);
+      this.outputChannel.appendLine(`[DLNE] Engine: ${flavour}`);
       const spawnEnv: NodeJS.ProcessEnv = {
         ...process.env,
+        DLNE_ENGINE_FLAVOR: flavour,
         PYTHONUNBUFFERED: '1',
         GGML_VK_PREVENT_BARRIERS: '1',
         RADV_PERFTEST: 'nogttspill',
@@ -1614,6 +1731,7 @@ export class WorkerManager {
    */
   private onWorkerExit(code: number | null): void {
     this.outputChannel.appendLine(`[DLNE] Worker process exited with code ${code}`);
+    this.engineFlavour.noteStopped();
     this.currentState = this.vcredistShown ? 'error' : 'idle';
     this.assignedRole = null;
     this.dock = null;
@@ -1789,6 +1907,8 @@ export class WorkerManager {
   private async stopWorkerGracefully(quiet: boolean): Promise<void> {
     this.statusMessage = 'Stopping worker...';
     this.outputChannel.appendLine('[DLNE] Stopping compute worker...');
+    // A start that was still waiting for the tray's worker to go is cancelled by this Stop.
+    if (this.handoverWaiting) this.handoverCancelled = true;
 
     try {
       await vscode.workspace.getConfiguration('dlne').update('worker.autoStart', false, vscode.ConfigurationTarget.Global);
@@ -1894,6 +2014,7 @@ export class WorkerManager {
       } catch {}   // pkill exits 1 when nothing matched
     }
 
+    this.engineFlavour.noteStopped();
     this.currentState = 'idle';
     this.externalWorker = false;
     this.trayWorker = false;
@@ -1917,6 +2038,8 @@ export class WorkerManager {
       // The tray app's worker is not this editor's to stop (its app would only report that it died): it keeps
       // donating, and the owner is told where to stop it.
       if (this.externalWorker && this.trayWorker) {
+        // A tray from 1.1.0 pauses for this editor (4b): Start here waits for it and runs the editor's own worker.
+        if (this.readTrayHandover().canPause) return await this.startWorker({ interactive: true, fromPanel: options.fromPanel });
         vscode.window.showInformationMessage(`DLNE: ${TRAY_WORKER_TEXT}`);
         return true;
       }
@@ -1953,6 +2076,23 @@ export class WorkerManager {
     return this.startWorker({ interactive: false });
   }
 
+  /**
+   * The flavour the worker should run changed (the owner said yes to CUDA, or chose an engine): restart this editor's
+   * own worker the way a settings change does, so a worker that carries a shard of the model leaves the swarm first.
+   * A worker started outside this editor is not ours to restart.
+   */
+  private async restartForFlavour(): Promise<void> {
+    const own = this.workerProcess && !this.workerProcess.killed && !this.stopping;
+    if (!own || this.flavourRestarting || this.disposed) return;
+    this.flavourRestarting = true;
+    try {
+      this.outputChannel.appendLine('[DLNE] The engine flavour changed; restarting the worker...');
+      await this.restartWorker();
+    } finally {
+      this.flavourRestarting = false;
+    }
+  }
+
   private emitChange() {
     this.onStatusChangeEmitter.fire(this.getStatus());
   }
@@ -1969,6 +2109,9 @@ export class WorkerManager {
     }
     this.settingListener?.dispose();
     this.settingListener = undefined;
+    this.engineListener?.dispose();
+    this.engineListener = undefined;
+    this.engineFlavour.onRestartNeeded = undefined;
     // Retain worker across window reloads: do NOT call stopWorker() on dispose.
     // Background compute should remain active unless the user explicitly stops it.
     this.outputChannel.dispose();

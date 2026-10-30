@@ -20,21 +20,39 @@ import {
 import { TrayAddon } from '../worker/trayAddon';
 import { TRAY_PAGE_URL } from '../worker/trayApp';
 import { DONATE_CSS, createDonatePanel } from './donateView';
+import { AGENT_CONTROLS_CSS, AgentControlsModel, buildAgentControls, createAgentControls, isKeyHolder } from './agentControls';
+import { getEngineState, onEngineStateChanged, setEngineSetting } from '../worker/engineFlavour';
+import type { EngineSetting } from '../worker/engineFlavour';
+import { KeyTier, getKeyTier, onKeyTierChanged } from '../agent/keyTier';
 import { phoneChatUrl } from '../serverUrl';
 import { ToolCallResult, ToolRegistry } from '../agent/tools';
 import { renderMarkdown } from './markdown';
-import { memoryMode, undoMemoryChange } from '../agent/memory';
+import { memoryMode } from '../agent/memory';
+import { MAX_PICTURES, PictureAttachment, checkPictures, visionOffered } from '../client/pictures';
+import { undoChange } from '../agent/skills';
 
 export interface ChatMessageItem {
   id: string;
   role: 'user' | 'assistant';
   text: string;
+  /** The pictures sent with a user message (4d): names only. A saved chat keeps a placeholder, never the bytes. */
+  pictures?: Array<{ name: string }>;
   thinking?: string;
   toolCalls?: Array<{
     name: string;
     args: Record<string, any>;
     result?: ToolCallResult;
   }>;
+}
+
+/**
+ * A value as the page's script holds it in its source. Nothing in it may end the script block (a GPU name comes from a
+ * driver), so the characters that could are written as escapes.
+ */
+function scriptData(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 }
 
 /** A message to the page about a task. The same shape is sent live and, later, again to a page that was away. */
@@ -175,7 +193,69 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       this._view?.webview.postMessage({
         type: 'workerStatus', status, copy: contributionCopy(status), role: roleCopy(status), donate: this._donateModel(status),
       });
+      // The worker's role decides whether Speed or Quality is shown, and its state whether CUDA is greyed.
+      this._postControls();
     });
+  }
+
+  // ---- the controls at the top (agentControls.ts) ----------------------------------------------------------------------
+
+  /** What the coordinator last said this caller is (keyTier.ts); null until it has, and with an older coordinator. */
+  private keyTier: KeyTier | null = null;
+
+  /** The panel's controls as they stand: the worker's role, the settings, the engine state and the key tier. */
+  private _controlsModel(): AgentControlsModel {
+    const settings = vscode.workspace.getConfiguration('dlne');
+    return buildAgentControls({
+      status: this.workerManager.getStatus(),
+      ownGpu: settings.get('ownGpu', 'faster'),
+      engine: getEngineState(),
+      tier: this.keyTier,
+      unlimitedTurns: settings.get('agent.unlimitedTurns', true),
+    });
+  }
+
+  private _postControls(): void {
+    this.post({ type: 'agentControls', model: this._controlsModel() });
+  }
+
+  /** Asks keyTier.ts who this caller is; the controls follow when the answer differs from what they show. */
+  private async _refreshKeyTier(): Promise<void> {
+    try {
+      const tier = await getKeyTier();
+      if (tier !== this.keyTier) {
+        this.keyTier = tier;
+        this._postControls();
+      }
+    } catch {
+      // not knowing is a tier of its own (null): the key holder's rows stay out of the panel
+    }
+  }
+
+  /** Speed or Quality was clicked: the setting is written, and Settings shows the same (it is the one setting). */
+  private async _onOwnGpu(value: unknown): Promise<void> {
+    if (value === 'faster' || value === 'smarter') {
+      await vscode.workspace.getConfiguration('dlne').update('ownGpu', value, vscode.ConfigurationTarget.Global);
+    }
+    this._postControls();
+  }
+
+  /** Auto, Vulkan or CUDA was clicked: engineFlavour.ts writes the setting (and asks the CUDA question first). */
+  private async _onEngine(value: unknown): Promise<void> {
+    const known = value === 'auto' || value === 'vulkan' || value === 'cuda';
+    // A computer that may not use CUDA is shown the button greyed; a post that gets past that is not acted on.
+    if (known && !(value === 'cuda' && getEngineState().capable === false)) {
+      await setEngineSetting(value as EngineSetting);
+    }
+    this._postControls();
+  }
+
+  /** The unlimited-turns switch: only an API-key holder (or the host) is shown it, so only they can write it. */
+  private async _onUnlimitedTurns(on: unknown): Promise<void> {
+    if (typeof on === 'boolean' && isKeyHolder(this.keyTier)) {
+      await vscode.workspace.getConfiguration('dlne').update('agent.unlimitedTurns', on, vscode.ConfigurationTarget.Global);
+    }
+    this._postControls();
   }
 
   /**
@@ -445,12 +525,30 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       if (e.affectsConfiguration('dlne.autoApproveAll')) {
         this._view?.webview.postMessage({ type: 'autoApprove', on: ToolRegistry.autoApproveAllOn() });
       }
+      // Speed or Quality, the Graphics API and the unlimited-turns switch show what Settings says, wherever it is changed.
+      if (['dlne.ownGpu', 'dlne.worker.engine', 'dlne.agent.unlimitedTurns'].some((key) => e.affectsConfiguration(key))) {
+        this._postControls();
+      }
     });
     webviewView.onDidDispose?.(() => autoListener?.dispose());
+
+    // The engine's state (what runs, whether CUDA is allowed) and the key tier change on their own.
+    const engineListener = onEngineStateChanged(() => this._postControls());
+    const tierListener = onKeyTierChanged((tier) => {
+      this.keyTier = tier;
+      this._postControls();
+    });
+    webviewView.onDidDispose?.(() => {
+      engineListener.dispose();
+      tierListener.dispose();
+    });
+    void this._refreshKeyTier();
 
     // The model line follows the status the status bar already polls; nothing here asks for it.
     const stopFollowing = this.client.onClusterStatus?.((status) => {
       this._view?.webview.postMessage({ type: 'modelLine', text: swarmModelLine(status) });
+      // The picture controls come and go with the coordinator's `capabilities.vision` (4d).
+      this._view?.webview.postMessage({ type: 'vision', on: visionOffered(status) });
     });
     webviewView.onDidDispose?.(() => {
       stopFollowing?.();
@@ -475,7 +573,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           break;
         }
         case 'sendMessage': {
-          await this.handleUserMessage(data.text);
+          await this.handleUserMessage(data.text, data.images);
           break;
         }
         case 'setAutoApprove': {
@@ -487,6 +585,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           if (typeof data.text === 'string' && data.text.length <= 1_000_000) {
             await vscode.env?.clipboard?.writeText(data.text);
           }
+          break;
+        }
+        case 'setOwnGpu': {
+          await this._onOwnGpu(data.value);
+          break;
+        }
+        case 'setEngine': {
+          await this._onEngine(data.value);
+          break;
+        }
+        case 'setUnlimitedTurns': {
+          await this._onUnlimitedTurns(data.on);
           break;
         }
         case 'abortTask': {
@@ -548,8 +658,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           break;
         }
         case 'undoMemory': {
-          // The Undo next to a memory change (docs/agent-memory.md 7.6); undoMemoryChange checks what it is given.
-          const undone = undoMemoryChange(data.change);
+          // The Undo next to a memory change (docs/agent-memory.md 7.6); undoChange checks what it is given.
+          const undone = undoChange(data.change);
           if (undone.ok) vscode.window.showInformationMessage(`DLNE: ${undone.message}`);
           else vscode.window.showWarningMessage(`DLNE: ${undone.message}`);
           this._view?.webview.postMessage({ type: 'memoryUndone', ok: undone.ok, message: undone.message });
@@ -578,8 +688,22 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
    * page is sent one `turnComplete` and the host is free for the next message. A page left "running" has only Stop
    * to press, which is what "it stops running and doesn't continue" looked like.
    */
-  private async handleUserMessage(text: string) {
-    if (typeof text !== 'string' || !text.trim()) return;
+  private async handleUserMessage(text: string, images?: unknown) {
+    if (typeof text !== 'string') return;
+    // Pictures the page sent (4d), checked again: the page is only a page. Their thumbnails are the page's own drawing,
+    // small JPEGs; anything else in their place is not shown.
+    const checked = checkPictures(images);
+    const thumbs = Array.isArray(images) ? images.map((i: any) => (typeof i?.thumb === 'string' && /^data:image\/jpeg;base64,[A-Za-z0-9+/]{1,60000}={0,2}$/.test(i.thumb) ? i.thumb : undefined)) : [];
+    const pictures = checked.pictures.map((picture, i) => ({ picture, thumb: thumbs[i] }));
+    // Words, or pictures that can be read: a message with neither starts nothing.
+    if (!text.trim() && !(pictures.length > 0 && visionOffered(this.client.lastKnownClusterStatus?.()))) {
+      if (pictures.length > 0 || checked.problems.length > 0) {
+        this.syncPage();
+        this.post({ type: 'refused', text });
+        this.post({ type: 'error', error: pictures.length > 0 ? 'Pictures cannot be read right now: the swarm\'s engine has no way to see them.' : `Left out: ${checked.problems.join('; ')}.` });
+      }
+      return;
+    }
 
     // The session shown when the message was sent: the task stays its own if another session is shown meanwhile.
     const session = this.active;
@@ -595,7 +719,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     session.stopping = false;
     let outcome: AgentRunOutcome | undefined;
     try {
-      outcome = await this.runTask(session, text);
+      outcome = await this.runTask(session, text, pictures);
     } catch (err) {
       // A throw out of the run: a tool call that failed outside the tool's own handling, a broken callback. The task
       // is over, and the page is told why in words.
@@ -620,23 +744,26 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   /** The agent's run for one message, drawing it on the page as it goes (while its session is the one shown). */
-  private runTask(session: Session, text: string): Promise<AgentRunOutcome> {
+  private runTask(session: Session, text: string, pictures: Array<{ picture: PictureAttachment; thumb?: string }> = []): Promise<AgentRunOutcome> {
     // The new turn comes first, so whatever follows (even an error) belongs to it and not to the one before.
     const turn = { index: session.history.length, events: [] as PageEvent[] };
     session.turn = turn;
 
+    // The pictures the page shows as sent are the ones the agent can read (it says so itself when it leaves one out).
+    const sent = this._vision() ? pictures : [];
     const userMsg: ChatMessageItem = {
       id: 'msg-' + Date.now() + '-u',
       role: 'user',
-      text
+      text,
+      ...(sent.length > 0 ? { pictures: sent.map((p) => ({ name: p.picture.name })) } : {})
     };
     session.history.push(userMsg);
     // The first thing asked names the session.
     const meta = this.index.sessions.find((s) => s.id === session.id);
-    if (meta && meta.title === NEW_SESSION_TITLE) meta.title = sessionTitle(text);
+    if (meta && meta.title === NEW_SESSION_TITLE) meta.title = sessionTitle(text || (pictures[0]?.picture.name ?? text));
     this.saveHistory(session);
 
-    this.emit(session, { type: 'appendUserMessage', text });
+    this.emit(session, { type: 'appendUserMessage', text, ...(sent.length > 0 ? { pictures: sent.map((p) => ({ name: p.picture.name, thumb: p.thumb })) } : {}) });
     this.postSessions();
 
     const assistantMsg: ChatMessageItem = {
@@ -686,7 +813,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       },
       // Text, not the error itself: an Error is JSON'd to nothing on its way to the page.
       onError: (error) => show({ type: 'error', error: `Error: ${describeError(error)}` })
-    }, { maxTurns, reflect: memoryMode(vscode.workspace.getConfiguration('dlne').get('agent.memory', 'auto')) !== 'off' });
+    }, { maxTurns, reflect: memoryMode(vscode.workspace.getConfiguration('dlne').get('agent.memory', 'auto')) !== 'off',
+      images: pictures.map((p) => p.picture) });
   }
 
   /**
@@ -738,7 +866,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       workerCopy: contributionCopy(workerStatus),
       workerRole: roleCopy(workerStatus),
       donate: this._donateModel(workerStatus),
+      controls: this._controlsModel(),
       modelLine: this._modelLine(),
+      vision: this._vision(),
       // The queue is the swarm's answer to this window's latest request: it is shown with a session that is waiting.
       queue: session.running ? this._queueView(this.client.currentQueue?.()) : null,
       autoApprove: ToolRegistry.autoApproveAllOn(),
@@ -764,7 +894,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
     const status = this.workerManager.getStatus();
     this.post({ type: 'workerStatus', status, copy: contributionCopy(status), role: roleCopy(status), donate: this._donateModel(status) });
+    this._postControls();
+    void this._refreshKeyTier();
     this.post({ type: 'modelLine', text: this._modelLine() });
+    this.post({ type: 'vision', on: this._vision() });
     this.post({ type: 'autoApprove', on: ToolRegistry.autoApproveAllOn() });
     this.post({ type: 'queue', queue: this.active.running ? this._queueView(this.client.currentQueue?.()) : null });
     this.postSessions();
@@ -778,6 +911,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private _logoSrc(): string {
     const logo = vscode.Uri.joinPath(this._extensionUri, 'media', 'dlne_logo.png');
     return (this._view ? this._view.webview.asWebviewUri(logo) : logo).toString();
+  }
+
+  /** Whether the coordinator says its engine can read pictures: the page shows its picture controls only then. */
+  private _vision(): boolean {
+    return visionOffered(this.client.lastKnownClusterStatus?.());
   }
 
   /** "DLNE Swarm (auto)", followed by the live model's name once a status answer has said it. */
@@ -814,11 +952,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const live = isContrib || isStarting;
     const { ruleHtml: ruleText } = contributionCopy(st);
     const role = roleCopy(st);
-    // The panel's first model sits in the script as data. Nothing in it may end the script block (a GPU name comes
-    // from a driver), so the characters that could are written as escapes.
-    const donateModel = JSON.stringify(this._donateModel(st))
-      .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026')
-      .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+    // The panel's first models sit in the script as data (see scriptData).
+    const donateModel = scriptData(this._donateModel(st));
+    const controlsModel = scriptData(this._controlsModel());
     // Shown as the link's tooltip; it comes from a setting, so it is escaped for the attribute.
     const phoneUrl = phoneChatUrl(vscode.workspace.getConfiguration('dlne'))
       .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
@@ -940,6 +1076,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     details.contrib-card > summary .contrib-title { flex: 1; }
     #contrib-rule, #role-display { margin-top: 4px; }
 ${DONATE_CSS}
+${AGENT_CONTROLS_CSS}
     .contrib-card a {
       color: var(--vscode-textLink-foreground);
       cursor: pointer;
@@ -1067,11 +1204,34 @@ ${DONATE_CSS}
       box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
     }
     .message {
+      position: relative;
       padding: 10px 12px;
       border-radius: 6px;
       line-height: 1.45;
       word-wrap: break-word;
     }
+    /* The words of the chat can be selected (Ctrl+C or Cmd+C, and the Copy of VS Code's own right-click menu). */
+    .message, .terminal-card {
+      -webkit-user-select: text;
+      user-select: text;
+    }
+    /* Copy on every message: out of sight until the pointer or the keyboard is on the message. */
+    .msg-copy {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      z-index: 1;
+      padding: 1px 6px;
+      font-size: 0.75em;
+      opacity: 0;
+    }
+    .msg-copy, .terminal-actions {
+      /* the buttons' words are not part of what a selection of the message copies */
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    .message:hover .msg-copy, .message:focus-within .msg-copy { opacity: 0.85; }
+    .msg-copy:hover, .msg-copy:focus-visible { opacity: 1; }
     .user {
       background-color: var(--vscode-button-background);
       color: var(--vscode-button-foreground);
@@ -1296,7 +1456,13 @@ ${DONATE_CSS}
     .terminal-cmd {
       color: #38bdf8;
       font-weight: bold;
+      cursor: pointer;
+      overflow-wrap: anywhere;
     }
+    /* The command line opens and shuts the card: the arrow says which. */
+    .terminal-cmd::before { content: '\\25B8'; margin-right: 6px; }
+    .terminal-card.expanded .terminal-cmd::before { content: '\\25BE'; }
+    .terminal-cmd:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007fd4); outline-offset: 2px; }
     .terminal-out {
       margin-top: 4px;
       color: #94a3b8;
@@ -1304,6 +1470,10 @@ ${DONATE_CSS}
       max-height: 140px;
       overflow-y: auto;
     }
+    .terminal-card.expanded .terminal-out { max-height: none; }
+    .terminal-actions { display: flex; gap: 6px; margin-top: 6px; }
+    .terminal-actions button { padding: 1px 8px; font-size: 0.8em; }
+    .terminal-actions button:disabled { opacity: 0.5; cursor: default; }
 
     /* Tool Call Active Pill */
     .tool-pill {
@@ -1346,6 +1516,42 @@ ${DONATE_CSS}
     #stop-btn:disabled {
       opacity: 0.6;
       cursor: default;
+    }
+    /* Pictures for the next message (4d): small thumbnails with a way to take each back out. */
+    #picture-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .picture-chip {
+      position: relative;
+      display: inline-block;
+    }
+    .picture-thumb {
+      display: block;
+      max-width: 72px;
+      max-height: 72px;
+      border-radius: 4px;
+      border: 1px solid var(--vscode-input-border, transparent);
+    }
+    .picture-remove {
+      position: absolute;
+      top: -6px;
+      right: -6px;
+      padding: 0 5px;
+      line-height: 1.4;
+      border-radius: 9px;
+      font-size: 0.75em;
+    }
+    .message.user .picture-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .message.user .picture-note {
+      font-size: 0.85em;
+      color: var(--vscode-descriptionForeground);
     }
     .btn-row {
       display: flex;
@@ -1420,6 +1626,9 @@ ${DONATE_CSS}
   </style>
 </head>
 <body>
+  <!-- Speed or Quality, the Graphics API, and a key holder's lines: drawn by the script from the model in agentControls.ts -->
+  <div class="agent-controls" id="agent-controls" style="display:none"></div>
+
   <!-- Donate compute: the panel is drawn by the script from the model in worker/donatePanel.ts -->
   <details class="contrib-card" id="contrib-card" open>
     <summary class="contrib-header">
@@ -1458,11 +1667,15 @@ ${DONATE_CSS}
   </div>
 
   <div id="input-container">
+    <div id="picture-strip" aria-label="Pictures for your next message" style="display:none;"></div>
+    <div class="busy-hint" id="picture-hint" role="status" aria-live="polite" style="display:none;"></div>
     <textarea id="prompt-input" rows="3" placeholder="Ask DLNE to write code, edit files, or fix bugs..."></textarea>
+    <input type="file" id="picture-input" accept="image/png,image/jpeg,image/webp,image/gif" multiple style="display:none;">
     <div class="busy-hint" id="busy-hint" role="status" aria-live="polite" style="display:none">DLNE is still working. Press Stop to interrupt it, or wait for it to finish. Your message is kept in the box.</div>
     <div class="btn-row">
       <span class="model-line" id="model-line" title="The swarm picks the model from the GPUs available; there is nothing to choose.">${modelLine}</span>
       <div class="btn-group-right">
+        <button class="secondary" id="attach-btn" style="display:none;" title="Attach a picture (PNG, JPEG, WebP or GIF; up to 4 MiB, 4 to a message). You can also paste one or drop it on the box." aria-label="Attach a picture">🖼</button>
         <button class="secondary toggle" id="auto-btn" aria-pressed="false" title="Off: the agent asks before it edits files or runs a command. On: every action runs without asking (edits anywhere, every command), from its next step, until you turn it off. The same switch as the status bar's DLNE: Auto/Ask and the setting dlne.autoApproveAll. The agent's next step can come from a volunteer's machine.">Auto: off</button>
         <button class="secondary" id="clear-btn" title="Start a new chat; this one stays in the list behind the back arrow">New chat</button>
         <button class="secondary" id="stop-btn" style="display:none;">Stop</button>
@@ -1480,6 +1693,15 @@ ${DONATE_CSS}
     const chatContainer = document.getElementById('chat-container');
     const promptInput = document.getElementById('prompt-input');
     const sendBtn = document.getElementById('send-btn');
+    const pictureStrip = document.getElementById('picture-strip');
+    const pictureHint = document.getElementById('picture-hint');
+    const pictureInput = document.getElementById('picture-input');
+    const attachBtn = document.getElementById('attach-btn');
+    // Pictures (4d): the controls are there only while the coordinator says its engine can read them.
+    let visionOn = ${this._vision() ? 'true' : 'false'};
+    attachBtn.style.display = visionOn ? 'inline-block' : 'none';
+    let pictures = [];      // for the next message: { name, dataUri, thumb }
+    let pictureBusy = 0;    // files still being read
     const stopBtn = document.getElementById('stop-btn');
     const clearBtn = document.getElementById('clear-btn');
     const autoBtn = document.getElementById('auto-btn');
@@ -1657,15 +1879,192 @@ ${DONATE_CSS}
     }
 
     // Sends a message to the agent, unless a task is running: then nothing is sent, and the words stay where they are.
-    function sendText(text) {
+    // \`attached\`: the pictures for this message (4d); they go as data URIs, with their small thumbnails to draw.
+    function sendText(text, attached) {
       if (busy) {
         busyHint.style.display = 'block';
         return false;
       }
       setBusy(true);
-      vscode.postMessage({ type: 'sendMessage', text });
+      const message = { type: 'sendMessage', text };
+      if (attached && attached.length > 0) {
+        message.images = attached.map((p) => ({ name: p.name, dataUri: p.dataUri, thumb: p.thumb }));
+      }
+      vscode.postMessage(message);
       return true;
     }
+
+    // ---- pictures (4d): pasted, dropped or attached; PNG, JPEG, WebP or GIF; 4 a message, 4 MiB each ------------------
+    const MAX_PICTURES = ${MAX_PICTURES};
+    const MAX_PICTURE_BYTES = 4 * 1024 * 1024;
+    const LONGEST_SIDE = 2048;          // a bigger picture is made smaller: the engine reads about 1,000 tokens of any
+    const PICTURE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+
+    function showPictureHint(text) {
+      pictureHint.textContent = text || '';
+      pictureHint.style.display = text ? 'block' : 'none';
+    }
+
+    function drawPictures() {
+      pictureStrip.textContent = '';
+      pictures.forEach((p) => {
+        const chip = document.createElement('div');
+        chip.className = 'picture-chip';
+        const img = document.createElement('img');
+        img.className = 'picture-thumb';
+        img.src = p.thumb;
+        img.alt = p.name;
+        img.title = p.name;
+        const remove = document.createElement('button');
+        remove.className = 'secondary picture-remove';
+        remove.textContent = '✕';
+        remove.title = 'Take ' + p.name + ' out';
+        remove.setAttribute('aria-label', 'Take ' + p.name + ' out');
+        remove.addEventListener('click', () => {
+          pictures = pictures.filter((q) => q !== p);
+          drawPictures();
+          showPictureHint('');
+        });
+        chip.appendChild(img);
+        chip.appendChild(remove);
+        pictureStrip.appendChild(chip);
+      });
+      pictureStrip.style.display = pictures.length > 0 ? 'flex' : 'none';
+    }
+
+    // The picture controls come and go with the coordinator's \`capabilities.vision\`. Pictures waiting for a message that
+    // can no longer carry them are taken back out, and the hint says so.
+    function setVision(on) {
+      visionOn = on === true;
+      attachBtn.style.display = visionOn ? 'inline-block' : 'none';
+      if (!visionOn && pictures.length > 0) {
+        pictures = [];
+        drawPictures();
+        showPictureHint('The swarm engine cannot read pictures right now, so the pictures were taken out of your message.');
+      }
+    }
+
+    function readAsDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(new Error('could not be read'));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function loadPicture(url) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('is not a picture the editor can open'));
+        img.src = url;
+      });
+    }
+
+    function dataUrlBytes(url) {
+      const body = url.length - url.indexOf(',') - 1;
+      return Math.floor(body * 3 / 4) - (url.endsWith('==') ? 2 : url.endsWith('=') ? 1 : 0);
+    }
+
+    // The picture drawn onto a canvas, no longer than \`longest\` on a side, as a data URI of \`type\`.
+    function redrawn(img, longest, type, quality) {
+      const w = img.naturalWidth || img.width;
+      const h = img.naturalHeight || img.height;
+      const k = Math.min(1, longest / Math.max(w, h, 1));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(w * k));
+      canvas.height = Math.max(1, Math.round(h * k));
+      const ctx = canvas.getContext('2d');
+      if (type === 'image/jpeg') {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      return canvas.toDataURL(type, quality);
+    }
+
+    // One file as a picture for the message: PNG and JPEG that fit are kept as they are; WebP and GIF (its first frame)
+    // become PNG, a picture too big for the limits is made smaller. The server reads PNG and JPEG only.
+    async function pictureFromFile(file) {
+      const name = String(file.name || 'picture').split('/').pop().split(String.fromCharCode(92)).pop() || 'picture';
+      if (PICTURE_TYPES.indexOf(file.type) < 0) throw new Error('is not a PNG, JPEG, WebP or GIF picture');
+      if (file.size > MAX_PICTURE_BYTES) throw new Error('is ' + (file.size / 1048576).toFixed(1) + ' MiB, and a picture may be 4 MiB at most');
+      const original = await readAsDataUrl(file);
+      const img = await loadPicture(original);
+      const longest = Math.max(img.naturalWidth || img.width, img.naturalHeight || img.height);
+      let dataUri = original;
+      if (!((file.type === 'image/png' || file.type === 'image/jpeg') && longest <= LONGEST_SIDE)) {
+        dataUri = redrawn(img, LONGEST_SIDE, file.type === 'image/jpeg' ? 'image/jpeg' : 'image/png', 0.92);
+        if (dataUrlBytes(dataUri) > MAX_PICTURE_BYTES) dataUri = redrawn(img, LONGEST_SIDE, 'image/jpeg', 0.85);
+        if (dataUrlBytes(dataUri) > MAX_PICTURE_BYTES) throw new Error('is too big to send, even made smaller');
+      }
+      return { name, dataUri, thumb: redrawn(img, 96, 'image/jpeg', 0.6) };
+    }
+
+    async function addPictureFiles(files) {
+      const notes = [];
+      for (const file of files) {
+        if (pictures.length + pictureBusy >= MAX_PICTURES) {
+          notes.push('a message carries ' + MAX_PICTURES + ' pictures at most');
+          break;
+        }
+        pictureBusy++;
+        try {
+          pictures.push(await pictureFromFile(file));
+          drawPictures();
+        } catch (err) {
+          notes.push((file.name || 'a picture') + ' ' + (err && err.message ? err.message : 'could not be added'));
+        } finally {
+          pictureBusy--;
+        }
+      }
+      showPictureHint(notes.length > 0 ? 'Not added: ' + notes.join('; ') + '.' : '');
+    }
+
+    // The picture files in a paste or a drop (the clipboard's items, or the dropped files).
+    function pictureFilesOf(source) {
+      const out = [];
+      const list = source && source.items ? Array.from(source.items) : [];
+      list.forEach((item) => {
+        if (item && item.kind === 'file' && String(item.type).indexOf('image/') === 0) {
+          const file = item.getAsFile();
+          if (file) out.push(file);
+        }
+      });
+      if (out.length === 0 && source && source.files) {
+        Array.from(source.files).forEach((file) => { if (String(file.type).indexOf('image/') === 0) out.push(file); });
+      }
+      return out;
+    }
+
+    function noPicturesNow() {
+      showPictureHint('The swarm engine cannot read pictures right now.');
+    }
+
+    promptInput.addEventListener('paste', (e) => {
+      const files = pictureFilesOf(e.clipboardData);
+      if (files.length === 0) return;      // text pastes as it always did
+      e.preventDefault();
+      if (!visionOn) return noPicturesNow();
+      void addPictureFiles(files);
+    });
+    inputContainer.addEventListener('dragover', (e) => {
+      if (e.dataTransfer && Array.from(e.dataTransfer.types || []).indexOf('Files') >= 0) e.preventDefault();
+    });
+    inputContainer.addEventListener('drop', (e) => {
+      const files = pictureFilesOf(e.dataTransfer);
+      if (files.length === 0) return;
+      e.preventDefault();
+      if (!visionOn) return noPicturesNow();
+      void addPictureFiles(files);
+    });
+    attachBtn.addEventListener('click', () => pictureInput.click());
+    pictureInput.addEventListener('change', () => {
+      const files = pictureInput.files ? Array.from(pictureInput.files) : [];
+      pictureInput.value = '';
+      if (files.length > 0) void addPictureFiles(files);
+    });
 
     // The agent's answer is shown as Markdown. renderMarkdown (src/views/markdown.ts, this same function) escapes
     // everything the model wrote before it reads any Markdown, so the text can never become markup of its own.
@@ -1687,6 +2086,75 @@ ${DONATE_CSS}
       });
     }
 
+    // Every message (yours and the agent's) has a Copy button. What it copies is plain text: your words as you typed
+    // them, and for the agent the Markdown it wrote (each answer block keeps its source in data-raw, as the rendered
+    // HTML cannot be turned back into it). Status lines and errors are not messages and have none.
+    function syncMessageCopy(message) {
+      const copyable = message.classList.contains('user') || message.querySelector('.assistant-body') !== null;
+      const button = message.querySelector('.msg-copy');
+      if (copyable && !button) {
+        const copy = document.createElement('button');
+        copy.className = 'secondary msg-copy';
+        copy.title = 'Copy this message';
+        copy.setAttribute('aria-label', 'Copy this message');
+        copy.textContent = 'Copy';
+        message.prepend(copy);
+      } else if (!copyable && button) {
+        button.remove();
+      }
+    }
+
+    function messageText(message) {
+      if (message.classList.contains('user')) {
+        const words = message.querySelector('.msg-text');
+        return words ? words.textContent : '';
+      }
+      return Array.from(message.querySelectorAll('.assistant-body'))
+        .map((block) => block.getAttribute('data-raw') || '')
+        .filter((raw) => raw !== '')
+        .join('\\n\\n');
+    }
+
+    // \`shown\`: the pictures sent with the message, { name, thumb }. A chat drawn again from the saved history has no thumbnails
+    // (only the names are kept), so each is a note, [picture: name].
+    function drawUserMessage(text, shown) {
+      const div = document.createElement('div');
+      div.className = 'message user';
+      const words = document.createElement('span');
+      words.className = 'msg-text';
+      words.textContent = text;
+      div.appendChild(words);
+      if (shown && shown.length > 0) {
+        const row = document.createElement('div');
+        row.className = 'picture-row';
+        shown.forEach((p) => {
+          if (p.thumb) {
+            const img = document.createElement('img');
+            img.className = 'picture-thumb';
+            img.src = p.thumb;
+            img.alt = '[picture: ' + p.name + ']';
+            img.title = p.name;
+            row.appendChild(img);
+          } else {
+            const note = document.createElement('span');
+            note.className = 'picture-note';
+            note.textContent = '[picture: ' + p.name + ']';
+            row.appendChild(note);
+          }
+        });
+        div.appendChild(row);
+      }
+      syncMessageCopy(div);
+      chatContainer.appendChild(div);
+    }
+
+    // The button says it was done for a moment, as the code blocks' Copy does.
+    function flashCopied(button) {
+      const was = button.textContent;
+      button.textContent = 'Copied';
+      setTimeout(() => { button.textContent = was; }, 1500);
+    }
+
     function renderCurrentAnswer() {
       if (renderTimer) {
         clearTimeout(renderTimer);
@@ -1694,7 +2162,9 @@ ${DONATE_CSS}
       }
       if (currentContentElem) {
         currentContentElem.innerHTML = renderMarkdown(currentContentRaw);
+        currentContentElem.setAttribute('data-raw', currentContentRaw);
         addCopyButtons(currentContentElem);
+        if (currentAssistantMsg) syncMessageCopy(currentAssistantMsg);
         keepUp();
       }
     }
@@ -1744,6 +2214,11 @@ ${DONATE_CSS}
     const donatePanel = createDonatePanel(document.getElementById('donate-panel'), (message) => vscode.postMessage(message));
     donatePanel.update(${donateModel});
 
+    // The controls at the top (agentControls.ts): the same, drawn from the model the extension builds.
+    ${createAgentControls.toString()}
+    const agentControls = createAgentControls(document.getElementById('agent-controls'), (message) => vscode.postMessage(message));
+    agentControls.update(${controlsModel});
+
     suiteBtn.addEventListener('click', () => {
       vscode.postMessage({ type: 'installSuite' });
     });
@@ -1764,8 +2239,17 @@ ${DONATE_CSS}
     // Enter calls this too, even while Send is hidden: the busy check is here, not in the button's looks.
     sendBtn.addEventListener('click', () => {
       const text = promptInput.value.trim();
-      if (!text) return;
-      if (sendText(text)) promptInput.value = '';
+      if (!text && pictures.length === 0) return;
+      if (pictureBusy > 0) {
+        showPictureHint('A picture is still being added. Send again in a moment.');
+        return;
+      }
+      if (sendText(text, pictures)) {
+        promptInput.value = '';
+        pictures = [];
+        drawPictures();
+        showPictureHint('');
+      }
     });
 
     stopBtn.addEventListener('click', () => {
@@ -1788,6 +2272,32 @@ ${DONATE_CSS}
     // Handle delegated click for Open File buttons in diff cards
     chatContainer.addEventListener('click', (e) => {
       const target = e.target;
+      // Copy from the chat (1.6.0): a message, or a terminal card's command or output. All go through VS Code's
+      // clipboard, as the code blocks' Copy does.
+      const messageCopy = target && target.closest ? target.closest('.msg-copy') : null;
+      if (messageCopy) {
+        const text = messageText(messageCopy.closest('.message'));
+        if (text) {
+          vscode.postMessage({ type: 'copyCode', text });
+          flashCopied(messageCopy);
+        }
+        return;
+      }
+      const cardOf = (elem) => (elem && elem.closest ? elem.closest('.terminal-card') : null);
+      if (target && target.classList.contains('term-copy-command')) {
+        vscode.postMessage({ type: 'copyCode', text: cardOf(target).getAttribute('data-command') || '' });
+        flashCopied(target);
+        return;
+      }
+      if (target && target.classList.contains('term-copy-output')) {
+        vscode.postMessage({ type: 'copyCode', text: cardOf(target).querySelector('.terminal-out').textContent });
+        flashCopied(target);
+        return;
+      }
+      if (target && target.classList.contains('terminal-cmd')) {
+        toggleTerminal(cardOf(target));
+        return;
+      }
       if (target && target.classList.contains('copy-btn')) {
         const code = target.parentElement.querySelector('code');
         vscode.postMessage({ type: 'copyCode', text: code ? code.textContent : '' });
@@ -1800,6 +2310,15 @@ ${DONATE_CSS}
         if (filePath) {
           vscode.postMessage({ type: 'openFile', path: filePath });
         }
+      }
+    });
+
+    // The command line is a button for the keyboard too.
+    chatContainer.addEventListener('keydown', (e) => {
+      const target = e.target;
+      if (target && target.classList.contains('terminal-cmd') && (e.key === 'Enter' || e.key === ' ')) {
+        e.preventDefault();
+        toggleTerminal(target.closest('.terminal-card'));
       }
     });
 
@@ -1860,16 +2379,46 @@ ${DONATE_CSS}
     function renderTerminalCard(parentElem, cmd, output, isError) {
       const card = document.createElement('div');
       card.className = 'terminal-card';
+      // The command (which the Copy command button copies) stays on the card, so a chat drawn again from the saved
+      // page, which has no listeners and no closures, still copies the right thing.
+      card.setAttribute('data-command', cmd);
       const cmdLine = document.createElement('div');
       cmdLine.className = 'terminal-cmd';
+      // A click, or Enter or Space, opens the card to its whole output and shuts it again (toggleTerminal).
+      cmdLine.setAttribute('role', 'button');
+      cmdLine.setAttribute('tabindex', '0');
+      cmdLine.setAttribute('aria-expanded', 'false');
+      cmdLine.title = 'Show the whole output';
       // the command is the model's, the output may be a repository's
       cmdLine.textContent = (isError ? '⚠️' : '⚡') + ' Terminal: ' + cmd;
       const out = document.createElement('div');
       out.className = 'terminal-out';
       out.textContent = output || '';
+      const actions = document.createElement('div');
+      actions.className = 'terminal-actions';
+      const copyCommand = document.createElement('button');
+      copyCommand.className = 'secondary term-copy-command';
+      copyCommand.textContent = 'Copy command';
+      const copyOutput = document.createElement('button');
+      copyOutput.className = 'secondary term-copy-output';
+      copyOutput.textContent = 'Copy output';
+      copyOutput.disabled = !output;
+      actions.appendChild(copyCommand);
+      actions.appendChild(copyOutput);
       card.appendChild(cmdLine);
       card.appendChild(out);
+      card.appendChild(actions);
       parentElem.appendChild(card);
+    }
+
+    // The terminal card shows 140 px of its output; its command line opens it to all of it, and shuts it again.
+    function toggleTerminal(card) {
+      const open = !card.classList.contains('expanded');
+      card.classList.toggle('expanded', open);
+      const cmdLine = card.querySelector('.terminal-cmd');
+      cmdLine.setAttribute('aria-expanded', open ? 'true' : 'false');
+      cmdLine.title = open ? 'Show less of the output' : 'Show the whole output';
+      saveWebviewState();
     }
 
     // Any other tool's result: one line, its mark, its name and the start of what it said.
@@ -1910,10 +2459,7 @@ ${DONATE_CSS}
     // One saved turn of the chat, drawn as it was kept (no status lines, no buttons: those belong to a live task).
     function renderHistoryItem(item) {
       if (item.role === 'user') {
-        const div = document.createElement('div');
-        div.className = 'message user';
-        div.textContent = item.text;
-        chatContainer.appendChild(div);
+        drawUserMessage(item.text, item.pictures);
       } else {
         const asstDiv = document.createElement('div');
         asstDiv.className = 'message assistant';
@@ -1949,8 +2495,10 @@ ${DONATE_CSS}
           const body = document.createElement('div');
           body.className = 'assistant-body';
           body.innerHTML = renderMarkdown(item.text);   // escaped first, then Markdown (markdown.ts)
+          body.setAttribute('data-raw', item.text);
           addCopyButtons(body);
           asstDiv.appendChild(body);
+          syncMessageCopy(asstDiv);
         }
         chatContainer.appendChild(asstDiv);
       }
@@ -1965,6 +2513,11 @@ ${DONATE_CSS}
 
         case 'donatePanel': {
           donatePanel.update(msg.model);
+          break;
+        }
+
+        case 'agentControls': {
+          agentControls.update(msg.model);
           break;
         }
 
@@ -1987,7 +2540,9 @@ ${DONATE_CSS}
           if (msg.modelLine) {
             modelLine.textContent = msg.modelLine;
           }
+          if (typeof msg.vision === 'boolean') setVision(msg.vision);
           showAutoApprove(msg.autoApprove === true);
+          if (msg.controls) agentControls.update(msg.controls);
           if (msg.workerStatus) {
             applyWorkerStatus(msg.workerStatus, msg.workerCopy, msg.workerRole, msg.donate);
           }
@@ -2035,10 +2590,7 @@ ${DONATE_CSS}
             continueBtn.remove();
             continueBtn = null;
           }
-          const div = document.createElement('div');
-          div.className = 'message user';
-          div.textContent = msg.text;
-          chatContainer.appendChild(div);
+          drawUserMessage(msg.text, msg.pictures);
           keepUp(true);     // your own message: the chat shows it, and follows the answer from there
 
           currentAssistantMsg = document.createElement('div');
@@ -2134,6 +2686,7 @@ ${DONATE_CSS}
               }
               currentContentElem.remove();
               currentContentElem = null;
+              if (currentAssistantMsg) syncMessageCopy(currentAssistantMsg);
             } else {
               renderCurrentAnswer();
             }
@@ -2221,6 +2774,11 @@ ${DONATE_CSS}
           div.textContent = typeof msg.error === 'string' && msg.error ? msg.error : 'Error: something went wrong.';
           chatContainer.appendChild(div);
           saveWebviewState();
+          break;
+        }
+
+        case 'vision': {
+          setVision(msg.on === true);
           break;
         }
 

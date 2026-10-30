@@ -42,6 +42,11 @@ BACKUP_META = "backup.json"
 # script cannot import): one ggml-rpc-server zip per worker platform, served for download,
 # and the upstream build the coordinator itself runs.
 RPC_PLATFORMS = ("win-x64", "linux-x64", "macos-arm64", "win-arm64", "linux-arm64", "macos-x64")
+# The CUDA engine (2.7): one zip per platform, about 600 MB each, served for download like the RPC zips. They are kept
+# OUT of the backups and out of managed_files on purpose: a backup tars every release-owned file into memory and
+# 1.2 GB of it each release would be absurd. A release that signs one installs it (or finds that exact file already
+# here); a release that signs none removes them.
+CUDA_PLATFORMS = ("win-x64", "linux-x64")
 SERVER_LLAMA_UPLOAD = "server-llama.tar.gz"
 LLAMA_DIR = "llama"      # root/llama/<build>/ holds each installed server build
 BIN_LINK = "bin"         # root/bin -> the server build in use (llama-server, ggml-rpc-server)
@@ -57,6 +62,14 @@ def rpc_zip_name(platform: str) -> str:
 
 def rpc_field(platform: str, what: str) -> str:
     return f"rpc_{platform.replace('-', '_')}_{what}"
+
+
+def cuda_zip_name(platform: str) -> str:
+    return f"cuda-bin-{platform}.zip"
+
+
+def cuda_field(platform: str, what: str) -> str:
+    return f"cuda_{platform.replace('-', '_')}_{what}"
 
 
 # The files a release owns on the host. Anything else in the install directory (models, config,
@@ -105,6 +118,31 @@ def _write_atomic(path: str, data: bytes) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temp, path)
+
+
+def _copy_atomic(source: str, path: str) -> None:
+    """Like _write_atomic for a file too big to read into memory."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp = f"{path}.tmp-{os.getpid()}"
+    with open(source, "rb") as src, open(temp, "wb") as handle:
+        shutil.copyfileobj(src, handle, 1024 * 1024)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+CUDA_ZIP_NAMES = tuple(cuda_zip_name(p) for p in CUDA_PLATFORMS)
+
+
+def prune_cuda_zips(root: str, manifest: Dict) -> List[str]:
+    """Remove the CUDA zips ``manifest`` does not sign (a release without CUDA, or a rollback to one)."""
+    removed = []
+    for platform in CUDA_PLATFORMS:
+        path = os.path.join(root, cuda_zip_name(platform))
+        if cuda_field(platform, "sha256") not in manifest and os.path.isfile(path):
+            os.remove(path)
+            removed.append(cuda_zip_name(platform))
+    return removed
 
 
 def installed_version(root: str) -> str:
@@ -232,6 +270,17 @@ def check_assets(root: str, manifest: Dict, assets_dir: Optional[str]) -> Dict[s
         name = rpc_zip_name(platform)
         path = os.path.join(assets_dir, name) if assets_dir else os.path.join(root, name)
         _check_file(path, manifest.get(rpc_field(platform, "size")), sha, f"{platform} RPC archive")
+        found[name] = path
+    for platform in CUDA_PLATFORMS:
+        sha = manifest.get(cuda_field(platform, "sha256"))
+        if sha is None:
+            continue
+        # Uploaded with this release, or already installed here from an earlier one (the deploy skips the upload
+        # when the host holds exactly the signed file).
+        name = cuda_zip_name(platform)
+        path = os.path.join(assets_dir, name) if assets_dir and os.path.exists(os.path.join(assets_dir, name)) \
+            else os.path.join(root, name)
+        _check_file(path, manifest.get(cuda_field(platform, "size")), sha, f"{platform} CUDA archive")
         found[name] = path
     if "server_llama_sha256" in manifest:
         if assets_dir and os.path.exists(os.path.join(assets_dir, SERVER_LLAMA_UPLOAD)):
@@ -402,6 +451,12 @@ def restore_backup(root: str, backup_dir: str) -> List[str]:
         if relative not in wanted:
             os.remove(os.path.join(root, *relative.split("/")))
             removed.append(relative)
+    # The restored manifest decides which CUDA zips stay (they are not in backups; see CUDA_PLATFORMS).
+    try:
+        with open(os.path.join(root, MANIFEST_NAME), "r", encoding="utf-8") as handle:
+            prune_cuda_zips(root, json.load(handle))
+    except (OSError, ValueError):
+        pass
     # The engine binaries the backup ran with (the build directories themselves are kept).
     if meta.get("bin_target") and meta["bin_target"] != current_bin_target(root):
         point_bin_at(root, meta["bin_target"])
@@ -417,7 +472,11 @@ def _install(root: str, members: Dict[str, bytes], archive_path: str, manifest: 
     _write_atomic(os.path.join(root, ARCHIVE_NAME), open(archive_path, "rb").read())
     for name, path in assets.items():
         if name not in (SERVER_LLAMA_UPLOAD, SERVER_SD_UPLOAD) and os.path.abspath(path) != os.path.abspath(os.path.join(root, name)):
-            _write_atomic(os.path.join(root, name), open(path, "rb").read())
+            if name in CUDA_ZIP_NAMES:
+                _copy_atomic(path, os.path.join(root, name))     # 600 MB: never held in memory
+            else:
+                _write_atomic(os.path.join(root, name), open(path, "rb").read())
+    prune_cuda_zips(root, manifest)
     if "server_llama_sha256" in manifest:
         server_dir = install_server_llama(root, manifest["llama_build"], assets.get(SERVER_LLAMA_UPLOAD, ""),
                                           manifest["server_llama_sha256"])
@@ -543,6 +602,15 @@ def _http_get(url: str, timeout: float = 5.0) -> bytes:
         return response.read()
 
 
+def _http_sha256(url: str, timeout: float = 5.0) -> str:
+    """SHA-256 of what ``url`` serves, read in blocks (a CUDA zip is 600 MB)."""
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 - loopback URL chosen by the operator
+        for chunk in iter(lambda: response.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def http_health(base_url: str, manifest_for: Callable[[str], Optional[Dict]], timeout: float = 120.0,
                 poll: float = 2.0, sleep: Callable[[float], None] = time.sleep) -> Health:
     """
@@ -577,6 +645,12 @@ def http_health(base_url: str, manifest_for: Callable[[str], Optional[Dict]], ti
                         digest = _sha256_bytes(_http_get(f"{base}/v1/download/rpc-bin/{platform}", timeout=60.0))
                         if digest != sha:
                             return (False, f"the {platform} RPC binaries it serves do not hash to the manifest")
+                    for platform in CUDA_PLATFORMS:
+                        sha = expected.get(cuda_field(platform, "sha256"))
+                        if sha is None:
+                            continue
+                        if _http_sha256(f"{base}/v1/download/cuda-bin/{platform}", timeout=300.0) != sha:
+                            return (False, f"the {platform} CUDA engine it serves does not hash to the manifest")
                     return (True, "up, serving the installed release")
             except Exception as exc:  # noqa: BLE001 - connection refused while it boots is expected
                 last = f"{type(exc).__name__}: {exc}"

@@ -902,6 +902,11 @@ def validate_hardware_profile(hw: dict) -> Tuple[bool, str]:
     if power is not None and power not in ("ac", "battery"):
         return (False, "power must be \"ac\" or \"battery\" when present")
 
+    # Which llama.cpp engine the node runs (2.7.0): a display fact, so only the two names are accepted.
+    flavour = hw.get("engine_flavour")
+    if flavour is not None and flavour not in ("vulkan", "cuda"):
+        return (False, "engine_flavour must be \"vulkan\" or \"cuda\" when present")
+
     # A CPU pool member (2.3.0) says so, and reports what it serves. A coding member (see
     # docs/coding-members.md) says "coding" and reports its model and speeds in a "coding" block.
     # A worker is one or the other, never both.

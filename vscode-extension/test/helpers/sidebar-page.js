@@ -96,14 +96,19 @@ class FakeElement {
 
   addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
   removeEventListener(type, fn) { this.listeners[type] = (this.listeners[type] || []).filter((f) => f !== fn); }
+  /** As in a browser, an event reaches the listeners of the element it happened on, then of each parent up to the page. */
   dispatch(type, event = {}) {
-    const e = { target: this, preventDefault() {}, ...event };
-    (this.listeners[type] || []).forEach((fn) => fn(e));
+    let stopped = false;
+    const e = { target: this, preventDefault() {}, stopPropagation() { stopped = true; }, ...event };
+    for (let node = this; node && !stopped; node = node.parent) (node.listeners[type] || []).forEach((fn) => fn(e));
   }
   /** As in a browser, click() fires the listeners whether or not the element is displayed. */
   click() { if (!this.disabled) this.dispatch('click'); }
   focus() {}
   scrollIntoView() {}
+  // A canvas that draws nothing and answers a data URI of the type asked (the panel's picture code, tests of 4d).
+  getContext() { return { fillStyle: '', fillRect() {}, drawImage() {} }; }
+  toDataURL(type = 'image/png') { return `data:${type};base64,${'QUJD'.repeat(4)}`; }
 
   matches(selector) {
     const m = /^([a-z0-9]*)((?:\.[\w-]+)*)$/i.exec(selector);
@@ -136,7 +141,7 @@ function outline(root, depth = 0) {
  * Runs the sidebar's script as a page. `state` is what VS Code hands a page it makes anew (what the old page kept with
  * setState); `toHost` receives what the page posts, as JSON; `keepState` is told what setState keeps.
  */
-function createPage(html, { state, toHost, keepState = () => {} }) {
+function createPage(html, { state, toHost, keepState = () => {}, globals = {} }) {
   const scripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
   const byId = {};
   const timers = new Map();
@@ -173,6 +178,7 @@ function createPage(html, { state, toHost, keepState = () => {} }) {
     byId[id] = new FakeElement('div');
     byId[id].style.display = 'none';
   }
+  Object.assign(sandbox, globals);       // what a browser has that the fake page does not (FileReader, Image...), when a test needs it
   vm.createContext(sandbox);
   for (const script of scripts) vm.runInContext(script, sandbox);
 
@@ -223,7 +229,7 @@ function createPage(html, { state, toHost, keepState = () => {} }) {
  * A WebviewView for `provider`. `retain`: the view keeps its page while hidden (registerWebviewViewProvider's
  * retainContextWhenHidden); without it a hidden view's page is thrown away.
  */
-function openView(provider, { retain = true } = {}) {
+function openView(provider, { retain = true, globals = {} } = {}) {
   const sent = [];          // everything the host posted: { message, delivered }
   const fromPage = [];      // everything the page posted
   const pending = [];       // what the host is still doing for those messages
@@ -307,6 +313,7 @@ function openView(provider, { retain = true } = {}) {
     const queued = loading || [];
     loading = queued;
     view.page = createPage(view.webview.html, {
+      globals,
       state: pageState,
       keepState: (s) => { pageState = s; },
       toHost: (message) => {

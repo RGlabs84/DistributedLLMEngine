@@ -134,6 +134,15 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Eight groups matter for most
   `unlocked` and `serving` is `engine` (`cpu` when the CPU pool answers). `requests_in_flight` counts the phone model
   requests running now on any machine (`engine_requests_in_flight` is the lanes' share) and `median_answer_seconds`
   the whole phone answers finished in the last 15 minutes.
+- **The engine's flavour (2.7)**: `ENGINE_FLAVOR` is `vulkan` (the default, and what TheWall runs), `cuda` or `auto`.
+  `cuda` runs the coordinator's own engine on llama.cpp's official CUDA 13.4 build of the same tag, which needs an NVIDIA
+  card of compute capability 7.5 or newer (Turing: RTX 20 / GTX 16 and later) and a driver of the 580 series or later;
+  `auto` is `cuda` exactly where a worker would be allowed it and `vulkan` everywhere else (also when the check is not
+  available); anything else spelled here is `vulkan`. The CUDA engine is a separate, signed release asset (about 600 MB
+  a platform, Linux and Windows on x64): the release installer puts `cuda-bin-<platform>.zip` beside the code and the
+  coordinator unpacks it into `bin-cuda/` on first use, next to `bin/`, which it never touches. If it cannot be had or will
+  not start, the engine runs on Vulkan and the log says why. `/v1/cluster/status` reports `engine_flavour` (`vulkan` or
+  `cuda`) for the flavour that really runs. The version stays one plain number: `2.7.0+cuda` is display only.
   `MEDIA_GPU` (a PCI address) keeps one card out of the model's memory; `ENGINE_MMPROJ` (a projector `.gguf`)
   lets the coding chat read images, on the media card when there is one; `ENGINE_IMAGE_MAX_TOKENS` (default 1024)
   caps what one image costs in context. Those three, the phone lanes and the image budget below change nothing
@@ -218,10 +227,10 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Eight groups matter for most
   (`[photo 1200x900 sha256:ab12cd34]`) and nothing else. See [`docs/privacy.md`](privacy.md#photos).
 
 - **Image generation (2.6.1, off by default)**: `IMAGE_GEN_ENABLED=true` lets the coordinator draw pictures from a
-  text description on the media card (`MEDIA_GPU`), with stable-diffusion.cpp's `sd-server` and Z-Image-Turbo, only
-  while vision is on (the coding engine checks each picture before anyone sees it). Phones use
-  `POST /v1/app/images`, the IDE `POST /v1/images`; `capabilities.image_generation` and an `image_generation`
-  block in `/v1/cluster/status` say when it is on (the block's `eta_seconds` says how long a picture takes). One
+  text description on the media card (`MEDIA_GPU`), with stable-diffusion.cpp's `sd-server` and FLUX.2 [klein] 4B
+  (since 2.6.6; three sizes, 512x512, 512x768 and 768x512, about 18 to 23 s each on the RX 580), only while vision
+  is on (the coding engine checks each picture before anyone sees it). Phones use `POST /v1/app/images`, the IDE
+  `POST /v1/images`; `capabilities.image_generation` and an `image_generation` block in `/v1/cluster/status` say when it is on (the block's `eta_seconds` says how long a picture takes). One
   picture at a time, a queue of `IMAGE_QUEUE_MAX`, `IMAGE_PER_HOUR` pictures an hour per network. A picture spends one
   free-trial chat, unless the caller holds a worker token or an API key, or (phones only, 2.6.2) comes from a network
   where a computer contributes to DLNE, now or in the last 24 hours: any registered worker's heartbeat makes its
@@ -246,7 +255,15 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Eight groups matter for most
 - **Who goes first, and how much**: when the coding engine is busy, its slots go to GPU
   contributors, API keys and the coordinator's own host first, CPU contributors second, and
   free-trial users third (`engine/priority.py`); autocomplete only runs on a slot nobody is
-  waiting for. CPU contributors get `CPU_CODING_LIMIT` (300) coding chats in any
+  waiting for. From 2.7.0 the same order holds in the picture queue (a waiting host, key or GPU
+  contributor's job runs before a CPU contributor's, and before a trial caller's; jobs of one tier
+  run in the order they came; a running picture is never pre-empted; phone jobs count as the
+  lowest tier) and in the coding-member queue (`CodingRouter.place`, which takes the number
+  `tier_priority` gives). `GET /v1/me` answers `{"tier": "key"}` for the caller's own request
+  (one of `host`, `key`, `gpu`, `cpu`, `trial`, `open`; `Cache-Control: no-store`): the tier the
+  middleware gives a chat request, worked out without charging a trial chat, so the extension
+  can tell whether a key holder's agent runs without a turn limit. Nothing else is in the answer,
+  and a coordinator older than 2.7.0 answers 404. CPU contributors get `CPU_CODING_LIMIT` (300) coding chats in any
   `CPU_CODING_WINDOW_HOURS` (5) hours. A GPU contributor is unlimited while its GPU is actually
   used, and for its first `GPU_STANDBY_GRACE_MINUTES` (30) minutes after it joins or last had a
   job (a GPU you have handed back for a game counts as used); a GPU that has stood by longer than
@@ -285,6 +302,18 @@ Linux on x64 and ARM64, macOS on Apple Silicon and Intel, the last CPU-only) and
 coordinator's own build. The extension and the worker
 refuse anything that does not match the maintainer's key, and never downgrade. Workers report
 their llama.cpp RPC protocol, and the coordinator only routes to workers that speak its own.
+
+Since 2.7 the same manifest also signs the CUDA engine, per platform (`win-x64`, `linux-x64`): `cuda_version` (13.4) and
+`cuda_<platform>_sha256` / `cuda_<platform>_size`, beside the Vulkan fields, which are unchanged. To package it:
+`scripts/package_llama.py b11838` downloads llama.cpp's `llama-<tag>-bin-ubuntu-cuda-13.4-x64.tar.gz` with its
+`cudart-llama-<tag>-bin-ubuntu-cuda-13.4-x64.tar.gz`, and `llama-<tag>-bin-win-cuda-13.4-x64.zip` with
+`cudart-llama-bin-win-cuda-13.4-x64.zip`, checks each against the SHA-256 GitHub publishes for it, and builds
+`cuda-bin-<platform>.zip` (servers, CUDA backend and NVIDIA's runtime flat under `bin/`; the Windows zip also carries the
+Visual C++ runtime). `--no-cuda` leaves the CUDA engine out for a quick Vulkan-only release. A deploy sends a CUDA zip only
+when the host does not already hold that exact file, and backups leave the CUDA zips out (a release that signs none removes
+them). Workers fetch one from `/v1/download/cuda-bin/<platform>`, verify size and SHA-256 against the signed manifest and
+keep it in `bin-cuda/`, separate from the Vulkan `bin/`. The driver minimum is a single constant,
+`engine.release.CUDA_MIN_DRIVER` (580), with its source cited there.
 ## Security and privacy
 
 - Prompts, and the code the agent reads, go to the coordinator you point the extension at. The

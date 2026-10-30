@@ -10,6 +10,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.7.0] - 2026-10-30
+
+Released with extension 1.6.0 and DLNE Donate 1.1.0. NVIDIA volunteers can run the CUDA engine (about 40% faster
+writing and 85% faster reading than Vulkan on an RTX 4070), API-key holders go first in every queue, long coding chats
+no longer get read again from the start, and pictures are back, faster. 2.6.6 was never released on its own: its
+pictures change is part of this version.
+
+### Added
+- **The CUDA engine (CUDA 13.4)** for workers with an NVIDIA GPU of compute capability 7.5 (Turing) or newer and driver
+  580 or later. The release carries `cuda-bin-<platform>.zip` for Linux and Windows x64 (llama.cpp b11838's official
+  CUDA builds, checked against GitHub's published SHA-256), signed in the manifest (`cuda_version`, `cuda_*_sha256`,
+  `cuda_*_size`; older workers ignore them) and served at `/v1/download/cuda-bin/<platform>`. Workers keep it in
+  `bin-cuda/`, beside the Vulkan engine in `bin/`. A worker started with `DLNE_ENGINE_FLAVOR=cuda` checks the card
+  (`nvidia-smi`), says what it found (`DLNE_CUDA:`), checks that the engine sees a CUDA device, and falls back to Vulkan
+  with the reason (`DLNE_ENGINE:`) when anything fails; it does not retry CUDA until it restarts. The heartbeat carries
+  `engine_flavour`, counted in the admin stats. Older cards stay on Vulkan.
+- **`ENGINE_FLAVOR`** (auto | vulkan | cuda, default vulkan) for a coordinator's own engine; `/v1/cluster/status` says
+  which one runs (`engine_flavour`).
+- **`GET /v1/me`** answers `{"tier": ...}` (host, key, gpu, cpu, trial or open) for the caller's own key, with
+  `Cache-Control: no-store`; asking costs a free-trial caller no chat.
+
+### Changed
+- **API-key holders go first** in the picture queue and the coding-member queue too (the coordinator's own engine
+  already did): a waiting key holder's job runs before a free trial's; nothing running is interrupted.
+- **A coding chat keeps its lane.** Each conversation (`X-DLNE-Session`, remembered under an HMAC tag, never the id)
+  goes back to the engine lane that holds its cached prompt, and a new one takes the lane used longest ago. Before,
+  every chat that arrived while the engine was idle took lane 0, so two conversations taking turns made the engine
+  read each one again from the start: 5 to 8 minutes at 90,000 tokens on TheWall.
+- The canary's request shape follows extension 1.6.0's tool list: `use_skill` and `save_skill`, a `remember` fact of up
+  to 1,000 characters, and `view_image` with its prompt line exactly while this engine can read pictures.
+- **The picture model is FLUX.2 [klein] 4B** (Q4_0, 2.46 GB, Apache-2.0, ungated) with the FLUX.2 VAE (full encoder,
+  small decoder, 0.25 GB), in 4 steps instead of Z-Image-Turbo's 8. The prompt reader is still the Qwen3 4B Instruct
+  2507 file. The whole picture stack runs on the media card, the prompt reader too, so the CPU's cores stay with the
+  coding model (the owner's layout). Measured on TheWall's RX 580: 512 x 512 in 26 s, 512 x 768 and 768 x 512 in 31 s
+  (Z-Image-Turbo took about 80 s for 768 x 768; with the reader on the CPU it was 17.5 and 22.5 s), the card's peak
+  5.7 GB with the vision projector. The engine needs 5.1 GiB free on the media card to start (was 5.6).
+- **Three sizes: square 512 x 512 (default), portrait 512 x 768, landscape 768 x 512.** The status lists them, so the
+  web chat and the Android app offer exactly these. Older clients that send the old sizes are drawn by shape:
+  768 x 768 and 1024 x 1024 become 512 x 512, 768 x 1024 becomes 512 x 768, 1024 x 768 becomes 768 x 512 (extension
+  1.5.4's generate_image keeps working). The 202 answer carries the size that will be drawn.
+- The phone and web chats say a picture takes "under a minute" (was "about a minute and a half").
+
 ## [2.6.5] - 2026-10-30
 
 Released with extension 1.5.4. TheWall can run the smarter coding model across all three of its cards with 128k of

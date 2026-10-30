@@ -26,17 +26,35 @@ from typing import Any, Dict, List, Optional
 
 # --- sizes -------------------------------------------------------------------------------------------------
 
-DEFAULT_SIZE = "768x768"
-SIZES = {"768x768": (768, 768), "1024x1024": (1024, 1024), "768x1024": (768, 1024), "1024x768": (1024, 768)}
+# Since 2.6.6 (FLUX.2 [klein] 4B) three sizes, one per shape: a picture in about 26 to 31 s on the RX 580 (2.7.0: the
+# whole picture stack on the card, its prompt reader too; 18 to 23 s with the reader on the CPU).
+DEFAULT_SIZE = "512x512"
+SIZES = {"512x512": (512, 512), "512x768": (512, 768), "768x512": (768, 512)}
 
 # What the phone chat's create_image tool asks for (engine/app_pool.py, IMAGE_TOOL): a shape, never a size. The model
-# picks a word and the size is ours; 1024x1024, which takes twice as long, is not on offer to it.
-SHAPE_SIZES = {"square": "768x768", "portrait": "768x1024", "landscape": "1024x768"}
+# picks a word and the size is ours.
+SHAPE_SIZES = {"square": "512x512", "portrait": "512x768", "landscape": "768x512"}
+
+# The sizes 2.6.1 to 2.6.5 offered. Clients from then (extension 1.5.4's generate_image, older Android and web pages)
+# may still send them, so each is drawn at today's size of the same shape. The job says which size was drawn.
+OLD_SIZES = {"768x768": "512x512", "1024x1024": "512x512", "768x1024": "512x768", "1024x768": "768x512"}
 
 
 def size_for_shape(shape: Any) -> str:
     """The size the tool's ``shape`` means: square for a missing or unknown one (a model's wrong word is no error)."""
     return SHAPE_SIZES.get(shape, DEFAULT_SIZE) if isinstance(shape, str) else DEFAULT_SIZE
+
+
+def drawn_size(size: Any) -> Optional[str]:
+    """
+    The size a request's ``size`` is drawn at: one of :data:`SIZES` as it is, an old one as today's size of the same
+    shape (:data:`OLD_SIZES`), a missing one (None) as the default. None for anything else, which the caller turns away.
+    """
+    if size is None:
+        return DEFAULT_SIZE
+    if not isinstance(size, str):
+        return None
+    return size if size in SIZES else OLD_SIZES.get(size)
 
 
 MAX_PROMPT_CHARS = 1000

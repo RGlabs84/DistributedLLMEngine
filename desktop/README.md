@@ -26,6 +26,14 @@ The Settings window follows exactly that:
 * **CPU**: on/off, RAM that snaps to the swarm's model stops (read live from `/v1/cluster/status`, `app_pool.tiers`,
   each stop labelled with the model it runs).
 * **Threads**: they mostly decide how much of the PC stays free. Default: physical cores minus 2, at least 4.
+* **Graphics engine** (1.1.0, shown when a GPU can be lent): Auto, Vulkan or CUDA, and a line saying what runs now
+  ("Running on CUDA", or why CUDA could not start). CUDA is greyed out with the reason on a computer that cannot use it
+  (an NVIDIA GPU of Turing or newer and a CUDA 13 driver; the worker says so in its `DLNE_CUDA` line). On a computer that
+  can, the window asks once, before anything is downloaded: **Use CUDA** / **Not now** (asked again after 3 days) /
+  **Keep Vulkan** (never asked again). The answer and the setting are `cuda_consent` and `engine` in `settings.json`
+  (`"yes"`, `"never"` or `{"later": <epoch ms>}`; `"auto"`, `"vulkan"`, `"cuda"`). The worker is started with
+  `DLNE_ENGINE_FLAVOR=vulkan|cuda`, resolved like the extension does it (auto is CUDA only with consent on a computer that
+  can), and is restarted when the resolved flavour changes. The tray menu's last line reads `DLNE Donate 1.1.0 · engine 2.7.0+cuda`.
 * Never more than half the installed RAM is offered by default; dragging past it (up to the installed RAM minus 4 GB)
   shows a warning.
 
@@ -80,6 +88,29 @@ computer), `state.json` (what the app is doing now), and `engine/`, the verified
    and so is what its log says about the model (downloading 40%, serving). If the app is killed, its worker notices within
    two seconds and ends itself.
 
+9. VS Code first (1.1.0): while DLNE runs in VS Code, this app's worker is paused. Every 10 seconds the app reads
+   `~/.dlne/editor.json` (written by the extension: `{"pid", "updated", "version"}`); it counts as present while it is under 90
+   seconds old and its pid is alive. Present: the app stops its worker the way its own Stop does, says "Paused: DLNE in VS
+   Code is using this computer" in the window and the tooltip, and starts nothing. Gone: it resumes by itself, if it was
+   donating before the pause (`vscode_first.py`).
+   Safeguards: the editor counts as gone only after two looks in a row miss the file, at least 20 seconds apart; and before
+   resuming the app checks that no other DLNE worker runs (a process whose arguments are exactly `dlne_server.py worker`, or
+   something on the worker's RPC ports; the app's own worker never counts, nothing is ever killed on that evidence). The extension
+   keeps its worker alive after VS Code closes, so the app then stays paused ("Paused: DLNE's worker from VS Code is still
+   running") and looks again every 10 seconds. `state.json` carries `"version": "1.1.0"`; while paused it says `"paused": true`
+   and `"state": "paused"` (`"stopping"` until the worker has really left).
+
+10. Updates (1.1.0): at start and every 12 hours the app reads `https://dlne.rossgilsonlabs.dev/downloads/desktop.json` (the
+   manifest the extension's "Optional add-on" reads; only https to that host, no redirect followed). A newer version shows a
+   tray notification and a line in the window, "DLNE Donate 1.2.0 is available", with **Update now** and **Later**. Update now
+   downloads the build, checks its size and SHA-256 against the manifest (a mismatch deletes it and keeps the old version),
+   stops the worker the way Stop does, and swaps: an AppImage is written beside the running one (`<name>.new`), swapped in under
+   its own name (the old file stays as `<name>.previous` until the next start) and started again once the app has exited;
+   on Windows the new exe waits in the app-data folder and runs `--finish-update <pid> <app>`, which waits for the app to exit,
+   copies itself over it and starts it again. A build that cannot replace itself (the Linux folder build, a run from the sources)
+   points to the download page instead. "Update automatically" (off by default) installs an available update at the next
+   moment the worker is idle (`updater.py`).
+
 Being polite: one instance (a lock file; a second launch opens the first one's Settings); Stop asks the worker to shut
 down, then ends its whole process tree and any program running from the engine folder, and Quit does the same; no admin
 rights; the app opens no socket of its own (the worker listens as it always does); no telemetry: the only network
@@ -117,7 +148,10 @@ laptop. Tests (no network, no display):
       installer.py      fetch + verify + safe unpack of the engine and llama.cpp programs ("nothing unverified runs")
       worker.py         the controller: start, stop (whole tree), version change, refusal, live config
       tiers.py          the smart-slider logic and config.txt keys (pure)
-      markers.py        DLNE_ROLE / DLNE_ALSO / DLNE_REFUSAL / DLNE_CLOCK
+      markers.py        DLNE_ROLE / DLNE_ALSO / DLNE_REFUSAL / DLNE_CLOCK / DLNE_DOCK / DLNE_YIELD / DLNE_CUDA / DLNE_ENGINE
+      engine_flavour.py the engine setting, the CUDA question's consent, how the flavour is resolved (pure)
+      vscode_first.py   the editor presence file and the pause/resume state machine
+      updater.py        the update check, the verified download, the swap on each platform
       ui.py trayicon.py app.py model.py     the window, the icon and menu, the wiring
       configfile.py settings.py autostart.py instance.py hardware.py netstatus.py bundled.py paths.py
     packaging/          PyInstaller spec, build scripts for Linux and Windows

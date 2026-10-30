@@ -3,6 +3,7 @@ import { DlneClient, formatLoadingTelemetry } from '../client/dlneClient';
 import { WorkerManager } from '../worker/workerManager';
 import { QueueUpdate, queueDetail, queueHeadline, queueStatusText } from '../client/queue';
 import { CPU_POOL_HEADLINE, CPU_POOL_PERK, contributionTooltip } from '../worker/contribution';
+import { engineLabel } from '../worker/engineFlavour';
 
 export class ClusterStatusBar {
   private statusBarItem: vscode.StatusBarItem;
@@ -130,6 +131,8 @@ export class ClusterStatusBar {
       `Total Compute: ${status.total_memory_gb}GB (${vram}GB VRAM, ${status.total_sysram_gb}GB SysRAM)`,
       `Workers in Pool: ${status.active_workers_count} node(s)`,
       ...contributionTooltip(workerStatus),
+      // The engine's version with its flavour as build metadata (2.7.0+cuda): display only, the version is what is compared.
+      ...(workerStatus.engineFlavour && !workerStatus.external ? [`Local engine: ${engineLabel(String(status.server_version ?? ''), workerStatus.engineFlavour)}`] : []),
       `Active Leases: ${leases}`,
       `Extension Version: ${extVersion}`,
       `Server Version: ${status.server_version}`,

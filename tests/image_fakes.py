@@ -33,7 +33,7 @@ def sd_png(width: int = 8, height: int = 8, prompt: str = "a red fox", colour: i
     return (b"\x89PNG\r\n\x1a\n"
             + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
             + chunk(b"sRGB", b"\x00")
-            + chunk(b"tEXt", b"parameters\x00" + prompt.encode() + b"\nSteps: 8, Seed: 42, Model: z_image_turbo")
+            + chunk(b"tEXt", b"parameters\x00" + prompt.encode() + b"\nSteps: 4, Seed: 42, Model: flux-2-klein-4b")
             + chunk(b"tIME", struct.pack(">HBBBBB", 2026, 10, 28, 5, 0, 0))
             + chunk(b"zTXt", b"Comment\x00\x00" + zlib.compress(prompt.encode()))
             + chunk(b"eXIf", b"MM\x00*" + prompt.encode())

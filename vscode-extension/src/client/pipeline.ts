@@ -15,6 +15,7 @@ import * as http from 'http';
 import * as vscode from 'vscode';
 import { AnswerOpener, openerFor, privacyModeFor, PrivacyMode, redactPayload, sealForMember } from '../privacy';
 import { RouteLookup, requestNeed } from './route';
+import { carriesPicture } from './pictures';
 
 export interface PreparedRequest {
   /** The bytes to send: the redacted JSON, or the sealed envelope. */
@@ -107,6 +108,11 @@ export async function prepareRequest(
   prepared.privacy = privacy;
   headers['X-DLNE-Privacy'] = privacy;
   if (ctx.forcePlain) {
+    return prepared;
+  }
+  // A coding member refuses a picture (IMAGE_INPUT_UNAVAILABLE), and only the coordinator's own engine has a projector: a
+  // request that carries one is never offered a route, so it is never sealed to a member.
+  if (carriesPicture(redacted.payload)) {
     return prepared;
   }
   try {

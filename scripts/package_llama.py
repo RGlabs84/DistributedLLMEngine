@@ -5,6 +5,7 @@ Turn one pinned upstream llama.cpp build into the binaries a DLNE release ships.
     scripts/package_llama.py b11838            download, verify, package
     scripts/package_llama.py b11838 --from DIR use archives already downloaded into DIR
     scripts/package_llama.py b11838 --vcredist FILE   use a VC_redist.x64.exe already downloaded (SHA-256 pinned)
+    scripts/package_llama.py b11838 --no-cuda  leave the CUDA engine out (a quick Vulkan-only run)
 
 Output, in release_dist/assets/llama/ (what `scripts/release.py build|deploy` signs):
 
@@ -15,9 +16,16 @@ Output, in release_dist/assets/llama/ (what `scripts/release.py build|deploy` si
         pinned by SHA-256 below), because a clean Windows has none of them.
     llama-<build>-bin-ubuntu-vulkan-x64.tar.gz
         the upstream build the coordinator itself runs, unchanged.
+    cuda-bin-<platform>.zip for win-x64 and linux-x64 (2.7)
+        llama.cpp's official CUDA 13.4 build of the same tag: ggml-rpc-server, llama-server, the CUDA backend
+        and NVIDIA's runtime (cudart, cuBLAS) from upstream's cudart-* archive, all flat under bin/ so the
+        loader finds them with $ORIGIN / beside the .exe. About 600 MB a platform against 35 MB for Vulkan, which
+        is why it is a separate asset and never replaces the Vulkan zip: old workers keep using that one.
+        The Windows zip carries the Visual C++ runtime too, like the Vulkan one.
     build.json
-        {"llama_build": ..., "rpc_proto": ...}. The protocol is read from the Linux
-        ggml-rpc-server's own startup banner, never typed in.
+        {"llama_build": ..., "rpc_proto": ..., "cuda": {...}}. The protocol is read from the Linux
+        ggml-rpc-server's own startup banner, never typed in. ``cuda`` (version and zip names) is only
+        there when the CUDA engine was packaged.
 
 Every upstream archive is checked against the SHA-256 digest GitHub publishes for it before
 anything is read from it. The upstream tag is pinned on purpose: a coordinator and its workers
@@ -25,7 +33,6 @@ must speak the same RPC protocol major, so "whatever is latest" is never accepta
 """
 
 import argparse
-import io
 import json
 import os
 import re
@@ -61,6 +68,15 @@ SOURCES = {
     "macos-x64": "llama-{b}-bin-macos-x64.tar.gz",
 }
 SERVER_SOURCE = "llama-{b}-bin-ubuntu-vulkan-x64.tar.gz"
+# CUDA (2.7): per platform, the engine archive and the runtime archive upstream publishes beside it. The CUDA version
+# is in the file names, so a newer toolkit is a deliberate edit of release.CUDA_VERSION, never "whatever is latest".
+# Upstream names the Windows runtime without the tag (cudart-llama-bin-win-...), the Linux one with it.
+CUDA_SOURCES = {
+    "linux-x64": ("llama-{b}-bin-ubuntu-cuda-%s-x64.tar.gz" % release.CUDA_VERSION,
+                  "cudart-llama-{b}-bin-ubuntu-cuda-%s-x64.tar.gz" % release.CUDA_VERSION),
+    "win-x64": ("llama-{b}-bin-win-cuda-%s-x64.zip" % release.CUDA_VERSION,
+                "cudart-llama-bin-win-cuda-%s-x64.zip" % release.CUDA_VERSION),
+}
 
 # The Visual C++ runtime the Windows zips carry beside the programs ("app-local deployment").
 # Upstream's Windows builds import VCRUNTIME140, VCRUNTIME140_1 and MSVCP140 and do not ship
@@ -93,16 +109,29 @@ class PackageError(Exception):
     """Something the operator needs to fix. The message is the whole story."""
 
 
-def fetch(build: str, dest: str) -> Dict[str, str]:
-    """Download the needed upstream archives with gh and check each against GitHub's digest."""
-    names = sorted({s.format(b=build) for s in SOURCES.values()} | {SERVER_SOURCE.format(b=build)})
+def upstream_names(build: str, cuda: bool = True) -> List[str]:
+    """Every upstream archive a package needs, by file name (the CUDA ones only when ``cuda``)."""
+    names = {s.format(b=build) for s in SOURCES.values()} | {SERVER_SOURCE.format(b=build)}
+    if cuda:
+        names |= {n.format(b=build) for pair in CUDA_SOURCES.values() for n in pair}
+    return sorted(names)
+
+
+def upstream_digests(build: str) -> Dict[str, str]:
+    """file name -> "sha256:<hex>", as GitHub publishes it for the release ``build`` of llama.cpp."""
     query = subprocess.run(
         ["gh", "api", f"repos/{UPSTREAM}/releases/tags/{build}", "--jq",
          '.assets[] | .name + " " + (.digest // "")'],
         capture_output=True, text=True)
     if query.returncode != 0:
         raise PackageError(f"Could not read release {build} from GitHub: {query.stderr.strip()}")
-    digests = dict(line.split(" ", 1) for line in query.stdout.strip().splitlines() if " " in line)
+    return dict(line.split(" ", 1) for line in query.stdout.strip().splitlines() if " " in line)
+
+
+def fetch(build: str, dest: str, cuda: bool = True) -> Dict[str, str]:
+    """Download the needed upstream archives with gh and check each against GitHub's digest."""
+    names = upstream_names(build, cuda)
+    digests = upstream_digests(build)
     paths = {}
     for name in names:
         digest = digests.get(name, "")
@@ -123,21 +152,28 @@ def _wanted(name: str) -> bool:
     return bool(release._RPC_MEMBER_RE.match(f"bin/{name}"))
 
 
-def _read_members(archive_path: str) -> List[Tuple[str, bytes]]:
-    """(basename, bytes) for every file an RPC zip should carry; symlinks are resolved to copies."""
+def _wanted_cuda(name: str) -> bool:
+    return bool(release._CUDA_MEMBER_RE.match(f"bin/{name}"))
+
+
+def _read_members(archive_path: str, wanted=_wanted, needs_server: bool = True) -> List[Tuple[str, bytes]]:
+    """
+    (basename, bytes) for every file a zip should carry that ``wanted`` accepts; symlinks are resolved to copies.
+    ``needs_server`` is False for an archive that only holds libraries (upstream's cudart-* one).
+    """
     found: Dict[str, bytes] = {}
     if archive_path.endswith(".zip"):
         with zipfile.ZipFile(archive_path) as z:
             for info in z.infolist():
                 base = os.path.basename(info.filename)
-                if not info.is_dir() and _wanted(base):
+                if not info.is_dir() and wanted(base):
                     found[base] = z.read(info)
     else:
         with tarfile.open(archive_path, "r:gz") as t:
             members = {m.name: m for m in t.getmembers()}
             for m in t.getmembers():
                 base = os.path.basename(m.name)
-                if not _wanted(base):
+                if not wanted(base):
                     continue
                 target = m
                 hops = 0
@@ -148,8 +184,10 @@ def _read_members(archive_path: str) -> List[Tuple[str, bytes]]:
                         break
                 if target is not None and target.isfile():
                     found[base] = t.extractfile(target).read()
-    if not any(name in found for name in release.RPC_EXECUTABLES):
+    if needs_server and not any(name in found for name in release.RPC_EXECUTABLES):
         raise PackageError(f"{os.path.basename(archive_path)} has no ggml-rpc-server.")
+    if not found:
+        raise PackageError(f"{os.path.basename(archive_path)} holds none of the files a release ships.")
     return sorted(found.items())
 
 
@@ -213,10 +251,12 @@ def vcruntime_members(vcredist: str, platform: str) -> List[Tuple[str, bytes]]:
     return members
 
 
-def write_rpc_zip(members: List[Tuple[str, bytes]], out_path: str) -> None:
-    """A deterministic zip: sorted entries, fixed dates, executables 0755 and the rest 0644."""
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+def write_rpc_zip(members: List[Tuple[str, bytes]], out_path: str, check=None) -> None:
+    """
+    A deterministic zip: sorted entries, fixed dates, executables 0755 and the rest 0644. It is written straight to
+    ``out_path`` (a CUDA zip is about 600 MB), then ``check`` (default release.check_rpc_bin) must accept it.
+    """
+    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for name, data in members:
             info = zipfile.ZipInfo(f"bin/{name}", date_time=_FIXED_DATE_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
@@ -224,9 +264,21 @@ def write_rpc_zip(members: List[Tuple[str, bytes]], out_path: str) -> None:
             executable = name in release.RPC_EXECUTABLES or name in release.APP_SERVER_EXECUTABLES
             info.external_attr = (0o100755 if executable else 0o100644) << 16
             z.writestr(info, data, compresslevel=9)
-    with open(out_path, "wb") as handle:
-        handle.write(buffer.getvalue())
-    release.check_rpc_bin(out_path)
+    (check or release.check_rpc_bin)(out_path)
+
+
+def cuda_members_for(platform: str, engine_archive: str, runtime_archive: str, vcredist: str = "") -> List[Tuple[str, bytes]]:
+    """
+    What cuda-bin-<platform>.zip holds: the engine archive's servers and libraries (its CUDA backend included),
+    upstream's CUDA runtime from the cudart archive beside them, and on Windows the Visual C++ runtime.
+    """
+    members = dict(_read_members(engine_archive, _wanted_cuda))
+    members.update(_read_members(runtime_archive, _wanted_cuda, needs_server=False))
+    if platform in VCRUNTIME_PLATFORMS:
+        if not vcredist:
+            raise PackageError(f"The {platform} CUDA zip needs the Visual C++ runtime; pass the pinned installer as vcredist.")
+        members.update(vcruntime_members(check_vcredist(vcredist), platform))
+    return sorted(members.items())
 
 
 def read_proto(linux_tarball: str) -> str:
@@ -273,12 +325,23 @@ def package(build: str, sources: Dict[str, str], out_dir: str, rpc_proto: str = 
                 raise PackageError(f"The {platform} zip needs the Visual C++ runtime; pass the pinned installer as vcredist.")
             members.update(vcruntime_members(check_vcredist(vcredist), platform))
         write_rpc_zip(sorted(members.items()), os.path.join(out_dir, release.rpc_zip_name(platform)))
+    # The CUDA engine is built only when every archive it needs was fetched (package_llama.py --no-cuda leaves them out).
+    cuda_zips = {}
+    for platform, (engine_name, runtime_name) in CUDA_SOURCES.items():
+        engine_name, runtime_name = engine_name.format(b=build), runtime_name.format(b=build)
+        if engine_name in sources and runtime_name in sources:
+            name = release.cuda_zip_name(platform)
+            write_rpc_zip(cuda_members_for(platform, sources[engine_name], sources[runtime_name], vcredist),
+                          os.path.join(out_dir, name), check=release.check_cuda_bin)
+            cuda_zips[platform] = name
     server_name = SERVER_SOURCE.format(b=build)
     shutil.copyfile(sources[server_name], os.path.join(out_dir, server_name))
     proto = rpc_proto or read_proto(sources[SOURCES["linux-x64"].format(b=build)])
     if release.proto_major(proto) is None:
         raise PackageError(f"{proto!r} is not an RPC protocol version like 8.0.1.")
     info = {"llama_build": build, "rpc_proto": proto, "server_llama": server_name, "vcruntime": VCREDIST_VERSION}
+    if cuda_zips:
+        info["cuda"] = {"version": release.CUDA_VERSION, "zips": cuda_zips}
     with open(os.path.join(out_dir, "build.json"), "w") as handle:
         json.dump(info, handle, indent=2)
         handle.write("\n")
@@ -291,13 +354,15 @@ def main(argv=None) -> int:
     parser.add_argument("--from", dest="source_dir", help="directory already holding the upstream archives (digests still checked)")
     parser.add_argument("--vcredist", default="", help="the pinned VC_redist.x64.exe already downloaded (its SHA-256 is checked); "
                         "by default it is downloaded from Microsoft")
+    parser.add_argument("--no-cuda", action="store_true", help="do not fetch or package the CUDA engine (about 1.2 GB of downloads)")
     parser.add_argument("--rpc-proto", default="", help="only when not on Linux: the protocol, e.g. 8.0.1")
     parser.add_argument("--out", default=OUT_DIR)
     args = parser.parse_args(argv)
     try:
         with tempfile.TemporaryDirectory() as tmp:
             dest = args.source_dir or tmp
-            sources = fetch(args.build, dest) if not args.source_dir else _verify_existing(args.build, dest)
+            cuda = not args.no_cuda
+            sources = fetch(args.build, dest, cuda) if not args.source_dir else _verify_existing(args.build, dest, cuda)
             vcredist = check_vcredist(args.vcredist) if args.vcredist else fetch_vcredist(tmp)
             info = package(args.build, sources, args.out, args.rpc_proto, vcredist)
     except PackageError as exc:
@@ -309,15 +374,11 @@ def main(argv=None) -> int:
     return 0
 
 
-def _verify_existing(build: str, directory: str) -> Dict[str, str]:
+def _verify_existing(build: str, directory: str, cuda: bool = True) -> Dict[str, str]:
     """Like fetch(), for archives already on disk: each must still match GitHub's digest."""
-    query = subprocess.run(["gh", "api", f"repos/{UPSTREAM}/releases/tags/{build}", "--jq",
-                            '.assets[] | .name + " " + (.digest // "")'], capture_output=True, text=True)
-    if query.returncode != 0:
-        raise PackageError(f"Could not read release {build} from GitHub: {query.stderr.strip()}")
-    digests = dict(line.split(" ", 1) for line in query.stdout.strip().splitlines() if " " in line)
+    digests = upstream_digests(build)
     paths = {}
-    for name in sorted({s.format(b=build) for s in SOURCES.values()} | {SERVER_SOURCE.format(b=build)}):
+    for name in upstream_names(build, cuda):
         path = os.path.join(directory, name)
         digest = digests.get(name, "")
         if not os.path.isfile(path) or not digest.startswith("sha256:") or release.sha256_file(path) != digest.split(":", 1)[1]:

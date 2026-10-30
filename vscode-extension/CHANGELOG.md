@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.6.0] - 2026-10-30
+
+Pairs with DLNE coordinator **2.7.0** (CUDA engines, `/v1/me`, coding lanes); with an older coordinator the new
+controls stay hidden or read as before. Pairs with DLNE Donate **1.1.0** for the tray hand-over.
+
+### Added
+- **The CUDA engine for NVIDIA GPUs.** When the worker finds a card that can run it (Turing or newer, driver 580 or
+  later), DLNE asks once: "Your NVIDIA GPU can run DLNE about 30-50% faster with the CUDA engine. It is a one-time
+  download of about 600 MB. Use CUDA?" (Use CUDA / Not now, asked again after 3 days / Keep Vulkan). The setting
+  `dlne.worker.engine` (Auto, Vulkan, CUDA) changes it later. If CUDA cannot start, the worker goes back to Vulkan and
+  says why.
+- **In the DLNE Agent panel:** Speed or Quality (`dlne.ownGpu`) while this computer serves as a coding member; the
+  Graphics API (Auto, Vulkan, CUDA, with "running on …"); for API-key holders, Unlimited turns and "Priority: first in
+  line".
+- **Unlimited turns for API-key holders** (`dlne.agent.unlimitedTurns`, on by default). Stop and the loop check still
+  work. Everyone else keeps today's limit.
+- **Terminal cards open:** click the command (or press Enter or Space) to see the whole output, and copy the command or
+  the output.
+- **Copy on every message**, yours and the agent's (the agent's as Markdown); message text can be selected and copied.
+- **Skills: the agent learns procedures.** A skill is a folder with a `SKILL.md` (name, one-line description, steps) in
+  `.dlne/skills/` for the project or `~/.dlne/skills/` for you. Only the names and descriptions sit in the prompt; the
+  agent loads a skill (`use_skill`) when a task matches it, and saves one (`save_skill`) after working out a procedure it
+  will need again. Project skills are saved at once with Undo; yours, and anything that fetches or runs from the web,
+  ask first. `dlne.agent.memory` covers skills too.
+- **The agent sees pictures.** Paste, drop or attach up to 4 pictures a message (PNG, JPEG, WebP, GIF; 4 MiB each), and
+  the agent can look at a picture file in the workspace itself (`view_image`). Offered while the coordinator can read
+  pictures (TheWall's vision); a message with a picture always goes to the coordinator, never to a volunteer. Older
+  pictures give way to a placeholder after 3 of your messages, so they never fill the context. The DLNE model in
+  VS Code's Chat view accepts pictures on the same condition.
+- **DLNE Donate and VS Code take turns.** While VS Code runs DLNE, DLNE Donate 1.1.0 pauses its worker (the panel says
+  so) and resumes when VS Code closes, so one computer never runs two workers.
+
+### Changed
+- **Bigger memory:** AGENTS.md, the project's memory and yours each hold up to 32,000 characters (8,000 / 8,000 / 4,000
+  before), and one fact up to 1,000 (500 before). On a machine with a small context the three together load at most
+  about a third of the prompt.
+- **Long chats stay fast.** The memory, AGENTS.md and the tool list are read once per conversation (and again at a
+  compaction), so saving a fact no longer makes the coordinator read the whole conversation again. A compaction keeps
+  less word for word (20% of the room, was 35%), so there is less to read again and longer until the next one.
+
 ## [1.5.4] - 2026-10-30
 
 Pairs with DLNE coordinator **2.6.5** for the big context and "smarter"; with an older coordinator those read as

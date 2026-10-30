@@ -67,7 +67,7 @@ def env(tmp_path, monkeypatch, sd):
     return e
 
 
-async def draw(e, prompt="a red fox", width=768, height=768, seed=42, **kwargs):
+async def draw(e, prompt="a red fox", width=512, height=512, seed=42, **kwargs):
     return await e.member.generate(prompt, width, height, seed, **kwargs)
 
 
@@ -88,9 +88,9 @@ async def test_nothing_starts_until_the_first_job_and_then_it_is_started_as_the_
     assert command[command.index("--diffusion-model") + 1] == str(models / "d.gguf")
     assert command[command.index("--vae") + 1] == str(models / "v.safetensors")
     assert command[command.index("--llm") + 1] == str(models / "l.gguf")
-    assert command[command.index("--backend") + 1] == "te=cpu"
+    assert "--backend" not in command, "the prompt reader runs on the media card with the rest (the owner's layout)"
     assert command[command.index("-t") + 1] == "4"
-    assert command[command.index("--cfg-scale") + 1] == "1.0" and command[command.index("--steps") + 1] == "8"
+    assert command[command.index("--cfg-scale") + 1] == "1.0" and command[command.index("--steps") + 1] == "4"
     assert "--eager-load" in command
     assert command.count("127.0.0.1") == 1 and "0.0.0.0" not in command         # bound to loopback and nothing else
     assert png.startswith(b"\x89PNG")
@@ -144,10 +144,10 @@ async def test_a_cpu_mask_without_taskset_starts_it_unpinned(env, monkeypatch):
 
 @pytest.mark.anyio
 async def test_the_body_sd_is_sent_is_built_here_and_holds_nothing_else(env):
-    await draw(env, "a red fox", 1024, 768, 77)
+    await draw(env, "a red fox", 768, 512, 77)
     (body,) = env.sd.bodies
-    assert body == {"prompt": "a red fox", "width": 1024, "height": 768, "seed": 77,
-                    "sample_params": {"sample_steps": 8, "guidance": {"txt_cfg": 1.0}},
+    assert body == {"prompt": "a red fox", "width": 768, "height": 512, "seed": 77,
+                    "sample_params": {"sample_steps": 4, "guidance": {"txt_cfg": 1.0}},
                     "output_format": "png", "embed_image_metadata": False}
 
 
@@ -216,14 +216,19 @@ def test_the_model_directory_can_be_moved(env, tmp_path):
 
 def test_the_real_pins_are_checked_by_exact_size(tmp_path, monkeypatch):
     monkeypatch.undo()
-    assert member_module.MODEL_FILES["diffusion"] == ("z_image_turbo-Q4_K.gguf", 3_864_250_304)
-    assert member_module.MODEL_FILES["vae"] == ("ae.safetensors", 335_304_388)
-    assert member_module.MODEL_FILES["llm"][1] == 2_497_280_736
+    assert member_module.MODEL_FILES["diffusion"] == ("flux-2-klein-4b-Q4_0.gguf", 2_460_378_560)
+    assert member_module.MODEL_FILES["vae"] == ("flux2-full-encoder-small-decoder.safetensors", 249_519_092)
+    assert member_module.MODEL_FILES["llm"] == ("Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf", 2_497_280_736)
+
+
+def test_klein_is_drawn_in_four_steps_without_guidance_and_needs_3_6_gib():
+    assert (member_module.STEPS, member_module.TXT_CFG) == (4, 1.0)
+    assert member_module.MIN_FREE_VRAM_GB == 5.1
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("free", [5.59, 0.5, None])
-async def test_it_does_not_start_when_the_media_card_lacks_5_6_gib(env, free):
+@pytest.mark.parametrize("free", [3.59, 0.5, None])
+async def test_it_does_not_start_when_the_media_card_lacks_3_6_gib(env, free):
     env.card = {"vk_index": 3, "free_gb": free}
     with pytest.raises(MemberError) as caught:
         await draw(env)
@@ -233,7 +238,7 @@ async def test_it_does_not_start_when_the_media_card_lacks_5_6_gib(env, free):
 
 @pytest.mark.anyio
 async def test_it_starts_when_the_card_has_exactly_enough(env):
-    env.card = {"vk_index": 0, "free_gb": 5.6}
+    env.card = {"vk_index": 0, "free_gb": 5.1}
     await draw(env)
     assert env.spawner.starts[0]["env"]["GGML_VK_VISIBLE_DEVICES"] == "0"
 
@@ -606,7 +611,7 @@ async def test_nothing_it_prints_after_it_is_ready_is_kept_or_logged(env, monkey
         await asyncio.sleep(0.5)                    # it prints a "prompt" line every 10 ms from now on
         assert member._output._keeping is False and member._output.tail() == []
         assert member.process.poll() is None
-        task = asyncio.create_task(member.generate("a TOPSECRET picture", 768, 768, 1))
+        task = asyncio.create_task(member.generate("a TOPSECRET picture", 512, 512, 1))
         await asyncio.sleep(0.3)                    # submitted; sd-server keeps "generating" and chattering
         member.process.kill()                       # a crash after readiness
         with pytest.raises(MemberError):

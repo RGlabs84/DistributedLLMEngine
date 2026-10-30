@@ -246,7 +246,7 @@ def test_a_decoy_request_is_shaped_like_the_extensions_agent_request():
     assert body["messages"][-1]["role"] in ("user", "tool")
     names = [t["function"]["name"] for t in body["tools"]]
     assert names == ["read_file", "write_file", "edit_file_diff", "list_directory", "search_codebase",
-                     "run_terminal_command", "get_workspace_diagnostics", "remember"]
+                     "run_terminal_command", "get_workspace_diagnostics", "remember", "use_skill", "save_skill"]
     json.dumps(body)       # plain JSON all the way down
 
 
@@ -274,10 +274,10 @@ def test_the_system_prompt_is_the_agent_memory_contracts_text():
     assert prompt.endswith("Begin with a short <think> plan.")
 
 
-def test_remember_is_the_eighth_and_last_tool_with_a_scope_of_project_or_user():
+def test_remember_is_the_eighth_tool_with_a_scope_of_project_or_user():
     tools = canary._AGENT_TOOLS
-    assert len(tools) == 8 and tools[-1]["function"]["name"] == "remember"
-    parameters = tools[-1]["function"]["parameters"]
+    assert len(tools) == 10 and tools[7]["function"]["name"] == "remember"
+    parameters = tools[7]["function"]["parameters"]
     assert parameters["required"] == ["fact", "scope"]
     assert parameters["properties"]["scope"]["enum"] == ["project", "user"]
     assert set(parameters["properties"]) == {"fact", "scope", "replaces"}   # replaces: update or remove a saved fact
@@ -294,7 +294,7 @@ MEMORY_2_REMEMBER_TOOL = r'''
     "parameters": {
       "type": "object",
       "properties": {
-        "fact": { "type": "string", "description": "One short, self-contained sentence (at most 500 characters); empty to remove the fact given in replaces." },
+        "fact": { "type": "string", "description": "One self-contained fact, a sentence or two (at most 1,000 characters); empty to remove the fact given in replaces." },
         "scope": { "type": "string", "enum": ["project", "user"], "description": "Where it is kept: project or user." },
         "replaces": { "type": "string", "description": "Optional: the id of a fact you saved earlier (the [a7f3] in front of it), or its opening words." }
       },
@@ -308,9 +308,96 @@ MEMORY_2_REMEMBER_TOOL = r'''
 def test_remember_is_memory_2s_tool_compared_as_json():
     """A decoy still carrying the old text (no ids, "its opening words are enough") would be one a member could
     tell from a real 1.5.x request."""
-    assert canary._AGENT_TOOLS[-1] == json.loads(MEMORY_2_REMEMBER_TOOL)
-    assert canary.agent_tools(True)[-2] == json.loads(MEMORY_2_REMEMBER_TOOL)      # generate_image goes after it
+    assert canary._AGENT_TOOLS[7] == json.loads(MEMORY_2_REMEMBER_TOOL)
+    assert canary.agent_tools(True)[7] == json.loads(MEMORY_2_REMEMBER_TOOL)
     assert "Its opening words are enough" not in json.dumps(canary._AGENT_TOOLS)
+
+
+# The skill tools and the skills paragraph (docs/agent-memory.md sections 2, 3 and 7.9; extension 1.6.0), word for word.
+# The docs folder is not on the CI copy, so the text is here too; canary-parity.test.js compares the docs, the extension
+# and canary.py.
+SKILL_PARAGRAPH = (
+    "Skills: under Skills in your notes are procedures saved earlier. When a task matches a skill's description, call "
+    "use_skill(name) and follow its steps. After you work out a procedure that is likely to be needed again (a release, "
+    "a test setup, a recurring chore), save it with save_skill(name, description, instructions, scope), short and step by step."
+)
+USE_SKILL_TOOL = json.loads(r'''{
+  "type": "function",
+  "function": {
+    "name": "use_skill",
+    "description": "Load the step-by-step instructions of a skill listed under Skills in your notes, when the task at hand matches its description. Returns the instructions and the skill's folder, where other files can be read with read_file.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "The skill's name, as listed under Skills."
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  }
+}''')
+SAVE_SKILL_TOOL = json.loads(r'''{
+  "type": "function",
+  "function": {
+    "name": "save_skill",
+    "description": "Save, update or remove a skill: a procedure you worked out that is likely to be needed again (how to release this project, how its tests run, a chore that recurs), written short and step by step. scope \"project\" keeps it in this project's .dlne/skills/<name>/SKILL.md; it is saved at once and shown to the user, who can undo it. scope \"user\" keeps it in ~/.dlne/skills/<name>/SKILL.md, for every project; the user approves it. You can only change a skill you wrote yourself; to remove one, give its name and leave instructions empty. Never put secrets in a skill.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Lower-case letters, digits and hyphens, at most 48 characters (like release-checklist)."
+        },
+        "description": {
+          "type": "string",
+          "description": "One line, at most 200 characters, saying what the skill is for and when to use it."
+        },
+        "instructions": {
+          "type": "string",
+          "description": "The steps, in Markdown, at most 12,000 characters; empty to remove the skill."
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "project",
+            "user"
+          ],
+          "description": "Where it is kept: project or user."
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "instructions",
+        "scope"
+      ]
+    }
+  }
+}''')
+
+
+def test_the_skill_tools_follow_remember_word_for_word_and_in_the_extensions_key_order():
+    """The fixed tool list changes with skills: a decoy without them, or with other text, could be told from a real
+    1.6.0 request. The order of the keys is part of it (the engine's cache sees bytes)."""
+    names = [t["function"]["name"] for t in canary._AGENT_TOOLS]
+    assert names[7:] == ["remember", "use_skill", "save_skill"]
+    assert canary._AGENT_TOOLS[8] == USE_SKILL_TOOL and canary._AGENT_TOOLS[9] == SAVE_SKILL_TOOL
+    assert json.dumps(canary._AGENT_TOOLS[8:]) == json.dumps([USE_SKILL_TOOL, SAVE_SKILL_TOOL])
+    assert SAVE_SKILL_TOOL["function"]["parameters"]["required"] == ["name", "description", "instructions", "scope"]
+    assert SAVE_SKILL_TOOL["function"]["parameters"]["properties"]["scope"]["enum"] == ["project", "user"]
+    assert canary.agent_tools(True)[:10] == canary._AGENT_TOOLS and canary.agent_tools(True)[-1]["function"]["name"] == "generate_image"
+
+
+def test_the_system_prompt_carries_the_skills_paragraph_before_the_paths_paragraph():
+    prompt = canary._AGENT_SYSTEM_PROMPT
+    assert f"\n\n{SKILL_PARAGRAPH}\n\nPaths are relative to the workspace root." in prompt
+    assert prompt.count("use_skill") == 1
+    with_image = canary.agent_system_prompt(True)
+    assert SKILL_PARAGRAPH in with_image and with_image.index("- generate_image(") < with_image.index(SKILL_PARAGRAPH)
 
 
 def test_about_two_in_five_canaries_carry_a_context_message_at_index_one():

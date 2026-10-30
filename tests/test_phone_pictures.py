@@ -38,8 +38,8 @@ from tests.test_phone_lane_endpoint import env, nothing_held, servers  # noqa: F
 
 CONTRACT_TOOL = {"type": "function", "function": {
     "name": "create_image",
-    "description": "Create a new picture from a description. It is shown to the user below your reply about a minute and "
-                   "a half later. Use it whenever the user asks for a picture, image, drawing, painting, illustration, "
+    "description": "Create a new picture from a description. It is shown to the user below your reply in under a "
+                   "minute. Use it whenever the user asks for a picture, image, drawing, painting, illustration, "
                    "photo-like scene, wallpaper, logo, icon, poster or art of something.",
     "parameters": {"type": "object", "properties": {
         "prompt": {"type": "string", "description": "A detailed English description of the picture: subject, setting, "
@@ -51,7 +51,7 @@ CONTRACT_TOOL = {"type": "function", "function": {
         "required": ["prompt"]}}}
 CONTRACT_LINE = (" You can create pictures with the create_image tool: when the user asks for a picture of something, call "
                  "it with a detailed description instead of describing a picture in words. The picture appears below your "
-                 "reply about a minute and a half later, so reply in one short sentence. You cannot change or edit a photo "
+                 "reply in under a minute, so reply in one short sentence. You cannot change or edit a photo "
                  "the user sent; offer to create a new picture from a description instead.")
 MADE = ("The picture is being made and will appear below your reply in about {seconds} seconds. Tell the user in one short "
         "sentence. Do not describe it as if you could see it, and add no link or placeholder.")
@@ -80,9 +80,9 @@ def test_the_prompt_says_nothing_new_without_the_tool_and_the_line_goes_last_wit
 
 
 @pytest.mark.parametrize("shape, size", [
-    ("square", "768x768"), ("portrait", "768x1024"), ("landscape", "1024x768"),
-    (None, "768x768"), ("wide", "768x768"), ("Landscape", "768x768"), ("1024x1024", "768x768"), ("", "768x768"),
-    (5, "768x768"), (["landscape"], "768x768"), ({"a": 1}, "768x768"), (True, "768x768"),
+    ("square", "512x512"), ("portrait", "512x768"), ("landscape", "768x512"),
+    (None, "512x512"), ("wide", "512x512"), ("Landscape", "512x512"), ("1024x1024", "512x512"), ("", "512x512"),
+    (5, "512x512"), (["landscape"], "512x512"), ({"a": 1}, "512x512"), (True, "512x512"),
 ])
 def test_a_shape_is_a_size_and_anything_else_is_square(shape, size):
     assert image_policy.size_for_shape(shape) == size and size in image_policy.SIZES
@@ -104,8 +104,8 @@ class Maker:
         if self.refusal is not None:
             code, detail = self.refusal
             return ap.Picture({"event": "image_refused", "code": code, "detail": detail}, REFUSED.format(detail=detail))
-        return ap.Picture({"event": "image_job", "id": f"job-{len(self.calls)}", "prompt": "a red fox", "size": "768x768",
-                           "position": 1, "eta_seconds": 80}, MADE.format(seconds=80))
+        return ap.Picture({"event": "image_job", "id": f"job-{len(self.calls)}", "prompt": "a red fox", "size": "512x512",
+                           "position": 1, "eta_seconds": 26}, MADE.format(seconds=26))
 
 
 class Looker:
@@ -196,14 +196,14 @@ async def test_a_model_that_calls_the_tool_makes_a_picture_and_the_phone_is_told
     member = Member_(tool_call([("c1", *FOX)]), content("On its way!") + DONE)
     out, pool = await run(member, ask(ON_ITS_OWN), tools, run_tool)
     assert maker.calls == [FOX[1]], "the arguments as the model wrote them"
-    assert dlne(out) == [{"event": "image_job", "id": "job-1", "prompt": "a red fox", "size": "768x768", "position": 1,
-                          "eta_seconds": 80}]
+    assert dlne(out) == [{"event": "image_job", "id": "job-1", "prompt": "a red fox", "size": "512x512", "position": 1,
+                          "eta_seconds": 26}]
     assert shown(out) == [("dlne", "image_job"), ("text", "On its way!")], "no 'searching' event: it is not a lookup"
     second = member.requests[1]
     assistant, tool = second["messages"][-2:]
     assert assistant["tool_calls"][0]["function"]["name"] == "create_image" and assistant["tool_calls"][0]["id"] == "c1"
     assert json.loads(assistant["tool_calls"][0]["function"]["arguments"]) == FOX[1]
-    assert tool == {"role": "tool", "tool_call_id": "c1", "content": MADE.format(seconds=80)}
+    assert tool == {"role": "tool", "tool_call_id": "c1", "content": MADE.format(seconds=26)}
     assert pool._inflight == {}
 
 
@@ -225,7 +225,7 @@ async def test_a_second_call_in_the_same_round_makes_no_job():
     out, _ = await run(member, ask("draw foxes"), tools, run_tool)
     assert len(maker.calls) == 1 and [e["event"] for e in dlne(out)] == ["image_job"]
     tool_messages = [m for m in member.requests[1]["messages"] if m["role"] == "tool"]
-    assert [(m["tool_call_id"], m["content"]) for m in tool_messages] == [("a", MADE.format(seconds=80)), ("b", ONE_ONLY)]
+    assert [(m["tool_call_id"], m["content"]) for m in tool_messages] == [("a", MADE.format(seconds=26)), ("b", ONE_ONLY)]
 
 
 @pytest.mark.anyio
@@ -264,7 +264,7 @@ async def test_a_lookup_and_a_picture_in_one_round_each_get_their_own_events_and
     assert looker.calls == [("web_search", {"query": "snow in Oslo"}, 1)] and maker.calls == [FOX[1]]
     assert [e["event"] for e in dlne(out)] == ["searching", "sources", "image_job"]
     replies = [m["content"] for m in member.requests[1]["messages"] if m["role"] == "tool"]
-    assert replies == ["[1] sunny", MADE.format(seconds=80)]
+    assert replies == ["[1] sunny", MADE.format(seconds=26)]
 
 
 @pytest.mark.anyio
@@ -380,7 +380,7 @@ async def test_a_plain_ask_whose_model_talks_instead_gets_the_servers_own_call_w
     (call,) = assistant["tool_calls"]
     assert call["id"] == "call_picture" and call["function"]["name"] == "create_image"
     assert json.loads(call["function"]["arguments"]) == {"prompt": SKETCH}
-    assert tool == {"role": "tool", "tool_call_id": "call_picture", "content": MADE.format(seconds=80)}
+    assert tool == {"role": "tool", "tool_call_id": "call_picture", "content": MADE.format(seconds=26)}
     assert pool._inflight == {}
 
 
@@ -782,11 +782,11 @@ async def test_a_chat_that_calls_the_tool_queues_a_job_owned_by_its_network(pict
     event = picture_event(out)
     assert set(event) == {"event", "id", "prompt", "size", "position", "eta_seconds"}
     assert event["prompt"] == SNOW_PROMPT, "what the job runs: cleaned, the tag block gone"
-    assert event["size"] == "1024x768" and event["position"] == 1 and event["eta_seconds"] == 111
+    assert event["size"] == "768x512" and event["position"] == 1 and event["eta_seconds"] == 31
     assert shown(out) == [("dlne", "image_job"), ("text", "It will show up below in a minute or so.")]
 
     job = pictures.service.get(NET, "app", event["id"])
-    assert job is not None and job.owner == NET and job.kind == "app" and job.size == "1024x768"
+    assert job is not None and job.owner == NET and job.kind == "app" and job.size == "768x512"
     assert pictures.service.get(OTHER_NET, "app", event["id"]) is None, "another network cannot see it"
     assert pictures.service.get(NET, "ide", event["id"]) is None, "and it is not a coding-side job"
     assert pictures.quota.summary(5)["chats_used"] == 1, "a stranger's picture spends a free-trial chat, as in 2.6.1"
@@ -794,7 +794,7 @@ async def test_a_chat_that_calls_the_tool_queues_a_job_owned_by_its_network(pict
     second = pictures.engine.chats[1]
     assistant, tool = second["messages"][-2:]
     assert assistant["tool_calls"][0]["function"]["name"] == "create_image"
-    assert tool["role"] == "tool" and tool["content"] == MADE.format(seconds=111)
+    assert tool["role"] == "tool" and tool["content"] == MADE.format(seconds=31)
     assert nothing_held(pictures.env), "the lane, the gate and the network's slot are all free"
 
 
@@ -806,14 +806,14 @@ async def test_the_phone_polls_the_job_like_one_made_from_the_dialog_and_gets_th
     async with lanes.client(lanes.REMOTE) as c, lanes.client(lanes.OTHER) as other:
         done = await finished(c, "/v1/app/images", job_id)
         assert (await other.get(f"/v1/app/images/{job_id}")).status_code == 404
-    assert done["status"] == "completed" and done["image"]["width"] == 768
-    assert pictures.member.calls[0]["prompt"] == SNOW_PROMPT and pictures.member.calls[0]["width"] == 768
+    assert done["status"] == "completed" and done["image"]["width"] == 512
+    assert pictures.member.calls[0]["prompt"] == SNOW_PROMPT and pictures.member.calls[0]["width"] == 512
     assert pictures.judge.calls[0][0] == "app", "its checks take a phone lane, as the dialog's do"
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("shape, size", [("square", "768x768"), ("portrait", "768x1024"), ("landscape", "1024x768"),
-                                         (None, "768x768"), ("wide", "768x768"), (5, "768x768"), ("1024x1024", "768x768")])
+@pytest.mark.parametrize("shape, size", [("square", "512x512"), ("portrait", "512x768"), ("landscape", "768x512"),
+                                         (None, "512x512"), ("wide", "512x512"), (5, "512x512"), ("1024x1024", "512x512")])
 async def test_the_shape_decides_the_size_and_a_wrong_word_is_square(pictures, shape, size):
     arguments = {"prompt": SNOW_PROMPT} if shape is None else {"prompt": SNOW_PROMPT, "shape": shape}
     pictures.engine.script = [[calls_create(arguments)], [reply("ok")]]
@@ -835,12 +835,12 @@ async def test_the_dialog_and_the_tool_run_the_one_shared_function(pictures, mon
 
     monkeypatch.setattr(coordinator, "_create_image_job", spy)
     async with lanes.client(lanes.REMOTE) as c:
-        assert (await c.post("/v1/app/images", json={"prompt": "from the dialog", "size": "768x1024"})).status_code == 202
+        assert (await c.post("/v1/app/images", json={"prompt": "from the dialog", "size": "512x768"})).status_code == 202
         assert (await c.post("/v1/images", json={"prompt": "from the IDE"})).status_code == 202
     pictures.engine.script = [[calls_create({"prompt": "from the chat", "shape": "portrait"})], [reply("ok")]]
     await chat(ON_ITS_OWN)
-    assert seen == [("app", "from the dialog", "768x1024"), ("ide", "from the IDE", None),
-                    ("app", "from the chat", "768x1024")]
+    assert seen == [("app", "from the dialog", "512x768"), ("ide", "from the IDE", None),
+                    ("app", "from the chat", "512x768")]
 
 
 @pytest.mark.anyio
@@ -864,7 +864,7 @@ async def test_a_second_call_in_the_same_answer_makes_no_job(pictures):
     picture_event(out)
     assert len(pictures.service._jobs) == 1 and pictures.quota.summary(5)["chats_used"] == 1
     tool_messages = [m for m in pictures.engine.chats[1]["messages"] if m["role"] == "tool"]
-    assert [m["content"] for m in tool_messages] == [MADE.format(seconds=80), ONE_ONLY]
+    assert [m["content"] for m in tool_messages] == [MADE.format(seconds=26), ONE_ONLY]
 
 
 @pytest.mark.anyio
@@ -1005,14 +1005,14 @@ async def test_a_plain_ask_whose_model_talks_instead_still_gets_its_picture(pict
     assert first["tool_choice"] == "required" and first["max_tokens"] == ap.IMAGE_HELD_TOKENS
     assert "create_image" in tools_of(first)
     event = picture_event(out)
-    assert event["prompt"] == SKETCH and event["size"] == "768x768"
+    assert event["prompt"] == SKETCH and event["size"] == "512x512"
     job = pictures.service.get(NET, "app", event["id"])
     assert job is not None and job.owner == NET and job.kind == "app"
     assert "fox in the snow: a red fox walks" not in text(out) and text(out) == "It will appear below."
     assert [e["dlne"]["event"] for e in events(out) if "dlne" in e] == ["image_job"], "the event comes before the reply"
     assert events(out)[0]["dlne"]["event"] == "image_job"
     assert second["messages"][-2]["tool_calls"][0]["id"] == "call_picture"
-    assert second["messages"][-1]["content"] == MADE.format(seconds=80) and "tool_choice" not in second
+    assert second["messages"][-1]["content"] == MADE.format(seconds=26) and "tool_choice" not in second
 
 
 @pytest.mark.anyio
@@ -1020,7 +1020,7 @@ async def test_a_plain_ask_whose_model_calls_the_tool_uses_the_models_descriptio
     pictures.engine.script = [[calls_create({"prompt": SNOW_PROMPT, "shape": "portrait"})], [reply("There you go.")]]
     out = await chat(SKETCH)
     event = picture_event(out)
-    assert event["prompt"] == SNOW_PROMPT and event["size"] == "768x1024"
+    assert event["prompt"] == SNOW_PROMPT and event["size"] == "512x768"
     assert len(pictures.engine.chats) == 2 and text(out) == "There you go."
 
 

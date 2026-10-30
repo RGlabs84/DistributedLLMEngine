@@ -11,6 +11,10 @@ const os = require('node:os');
 const path = require('node:path');
 
 const stub = require('./helpers/vscode-stub');
+
+// 2.7.0: the memory sizes depend on the coding context (memoryCaps). These tests use TheWall's 131,072, where every
+// file loads its full 32,000 characters; the limit on the three together has its own test.
+require('../dist/agent/memory').setMemoryContextTokens(131072);
 const { ToolRegistry } = require('../dist/agent/tools');
 const { factId } = require('../dist/agent/memory');
 
@@ -62,11 +66,11 @@ const remember = (fact, scope) => ToolRegistry.executeTool('remember', { fact, s
 
 // ---- the definition -----------------------------------------------------------------------------------
 
-test('remember is the last of eight tools, the other seven first and unchanged', () => {
+test('remember is the eighth tool, the other seven first and unchanged, and the two skill tools follow it', () => {
   const names = ToolRegistry.getToolDefinitions().map((t) => t.function.name);
   assert.deepEqual(names, [
     'read_file', 'write_file', 'edit_file_diff', 'list_directory', 'search_codebase',
-    'run_terminal_command', 'get_workspace_diagnostics', 'remember',
+    'run_terminal_command', 'get_workspace_diagnostics', 'remember', 'use_skill', 'save_skill',
   ]);
 });
 
@@ -75,8 +79,8 @@ test('the definition is exactly the contract\'s JSON', () => {
   const match = doc.match(/<!-- REMEMBER_TOOL begin -->\s*```json\n([\s\S]*?)\n```\s*<!-- REMEMBER_TOOL end -->/);
   assert.ok(match, 'the REMEMBER_TOOL markers are in the contract');
   const tools = ToolRegistry.getToolDefinitions();
-  assert.deepEqual(tools[tools.length - 1], JSON.parse(match[1]));
-  assert.equal(JSON.stringify(tools[tools.length - 1]), JSON.stringify(JSON.parse(match[1])), 'same key order too');
+  assert.deepEqual(tools[7], JSON.parse(match[1]));
+  assert.equal(JSON.stringify(tools[7]), JSON.stringify(JSON.parse(match[1])), 'same key order too');
 });
 
 // ---- the approval -------------------------------------------------------------------------------------
@@ -223,11 +227,11 @@ test('a fact already remembered is not asked about again, and is not an error', 
 test('a full memory file is answered without a question', () =>
   project(async ({ asked, projectFile }) => {
     fs.mkdirSync(path.dirname(projectFile), { recursive: true });
-    fs.writeFileSync(projectFile, 'x'.repeat(7_950));
+    fs.writeFileSync(projectFile, 'x'.repeat(31_950));
     const result = await remember('y'.repeat(100), 'project');
     assert.equal(asked.length, 0);
     assert.equal(result.is_error, true);
-    assert.match(result.output, /^The project memory is full \(7950 of 8000 characters\), so nothing was saved\./);
+    assert.match(result.output, /^The project memory is full \(31950 of 32000 characters\), so nothing was saved\./);
   }));
 
 // ---- automatic memory (dlne.agent.memory "auto", the default; docs/agent-memory.md 7.4, 7.6) --------------
@@ -325,16 +329,16 @@ test('2026-10-30 replayed: a nearly full file, a new fact refused with the facts
   project(async ({ root, home, projectFile }) => {
     const { loadMemory } = require('../dist/agent/memory');
     const finding = (n) => `Finding ${n}: ${'the GA102 SEC2 image keeps its signature table after the header '.repeat(7).trim()}.`;
-    const findings = Array.from({ length: 15 }, (_, n) => finding(n + 1));
+    const findings = Array.from({ length: 66 }, (_, n) => finding(n + 1));
     fs.mkdirSync(path.dirname(projectFile), { recursive: true });
     fs.writeFileSync(projectFile, ['- The user\'s own note: ' + 'x'.repeat(500), ...findings.map((f) => `- ${f} <!-- dlne -->`)].join('\n') + '\n');
     const used = loadMemory(root, { homeDir: home }).project.text.length;
-    assert.ok(used > 7_400 && used < 8_000, String(used));
+    assert.ok(used > 31_400 && used < 32_000, String(used));
 
     const fresh = `The SEC2 unlock needs the BTL1 header patched first: ${'patch_loc 0x7d00 then os_data_off 0x7e00, '.repeat(10).trim()}`;
     const refused = await remember(fresh, 'project');
     assert.equal(refused.is_error, true);
-    assert.ok(refused.output.startsWith(`The project memory is full (${used} of 8000 characters), so nothing was saved. Make room first: `), refused.output);
+    assert.ok(refused.output.startsWith(`The project memory is full (${used} of 32000 characters), so nothing was saved. Make room first: `), refused.output);
     assert.match(refused.output, new RegExp(`Yours, largest first: \\${tag(finding(10))} \\(${finding(10).length} chars\\) "Finding 10: `));
 
     // The call that failed a dozen times that day: the fact quoted with its memory's name in front.
@@ -350,13 +354,13 @@ test('2026-10-30 replayed: a nearly full file, a new fact refused with the facts
 
 test('a long update takes the old fact\'s place in parts, says so, and repeating it adds nothing', () =>
   project(async ({ projectFile }) => {
-    // 2026-10-28: an update over 500 characters left its second part at the end of the file; the model took that
+    // 2026-10-28: an update over the fact limit (500 characters then, 1,000 since 2.7.0) left its second part at the end of the file; the model took that
     // for a failure, removed the part and repeated the update, three times over.
     const sig = (name, offsets) => `Secondary ${name} (0x5a87e20e, 0x8f90b178, 0xb2c0285a, 0x38894ef0) at 3 offsets (${offsets}).`;
     const main = 'AD102 SEC2 repeating 4-dword signatures: Main (0x5a87e20e, 0x8f90b178, 0xb2c0285a, 0x38894ef0) at 6 offsets (0x2210, 0x6290, 0x6d50, 0x6f30, 0x6f80, 0x7050).';
-    const abc = `${main} ${sig('A', '0x2060, 0x3050, 0x7310')} ${sig('B', '0x2100, 0x2ec0, 0x3000')} ${sig('C', '0x2490, 0x5550, 0x5e50')}`;
-    const abcd = `${abc} ${sig('D', '0x5600, 0x70b0, 0x72d0')} These are magic markers in encrypted code.`;
-    assert.ok(abc.length <= 500 && abcd.length > 500);
+    const abc = [main, ...'ABCDEFGH'.split('').map((n) => sig(n, '0x2060, 0x3050, 0x7310'))].join(' ');
+    const abcd = `${abc} ${sig('I', '0x5600, 0x70b0, 0x72d0')} These are magic markers in encrypted code.`;
+    assert.ok(abc.length <= 1000 && abcd.length > 1000, `${abc.length} ${abcd.length}`);
     await remember(abc, 'project');
     await remember('Key files live in firmware/blobs/.', 'project');
     const facts = () => fs.readFileSync(projectFile, 'utf8').split('\n').filter((l) => l.startsWith('- '));
@@ -364,9 +368,9 @@ test('a long update takes the old fact\'s place in parts, says so, and repeating
     const r = await change(abcd, 'project', 'AD102 SEC2 repeating');
     assert.equal(r.is_error, undefined, r.output);
     assert.ok(r.output.startsWith(`📝 Updated for this project ${tag(abc)} → [`), r.output);
-    assert.match(r.output, /\n📝 Remembered for this project \[[0-9a-f]{4}\]: Secondary D .*\nIt is over 500 characters, so it was saved as these 2 facts, one after the other\. That is expected: nothing more to do\.$/);
+    assert.match(r.output, /\n📝 Remembered for this project \[[0-9a-f]{4}\]: Secondary I .*\nIt is over 1000 characters, so it was saved as these 2 facts, one after the other\. That is expected: nothing more to do\.$/);
     assert.equal(facts().length, 3);
-    assert.match(facts()[1], /Secondary D/, 'the second part right after the first, not at the end');
+    assert.match(facts()[1], /Secondary I/, 'the second part right after the first, not at the end');
     assert.match(facts()[2], /Key files/);
 
     const again = await change(abcd, 'project', 'AD102 SEC2 repeating');
@@ -416,18 +420,18 @@ test('off: nothing is saved and nothing is asked', () =>
     assert.equal(fs.existsSync(projectFile), false);
   }, { mode: 'off' }));
 
-test('a fact over 500 characters is saved in parts at sentence ends, and one Undo removes them all', () =>
+test('a fact over 1,000 characters is saved in parts at sentence ends, and one Undo removes them all', () =>
   project(async ({ projectFile }) => {
     // 2026-10-27: a 720-character fact was refused at the end of a 23-minute task, as the task's last word.
     const sentence = (n) => `Fact ${n}: gpu_unlock 2.5.3 must load before nvidia, and modprobe needs options gpu_unlock targets=all.`;
-    const long = [1, 2, 3, 4, 5, 6, 7, 8].map(sentence).join(' ');
-    assert.ok(long.length > 700);
+    const long = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(sentence).join(' ');
+    assert.ok(long.length > 1000);
     const r = await remember(long, 'project');
     assert.equal(r.is_error, undefined, r.output);
     const facts = fs.readFileSync(projectFile, 'utf8').split('\n').filter((l) => l.startsWith('- '))
       .map((l) => l.replace(/^- /, '').replace(/\s*<!--.*-->\s*$/, ''));
     assert.ok(facts.length >= 2);
-    assert.ok(facts.every((f) => f.length <= 500 && /\.$/.test(f)), 'whole sentences, each part within the limit');
+    assert.ok(facts.every((f) => f.length <= 1000 && /\.$/.test(f)), 'whole sentences, each part within the limit');
     assert.equal(facts.join(' '), long, 'nothing lost, "2.5.3" kept whole');
     assert.ok(Array.isArray(r.memoryChange) && r.memoryChange.length === facts.length);
     const { undoMemoryChange } = require('../dist/agent/memory');
@@ -437,8 +441,8 @@ test('a fact over 500 characters is saved in parts at sentence ends, and one Und
 
 test('one sentence too long on its own is cut at a space', () => {
   const { splitFact } = require('../dist/agent/memory');
-  const parts = splitFact('word '.repeat(150).trim());
-  assert.ok(parts.length === 2 && parts.every((p) => p.length <= 500 && !p.startsWith(' ') && !p.endsWith(' ')));
-  assert.equal(parts.join(' '), 'word '.repeat(150).trim());
+  const parts = splitFact('word '.repeat(300).trim());
+  assert.ok(parts.length === 2 && parts.every((p) => p.length <= 1000 && !p.startsWith(' ') && !p.endsWith(' ')));
+  assert.equal(parts.join(' '), 'word '.repeat(300).trim());
   assert.deepEqual(splitFact('  short fact.  '), ['short fact.']);
 });

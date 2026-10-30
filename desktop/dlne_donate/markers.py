@@ -21,6 +21,11 @@ CLOCK_MARKER = "DLNE_CLOCK: "
 # 2.5.0: whether the machine is docked (wired + mains) and whether it is stepping aside for its owner's own load.
 DOCK_MARKER = "DLNE_DOCK: "
 YIELD_MARKER = "DLNE_YIELD: "
+# 2.7.0 (docs/release-2.7-contract.md sections 1 and 7): whether this computer may run the CUDA engine (printed before any engine
+# download), and which engine flavour actually runs, with the reason when CUDA could not start and Vulkan took over.
+CUDA_MARKER = "DLNE_CUDA: "
+ENGINE_MARKER = "DLNE_ENGINE: "
+ENGINE_FLAVOURS = ("vulkan", "cuda")
 
 # The worker's exit codes (engine/worker.py).
 VERSION_MISMATCH_EXIT_CODE = 75
@@ -62,6 +67,23 @@ class Yield:
     """Whether the machine is stepping aside for its owner's own load (2.5.0), and why."""
     yielding: bool = False
     why: str = ""               # fullscreen, gpu or cpu
+
+
+@dataclass(frozen=True)
+class Cuda:
+    """What the worker read about this computer and CUDA (2.7.0): may it run the CUDA engine, and if not, why not."""
+    capable: bool = False
+    reason: str = ""            # plain words, "" when capable
+    gpu: str = ""
+    compute_cap: str = ""
+    driver: str = ""
+
+
+@dataclass(frozen=True)
+class EngineRun:
+    """The engine flavour the worker runs (2.7.0). ``fallback`` says why CUDA could not start when Vulkan runs instead."""
+    flavour: str = "vulkan"
+    fallback: str = ""
 
 
 def take_complete_lines(pending: str, chunk: str) -> Tuple[str, str]:
@@ -162,6 +184,50 @@ def parse_yield(output: str) -> Optional[Yield]:
             continue
         why = facts.get("why") if facts["yielding"] and facts.get("why") in ("fullscreen", "gpu", "cpu") else ""
         found = Yield(yielding=facts["yielding"], why=why)
+    return found
+
+
+_LINES = re.compile(r"\r?\n")      # the extension splits on exactly this (str.splitlines would also cut at form feeds and U+2028)
+
+
+def _bounded(value: Any, limit: int) -> str:
+    """A string field as the extension's parser keeps it (contribution.ts parseCudaProbe): trimmed, cut to ``limit``; "" for anything else."""
+    return value.strip()[:limit] if isinstance(value, str) else ""
+
+
+def parse_cuda(output: str) -> Optional[Cuda]:
+    """The last CUDA facts the worker printed (DLNE_CUDA), or None. A line without a true/false ``capable`` is ignored."""
+    found: Optional[Cuda] = None
+    for line in _LINES.split(output):
+        at = line.find(CUDA_MARKER)
+        if at == -1:
+            continue
+        try:
+            facts = json.loads(line[at + len(CUDA_MARKER):].strip())
+        except ValueError:
+            continue
+        if not isinstance(facts, dict) or not isinstance(facts.get("capable"), bool):
+            continue
+        found = Cuda(capable=facts["capable"], reason="" if facts["capable"] else _bounded(facts.get("reason"), 200),
+                     gpu=_bounded(facts.get("gpu"), 120),
+                     compute_cap=_bounded(facts.get("compute_cap"), 16), driver=_bounded(facts.get("driver"), 32))
+    return found
+
+
+def parse_engine(output: str) -> Optional[EngineRun]:
+    """The last engine flavour the worker printed (DLNE_ENGINE), or None. A flavour other than vulkan or cuda is ignored."""
+    found: Optional[EngineRun] = None
+    for line in _LINES.split(output):
+        at = line.find(ENGINE_MARKER)
+        if at == -1:
+            continue
+        try:
+            facts = json.loads(line[at + len(ENGINE_MARKER):].strip())
+        except ValueError:
+            continue
+        if not isinstance(facts, dict) or facts.get("flavour") not in ENGINE_FLAVOURS:
+            continue
+        found = EngineRun(flavour=facts["flavour"], fallback="" if facts["flavour"] == "cuda" else _bounded(facts.get("fallback"), 300))
     return found
 
 
@@ -309,6 +375,8 @@ class OutputReader:
     clock_offset: Optional[int] = None
     dock: Optional[Dock] = None
     yielding: Optional[Yield] = None
+    cuda: Optional[Cuda] = None
+    engine: Optional[EngineRun] = None
     activity: Optional[Activity] = None
     heartbeat_ok: bool = False
     needs_vcredist: bool = False
@@ -316,7 +384,7 @@ class OutputReader:
 
     def feed(self, chunk: str, stream: str = "stdout") -> Dict[str, Any]:
         """Returns what changed, as ``{"role": Role}`` / ``{"also": bool}`` / ``{"refusal": str}`` / ``{"clock": int}`` /
-        ``{"dock": Dock}`` / ``{"yield": Yield}``."""
+        ``{"dock": Dock}`` / ``{"yield": Yield}`` / ``{"cuda": Cuda}`` / ``{"engine": EngineRun}``."""
         complete, rest = take_complete_lines(self._tail.get(stream, ""), chunk)
         self._tail[stream] = rest
         changed: Dict[str, Any] = {}
@@ -349,6 +417,14 @@ class OutputReader:
         if yielding is not None and yielding != self.yielding:
             self.yielding = yielding
             changed["yield"] = yielding
+        cuda = parse_cuda(complete)
+        if cuda is not None and cuda != self.cuda:
+            self.cuda = cuda
+            changed["cuda"] = cuda
+        engine = parse_engine(complete)
+        if engine is not None and engine != self.engine:
+            self.engine = engine
+            changed["engine"] = engine
         activity = parse_activity(complete)
         if activity and activity != self.activity:
             self.activity = activity

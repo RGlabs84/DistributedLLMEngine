@@ -515,8 +515,8 @@ async def test_a_plain_ask_for_a_picture_with_a_photo_is_left_to_the_model(engin
 
     async def maker(arguments):
         made.append(arguments)
-        return app_pool_module.Picture({"event": "image_job", "id": "j1", "prompt": "p", "size": "768x768",
-                                        "position": 1, "eta_seconds": 80}, "made")
+        return app_pool_module.Picture({"event": "image_job", "id": "j1", "prompt": "p", "size": "512x512",
+                                        "position": 1, "eta_seconds": 18}, "made")
 
     tools, run_tool = app_pool_module.with_pictures(None, None, maker)
     engine.reset()

@@ -1,5 +1,5 @@
 """
-Canaries while image generation is on (2.6.1): the decoy requests look exactly like the extension's, which then carries a ninth
+Canaries while image generation is on (2.6.1): the decoy requests look exactly like the extension's, which then carries an eleventh
 tool (generate_image) and one more line in its system prompt. With image generation off a decoy is what it always was.
 
 The extension's text is read from its source (vscode-extension/src/agent/imageTool.ts), the way the other canary parity
@@ -45,17 +45,17 @@ def seeded(**kwargs):
 
 def test_with_image_generation_off_a_decoy_is_exactly_what_it_was():
     body = seeded()
-    assert body["tools"] is canary._AGENT_TOOLS and len(body["tools"]) == 8
+    assert body["tools"] is canary._AGENT_TOOLS and len(body["tools"]) == 10
     assert body["messages"][0] == {"role": "system", "content": canary._AGENT_SYSTEM_PROMPT}
     assert "generate_image" not in json.dumps(body)
     assert seeded(image_generation=False)["tools"] == body["tools"]
 
 
-def test_with_it_on_the_ninth_tool_is_last_and_the_first_eight_are_untouched():
+def test_with_it_on_the_eleventh_tool_is_last_and_the_first_ten_are_untouched():
     body = seeded(image_generation=True)
-    assert [t["function"]["name"] for t in body["tools"]][-1] == "generate_image" and len(body["tools"]) == 9
-    assert body["tools"][:8] == canary._AGENT_TOOLS
-    assert len(canary._AGENT_TOOLS) == 8                             # the shared list is not mutated
+    assert [t["function"]["name"] for t in body["tools"]][-1] == "generate_image" and len(body["tools"]) == 11
+    assert body["tools"][:10] == canary._AGENT_TOOLS
+    assert len(canary._AGENT_TOOLS) == 10                            # the shared list is not mutated
 
 
 def test_with_it_on_one_line_joins_the_prompt_before_run_terminal_command_and_nothing_else_changes():
@@ -115,7 +115,7 @@ def test_the_extensions_prompt_line_and_where_it_goes_are_the_canarys(ts):
 
 def test_the_extension_adds_the_tool_last_to_the_agents_list(ts):
     source = extension_file("agentLoop.ts")
-    assert source is not None and "[...ToolRegistry.getToolDefinitions(), imageToolDefinition()]" in source
+    assert source is not None and "...(this.imageOffered ? [imageToolDefinition()] : []),\n      ...(this.visionOn ? [viewImageToolDefinition()] : [])," in source
 
 
 # --- the scheduler ----------------------------------------------------------------------------------------------
@@ -142,7 +142,7 @@ async def test_the_scheduler_asks_for_the_image_tool_only_while_images_are_offer
     assert await s.tick() == [tid("a")]
     assert asked == ([{"image_generation": True}] if nine else [{}])
     ((_, body),) = router.sent
-    assert len(body["tools"]) == (9 if nine else 8)
+    assert len(body["tools"]) == (11 if nine else 10)
     assert ("generate_image(prompt, path, size)" in body["messages"][0]["content"]) is nine
 
 

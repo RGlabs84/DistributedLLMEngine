@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from . import engine_flavour
 from .configfile import format_gb
 
 # The swarm's floors for a CPU member (engine/config.py cpu_min_*) and for a coding member.
@@ -165,6 +166,12 @@ class Settings:
     threads: int = 4
     resume_donating: bool = False       # start donating when the app starts (off: donating is always the owner's click)
     lend_notice_seen: bool = False      # the owner has been told what lending a GPU means
+    # 2.7.0, the engine flavour (engine_flavour.py): auto | vulkan | cuda, and the answer to the CUDA question
+    # (yes | never | later | unasked; for "later" the epoch milliseconds when it is asked again).
+    engine: str = "auto"
+    cuda_consent: str = "unasked"
+    cuda_later_ms: int = 0
+    auto_update: bool = False           # "Update automatically" (4a): install a newer DLNE Donate at the next idle moment; off by default
 
 
 def default_settings(hw: Hardware, tiers: Sequence[Dict[str, Any]]) -> Settings:
@@ -212,8 +219,11 @@ def settings_from_json(data: Any, hw: Hardware, tiers: Sequence[Dict[str, Any]])
         threads=int(_number(data.get("threads"), base.threads)),
         resume_donating=flag("resume_donating", False),
         lend_notice_seen=flag("lend_notice_seen", False),
+        engine=engine_flavour.clean_engine(data.get("engine")),
+        auto_update=flag("auto_update", False),
     )
-    return clamp_settings(loaded, hw, tiers)
+    consent, later_ms = engine_flavour.consent_from_json(data.get("cuda_consent"))
+    return clamp_settings(replace(loaded, cuda_consent=consent, cuda_later_ms=later_ms), hw, tiers)
 
 
 def settings_to_json(settings: Settings) -> Dict[str, Any]:
@@ -224,6 +234,9 @@ def settings_to_json(settings: Settings) -> Dict[str, Any]:
         "threads": settings.threads,
         "resume_donating": settings.resume_donating,
         "lend_notice_seen": settings.lend_notice_seen,
+        "engine": settings.engine,
+        "cuda_consent": engine_flavour.consent_to_json(settings.cuda_consent, settings.cuda_later_ms),
+        "auto_update": settings.auto_update,
     }
 
 
@@ -244,8 +257,11 @@ def clamp_settings(settings: Settings, hw: Hardware, tiers: Sequence[Dict[str, A
     vram = min(max(settings.gpu_vram_gb or vram_high, vram_low), vram_high) if hw.has_gpu else 0.0
     ram = float(min(max(int(round(settings.gpu_ram_gb)), low), hard))
     lo_t, hi_t = thread_bounds(hw)
+    consent, later_ms = engine_flavour.consent_from_json(
+        {"later": settings.cuda_later_ms} if settings.cuda_consent == "later" else settings.cuda_consent)
     return replace(settings, gpu_enabled=gpu_on, gpu_vram_gb=round(vram, 1), gpu_ram_gb=ram, cpu_enabled=cpu_on,
-                   cpu_ram_gb=snap_cpu_ram(settings.cpu_ram_gb, hw, tiers), threads=min(max(settings.threads, lo_t), hi_t))
+                   cpu_ram_gb=snap_cpu_ram(settings.cpu_ram_gb, hw, tiers), threads=min(max(settings.threads, lo_t), hi_t),
+                   engine=engine_flavour.clean_engine(settings.engine), cuda_consent=consent, cuda_later_ms=later_ms)
 
 
 # --------------------------------------------------------------------------------------------------

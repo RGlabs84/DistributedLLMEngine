@@ -22,8 +22,12 @@ import * as os from 'os';
 import * as path from 'path';
 import { excludedReason, excludedReasonSkipping, redactSecrets } from '../privacy';
 
-export interface MemorySource { label: 'instructions' | 'project' | 'user'; path: string; text: string }
-export interface MemorySources { instructions?: MemorySource; project?: MemorySource; user?: MemorySource }
+export interface MemorySource { label: 'instructions' | 'project' | 'user' | 'skills'; path: string; text: string }
+export interface MemorySources {
+  instructions?: MemorySource; project?: MemorySource; user?: MemorySource;
+  /** The `## Skills` list (skills.ts, docs/agent-memory.md 7.9): rendered last, after the three memory files. */
+  skills?: MemorySource;
+}
 export interface MemoryOptions {
   /** False is the same as mode "off" (kept for callers from before the modes). */
   enabled?: boolean;
@@ -44,14 +48,38 @@ export const CONTEXT_HEADINGS = {
   project: '## Project memory (.dlne/memory.md)',
   user: "## The user's preferences (~/.dlne/memory.md)",
 };
+/** The skills list's heading (docs/agent-memory.md 7.9): the last section of the block, when there are skills. */
+export const CONTEXT_SKILLS_HEADING = '## Skills';
 
 // ---- sizes and fixed texts -----------------------------------------------------------------------------
 
-const INSTRUCTIONS_CAP = 8_000;
-const PROJECT_CAP = 8_000;
-const USER_CAP = 4_000;
+/** The coding model's context the memory sizes are worked out for (setMemoryContextTokens), 32,768 until one is known. */
+let memoryContextTokens = 32_768;
+
+/** The most each memory file holds and DLNE loads, in characters (owner, 2026-10-30: "32000 across the board"). */
+const MEMORY_FILE_CAP = 32_000;
+
+/**
+ * The most of each file DLNE loads, in characters, and of the three together (2.7.0). Each file holds up to 32,000
+ * characters (8,000 / 8,000 / 4,000 before 2.7.0). The three together load at most three quarters of a character per
+ * token of the coding context, never under the 20,000 they could total before: about a third of the prompt, so a small
+ * machine still has room for the conversation. 24,576 at 32,768 tokens; 48,096 at 64,128; everything (96,000) from
+ * 128,000. Files are filled in order (AGENTS.md, project, user). The block is read once per conversation
+ * (agentLoop.ts), so a large memory costs one reading, not one a request.
+ */
+export function memoryCaps(contextTokens: number = memoryContextTokens): { instructions: number; project: number; user: number; total: number } {
+  const tokens = Number.isFinite(contextTokens) && contextTokens > 0 ? contextTokens : 32_768;
+  const total = Math.min(3 * MEMORY_FILE_CAP, Math.max(20_000, Math.floor(tokens * 0.75)));
+  return { instructions: MEMORY_FILE_CAP, project: MEMORY_FILE_CAP, user: MEMORY_FILE_CAP, total };
+}
+
+/** The coding model's context, from the agent (AgentLoop.run), for memoryCaps. */
+export function setMemoryContextTokens(contextTokens: number): void {
+  if (Number.isFinite(contextTokens) && contextTokens > 0) memoryContextTokens = Math.floor(contextTokens);
+}
+
 /** The longest fact `remember` writes on one line: a longer one is saved in parts (splitFact). */
-const FACT_MAX_CHARS = 500;
+const FACT_MAX_CHARS = 1_000;
 
 /** The first line of a file `remember` created. It is not loaded, since it says nothing to the model. */
 const MEMORY_TITLE = '# DLNE memory';
@@ -59,7 +87,7 @@ const MEMORY_TITLE = '# DLNE memory';
 function newFileHeader(scope: 'project' | 'user'): string {
   const about = scope === 'project' ? 'this project' : 'your preferences, for every project';
   return `${MEMORY_TITLE}\n\n` +
-    `<!-- What the DLNE agent remembers about ${about}. It reads this file at the start of every request and sends it, ` +
+    `<!-- What the DLNE agent remembers about ${about}. It reads this file at the start of every conversation and sends it, ` +
     'with the rest of the prompt, to the DLNE swarm (the coordinator or a volunteer\'s coding member). ' +
     'Add, edit or delete lines freely; keep secrets out. -->\n\n';
 }
@@ -72,7 +100,7 @@ const MEMORY_OFF = 'Memory is off (the dlne.agent.memory setting), so nothing wa
  * that must not silently switch memory off. A memory file is still kept out by `.dlneignore` (the user's word on
  * what DLNE may touch) and by the credential-file rules. AGENTS.md is not a memory file and keeps every rule.
  */
-function memoryExclusion(file: string, isMemoryFile: boolean): string | null {
+export function memoryExclusion(file: string, isMemoryFile: boolean): string | null {
   try {
     // Skipping the git rules (rather than excusing a git-sourced reason) keeps a .dlneignore entry in force even
     // where a .gitignore entry for the folder would have been found first.
@@ -87,7 +115,7 @@ function memoryExclusion(file: string, isMemoryFile: boolean): string | null {
  * links elsewhere would otherwise send that other file to the swarm, or write the user's facts there. A path that
  * does not exist yet is judged by its nearest existing folder.
  */
-function leavesRoot(file: string, root: string): boolean {
+export function leavesRoot(file: string, root: string): boolean {
   const real = (p: string): string => {
     const missing: string[] = [];
     let current = path.resolve(p);
@@ -107,7 +135,7 @@ function leavesRoot(file: string, root: string): boolean {
 }
 
 /** Invisible and direction-changing characters: in a fact they could hide text from the approval dialog. */
-const HIDDEN_CHARACTERS = /[​-‏‪-‮⁠-⁤⁦-⁩﻿]/;
+export const HIDDEN_CHARACTERS = /[​-‏‪-‮⁠-⁤⁦-⁩﻿]/;
 
 // ---- loading (section 7.2) -----------------------------------------------------------------------------
 
@@ -126,7 +154,7 @@ function cleaned(raw: string): string {
 }
 
 /** Read no more of a file than loading can use (a cut file is marked anyway): a huge one must not stall a request. */
-function readHead(file: string, cap: number): string {
+export function readHead(file: string, cap: number): string {
   const limit = cap * 4 + 4096; // UTF-8 takes at most 4 bytes a character; the rest covers comments to strip
   const fd = fs.openSync(file, 'r');
   try {
@@ -182,16 +210,21 @@ export function loadMemory(workspaceRoot: string | undefined, options: MemoryOpt
     const userPath = userMemoryPath(options);
     const home = options.homeDir ?? os.homedir();
     // Each file must really be where it says: the project's inside the workspace, the user's inside the home folder.
-    const wanted: Array<[MemorySource['label'], string | undefined, number, string | undefined]> = [
-      ['instructions', workspaceRoot ? path.join(workspaceRoot, 'AGENTS.md') : undefined, INSTRUCTIONS_CAP, workspaceRoot],
+    const caps = memoryCaps();
+    const wanted: Array<[Exclude<MemorySource['label'], 'skills'>, string | undefined, number, string | undefined]> = [
+      ['instructions', workspaceRoot ? path.join(workspaceRoot, 'AGENTS.md') : undefined, caps.instructions, workspaceRoot],
       // A workspace opened at the home folder would otherwise send the same file twice.
-      ['project', workspaceRoot && projectMemoryPath(workspaceRoot) !== userPath ? projectMemoryPath(workspaceRoot) : undefined, PROJECT_CAP, workspaceRoot],
-      ['user', userPath, USER_CAP, home],
+      ['project', workspaceRoot && projectMemoryPath(workspaceRoot) !== userPath ? projectMemoryPath(workspaceRoot) : undefined, caps.project, workspaceRoot],
+      ['user', userPath, caps.user, home],
     ];
+    let room = caps.total;
     for (const [label, file, cap, root] of wanted) {
-      if (!file || !root) continue;
-      const text = loadFile(file, cap, label !== 'instructions', root);
-      if (text) sources[label] = { label, path: file, text };
+      if (!file || !root || room <= 0) continue;
+      const text = loadFile(file, Math.min(cap, room), label !== 'instructions', root);
+      if (text) {
+        sources[label] = { label, path: file, text };
+        room -= Math.min(text.length, cap);
+      }
     }
   } catch {
     // whatever was loaded before the failure still counts
@@ -206,6 +239,7 @@ export function renderContextBlock(sources: MemorySources): string | null {
     const source = sources[label];
     if (source && source.text) sections.push(`${CONTEXT_HEADINGS[label]}\n${source.text}`);
   }
+  if (sources.skills && sources.skills.text) sections.push(`${CONTEXT_SKILLS_HEADING}\n${sources.skills.text}`);
   if (sections.length === 0) return null;
   return `${CONTEXT_OPEN}\n${CONTEXT_INTRO}\n\n${sections.join('\n\n')}\n${CONTEXT_CLOSE}`;
 }
@@ -222,7 +256,7 @@ export function memoryMode(setting: unknown): MemoryMode {
   return 'auto';
 }
 
-function modeOf(options: MemoryOptions): MemoryMode {
+export function modeOf(options: MemoryOptions): MemoryMode {
   return options.enabled === false ? 'off' : (options.mode ?? 'auto');
 }
 
@@ -568,7 +602,7 @@ export function checkRemember(
 
   // The whole file is read, because a fact is added by rewriting it. One far past its cap is more than DLNE
   // reads at all (section 12): it is the user's to tidy, and no change through remember is offered.
-  const cap = scope === 'project' ? PROJECT_CAP : USER_CAP;
+  const cap = scope === 'project' ? memoryCaps().project : memoryCaps().user;
   let existing = '';
   try {
     if (fs.statSync(file).size > cap * 4 + 4096) {
@@ -612,7 +646,7 @@ export function checkRemember(
 }
 
 /** Writes `content` to `file` in one step, so a crash never leaves half a memory file. */
-function writeAtomically(file: string, content: string, mode: number): void {
+export function writeAtomically(file: string, content: string, mode: number): void {
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(temp, content, { encoding: 'utf-8', mode });

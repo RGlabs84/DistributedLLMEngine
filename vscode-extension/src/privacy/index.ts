@@ -150,7 +150,11 @@ export function redactPayload<T extends Record<string, any>>(payload: T): { payl
       if (!message || typeof message !== 'object') {
         return message;
       }
-      const copy: Record<string, any> = { ...message, content: clean(message.content) };
+      // A message with pictures has a list for its content: the text parts are cleaned, the pictures are left as they are.
+      const content = Array.isArray(message.content)
+        ? message.content.map((part: any) => (part && part.type === 'text' ? { ...part, text: clean(part.text) } : part))
+        : clean(message.content);
+      const copy: Record<string, any> = { ...message, content };
       if (Array.isArray(message.tool_calls)) {
         copy.tool_calls = message.tool_calls.map((call: any) =>
           call && call.function

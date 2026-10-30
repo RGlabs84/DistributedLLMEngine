@@ -9,9 +9,12 @@ import { DiffManager, FileDiffData } from './diffManager';
 import { allowedAlways, alwaysPrefix } from './commandRules';
 import { ToolDefinition } from '../client/dlneClient';
 import { MemoryChange, MemoryMode, checkRemember, memoryMode, rememberFact, riskyFact } from './memory';
+import { SkillChange, checkSaveSkill, saveSkill, useSkill } from './skills';
 import { ImageApi, ImageArgs, prepareImageArgs, runImageJob, savedText } from './imageTool';
 import { REDACTION_MARK, excludedNotice, excludedReason, isExcludedFile, redactSecrets, redactionNote } from '../privacy';
 import { isPastedFile } from './pasted';
+import { PictureAttachment, pictureFromBytes } from '../client/pictures';
+import { VIEW_IMAGE_TOOL_NAME } from './viewImage';
 
 export interface ToolCallResult {
   tool_call_id?: string;
@@ -21,16 +24,20 @@ export interface ToolCallResult {
   fileDiff?: FileDiffData;
   terminalCommand?: string;
   /** What `remember` changed in a memory file: the chats offer Undo for it (docs/agent-memory.md 7.6). */
-  /** A long fact saved in parts (splitFact) is several changes, undone together. */
-  memoryChange?: MemoryChange | MemoryChange[];
+  /** A long fact saved in parts (splitFact) is several changes, undone together. A saved skill is one SkillChange (skills.ts). */
+  memoryChange?: MemoryChange | MemoryChange[] | SkillChange;
   /** The workspace-relative path of a picture `generate_image` saved: the chats offer to open it. */
   imagePath?: string;
+  /** The picture `view_image` opened: the loop puts it in the user's side of the next request (tool results stay text). */
+  image?: PictureAttachment;
 }
 
 /** What a tool call may need from the run it belongs to; only generate_image uses it. */
 export interface ToolContext {
   /** The coordinator's image endpoints. Absent: the tool is not offered, and a call to it is refused. */
   images?: ImageApi;
+  /** The coordinator says its engine can read pictures (`capabilities.vision`): view_image is offered, and works. */
+  vision?: boolean;
   /** The run was stopped: a running image job is cancelled at the coordinator. */
   signal?: AbortSignal;
   /** The status line while a long tool runs. */
@@ -355,6 +362,9 @@ function isMemoryPath(root: string | undefined, target: string): boolean {
   const real = (p: string) => (caseless ? realPathOf(p).toLowerCase() : realPathOf(p));
   const file = real(target);
   if (file === real(path.join(os.homedir(), '.dlne', 'memory.md'))) return true;
+  // The user's skills (skills.ts) are written only by save_skill, which asks, just as for the memory file.
+  const userSkills = path.relative(real(path.join(os.homedir(), '.dlne', 'skills')), file);
+  if (userSkills === '' || (!userSkills.startsWith('..') && !path.isAbsolute(userSkills))) return true;
   if (!root) return false;
   if (file === real(path.join(root, 'AGENTS.md'))) return true;
   const rel = path.relative(real(path.join(root, '.dlne')), file);
@@ -437,6 +447,7 @@ export class ToolRegistry {
 
     switch (name) {
       case 'read_file':
+      case 'view_image':
       case 'list_directory': {
         const target = resolvePath(root, args.path || '.');
         const inside = insideWorkspace(root, target);
@@ -445,7 +456,7 @@ export class ToolRegistry {
         if (name === 'read_file' && autoReads && isPastedFile(target)) return null;
         req = {
           tool: name,
-          summary: `${name === 'read_file' ? 'read' : 'list'} ${inside ? path.relative(root!, target) || '.' : target}${inside ? '' : ' (outside your workspace)'}`,
+          summary: `${name === 'read_file' ? 'read' : name === 'view_image' ? 'look at' : 'list'} ${inside ? path.relative(root!, target) || '.' : target}${inside ? '' : ' (outside your workspace)'}`,
           detail: `${target}\n\nIts contents will be sent to the DLNE coordinator as part of the conversation.`,
           sessionAllowed: false,
         };
@@ -532,8 +543,34 @@ export class ToolRegistry {
         };
         break;
       }
+      case 'save_skill': {
+        // As for remember: a save that would be refused anyway is not asked about; the call goes on and the model is told why.
+        const options = memoryOptions();
+        const check = checkSaveSkill(args, root, options);
+        if (!check.ready) return null;
+        const userSkills = path.resolve(path.join(os.homedir(), '.dlne', 'skills'));
+        const rel = path.relative(userSkills, path.resolve(check.file));
+        // The user's own skills ask every time, and so does a workspace opened at the home folder (its project folder is theirs).
+        const projectFile = check.scope === 'project' && (rel.startsWith('..') || path.isAbsolute(rel));
+        // Steps that fetch, run or escalate, or a link, are shown first whatever the mode: text the agent read could plant one.
+        const risky = check.after !== null && riskyFact(`${check.description} ${check.instructions}`);
+        if (projectFile && !risky && !check.hides && options.mode === 'auto') return null;
+        const where = check.scope === 'project' ? 'for this project' : 'about you, for every project';
+        const excerpt = check.instructions.slice(0, 600) + (check.instructions.length > 600 ? '…' : '');
+        req = {
+          tool: name,
+          summary: check.after === null
+            ? `remove a skill ${where}: "${check.name}"`
+            : `${check.before === null ? 'save' : 'update'} a skill ${where}: "${check.name}" - ${check.description}`,
+          detail: `${check.file}\n\n${excerpt}\n\nThe skill's name and description are sent with every DLNE request, and its steps when the agent uses it, ` +
+            "to the coordinator or a volunteer's coding member." +
+            (check.hides ? '\n\nIt hides your own skill of the same name.' : ''),
+          sessionAllowed: false,
+        };
+        break;
+      }
       default:
-        return null; // unknown tools fail on their own in executeToolInternal
+        return null; // unknown tools fail on their own in executeToolInternal; use_skill only reads, so it never asks
     }
 
     if (signal?.aborted) return STOPPED_NOTICE;
@@ -669,11 +706,43 @@ export class ToolRegistry {
           parameters: {
             type: 'object',
             properties: {
-              fact: { type: 'string', description: 'One short, self-contained sentence (at most 500 characters); empty to remove the fact given in replaces.' },
+              fact: { type: 'string', description: 'One self-contained fact, a sentence or two (at most 1,000 characters); empty to remove the fact given in replaces.' },
               scope: { type: 'string', enum: ['project', 'user'], description: 'Where it is kept: project or user.' },
               replaces: { type: 'string', description: 'Optional: the id of a fact you saved earlier (the [a7f3] in front of it), or its opening words.' }
             },
             required: ['fact', 'scope']
+          }
+        }
+      },
+      // Skills (extension 1.6.0, docs/agent-memory.md section 3 and 7.9): kept word for word like remember, for the same reason.
+      {
+        type: 'function',
+        function: {
+          name: 'use_skill',
+          description: 'Load the step-by-step instructions of a skill listed under Skills in your notes, when the task at hand matches its description. Returns the instructions and the skill\'s folder, where other files can be read with read_file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'The skill\'s name, as listed under Skills.' }
+            },
+            required: ['name']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'save_skill',
+          description: 'Save, update or remove a skill: a procedure you worked out that is likely to be needed again (how to release this project, how its tests run, a chore that recurs), written short and step by step. scope "project" keeps it in this project\'s .dlne/skills/<name>/SKILL.md; it is saved at once and shown to the user, who can undo it. scope "user" keeps it in ~/.dlne/skills/<name>/SKILL.md, for every project; the user approves it. You can only change a skill you wrote yourself; to remove one, give its name and leave instructions empty. Never put secrets in a skill.',
+          parameters: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Lower-case letters, digits and hyphens, at most 48 characters (like release-checklist).' },
+              description: { type: 'string', description: 'One line, at most 200 characters, saying what the skill is for and when to use it.' },
+              instructions: { type: 'string', description: 'The steps, in Markdown, at most 12,000 characters; empty to remove the skill.' },
+              scope: { type: 'string', enum: ['project', 'user'], description: 'Where it is kept: project or user.' }
+            },
+            required: ['name', 'description', 'instructions', 'scope']
           }
         }
       }
@@ -700,7 +769,7 @@ export class ToolRegistry {
   private static privacyRefusal(name: string, args: Record<string, any>, root: string | undefined): string | null {
     if (typeof args?.path !== 'string' || !args.path) return null;
     const target = resolvePath(root, args.path);
-    if (name === 'read_file' || name === 'edit_file_diff') {
+    if (name === 'read_file' || name === 'edit_file_diff' || name === VIEW_IMAGE_TOOL_NAME) {
       let reason: string | null;
       try {
         reason = excludedReason(target);
@@ -712,7 +781,7 @@ export class ToolRegistry {
     if (name === 'write_file' || name === 'edit_file_diff' || name === 'generate_image') {
       if (isMemoryPath(root, target)) {
         return `Refused: ${args.path} is part of the agent's persistent memory, which the file tools never change. ` +
-          'Save a fact with the remember tool instead (the user approves each one); AGENTS.md is the user\'s to edit.';
+          'Save a fact with the remember tool, or a procedure with save_skill, instead (the user approves what is for every project); AGENTS.md is the user\'s to edit.';
       }
       const writes = [args.content, args.search_block, args.replace_block].map((s) => String(s ?? '')).join('\n');
       if (writes.includes(REDACTION_MARK)) {
@@ -760,7 +829,8 @@ export class ToolRegistry {
     const refusal = await this.checkApproval(name, args || {}, root, approveAll, context.signal);
     if (refusal) return { name, output: refusal, is_error: true };
     const result = await this.executeToolInternal(name, args, context);
-    return this.capOutput(this.scrub(result));
+    // A skill's instructions (at most 12,000 characters) are the point of the call: they are not cut to the usual 8,000.
+    return name === 'use_skill' ? this.scrub(result) : this.capOutput(this.scrub(result));
   }
 
   private static async executeToolInternal(name: string, args: Record<string, any>, context: ToolContext = {}): Promise<ToolCallResult> {
@@ -783,6 +853,25 @@ export class ToolRegistry {
 
           const numbered = lines.slice(start, end).map((line, idx) => `${start + idx + 1}: ${line}`);
           return { name, output: numbered.join('\n') + redactionNote(hidden) };
+        }
+
+        case 'view_image': {
+          if (!context.vision) return { name, output: 'Pictures are not available on this coordinator.', is_error: true };
+          const filePath = resolvePath(rootPath, args.path);
+          if (!fs.existsSync(filePath)) return { name, output: `File not found: ${args.path}`, is_error: true };
+          const stat = fs.statSync(filePath);
+          if (!stat.isFile()) return { name, output: `${args.path} is not a file.`, is_error: true };
+          if (stat.size > 4 * 1024 * 1024) {
+            return { name, output: `Cannot show ${args.path}: it is ${(stat.size / 1048576).toFixed(1)} MiB, and a picture may be 4 MiB at most.`, is_error: true };
+          }
+          const picture = pictureFromBytes(path.basename(filePath), fs.readFileSync(filePath));
+          if (!picture.ok) return { name, output: `Cannot show ${args.path}: ${picture.error}.`, is_error: true };
+          const { width, height } = picture.picture;
+          return {
+            name,
+            output: `Showing ${args.path}${width && height ? ` (${width}x${height})` : ''}`,
+            image: picture.picture,
+          };
         }
 
         case 'write_file': {
@@ -972,6 +1061,18 @@ export class ToolRegistry {
           const root = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : undefined;
           const replaces = typeof args.replaces === 'string' ? args.replaces : undefined;
           const saved = rememberFact(args.scope, args.fact ?? '', root, memoryOptions(), replaces);
+          return { name, output: saved.message, is_error: saved.ok ? undefined : true, memoryChange: saved.change };
+        }
+
+        case 'use_skill': {
+          const root = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : undefined;
+          const used = useSkill(args.name, root, memoryOptions());
+          return { name, output: used.message, is_error: used.ok ? undefined : true };
+        }
+
+        case 'save_skill': {
+          const root = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : undefined;
+          const saved = saveSkill(args, root, memoryOptions());
           return { name, output: saved.message, is_error: saved.ok ? undefined : true, memoryChange: saved.change };
         }
 

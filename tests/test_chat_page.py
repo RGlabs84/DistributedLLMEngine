@@ -1018,18 +1018,20 @@ const png = process.argv[3];
 const text = (node) => node.textContent;
 const find = (root, cls) => root.all().filter((n) => n.className === cls || n.className.split(' ').indexOf(cls) !== -1);
 
-out.eta = [C.imageEta({ '768x768': 80, '1024x1024': 153 }, '1024x1024'), C.imageEta({ '768x768': 80, '1024x1024': 153 }, '768x1024'),
-           C.imageEta(null, '1024x768'), C.imageEta(undefined, 'weird')];
+out.eta = [C.imageEta({ '512x512': 18, '512x768': 23, '768x512': 23 }, '768x512'), C.imageEta({ '512x512': 18 }, '512x768'),
+           C.imageEta(null, '768x512'), C.imageEta(undefined, 'weird')];
+out.sizes = ['512x512', '512x768', '768x512', '768x768', '1024x1024', '768x1024', '1024x768', '640x480', '__proto__',
+             'toString', null, 7].map(C.imageSize);
 out.about = [80, 153, 61, 3].map(C.aboutSeconds);
 out.seconds = [0, 59, 119, 120, 125].map(C.seconds);
 
-const msg = { role: 'assistant', kind: 'image', content: C.imagePlaceholder('a <b>red</b>   fox'), prompt: 'a <b>red</b> fox', size: '768x768',
+const msg = { role: 'assistant', kind: 'image', content: C.imagePlaceholder('a <b>red</b>   fox'), prompt: 'a <b>red</b> fox', size: '512x512',
               state: 'queued', imageId: 'AbCdEf12_-xyz789', startedAt: now };
 out.placeholder = msg.content;
 const status = (state, extra) => { const m = Object.assign({}, msg, { state }, extra || {}); return C.imageStatus(m); };
 out.lines = {
   queued: status('queued'), checking: status('checking'), generating: status('generating', { eta: 80 }),
-  generatingBig: status('generating', { size: '1024x1024', eta: 153 }), reviewing: status('reviewing'), completed: status('completed'),
+  generatingBig: status('generating', { size: '768x512', eta: 153 }), reviewing: status('reviewing'), completed: status('completed'),
   cancelled: status('cancelled'), expired: status('expired'), failed: status('failed'),
   refused: status('refused', { note: 'I can’t make that picture, but I’d be glad to help with something else.' }),
 };
@@ -1160,9 +1162,15 @@ def image_run(tmp_path_factory):
 
 
 def test_the_estimate_is_the_servers_own_figure_or_the_squares_scaled_by_area(image_run):
-    assert image_run["eta"][0] == 153
-    assert image_run["eta"][1] == pytest.approx(80 * 768 * 1024 / (768 * 768))
-    assert image_run["eta"][2] == pytest.approx(80 * 1024 * 768 / (768 * 768)) and image_run["eta"][3] == 80
+    assert image_run["eta"][0] == 23
+    assert image_run["eta"][1] == pytest.approx(18 * 512 * 768 / (512 * 512))
+    assert image_run["eta"][2] == pytest.approx(18 * 768 * 512 / (512 * 512)) and image_run["eta"][3] == 18
+
+
+def test_an_old_size_is_read_as_todays_size_of_its_shape(image_run):
+    assert image_run["sizes"] == ["512x512", "512x768", "768x512",                     # today's, as they are
+                                  "512x512", "512x512", "512x768", "768x512",          # 2.6.1 to 2.6.5's, by shape
+                                  "512x512", "512x512", "512x512", "512x512", "512x512"]   # anything else is the square
     assert image_run["about"] == ["80 s", "2 min 35 s", "60 s", "5 s"]
     assert image_run["seconds"] == ["0 s", "59 s", "119 s", "2 min", "2 min 5 s"]
 
@@ -1240,9 +1248,9 @@ def test_a_refusal_or_error_shows_the_servers_words_as_text_and_offers_another_g
 def test_a_saved_image_card_keeps_text_only(image_run):
     active = image_run["savedActive"]
     assert active == {"role": "assistant", "kind": "image", "content": "[Image: a <b>red</b> fox]", "prompt": "a <b>red</b> fox",
-                      "size": "768x768", "state": "queued", "imageId": "AbCdEf12_-xyz789", "startedAt": 1700000000000}
+                      "size": "512x512", "state": "queued", "imageId": "AbCdEf12_-xyz789", "startedAt": 1700000000000}
     done = image_run["savedDone"]
-    assert done["state"] == "completed" and done["size"] == "1024x768"
+    assert done["state"] == "completed" and done["size"] == "768x512"                   # saved by 2.6.5 as 1024x768
     for kept in (active, done):
         assert not {"picture", "b64_png", "cancelling", "evil"} & set(kept)
     # A job without a usable id cannot be followed after a reload, so it ends as failed, with the reason.
@@ -1279,15 +1287,17 @@ def test_create_image_is_hidden_until_the_status_says_the_server_makes_images():
     assert "ui.tools" not in page
 
 
-def test_the_image_sheet_takes_a_prompt_and_one_of_the_four_sizes():
+def test_the_image_sheet_takes_a_prompt_and_one_of_the_three_sizes():
     sheet = chat_page.CHAT_HTML.split('<dialog id="image"', 1)[1].split("</dialog>", 1)[0]
-    assert re.findall(r'<option value="(\d+x\d+)"', sheet) == ["768x768", "1024x1024", "768x1024", "1024x768"]
-    assert '<option value="768x768">' in sheet and "selected" not in sheet            # the first, 768x768, is the default
+    assert re.findall(r'<option value="(\d+x\d+)">([^<]*)</option>', sheet) == [
+        ("512x512", "Square, 512 x 512"), ("512x768", "Portrait, 512 x 768"), ("768x512", "Landscape, 768 x 512")]
+    assert '<option value="512x512">' in sheet and "selected" not in sheet            # the first, 512x512, is the default
     assert re.search(r'<textarea id="image-prompt"[^>]*maxlength="1000"', sheet)
     assert 'for="image-prompt"' in sheet and 'for="image-size"' in sheet               # both fields are labelled
     assert 'id="image-status" role="alert"' in sheet                                   # errors are announced
     assert "isn't saved with your chat" in sheet                                       # the bytes are not kept: said up front too
-    assert "IMAGE_SIZES = ['768x768', '1024x1024', '768x1024', '1024x768']" in chat_page.CHAT_HTML
+    assert "IMAGE_SIZES = ['512x512', '512x768', '768x512']" in chat_page.CHAT_HTML
+    assert "It takes under a minute." in sheet
 
 
 def test_a_job_is_started_on_the_phone_endpoint_with_the_chat_id_and_never_sends_the_prompt_to_the_chat():
@@ -1700,7 +1710,7 @@ const photo = (tag) => ({ src: JPEG(tag), thumb: JPEG('t' + tag), width: 10, hei
   out.budget = shape(wire([U('old'), A('mid'), hold(U('x'.repeat(50), 1), 1, 'g')], 10));
   out.freePictures = shape(wire([U('q'.repeat(10)), A('a'.repeat(10)), hold(U('', 4), 4, 'h')], 20)).map((m) => m[0]);
   out.firstIsUser = shape(wire([A('stray'), U('x'), A('y')]));
-  const job = { prompt: 'a red fox', size: '768x768', state: 'completed' };
+  const job = { prompt: 'a red fox', size: '512x512', state: 'completed' };
   out.pictureText = shape(wire([U('draw a fox'), A('Here you go.', job), U('bluer')]));
   out.pictureOnly = shape(wire([U('draw a fox'), A('', job), U('bluer')]));
   out.refusedAddsNothing = shape(wire([U('draw x'), Object.assign(A('No can do.'), { pictureNote: 'refused words' }), U('ok')]));
@@ -1716,14 +1726,14 @@ const photo = (tag) => ({ src: JPEG(tag), thumb: JPEG('t' + tag), width: 10, hei
   // ---- the two events, alone and inside a stream
   const ev = (event) => JSON.stringify({ dlne: event });
   let reply = { role: 'assistant', content: '' };
-  const got = C.applyData(reply, ev({ event: 'image_job', id: 'job001-abcdefgh', prompt: '  a <b>red</b>   fox  ', size: '768x1024', position: 1, eta_seconds: 90 }));
+  const got = C.applyData(reply, ev({ event: 'image_job', id: 'job001-abcdefgh', prompt: '  a <b>red</b>   fox  ', size: '512x768', position: 1, eta_seconds: 90 }));
   const stamp = reply.job.startedAt;
   delete reply.job.startedAt;
   out.job = { got, job: reply.job, startedNow: Math.abs(stamp - Date.now()) < 5000 };
-  out.secondJob = [C.applyData(reply, ev({ event: 'image_job', id: 'other-job-12345', prompt: 'x', size: '768x768' })), reply.job.imageId];
+  out.secondJob = [C.applyData(reply, ev({ event: 'image_job', id: 'other-job-12345', prompt: 'x', size: '512x512' })), reply.job.imageId];
   out.badIds = [{ id: '../etc/passwd' }, { id: 'short' }, { id: 5 }, {}, { id: 'a'.repeat(200) }].map((e) => {
     const rr = { role: 'assistant', content: '' };
-    return [C.applyData(rr, ev(Object.assign({ event: 'image_job', prompt: 'p', size: '768x768' }, e))), 'job' in rr];
+    return [C.applyData(rr, ev(Object.assign({ event: 'image_job', prompt: 'p', size: '512x512' }, e))), 'job' in rr];
   });
   const odd = { role: 'assistant', content: '' };
   C.applyData(odd, ev({ event: 'image_job', id: 'job002-abcdefgh', prompt: '', size: '5x5', eta_seconds: 'soon' }));
@@ -1731,7 +1741,7 @@ const photo = (tag) => ({ src: JPEG(tag), thumb: JPEG('t' + tag), width: 10, hei
   out.oddJob = odd.job;
   out.etas = [0, -4, 4000, 6.5].map((eta) => {
     const rr = { role: 'assistant', content: '' };
-    C.applyData(rr, ev({ event: 'image_job', id: 'job002-abcdefgh', prompt: 'p', size: '768x768', eta_seconds: eta }));
+    C.applyData(rr, ev({ event: 'image_job', id: 'job002-abcdefgh', prompt: 'p', size: '512x512', eta_seconds: eta }));
     return rr.job.eta === undefined ? null : rr.job.eta;
   });
   const refused = { role: 'assistant', content: '' };
@@ -1744,7 +1754,7 @@ const photo = (tag) => ({ src: JPEG(tag), thumb: JPEG('t' + tag), width: 10, hei
   out.refusedMarkup = markup.pictureNote;
 
   const streamEvents = [
-    { dlne: { event: 'image_job', id: 'job003-abcdefgh', prompt: 'a fox', size: '768x768', position: null, eta_seconds: null } },
+    { dlne: { event: 'image_job', id: 'job003-abcdefgh', prompt: 'a fox', size: '512x512', position: null, eta_seconds: null } },
     { choices: [{ index: 0, delta: { content: 'Sure! ' }, finish_reason: null }] },
     { dlne: { event: 'retract' } },
     { choices: [{ index: 0, delta: { content: 'On its way.' }, finish_reason: null }] },
@@ -1817,7 +1827,7 @@ const photo = (tag) => ({ src: JPEG(tag), thumb: JPEG('t' + tag), width: 10, hei
   const calls = [];
   const ctx = (extra) => Object.assign({ picture: () => pic, now: () => now, cancel: () => calls.push('cancel'), retry: () => calls.push('retry') }, extra || {});
   const visible = (v) => v.row.all().filter((n) => (n.tagName === 'BUTTON' || n.tagName === 'A') && !n.hidden).map(text);
-  const finished = { prompt: 'a fox', size: '768x768', state: 'completed' };
+  const finished = { prompt: 'a fox', size: '512x512', state: 'completed' };
   let card = C.imageCard(finished, ctx(), true);
   out.embedded = { same: card.row === card.card, cls: card.card.className, plain: visible(card) };
   let reported = false;
@@ -1830,7 +1840,7 @@ const photo = (tag) => ({ src: JPEG(tag), thumb: JPEG('t' + tag), width: 10, hei
   card.update();
   const again = buttons().find((b) => /Report/.test(b.textContent));
   out.afterReport = { calls: calls.slice(), text: again.textContent, disabled: again.disabled, popup: again.attrs['aria-haspopup'] };
-  const running = C.imageCard({ prompt: 'a fox', size: '768x768', state: 'generating', startedAt: now }, ctx({ picture: () => null, share: () => {}, report: () => {} }), true);
+  const running = C.imageCard({ prompt: 'a fox', size: '512x512', state: 'generating', startedAt: now }, ctx({ picture: () => null, share: () => {}, report: () => {} }), true);
   out.running = visible(running);
   const gone = C.imageCard(finished, ctx({ picture: () => null, share: () => {}, report: () => {} }), true);
   out.afterReload = visible(gone);
@@ -1938,10 +1948,10 @@ def test_a_reply_that_made_a_picture_goes_back_with_its_description_and_a_refuse
 def test_an_image_job_event_gives_the_reply_a_job_card_and_a_second_one_is_ignored(photo_run):
     job = photo_run["job"]
     assert job["got"] == "changed" and job["startedNow"] is True
-    assert job["job"] == {"prompt": "a <b>red</b> fox", "size": "768x1024", "state": "queued", "imageId": "job001-abcdefgh", "eta": 90}
+    assert job["job"] == {"prompt": "a <b>red</b> fox", "size": "512x768", "state": "queued", "imageId": "job001-abcdefgh", "eta": 90}
     assert photo_run["secondJob"] == ["skip", "job001-abcdefgh"]                       # one picture per answer
     assert photo_run["badIds"] == [["skip", False]] * 5                                # no usable id, no job: never polled
-    assert photo_run["oddJob"] == {"prompt": "A picture", "size": "768x768", "state": "queued", "imageId": "job002-abcdefgh"}
+    assert photo_run["oddJob"] == {"prompt": "A picture", "size": "512x512", "state": "queued", "imageId": "job002-abcdefgh"}
     assert photo_run["etas"] == [None, None, None, 6.5]                                # an estimate that is not one is left out
 
 
@@ -1956,7 +1966,7 @@ def test_the_picture_events_survive_any_split_of_the_stream_and_a_retract_keeps_
     first = photo_run["streams"][0]
     assert all(run == first for run in photo_run["streams"])
     assert first["content"] == "On its way."                                          # the retract emptied "Sure! " only
-    assert first["job"] == {"prompt": "a fox", "size": "768x768", "state": "queued", "imageId": "job003-abcdefgh"}
+    assert first["job"] == {"prompt": "a fox", "size": "512x512", "state": "queued", "imageId": "job003-abcdefgh"}
 
 
 def test_a_saved_chat_keeps_how_many_photos_and_a_pictures_words_never_bytes(photo_run):
@@ -1964,7 +1974,7 @@ def test_a_saved_chat_keeps_how_many_photos_and_a_pictures_words_never_bytes(pho
     assert photo_run["badCounts"] == [False] * 7                                       # 0, 5, "2", 1.5, -1, null, true
     assert photo_run["cleanJob"] == {
         "role": "assistant", "content": "Sure", "pictureNote": "note",
-        "job": {"prompt": "a fox", "size": "1024x768", "state": "generating", "imageId": "job003-abcdefgh",
+        "job": {"prompt": "a fox", "size": "768x512", "state": "generating", "imageId": "job003-abcdefgh",   # 2.6.5's 1024x768
                 "startedAt": 1700000000000, "eta": 80}}
     no_id = photo_run["cleanNoId"]                                                     # it cannot be followed after a reload
     assert no_id["state"] == "failed" and "imageId" not in no_id and "closed before" in no_id["note"]

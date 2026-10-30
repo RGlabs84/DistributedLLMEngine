@@ -1,5 +1,10 @@
 # Image generation (since server 2.6.1)
 
+Reading and making pictures are both the coordinator's own (TheWall's): the coding engine reads a picture with its vision
+projector (`capabilities.vision`, since 2.6.1, and since extension 1.6.0 the agent's panel and its `view_image` tool send
+them), and `sd-server` draws one. Neither ever runs on a volunteer's machine: a coding member refuses a picture
+(`IMAGE_INPUT_UNAVAILABLE`), so a request that carries one is never sealed to a member.
+
 The coordinator can draw a picture from a text description. It is **off by default**, runs **only on the coordinator's
 own media card** (`MEDIA_GPU`) and never on a volunteer's machine or a coding member. This page is for the operator who
 turns it on and for the people writing clients (the web chat, the Android app, the VS Code extension).
@@ -15,10 +20,20 @@ explains it. See [Paused](#paused-image_gen_enabledpaused).
 
 | Part | What |
 |---|---|
-| The image engine | stable-diffusion.cpp `master-1017-be48649`, `sd-server`, with Z-Image-Turbo (Q4_K) and its VAE; the text encoder is the Qwen3-4B Instruct 2507 the CPU pool already pins (`scripts/app_models.json`, tier `qwen3-4b`), run on the CPU. All three model files are ungated (Apache-2.0). |
+| The image engine | stable-diffusion.cpp `master-1017-be48649`, `sd-server`, with FLUX.2 [klein] 4B (since 2.6.6; Z-Image-Turbo before) and the FLUX.2 VAE with the full encoder and the small decoder; the text encoder is the Qwen3-4B Instruct 2507 the CPU pool already pins (`scripts/app_models.json`, tier `qwen3-4b`), run on the CPU. All three model files are ungated (Apache-2.0). |
 | Where it runs | The media card only (`GGML_VK_VISIBLE_DEVICES` is set to that card's global Vulkan index, found from the PCI address in `MEDIA_GPU`). `sd-server` listens on `127.0.0.1` on a free port, and runs in an empty private directory. |
 | The checks | The coordinator's own engine reads the description, and later the finished picture (so vision, `capabilities.vision`, must be on). |
-| Measured on TheWall (RX 580) | 768x768: 78 to 80 s. 1024x1024: 153 s. Cold start (loading the models): 24 s. Peak 6.45 GiB of the card with the vision projector also on it; 4.85 GiB idle with `sd-server` loaded. 512x512 is faster but draws stray made-up text, so it is not offered. |
+| Measured on TheWall (RX 580, 2026-10-30) | 512x512: 17.5 s. 512x768 and 768x512: 22.5 s. Cold start (loading the models): 16 s. Peak 4,260 MiB of the card with the vision projector (about 985 MiB) also on it, so klein itself peaks at about 3.2 GiB. With the text encoder on the card too it is 26 and 31 s and the card peaks at 5.7 GB. Since 2.7.0 the encoder runs on the card (the owner's layout: the CPU's cores stay with the coding model). |
+
+### The model files
+
+| Role | File (in `IMAGE_MODEL_DIR`) | Size (bytes) | From (pinned revision in `scripts/image_models.json`) |
+|---|---|---|---|
+| diffusion | `flux-2-klein-4b-Q4_0.gguf` | 2,460,378,560 | `leejet/FLUX.2-klein-4B-GGUF` |
+| vae | `flux2-full-encoder-small-decoder.safetensors` | 249,519,092 | `black-forest-labs/FLUX.2-small-decoder`, file `full_encoder_small_decoder.safetensors`, saved under this name |
+| llm (text encoder) | `Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf` | 2,497,280,736 | the CPU pool's `qwen3-4b` pin in `scripts/app_models.json` |
+
+The VAE must be the full-encoder file: `small_decoder.safetensors` on its own is refused by `sd-server` ("VAE tensor ... encoder ... not in model metadata").
 
 ## Turning it on (operator)
 
@@ -31,7 +46,7 @@ explains it. See [Paused](#paused-image_gen_enabledpaused).
 2. **Models.** On the coordinator host: `python scripts/fetch_image_models.py` (into `IMAGE_MODEL_DIR`, default
    `models/image` under the install; `--dir` overrides). It resumes an interrupted download and moves a file into place
    only when its size and SHA-256 match the pin in `scripts/image_models.json`; a wrong file is deleted and refused.
-   About 6.7 GB in all.
+   About 5.2 GB in all.
 3. **Config** (`config/config.txt`), with `MEDIA_GPU` and `ENGINE_MMPROJ` already set (the media card carries the vision
    projector; the engine must be a Vulkan build):
 
@@ -62,18 +77,18 @@ unavailable.
 | `IMAGE_PER_HOUR` | 6 | 1 to 60 | Pictures one network may start in any hour. |
 | `IMAGE_QUEUE_MAX` | 4 | 1 to 16 | Jobs that may wait; more get `429 image_busy`. |
 | `IMAGE_JOB_TIMEOUT_SECONDS` | 300 | 60 to 900 | A job running longer is stopped and `sd-server` replaced. |
-| `IMAGE_IDLE_UNLOAD_MINUTES` | 20 | 0 to 1440 | `sd-server` is stopped after this long with no job (the next one reloads it, 24 s). 0: never. |
+| `IMAGE_IDLE_UNLOAD_MINUTES` | 20 | 0 to 1440 | `sd-server` is stopped after this long with no job (the next one reloads it, 16 s). 0: never. |
 | `IMAGE_RESULT_TTL_SECONDS` | 1800 | 60 to 3600 | A finished job is kept this long, then `expired` (30 min since 2.6.2: the Android app checks only while it is on screen). |
 
 A value outside its range keeps the default.
 
 ### What `sd-server` does and does not get
 
-- Started lazily on the first job; only if the media card has at least 5.6 GiB free (read live from the card).
-- Command: `sd-server --listen-ip 127.0.0.1 --listen-port <free port> --diffusion-model ... --vae ... --llm ... --backend te=cpu -t <IMAGE_THREADS> --cfg-scale 1.0 --steps 8 --eager-load`.
+- Started lazily on the first job; only if the media card has at least 5.1 GiB free (read live from the card; klein and its prompt reader peak at about 4.7 GiB).
+- Command: `sd-server --listen-ip 127.0.0.1 --listen-port <free port> --diffusion-model <dir>/flux-2-klein-4b-Q4_0.gguf --vae <dir>/flux2-full-encoder-small-decoder.safetensors --llm <dir>/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf -t <IMAGE_THREADS> --cfg-scale 1.0 --steps 4 --eager-load`, under `taskset <IMAGE_CPU_MASK>` when that is set. klein is distilled for four steps and no guidance.
 - Environment: `GGML_VK_VISIBLE_DEVICES=<the media card>`, `LD_LIBRARY_PATH=<install>/bin-sd`. Working directory: an empty private directory, removed when it stops.
 - Its output (stdout and stderr) is kept only while it starts: the last 200 lines, in memory. If it exits or never answers during startup, the coordinator log gets how it ended (exit code or signal) and its last 40 lines, each as `sd-server: <line>`. The moment it is ready the kept lines are dropped and nothing it prints afterwards is ever kept or logged, because from the first job on it prints the prompt; the output is still read and thrown away so its pipe never fills. A crash after readiness logs only the exit code or signal.
-- The request body is built by the coordinator from the cleaned prompt, the size and a random seed, with fixed steps and guidance; no field a client sends is passed on.
+- The request body (`POST /sdcpp/v1/img_gen`) is built by the coordinator from the cleaned prompt, the size and a random seed, with fixed steps and guidance (`sample_steps` 4, `txt_cfg` 1.0); no field a client sends is passed on.
 - A job timeout, a crash or a failed job kills it; the next job starts it again. **Three failures in a row** make image generation unavailable for 30 minutes. A cancelled job, or a media card without enough memory, is not a failure.
 - It is a child of the coordinator: stopping DLNE stops it, and the coding engine's restart path never waits on it.
 
@@ -82,7 +97,7 @@ A value outside its range keeps the default.
 1. **Clean** the prompt: control and invisible characters dropped, every `<...>` block (`<lora:...>`, `<sd_cpp_extra_args>...</...>`) removed, whitespace collapsed. 1 to 1000 characters remain, or the request is a 400.
 2. **Term list** (`engine/image_policy.py`): obvious cases are refused with a 400 `prompt_refused` before anything is queued, and cost nothing (no trial chat, no hour).
 3. **Model check** of the prompt, by the coordinator's own engine, as a strict JSON verdict `{"allowed": bool, "category": str}`. Anything that is not plainly `allowed: true` is a refusal (fails closed). The job ends `refused`.
-4. **Draw** on `sd-server`: one job at a time, FIFO, a random seed.
+4. **Draw** on `sd-server`: one job at a time, a random seed. The queue goes by tier (2.7.0, `engine/priority.py`): a waiting job from the host, an API-key holder or a GPU contributor runs before a CPU contributor's and before a trial caller's (phone jobs are in the lowest tier), jobs of one tier run first come first served, and a running job is never pre-empted. `position` and `eta_seconds` follow that order.
 5. **Strip metadata**: only `IHDR`, `PLTE`, `tRNS`, `IDAT`, `IEND`, `sRGB`, `gAMA`, `cHRM`, `pHYs` chunks are kept. stable-diffusion.cpp writes the prompt into a `parameters` text chunk; it, EXIF, time stamps and all other text are removed.
 6. **Model check** of the stripped picture by the coordinator's vision model, same verdict. Refused: the picture is dropped, the job ends `refused`.
 7. **Hold** the PNG in memory only, for `IMAGE_RESULT_TTL_SECONDS` after the job finishes (fetching it does not remove it earlier). Then the job is `expired` and the picture is dropped.
@@ -109,14 +124,26 @@ A network (the trial's own identity: an IPv4 address, an IPv6 /64) from which **
 ### `POST /v1/app/images`
 
 ```json
-{"prompt": "a red fox in the snow", "size": "768x768", "chat_id": "<uuid, optional>"}
+{"prompt": "a red fox in the snow", "size": "512x512", "chat_id": "<uuid, optional>"}
 ```
 
-`size` is one of `768x768` (default), `1024x1024`, `768x1024`, `1024x768`.
+`size` is one of `512x512` (square, the default), `512x768` (portrait), `768x512` (landscape).
+
+**Old sizes (2.6.1 to 2.6.5).** Clients from before 2.6.6 (the VS Code extension 1.5.4's `generate_image`, older Android
+and web pages) may send the four sizes those servers offered. They are not refused: each is drawn at the size of its
+shape. The `202` answer's `size` and the finished picture's `width` and `height` are the size actually drawn.
+
+| Sent | Drawn |
+|---|---|
+| `768x768`, `1024x1024` | `512x512` |
+| `768x1024` | `512x768` |
+| `1024x768` | `768x512` |
+
+Any other size is `400 bad_size`.
 
 | Status | Body |
 |---|---|
-| `202` | `{"id", "status": "queued", "position", "eta_seconds"}` |
+| `202` | `{"id", "status": "queued", "size", "position", "eta_seconds"}`. `size` (since 2.6.6) is the size that will be drawn. |
 | `400` | `{"detail", "code"}`: `bad_request`, `prompt_empty`, `prompt_too_long`, `bad_size`, `prompt_refused` (+ `"category"`) |
 | `429` | `{"detail", "code"}` with `Retry-After`: `image_quota` (the hourly cap, or the free trial is used up and the network is no contributor's), `image_busy` (the queue is full) |
 | `503` | `{"detail", "code": "image_generation_unavailable"}`. While the engine restarts the `detail` is "DLNE is restarting, try again in a moment." While pictures are paused: `{"detail", "code": "image_generation_paused", "page": "/pictures"}` ([Paused](#paused-image_gen_enabledpaused)). |
@@ -126,9 +153,9 @@ A network (the trial's own identity: an IPv4 address, an IPv6 /64) from which **
 ### `GET /v1/app/images/{id}`
 
 ```json
-{"id": "...", "status": "generating", "elapsed_seconds": 41, "eta_seconds": 81}
-{"id": "...", "status": "completed", "elapsed_seconds": 86,
- "image": {"b64_png": "...", "width": 768, "height": 768, "seed": 123456789}}
+{"id": "...", "status": "generating", "elapsed_seconds": 12, "eta_seconds": 24}
+{"id": "...", "status": "completed", "elapsed_seconds": 27,
+ "image": {"b64_png": "...", "width": 512, "height": 512, "seed": 123456789}}
 {"id": "...", "status": "refused", "elapsed_seconds": 6,
  "error": {"detail": "I can't make ...", "code": "prompt_refused", "category": "violence"}}
 ```
@@ -158,9 +185,9 @@ The tool and its line in the system prompt are offered only when the request's f
 | Argument | |
 |---|---|
 | `prompt` | Required text: the picture described in English (subject, setting, style, colours, lighting, composition), under 1,000 characters, never a real named person. It goes through exactly what a dialog's prompt does: cleaned, measured, term list, charge, hourly cap, queue. |
-| `shape` | `square` (768x768), `portrait` (768x1024) or `landscape` (1024x768). Missing or unknown is square. The model never chooses 1024x1024, which takes twice as long. |
+| `shape` | `square` (512x512), `portrait` (512x768) or `landscape` (768x512). Missing or unknown is square. |
 
-When the tool is offered the system prompt ends with: " You can create pictures with the create_image tool: when the user asks for a picture of something, call it with a detailed description instead of describing a picture in words. The picture appears below your reply about a minute and a half later, so reply in one short sentence. You cannot change or edit a photo the user sent; offer to create a new picture from a description instead."
+When the tool is offered the system prompt ends with: " You can create pictures with the create_image tool: when the user asks for a picture of something, call it with a detailed description instead of describing a picture in words. The picture appears below your reply in under a minute, so reply in one short sentence. You cannot change or edit a photo the user sent; offer to create a new picture from a description instead."
 
 **One picture per answer.** A second `create_image` call in the same answer, in the same round or a later one, is told "Only one picture per message." and makes no job. A first call that was refused still counts as the answer's one picture.
 
@@ -171,7 +198,7 @@ When the tool is offered the system prompt ends with: " You can create pictures 
 Events in the answer's stream, before the model's reply text when the call was required (when the model chose to call it, after whatever it had already written). They carry no `choices`, so an OpenAI client skips them; there is no `searching` event for a picture.
 
 ```
-data: {"dlne": {"event": "image_job", "id": "...", "prompt": "A red fox in fresh snow ...", "size": "1024x768", "position": 1, "eta_seconds": 111}}
+data: {"dlne": {"event": "image_job", "id": "...", "prompt": "A red fox in fresh snow ...", "size": "768x512", "position": 1, "eta_seconds": 23}}
 data: {"dlne": {"event": "image_refused", "code": "prompt_refused", "detail": "I can't make images with nudity or sexual content. ..."}}
 ```
 
@@ -179,7 +206,7 @@ data: {"dlne": {"event": "image_refused", "code": "prompt_refused", "detail": "I
 |---|---|
 | `id` | The job's id. Poll `GET /v1/app/images/{id}` as for any phone job. |
 | `prompt` | The cleaned description the job runs (a client keeps it as `[Picture created: <prompt>]` in its history). |
-| `size` | `768x768`, `768x1024` or `1024x768`. |
+| `size` | `512x512`, `512x768` or `768x512`. |
 | `position`, `eta_seconds` | As in the `202` answer: `position` counts the running job, `eta_seconds` is the whole wait from now. |
 
 `image_refused` carries the `code` and `detail` that `POST /v1/app/images` would have answered, and nothing else (no category, no retry time): `prompt_refused` (the term list), `prompt_empty`, `prompt_too_long`, `image_quota` (the hour's cap, or the trial used up on a network that is nobody's contributor), `image_busy`, `image_generation_unavailable` (the engine restarted since the tool was offered), `image_generation_paused` (pictures are paused; its `detail` ends with " More: " and the `/pictures` page's full address), and `generation_failed` for an unexpected error while queueing, the one code the endpoint has no answer for. A refusal costs nothing. A prompt the checks refuse later is not an `image_refused` event: the job is made and then ends `refused`, as from the dialog.
@@ -207,9 +234,9 @@ The tool call runs on the coordinator whichever machine answers the chat: the en
   "capabilities": {"vision": true, "image_generation": true},
   "image_generation": {
     "queue": 0, "busy": false,
-    "eta_seconds": {"768x768": 80, "1024x1024": 153},
-    "sizes": ["768x768", "1024x1024", "768x1024", "1024x768"],
-    "default_size": "768x768",
+    "eta_seconds": {"512x512": 18, "512x768": 23, "768x512": 23},
+    "sizes": ["512x512", "512x768", "768x512"],
+    "default_size": "512x512",
     "per_hour": 6
   }
 }
@@ -225,7 +252,7 @@ The tool call runs on the coordinator whichever machine answers the chat: the en
   ```
 
   `images` appears only while paused; with pictures on or off the status is as above.
-- `queue` is the jobs waiting, `busy` whether one is running, `eta_seconds` the current median per size, `per_hour` the configured `IMAGE_PER_HOUR`. Pages should read these, never type them.
+- `queue` is the jobs waiting, `busy` whether one is running, `eta_seconds` the current median for each of `sizes` (until 2.6.5 only the two squares), `per_hour` the configured `IMAGE_PER_HOUR`. Pages should read these, never type them.
 
 ## Paused (`IMAGE_GEN_ENABLED=paused`)
 
@@ -260,10 +287,15 @@ word it differently. Tests: `tests/test_pictures_page.py`.
 - Show "Create image" only while `capabilities.image_generation === true` (missing means false). While `images.paused`
   is `true`, a client may show a greyed "Pictures paused" in its place that opens `images.page` (the web chat does);
   one that does not know the key simply shows no picture button, as with pictures off.
-- Poll every 2 s while visible, 5 s in the background. Show elapsed time against `eta_seconds`, not a progress bar (there are no step previews). A `GET` is cheap until `completed`, which carries the whole PNG (about 1 MB at 768x768): stop polling then.
+- Poll every 2 s while visible, 5 s in the background. Show elapsed time against `eta_seconds`, not a progress bar (there are no step previews). A `GET` is cheap until `completed`, which carries the whole PNG (well under 1 MB at these sizes): stop polling then.
 - Show the server's `detail` for every refusal and error. Show `Retry-After` for a 429.
 - A picture made from the Create image dialog is a card in the conversation whose saved text is `[Image: <prompt>]`; never send the picture's bytes to the chat model. (The Android app leaves those cards out of the history it sends; the web chat sends the placeholder text. A reply that the chat itself made a picture for is different: its history text is `[Picture created: <prompt>]`, see below.)
 - Save with the picture's own bytes; they carry no metadata.
+- **Sizes come from the status (2.6.6).** Offer the status's `sizes`, preselect `default_size`, and label each with its
+  shape (square, portrait, landscape) and its `eta_seconds`. A client with the 2.6.1 sizes typed in still works (they
+  are drawn by shape, [above](#post-v1appimages)), but should read the picture's `width` and `height` rather than
+  assume the size it asked for. The extension's `generate_image` tool still lists the old four; it changes with the
+  next extension release, together with `engine/canary.py`.
 - **Asking the chat for a picture (2.6.2).** Send `"features": ["image_jobs"]` with each chat request, and only if the client shows what comes back: the server offers the model its picture tool to clients that say so. On `image_job` show a job card under the streaming reply (stage, elapsed against the estimate, Cancel) and poll the `id` as above; several can run at once, one per reply, so key them by id. On `image_refused` show its `detail` as a quiet notice under the reply. In the history send a reply that made a picture as its text followed by `\n\n[Picture created: <prompt>]` (a reply with no text is just the line), so "make it bluer" can reuse the description; a refused, failed or cancelled one adds nothing. While the tool is on offer, the server turns that last line back into the `create_image` call it was (and a short "The picture was made and shown to the user." result) before the model reads the history, because a model shown the bare line tended to type it out instead of calling the tool; so the line must be the very end of the reply's text. Without the tool the line stays as text.
 - A phone on a contributor's network never meets the free-trial wall for a picture; one that does gets the `image_quota` words above, which say how to avoid it.
 

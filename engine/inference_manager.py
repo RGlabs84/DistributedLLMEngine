@@ -49,7 +49,8 @@ from typing import Dict, List, Optional, Tuple
 
 from engine import gguf
 from engine.config import SPEC_DEFAULTS, engine_args_without_placement, get_base_dir, get_worker_limits
-from engine.downloader import download_and_extract_engine
+from engine.downloader import (download_and_extract_engine, coordinator_engine_flavour, engine_dir,
+                               set_coordinator_engine_flavour)
 from engine.logger import log_coordinator, log_error, log_warning
 from engine.model_alias import alias_args
 
@@ -576,6 +577,23 @@ def speculative_args(limits: dict, draft_path: Optional[str]) -> List[str]:
     return args + ["--spec-type", ",".join(types)]
 
 
+def select_coordinator_engine() -> Optional[str]:
+    """
+    The llama-server program the coordinator's own engine runs. ENGINE_FLAVOR (2.7) decides between the Vulkan build
+    and the CUDA one (see downloader.resolve_engine_flavour). When CUDA was chosen but cannot be had (the release
+    signs none for this platform, the download failed, the program will not start) the engine runs on Vulkan, as the
+    log says, and the status reports the flavour that really runs. With the Vulkan flavour this is exactly the call
+    it always was.
+    """
+    if coordinator_engine_flavour() == "cuda":
+        path = download_and_extract_engine("coordinator", flavour="cuda")
+        if path:
+            return path
+        log_warning("The CUDA engine could not be used on this host; running the engine on Vulkan instead.")
+        set_coordinator_engine_flavour("vulkan")
+    return download_and_extract_engine("coordinator")
+
+
 def _endpoint_is_remote(endpoint: str) -> bool:
     """
     True when an RPC endpoint lives on another machine.
@@ -613,7 +631,8 @@ def engine_build_is_vulkan() -> bool:
     nothing either way (a monolithic build, none yet) is taken as Vulkan.
     """
     try:
-        names = [n.lower() for n in os.listdir(os.path.join(get_base_dir(), "bin"))]
+        # The folder of the flavour this engine runs: bin/, or bin-cuda/ when ENGINE_FLAVOR chose CUDA (2.7).
+        names = [n.lower() for n in os.listdir(engine_dir(get_base_dir(), coordinator_engine_flavour()))]
     except OSError:
         return True
     if any("ggml-vulkan" in n for n in names):
@@ -2252,7 +2271,7 @@ class InferenceManager:
                 self._check_projector_failure(plan.stale_handle["data"])
                 self._stop_and_settle(plan.stale_handle)
 
-            binary_path = download_and_extract_engine("coordinator")
+            binary_path = select_coordinator_engine()
             if not binary_path:
                 return False, 0, "Binary Missing"
 

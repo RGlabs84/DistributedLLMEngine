@@ -445,7 +445,8 @@ class CodingMember:
                  limits_provider: Optional[Callable[[], Dict[str, Any]]] = None,
                  resources_provider: Optional[Callable[[], Dict[str, Any]]] = None,
                  start_gate: Optional[threading.Event] = None,
-                 ready_timeout: float = 300.0, poll_seconds: float = 1.0) -> None:
+                 ready_timeout: float = 300.0, poll_seconds: float = 1.0,
+                 engine: Optional[Any] = None) -> None:
         """
         ``port`` is the worker's RPC port (the proxy listens there). ``tiers_loader`` returns the
         signed release's coding ladder. ``download``, ``measure``, ``keyring`` and ``identity`` default to
@@ -464,7 +465,12 @@ class CodingMember:
 
         ``resources_provider`` is read at every server start and returns the volunteer's limits as launch
         settings: ``{"threads": n (0 = llama.cpp's default), "extra_args": [...], "cache_ram_mib": n}``.
+
+        ``engine`` is the worker's engine.engine_flavour.EngineFlavour (2.7.0): it says where the engine files are, is
+        told when a server is ready (the DLNE_ENGINE line), and takes over when a CUDA server dies while starting (the
+        member then starts the model again on Vulkan). None: the install's bin/ folder, Vulkan, as before.
         """
+        self.engine = engine
         self.base_dir = base_dir
         self.tiers_loader = tiers_loader
         self.port = port
@@ -988,8 +994,9 @@ class CodingMember:
 
     # --------------------------------------------------------------------- server
     def _binary(self) -> Optional[str]:
+        bin_dir = self.engine.bin_dir() if self.engine is not None else os.path.join(self.base_dir, "bin")
         for name in ("llama-server.exe", "llama-server"):
-            candidate = os.path.join(self.base_dir, "bin", name)
+            candidate = os.path.join(bin_dir, name)
             if os.path.exists(candidate):
                 if not name.endswith(".exe"):
                     with contextlib.suppress(OSError):
@@ -1081,7 +1088,24 @@ class CodingMember:
             self.decode_tps = self.prefill_tps = 0.0
             self._measure_after, self._measure_failures = 0.0, 0
         if self._wait_ready() is None:
+            if self._cuda_fell_back(tier, model_path):
+                return
             self._note_exit()
+
+    def _cuda_fell_back(self, tier: Dict[str, Any], model_path: str) -> bool:
+        """
+        A CUDA server that died before it ever served is the contract's "CUDA could not start" (section 1): say so,
+        fetch the Vulkan engine and start the model again with it, once (the flavour never goes back to CUDA in this
+        process). A CUDA server that has served before and then dies is an ordinary crash, handled as ever.
+        True when the model was started again.
+        """
+        engine = self.engine
+        if engine is None or engine.running != "cuda" or engine.confirmed == "cuda" or self._stopped.is_set():
+            return False
+        self._stop_engine()
+        engine.fall_back("the CUDA model server stopped while starting")
+        self._start(tier, model_path)
+        return True
 
     def _wait_ready(self) -> Optional[bool]:
         """Poll llama-server's /health: True when ready (and measured), False when still loading at
@@ -1096,6 +1120,8 @@ class CodingMember:
                     self.ready = True
                     self._ready_since = time.monotonic()
                     log_success(f"Serving {self.model} to the coding pool.")
+                    if self.engine is not None:
+                        self.engine.confirm()          # the DLNE_ENGINE line, and the other flavour's files go
                     self._join_test(process)
                     return True
             except httpx.HTTPError:

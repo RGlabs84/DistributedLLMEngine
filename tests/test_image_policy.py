@@ -10,6 +10,33 @@ from engine import media
 from tests.image_fakes import chunk, sd_png
 
 
+# --- sizes ---------------------------------------------------------------------------------------------------
+
+def test_three_sizes_one_per_shape_and_square_is_the_default():
+    assert policy.SIZES == {"512x512": (512, 512), "512x768": (512, 768), "768x512": (768, 512)}
+    assert list(policy.SIZES) == ["512x512", "512x768", "768x512"] and policy.DEFAULT_SIZE == "512x512"
+    assert policy.SHAPE_SIZES == {"square": "512x512", "portrait": "512x768", "landscape": "768x512"}
+
+
+@pytest.mark.parametrize("sent, drawn", [
+    (None, "512x512"), ("512x512", "512x512"), ("512x768", "512x768"), ("768x512", "768x512"),
+    # what 2.6.1 to 2.6.5 offered, mapped by shape
+    ("768x768", "512x512"), ("1024x1024", "512x512"), ("768x1024", "512x768"), ("1024x768", "768x512"),
+    # anything else is turned away
+    ("", None), ("256x256", None), ("512X512", None), (" 512x512", None), ("square", None), (512, None),
+    (["512x512"], None), (True, None), ("1920x1080", None),
+])
+def test_a_size_is_drawn_as_it_is_an_old_one_by_its_shape_and_anything_else_is_refused(sent, drawn):
+    assert policy.drawn_size(sent) == drawn
+
+
+def test_every_old_size_keeps_its_shape():
+    for old, new in policy.OLD_SIZES.items():
+        (ow, oh), (nw, nh) = (map(int, old.split("x"))), policy.SIZES[new]
+        assert (ow > oh, ow == oh, ow < oh) == (nw > nh, nw == nh, nw < nh), old
+    assert not set(policy.OLD_SIZES) & set(policy.SIZES)
+
+
 # --- cleaning -----------------------------------------------------------------------------------------------
 
 def test_cleaning_drops_extra_args_loras_and_other_tag_blocks():

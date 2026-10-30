@@ -415,7 +415,7 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # prompt and its settings into a tEXt chunk called "parameters"; EXIF, ICC profiles, time stamps and text of
 # any kind go the same way.
 PNG_KEPT_CHUNKS = frozenset({b"IHDR", b"PLTE", b"tRNS", b"IDAT", b"IEND", b"sRGB", b"gAMA", b"cHRM", b"pHYs"})
-MAX_PNG_BYTES = 32 * 1024 * 1024         # what a generated image may take; far above the 1024x1024 sd writes (about 1.5 MiB)
+MAX_PNG_BYTES = 32 * 1024 * 1024         # what a generated image may take; far above the 768x512 sd writes (well under 1 MiB)
 
 
 def strip_png_metadata(data: bytes) -> bytes:

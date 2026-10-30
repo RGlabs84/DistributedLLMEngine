@@ -122,7 +122,7 @@ async function runPlan(plan = {}) {
 test('A1: a task seen again after the view was away shows what a page that never left shows, in the middle of it and at the end', async () => {
   const never = await runPlan();
   // Not vacuous: the page that stayed shows the whole task.
-  assert.match(never.middle.chat, /user "build it"/);
+  assert.match(never.middle.chat, /msg-text "build it"/);
   assert.match(never.middle.chat, /tool-pill "✅ list_directory:\s+notes\.txt"/);
   assert.match(never.middle.chat, /tool-pill "⏳ Waiting for the swarm to start your answer \(3 s\)\."/);
   assert.deepEqual(never.middle.controls, { send: 'hidden', stop: 'shown', stopLabel: 'Stop', stopDisabled: false, hint: 'hidden', input: '', queue: 'hidden' });
@@ -720,5 +720,72 @@ test('A5: two Undos in a row are answered in turn, each on its own button', asyn
     assert.equal(second.title, 'Cannot undo: b was changed since.');
     page.receive({ type: 'memoryUndone', ok: true, message: 'a stray answer' });   // none is waiting: nothing happens
     assert.deepEqual(page.errors, []);
+  });
+});
+
+test('skills: a saved skill shows in the panel like a saved fact, with an Undo that takes it back', async () => {
+  const { saveSkill } = require('../dist/agent/skills');
+  await withSidebar([say('x')], {}, async (sb) => {
+    const page = sb.view.page;
+    const saved = saveSkill({ name: 'release-checklist', description: 'How to release.', instructions: '1. Tag it.', scope: 'project' }, sb.workspace);
+    const file = path.join(sb.workspace, '.dlne', 'skills', 'release-checklist', 'SKILL.md');
+    assert.equal(fs.existsSync(file), true);
+    page.receive({ type: 'appendUserMessage', text: 'save it' });
+    page.receive({ type: 'toolEnd', result: { name: 'save_skill', output: saved.message, memoryChange: saved.change } });
+    page.receive({ type: 'turnComplete' });
+    assert.match(page.chat(), /save_skill: 📘 Skill saved for this project: release-checklist/);
+    const [undo] = page.find('undo-btn');
+    assert.equal(undo.textContent, '↩ Undo');
+    undo.click();
+    await sb.view.idle();
+    assert.equal(undo.textContent, '✓ Undone');
+    assert.equal(fs.existsSync(file), false);
+  });
+});
+
+// ---- 4d: pictures in the message --------------------------------------------------------------------------------
+
+const PNG_BYTES = (() => {
+  const b = Buffer.alloc(33);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(b);
+  b.writeUInt32BE(13, 8);
+  b.write('IHDR', 12, 'latin1');
+  b.writeUInt32BE(64, 16);
+  b.writeUInt32BE(48, 20);
+  return b;
+})();
+const PICTURE = { name: 'house.png', dataUri: `data:image/png;base64,${PNG_BYTES.toString('base64')}`, thumb: 'data:image/jpeg;base64,QUJD' };
+
+test('4d: a picture sent from the panel reaches the agent with the message, and the chat shows it with its thumbnail and saves a placeholder', async () => {
+  await withSidebar([say('A house.')], {}, async (sb) => {
+    sb.client.lastKnownClusterStatus = () => ({ capabilities: { vision: true } });
+    sb.view.toHost({ type: 'sendMessage', text: 'what is this?', images: [PICTURE, { name: 'bad.png', dataUri: 'data:image/png;base64,AAAA' }] });
+    await sb.view.idle();
+    const [call] = sb.client.calls;
+    const user = call.messages.find((m) => m.role === 'user');
+    assert.equal(user.content, 'what is this?');
+    assert.deepEqual(user.images.map((p) => p.name), ['house.png']);
+    const shown = sb.view.posted('appendUserMessage')[0];
+    assert.deepEqual(shown.pictures, [{ name: 'house.png', thumb: 'data:image/jpeg;base64,QUJD' }]);
+    // the chat the page draws again from the saved history has the name only
+    const history = sb.provider.active.history;
+    assert.deepEqual(history.find((m) => m.role === 'user').pictures, [{ name: 'house.png' }]);
+    assert.ok(!JSON.stringify(history).includes('base64'));
+  });
+});
+
+test('4d: with no vision a picture is left out in words, and a picture alone starts nothing', async () => {
+  await withSidebar([say('ok')], {}, async (sb) => {
+    sb.view.toHost({ type: 'sendMessage', text: 'look', images: [PICTURE] });
+    await sb.view.idle();
+    assert.equal(sb.client.calls[0].messages.find((m) => m.role === 'user').images, undefined);
+    assert.match(sb.view.page.chat(), /Left out: house\.png: the swarm(?:'|&#39;)s engine cannot read pictures right now\./);
+    assert.equal(sb.view.posted('appendUserMessage')[0].pictures, undefined, 'a picture that was not sent is not shown as sent');
+    const before = sb.client.calls.length;
+    sb.view.toHost({ type: 'sendMessage', text: '', images: [PICTURE] });
+    await sb.view.idle();
+    assert.equal(sb.client.calls.length, before, 'no picture to read and no words: nothing is sent');
+    assert.equal(sb.view.posted('refused').length, 1);
+    assert.equal(sb.view.page.controls().send, 'shown');
   });
 });

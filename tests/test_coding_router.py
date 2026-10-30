@@ -19,6 +19,7 @@ from engine import coding_router as cr
 from engine.coding_router import CodingMember, CodingRouter, assign_role, normalize_privacy, normalize_trust_ids
 from engine.registry import WorkerRegistry, is_coding_member
 from engine.e2e import generate_keypair
+from engine.priority import tier_priority
 from tests.coding_router_fakes import make_identity, sign_block
 
 MODEL = "Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
@@ -581,6 +582,47 @@ async def test_a_slot_that_frees_up_goes_to_the_best_tier_then_the_earliest(rout
         order.append(expected)
     held.release()
     assert order == ["gpu", "cpu", "trial"] and router.in_flight() == 0
+
+
+@pytest.mark.anyio
+async def test_key_host_and_gpu_callers_all_go_first_in_the_member_queue_then_open_and_cpu_then_trial(router):
+    """The member queue takes the number the coordinator derives from the caller's tier (engine/priority.tier_priority),
+    so API-key holders (2.7.0) share first place with the host and GPU contributors, ahead of everyone else."""
+    only = [member("a", slots=1)]
+    held = await router.place(want(only), 0, 0)
+    assert held is not None
+    waiting = {}
+    for tier in ("trial", "cpu", "open", "gpu", "key", "host"):      # the worst tiers arrive first
+        waiting[tier] = asyncio.create_task(router.place(want(only), tier_priority(tier), 5))
+        await asyncio.sleep(0.05)
+    order = []
+    for _ in range(6):
+        held.release()
+        done, _pending = await asyncio.wait(list(waiting.values()), timeout=1, return_when=asyncio.FIRST_COMPLETED)
+        assert len(done) == 1
+        got = next(tier for tier, task in waiting.items() if task in done)
+        held = waiting.pop(got).result()
+        order.append(got)
+    held.release()
+    # the first tier by arrival (gpu, key, host), then the second by arrival (cpu, open), then the trial
+    assert order == ["gpu", "key", "host", "cpu", "open", "trial"] and router.in_flight() == 0
+
+
+@pytest.mark.anyio
+async def test_a_waiting_key_holder_is_placed_ahead_of_a_trial_who_came_first(router):
+    only = [member("a", slots=1)]
+    held = await router.place(want(only), 0, 0)
+    trial_ticket, key_ticket = {}, {}
+    trial = asyncio.create_task(router.place(want(only), tier_priority("trial"), 5, trial_ticket))
+    await asyncio.sleep(0.05)
+    key = asyncio.create_task(router.place(want(only), tier_priority("key"), 5, key_ticket))
+    await asyncio.sleep(0.05)
+    assert router.position(key_ticket) == 1 and router.position(trial_ticket) == 2
+    held.release()
+    lease = await asyncio.wait_for(key, 1)
+    assert not trial.done()                                  # the trial still waits for the next free slot
+    lease.release()
+    (await asyncio.wait_for(trial, 1)).release()
 
 
 @pytest.mark.anyio

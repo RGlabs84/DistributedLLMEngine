@@ -687,15 +687,14 @@ dialog::backdrop { background: rgba(2, 8, 10, .62); }
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
       </button>
     </div>
-    <p class="muted small">Describe the picture you want. It takes a minute or two. It counts as one of your free chats, unless a computer on your network is contributing to DLNE.</p>
+    <p class="muted small">Describe the picture you want. It takes under a minute. It counts as one of your free chats, unless a computer on your network is contributing to DLNE.</p>
     <label class="field-label" for="image-prompt">Description</label>
     <textarea id="image-prompt" rows="4" maxlength="1000" aria-describedby="image-hint"></textarea>
     <label class="field-label" for="image-size">Size</label>
     <select id="image-size">
-      <option value="768x768">Square, 768 x 768</option>
-      <option value="1024x1024">Large square, 1024 x 1024</option>
-      <option value="768x1024">Portrait, 768 x 1024</option>
-      <option value="1024x768">Landscape, 1024 x 768</option>
+      <option value="512x512">Square, 512 x 512</option>
+      <option value="512x768">Portrait, 512 x 768</option>
+      <option value="768x512">Landscape, 768 x 512</option>
     </select>
     <p class="muted small" id="image-hint">The picture is checked before you see it. It isn't saved with your chat: save it to keep it.</p>
     <p class="report-status error" id="image-status" role="alert" hidden></p>
@@ -1096,7 +1095,7 @@ const DLNEChat = (() => {
     const known = IMAGE_ACTIVE.concat(IMAGE_FINAL);
     const kept = {
       prompt,
-      size: IMAGE_SIZES.indexOf(m.size) !== -1 ? m.size : IMAGE_SIZES[0],
+      size: imageSize(m.size),
       state: known.indexOf(m.state) !== -1 ? m.state : 'failed',
     };
     if (IMAGE_ACTIVE.indexOf(kept.state) !== -1) {
@@ -1120,7 +1119,7 @@ const DLNEChat = (() => {
     if (!isImageId(event.id)) return null;
     const job = {
       prompt: str(event.prompt, 1000) || 'A picture',
-      size: IMAGE_SIZES.indexOf(event.size) !== -1 ? event.size : IMAGE_SIZES[0],
+      size: imageSize(event.size),
       state: 'queued', imageId: event.id, startedAt: now,
     };
     if (typeof event.eta_seconds === 'number' && event.eta_seconds > 0 && event.eta_seconds < 3600) job.eta = event.eta_seconds;
@@ -1574,7 +1573,14 @@ const DLNEChat = (() => {
   // sees and all a saved chat keeps; the picture itself stays in memory (the page's WeakMap). Since 2.6.2 a reply
   // can carry the same thing as ``reply.job`` ({ prompt, size, state, imageId, startedAt, eta, note }, no role): the
   // picture the model asked for, shown under the reply's text.
-  const IMAGE_SIZES = ['768x768', '1024x1024', '768x1024', '1024x768'];
+  const IMAGE_SIZES = ['512x512', '512x768', '768x512'];
+  // The sizes of 2.6.1 to 2.6.5, which a chat saved then may still hold: read as today's size of the same shape,
+  // as the server draws them. Anything else is the default square.
+  const IMAGE_OLD_SIZES = { '768x768': '512x512', '1024x1024': '512x512', '768x1024': '512x768', '1024x768': '768x512' };
+  function imageSize(size) {
+    if (IMAGE_SIZES.indexOf(size) !== -1) return size;
+    return Object.prototype.hasOwnProperty.call(IMAGE_OLD_SIZES, size) ? IMAGE_OLD_SIZES[size] : IMAGE_SIZES[0];
+  }
   const IMAGE_ACTIVE = ['queued', 'checking', 'generating', 'reviewing'];
   const IMAGE_FINAL = ['completed', 'refused', 'failed', 'cancelled', 'expired'];
   const IMAGE_ID = /^[A-Za-z0-9_-]{8,128}$/;
@@ -1591,14 +1597,14 @@ const DLNEChat = (() => {
   }
   const aboutSeconds = (n) => seconds(Math.max(5, Math.round(n / 5) * 5));
 
-  // The estimate for ``size`` in seconds: the server's own figure if it has one, else the square's
-  // scaled by area (the server only measures the two squares).
+  // The estimate for ``size`` in seconds: the server's own figure if it has one (since 2.6.6 it gives every size),
+  // else the square's scaled by area, else the square's measured 18 s.
   function imageEta(etas, size) {
     const known = etas && typeof etas === 'object' ? etas : {};
     if (Number(known[size]) > 0) return Number(known[size]);
-    const base = Number(known['768x768']) > 0 ? Number(known['768x768']) : 80;
+    const base = Number(known['512x512']) > 0 ? Number(known['512x512']) : 18;
     const dims = String(size).split('x').map(Number);
-    return dims.length === 2 && dims[0] > 0 && dims[1] > 0 ? base * dims[0] * dims[1] / (768 * 768) : base;
+    return dims.length === 2 && dims[0] > 0 && dims[1] > 0 ? base * dims[0] * dims[1] / (512 * 512) : base;
   }
 
   function imageStatus(msg) {
@@ -1759,8 +1765,8 @@ const DLNEChat = (() => {
     str, el, clear, button, safeUrl, link, markdown, copyText, cleanSources, sourceList, applyData, streamReader,
     lookupLine, cleanMessage, reportPayload, reportResult, uuid4, isChatId, place,
     locator, LOCATION_TEXT, NO_LOCATION_NOTE, FIX_MAX_AGE, FIX_REFRESH, isLocalQuestion, asksLocal, shouldAskLocation,
-    IMAGE_SIZES, imageActive, isImageId, imagePlaceholder, imageEta, imageStatus, imageClock, imageApply, imagePicture, imageCard,
-    aboutSeconds, seconds, pictureBytes,
+    IMAGE_SIZES, imageSize, imageActive, isImageId, imagePlaceholder, imageEta, imageStatus, imageClock, imageApply, imagePicture,
+    imageCard, aboutSeconds, seconds, pictureBytes,
     MAX_PHOTOS, PHOTO_GONE, photoCount, photoSize, thumbSize, dataUrlBytes, fitPhoto, turnText, wireMessages, trayItem, photoStrip,
     PHOTO_FILE_MAX_BYTES, PHOTO_FILE_MAX_PIXELS, readBytes, imageHeader, photoRefusal, locationCardWanted,
   };
@@ -1772,7 +1778,7 @@ const DLNEChat = (() => {
   const {
     el, clear, button, markdown, copyText, sourceList, applyData, streamReader, cleanMessage, reportPayload, reportResult,
     str, uuid4, isChatId, locator, LOCATION_TEXT, NO_LOCATION_NOTE, asksLocal, locationCardWanted, IMAGE_SIZES, imageActive, isImageId,
-    imagePlaceholder, imageEta, imageApply, imagePicture, imageCard, aboutSeconds, pictureBytes,
+    imageSize, imagePlaceholder, imageEta, imageApply, imagePicture, imageCard, aboutSeconds, pictureBytes,
     MAX_PHOTOS, photoCount, dataUrlBytes, fitPhoto, wireMessages, trayItem, photoStrip, photoRefusal,
   } = DLNEChat;
   const API = '/v1/app/chat/completions';
@@ -2467,7 +2473,7 @@ const DLNEChat = (() => {
 
   function openImage(again) {
     if (!imageSupport) return;
-    if (again) { ui.imagePrompt.value = again.prompt; if (IMAGE_SIZES.indexOf(again.size) !== -1) ui.imageSize.value = again.size; }
+    if (again) { ui.imagePrompt.value = again.prompt; ui.imageSize.value = imageSize(again.size); }
     showImageStatus('', '');
     openDialog(ui.image);
     ui.imagePrompt.focus();

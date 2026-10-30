@@ -36,6 +36,10 @@ def app_home(tmp_path, monkeypatch):
     monkeypatch.setenv("DLNE_DONATE_HOME", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    # The presence file of DLNE in VS Code: never the real ~/.dlne/editor.json of whoever runs the tests.
+    monkeypatch.setenv("DLNE_DONATE_EDITOR_FILE", str(tmp_path / "dot-dlne" / "editor.json"))
+    # No test looks for a newer DLNE Donate on the real website.
+    monkeypatch.setenv("DLNE_DONATE_NO_UPDATE_CHECK", "1")
     return home
 
 
