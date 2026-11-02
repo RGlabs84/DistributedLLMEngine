@@ -2710,6 +2710,23 @@ def test_the_target_config_gives_the_engine_two_cards_and_the_projector_the_thir
     assert cards.logged == []
 
 
+def test_a_takeover_lease_puts_the_projector_on_the_cpu_and_keeps_vision_on(cards):
+    """engine_mmproj_cpu is set only by a takeover lease (engine/takeover.py): the media card is lent out."""
+    cmd, entry, env = _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cards.projector,
+                             engine_mmproj_cpu=True)
+
+    assert "--no-mmproj-offload" in cmd and "--mmproj-device" not in cmd
+    assert _flag(cmd, "--mmproj") == cards.projector and entry["mmproj_path"] == cards.projector
+    assert _flag(cmd, "--device") == "Vulkan0,Vulkan1", "the model still gets none of the media card"
+    assert cards.logged == [] and cards.errors == []
+
+
+def test_without_a_lease_the_projector_is_never_told_to_stay_off_the_card(cards):
+    cmd, _entry, _env = _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580, engine_mmproj=cards.projector)
+
+    assert "--no-mmproj-offload" not in cmd and _flag(cmd, "--mmproj-device") == "Vulkan2"
+
+
 def test_the_media_card_alone_changes_the_devices_and_nothing_else(cards):
     cmd, _entry, env = _start(cards, allowed_gpu_indices="0,1", media_gpu=RX580)
 

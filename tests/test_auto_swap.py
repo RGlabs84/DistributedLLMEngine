@@ -254,6 +254,24 @@ async def test_a_model_change_made_elsewhere_counts_as_a_manual_swap():
 
 
 @pytest.mark.anyio
+async def test_nothing_switches_while_a_takeover_lease_borrows_hardware(monkeypatch):
+    # 2.7.1: a lease makes the pool look smaller while it runs and bigger as it ends; a switch then would fight it.
+    from engine import takeover
+    lease = {"state": takeover.STATE_ACTIVE}
+    monkeypatch.setattr(takeover, "load_lease", lambda: lease)
+    rig = Rig(vram=24)
+    held = await rig.every(T0, T0 + 3600)
+    assert held.state == "steady" and held.reason == "takeover"
+    assert rig.swaps == [] and rig.downloads == []
+    for state in (takeover.STATE_GRANTING, takeover.STATE_RESTORING):
+        lease["state"] = state
+        assert (await rig.at(T0 + 3630)).reason == "takeover"
+    monkeypatch.setattr(takeover, "load_lease", lambda: None)   # the lease is over: switching resumes
+    await rig.every(T0 + 3660, T0 + 7260)
+    assert [s[0] for s in rig.swaps] == ["t24"]
+
+
+@pytest.mark.anyio
 async def test_auto_swap_false_does_nothing():
     rig = Rig(vram=48, ready=("t16",), settings={"auto_swap": False})
     await rig.every(T0, T0 + 7200)

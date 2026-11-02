@@ -15,6 +15,15 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-feature android:name="android.hardware.location" android:required="false" />
+
+    <!--
+        Microphone, only asked for the first time the person taps the mic button next to the message box
+        (shown only while the server offers voice), after a note that the clip goes to the DLNE server to
+        be turned into text and is not kept. The recording stays in memory. Optional hardware so the app
+        is not hidden on devices without a microphone.
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
     <uses-feature android:name="android.hardware.location.network" android:required="false" />
 

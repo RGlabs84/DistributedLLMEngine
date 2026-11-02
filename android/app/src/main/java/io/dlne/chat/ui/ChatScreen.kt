@@ -41,6 +41,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
@@ -49,11 +50,15 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -63,22 +68,28 @@ import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.dlne.chat.R
 import io.dlne.chat.data.ChatMessage
 import io.dlne.chat.data.ReportReason
+import io.dlne.chat.data.VoiceMode
 import io.dlne.chat.data.Role
 import io.dlne.chat.net.ClusterStatus
 import io.dlne.chat.update.UpdateBanner
 import java.io.File
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /** What the chat screen can ask the view model to do. */
 class ChatActions(
@@ -103,6 +114,10 @@ class ChatActions(
     /** Photos chosen with the "+" menu (and the camera's temporary file, when it came from the camera). */
     val onAddPhotos: (uris: List<Uri>, cameraFile: File?) -> Unit,
     val onRemovePhoto: (id: String) -> Unit,
+    /** The mic's text is in the box: in Conversation mode, send it as Send would and read the answer ([language] of the clip). */
+    val onVoiceText: (language: String?) -> Unit,
+    val onStopSpeaking: () -> Unit,
+    val onSpeechNoteShown: () -> Unit,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -175,19 +190,25 @@ fun ChatScreen(
         if (messages.isEmpty() && pending == null && imageJobs.isEmpty()) {
             EmptyState(Modifier.fillMaxSize().padding(padding))
         } else {
-            MessageList(
-                messages = messages,
-                pending = pending,
-                imageJobs = imageJobs,
-                onCancelImage = actions.onCancelImage,
-                canRetry = !state.isStreaming && state.error == null,
-                onRetry = actions.onRetry,
-                onReport = actions.onReport,
-                contentPadding = padding,
-            )
+            // A conversation opens at its newest message, following, whatever the last one's scroll was.
+            key(state.current?.id) {
+                MessageList(
+                    messages = messages,
+                    pending = pending,
+                    imageJobs = imageJobs,
+                    onCancelImage = actions.onCancelImage,
+                    canRetry = !state.isStreaming && state.error == null,
+                    onRetry = actions.onRetry,
+                    onReport = actions.onReport,
+                    contentPadding = padding,
+                )
+            }
         }
     }
 }
+
+/** The list key of the answer being written. */
+private const val PENDING_KEY = "pending"
 
 /** "Qwen3 4B Instruct · 3 machines serving", from the service status, when available. */
 @Composable
@@ -237,8 +258,33 @@ private fun MessageList(
     contentPadding: PaddingValues,
 ) {
     val listState = rememberLazyListState()
-    // Jump to the newest message whenever one is added (sent, or an answer saved), or a picture starts or ends.
-    LaunchedEffect(messages.size, pending != null, imageJobs.size) { listState.scrollToItem(0) }
+    // Following the newest message (ScrollFollow.kt): decided by where each scroll ends, not by every frame, so a new
+    // item arriving at the bottom (which shifts the indices for a moment) never counts as the reader leaving.
+    var following by remember { mutableStateOf(true) }
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
+            if (!scrolling) following = atNewest(listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
+        }
+    }
+    // A reader scrolled up into the answer being written keeps the same words in view while it grows.
+    LaunchedEffect(listState) {
+        var lastSize = 0
+        snapshotFlow { listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == PENDING_KEY }?.size ?: 0 }
+            .collect { size ->
+                val first = listState.layoutInfo.visibleItemsInfo.firstOrNull()
+                val delta = keepReaderInPlace(following, first?.key, PENDING_KEY, listState.firstVisibleItemScrollOffset, lastSize, size)
+                if (delta > 0) listState.dispatchRawDelta(delta.toFloat())
+                lastSize = size
+            }
+    }
+    // Go to the newest message when the reader sends one, and when something new arrives while they are following.
+    var seenCount by remember { mutableIntStateOf(messages.size) }
+    LaunchedEffect(messages.size, pending != null, imageJobs.size) {
+        val justSent = messages.size > seenCount && messages.lastOrNull()?.role == Role.USER
+        seenCount = messages.size
+        if (justSent) following = true
+        if (jumpToNewest(following, justSent, listState.isScrollInProgress)) listState.scrollToItem(0)
+    }
 
     val last = messages.lastOrNull()
     val unanswered = canRetry && pending == null && last?.role == Role.USER && last.image == null
@@ -250,56 +296,71 @@ private fun MessageList(
     var openSources by rememberSaveable { mutableStateOf(listOf<String>()) }
     val toggleSources = { id: String -> openSources = if (id in openSources) openSources - id else openSources + id }
 
-    LazyColumn(
-        state = listState,
-        reverseLayout = true,
-        contentPadding = PaddingValues(
-            // Side padding includes any landscape navigation bar or display cutout.
-            start = contentPadding.calculateStartPadding(direction) + 16.dp,
-            end = contentPadding.calculateEndPadding(direction) + 16.dp,
-            top = contentPadding.calculateTopPadding() + 12.dp,
-            bottom = contentPadding.calculateBottomPadding() + 12.dp,
-        ),
-        verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.Bottom),
-        modifier = Modifier.fillMaxSize(),
-    ) {
-        if (unanswered) {
-            item(key = "unanswered") { NoticeRow(stringResource(R.string.not_answered), onRetry) }
-        }
-        // A Create image request or picture in progress is a card of its own; the pictures the chat makes
-        // sit inside the reply that asked for them (below).
-        for (job in imageJobs) {
-            if (job.replyId != null) continue
-            item(key = "image-job-${job.jobId ?: "request"}") { ImageJobCard(job, onCancel = { job.jobId?.let(onCancelImage) }) }
-        }
-        if (pending != null) {
-            item(key = "pending") {
-                PendingMessage(
-                    pending,
-                    sourcesOpen = pending.messageId in openSources,
-                    onToggleSources = { toggleSources(pending.messageId) },
-                    job = imageJobs.forReply(pending.messageId),
-                    onCancelImage = onCancelImage,
-                )
+    val scope = rememberCoroutineScope()
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(
+            state = listState,
+            reverseLayout = true,
+            contentPadding = PaddingValues(
+                // Side padding includes any landscape navigation bar or display cutout.
+                start = contentPadding.calculateStartPadding(direction) + 16.dp,
+                end = contentPadding.calculateEndPadding(direction) + 16.dp,
+                top = contentPadding.calculateTopPadding() + 12.dp,
+                bottom = contentPadding.calculateBottomPadding() + 12.dp,
+            ),
+            verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.Bottom),
+            modifier = Modifier.fillMaxSize(),
+        ) {
+            if (unanswered) {
+                item(key = "unanswered") { NoticeRow(stringResource(R.string.not_answered), onRetry) }
+            }
+            // A Create image request or picture in progress is a card of its own; the pictures the chat makes
+            // sit inside the reply that asked for them (below).
+            for (job in imageJobs) {
+                if (job.replyId != null) continue
+                item(key = "image-job-${job.jobId ?: "request"}") { ImageJobCard(job, onCancel = { job.jobId?.let(onCancelImage) }) }
+            }
+            if (pending != null) {
+                item(key = PENDING_KEY) {
+                    PendingMessage(
+                        pending,
+                        sourcesOpen = pending.messageId in openSources,
+                        onToggleSources = { toggleSources(pending.messageId) },
+                        job = imageJobs.forReply(pending.messageId),
+                        onCancelImage = onCancelImage,
+                    )
+                }
+            }
+            items(count = messages.size, key = { index -> messages[messages.size - 1 - index].id }) { index ->
+                val message = messages[messages.size - 1 - index]
+                val isLast = index == 0
+                when (message.role) {
+                    Role.USER -> UserMessage(message)
+                    Role.ASSISTANT -> if (message.image != null) {
+                        ImageResult(message, onReport = if (message.image.file != null) ({ onReport(message.id) }) else null)
+                    } else AssistantMessage(
+                        message,
+                        // A reply that made (or was refused) a picture is answered: asking again would make another.
+                        onRetry = if (isLast && canRetry && pending == null && message.notice != null && message.picture == null) onRetry else null,
+                        onReport = { onReport(message.id) },
+                        sourcesOpen = message.id in openSources,
+                        onToggleSources = { toggleSources(message.id) },
+                        job = imageJobs.forReply(message.id),
+                        onCancelImage = onCancelImage,
+                    )
+                }
             }
         }
-        items(count = messages.size, key = { index -> messages[messages.size - 1 - index].id }) { index ->
-            val message = messages[messages.size - 1 - index]
-            val isLast = index == 0
-            when (message.role) {
-                Role.USER -> UserMessage(message)
-                Role.ASSISTANT -> if (message.image != null) {
-                    ImageResult(message, onReport = if (message.image.file != null) ({ onReport(message.id) }) else null)
-                } else AssistantMessage(
-                    message,
-                    // A reply that made (or was refused) a picture is answered: asking again would make another.
-                    onRetry = if (isLast && canRetry && pending == null && message.notice != null && message.picture == null) onRetry else null,
-                    onReport = { onReport(message.id) },
-                    sourcesOpen = message.id in openSources,
-                    onToggleSources = { toggleSources(message.id) },
-                    job = imageJobs.forReply(message.id),
-                    onCancelImage = onCancelImage,
-                )
+        // Scrolled up to read: one tap back to the newest message, which follows again.
+        if (!following) {
+            SmallFloatingActionButton(
+                onClick = {
+                    following = true
+                    scope.launch { listState.animateScrollToItem(0) }
+                },
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = contentPadding.calculateBottomPadding() + 8.dp),
+            ) {
+                Text(stringResource(R.string.latest), modifier = Modifier.padding(horizontal = 12.dp))
             }
         }
     }
@@ -487,6 +548,17 @@ private fun InputBar(draft: String, photos: DraftPhotos, state: ChatUiState, act
                 )
             }
             if (!photos.isEmpty) DraftPhotoStrip(photos, onRemove = actions.onRemovePhoto)
+            // The box keeps its own cursor so a spoken text lands where the person was typing; the draft
+            // (the view model's text) wins whenever it changes from outside (Send empties it, a share fills it).
+            var field by remember { mutableStateOf(TextFieldValue(draft, TextRange(draft.length))) }
+            if (field.text != draft) field = TextFieldValue(draft, TextRange(draft.length))
+            var voiceMessage by remember { mutableStateOf<String?>(null) }
+            state.speechNote?.let { note ->
+                LaunchedEffect(note) {
+                    voiceMessage = note
+                    actions.onSpeechNoteShown()
+                }
+            }
             Row(verticalAlignment = Alignment.Bottom) {
                 // The "+": Photos and Camera when the server can look at photos, Create image when it can make
                 // them; nothing at all on an older server.
@@ -499,8 +571,8 @@ private fun InputBar(draft: String, photos: DraftPhotos, state: ChatUiState, act
                     onCreateImage = { imageDialog = true },
                 )
                 TextField(
-                    value = draft,
-                    onValueChange = actions.onDraftChange,
+                    value = field,
+                    onValueChange = { field = it; actions.onDraftChange(it.text) },
                     placeholder = {
                         Text(
                             if (photos.isEmpty) stringResource(R.string.input_placeholder)
@@ -520,8 +592,38 @@ private fun InputBar(draft: String, photos: DraftPhotos, state: ChatUiState, act
                     ),
                     modifier = Modifier.weight(1f).heightIn(min = 52.dp),
                 )
+                if (voiceButtonVisible(state.status)) {
+                    Spacer(Modifier.size(8.dp))
+                    VoiceButton(
+                        status = state.status,
+                        serverUrl = state.serverUrl,
+                        enabled = state.privacyAcknowledged,
+                        conversation = state.voiceMode == VoiceMode.CONVERSATION,
+                        speaking = state.speaking,
+                        onText = { spoken, language ->
+                            val put = insertAtCursor(field.text, field.selection.start, field.selection.end, spoken)
+                            field = TextFieldValue(put.text, TextRange(put.cursor))
+                            actions.onDraftChange(put.text)
+                            actions.onVoiceText(language)
+                        },
+                        onStopSpeaking = actions.onStopSpeaking,
+                        onMessage = { voiceMessage = it },
+                    )
+                }
                 Spacer(Modifier.size(8.dp))
                 SendButton(draft, photos, state, actions)
+            }
+            voiceMessage?.let { text ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.weight(1f).padding(start = 16.dp, top = 4.dp)
+                            .semantics { liveRegion = LiveRegionMode.Polite },
+                    )
+                    TextButton(onClick = { voiceMessage = null }) { Text(stringResource(R.string.dismiss)) }
+                }
             }
             Text(
                 stringResource(R.string.input_hint),

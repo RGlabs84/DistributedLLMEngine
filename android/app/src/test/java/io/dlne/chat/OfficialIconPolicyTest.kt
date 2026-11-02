@@ -34,7 +34,7 @@ class OfficialIconPolicyTest {
         "ic_add", "ic_back", "ic_copy", "ic_delete", "ic_flag", "ic_image", "ic_info",
         "ic_menu", "ic_open_in_new", "ic_send", "ic_settings", "ic_stop",
         // The "+" menu and the photo thumbnails: camera, create image, remove (x).
-        "ic_camera", "ic_sparkle", "ic_close",
+        "ic_camera", "ic_sparkle", "ic_close", "ic_mic", "ic_speaking_stop",
     )
 
     /** Files generated from the official logo, relative to src/main/res. */

@@ -7,7 +7,8 @@ The native DLNE chat app: Kotlin, Jetpack Compose, Material 3, one activity. Pho
 - minSdk 26 (Android 8.0), targetSdk / compileSdk 36 (Android 16)
 - Two builds of the same app (same package, same signing key), see "Flavors and updates" below:
   `sideload` (the APK on the website, with the in-app updater) and `play` (Google Play, none).
-- Permissions: both builds ask for `INTERNET`, and for `ACCESS_FINE_LOCATION` with `ACCESS_COARSE_LOCATION` (precise
+- Permissions: both builds ask for `INTERNET`, for `RECORD_AUDIO` (only at the first tap of the mic button, which is
+  shown only while the server offers voice; the recording stays in memory), and for `ACCESS_FINE_LOCATION` with `ACCESS_COARSE_LOCATION` (precise
   and approximate together, so the person can allow only approximate), which are requested only when the person turns
   on Settings > Share location or taps "Use my location" on the chat's location card, never at startup or in the
   background. `sideload` also asks for `REQUEST_INSTALL_PACKAGES` (to hand a verified update to Android's installer;
@@ -331,6 +332,19 @@ the Play icon is not exactly the official logo as a 512 x 512 32-bit PNG.
   on until it is turned off in Settings; it goes away when the held words are deleted or stop being a local question,
   a permission dialog that is interrupted leaves it up (nothing is sent without an answer), and a message of photos
   alone asks nothing. The Settings switch works as before.
+- **Voice (1.0.7).** While the status says `capabilities.voice` a mic button sits beside Send (`ui/VoiceButton.kt`;
+  nothing on an older server or while voice is off). Tap to record, tap again to stop; the button turns red and shows
+  the clock, and the recording stops by itself at `voice.max_seconds` (60 if the status gives none, never more).
+  `voice/VoiceRecorder.kt` records with `AudioRecord` at 16 kHz mono PCM16 into memory, `voice/Wav.kt` writes the
+  44-byte WAV header, and `DlneApi.transcribe` posts it to `POST /v1/audio/transcriptions` (multipart `file`,
+  `response_format=json`; same client as chat) and returns the text. The text is inserted at the cursor of the message
+  box (`insertAtCursor`) and never sent automatically. The first tap shows a one-time note (the clip goes to the DLNE
+  server to be turned into text and is not kept), then Android's `RECORD_AUDIO` question; if it is refused the
+  message box says where to turn it on. Errors in plain words (`net/Voice.kt` `VoiceMessages`): `voice_quota` "Voice is
+  used up for this hour", `voice_busy`, `voice_paused` / `voice_unavailable` show the server's sentence, and so on.
+  Content descriptions on every state and TalkBack announcements when recording starts, the text arrives or it fails.
+  Leaving the screen drops a recording without sending it. Design: `docs/voice-contract.md`.
+  Release note 1.0.7: speak instead of type (needs a DLNE server with voice on).
 - **The header** keeps the last good status (the model and the machines serving) when a refresh fails, and refreshes
   again when the app comes back to the foreground as well as every minute (`ui/StatusRefresher.kt`).
 - **Upgrading to compileSdk 37 (Android 17).** Needs Android Gradle Plugin 9.x, which moves

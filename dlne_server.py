@@ -129,6 +129,39 @@ def cmd_adminkey(args):
         print("✅ Operator key revoked. /v1/admin/* now accepts only the legacy password session.")
 
 
+def cmd_takeoverkey(args):
+    """Mint or remove the takeover-only key (2.7.3): it opens /v1/admin/takeover* and nothing else."""
+    if args.takeover_action == "create":
+        key = mint_admin_key()
+        if not set_config_values({"TAKEOVER_KEY_HASH": hash_admin_key(key)}):
+            print("Error: could not write TAKEOVER_KEY_HASH to config.txt", file=sys.stderr)
+            sys.exit(1)
+        if args.out:
+            # The key goes straight into a file only its owner can read and is never shown, so it can be handed to the
+            # tool that uses it (DLNE-Sec imports it into its own encrypted store and deletes the file).
+            path = os.path.abspath(os.path.expanduser(args.out))
+            old = os.umask(0o077)
+            try:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(key)
+                os.chmod(path, 0o600)
+            finally:
+                os.umask(old)
+            print(f"Takeover key created and written to {path} (mode 600). It was not shown; only its hash is stored.")
+            print("Creating a new one replaces (revokes) the previous one.")
+            return
+        if args.quiet:
+            print(key)
+            return
+        print(f"\nTakeover key: {key}\n")
+        print("Save it now: only its hash is stored. It opens /v1/admin/takeover* only. A new one replaces it.")
+    elif args.takeover_action == "revoke":
+        if not set_config_values({"TAKEOVER_KEY_HASH": ""}):
+            print("Error: could not write TAKEOVER_KEY_HASH to config.txt", file=sys.stderr)
+            sys.exit(1)
+        print("Takeover key revoked. Takeover leases now take only the operator key.")
+
+
 def cmd_status(args):
     """Query live DLNE Server Unit status."""
     host = args.host or "127.0.0.1"
@@ -257,6 +290,12 @@ def main():
     p_admin.add_argument("admin_action", choices=["create", "revoke"], help="Action")
     p_admin.add_argument("--quiet", action="store_true", help="Print only the new key (for scripts)")
 
+    # takeoverkey
+    p_take = subparsers.add_parser("takeoverkey", help="Manage the takeover-only key for /v1/admin/takeover*")
+    p_take.add_argument("takeover_action", choices=["create", "revoke"], help="Action")
+    p_take.add_argument("--out", default=None, help="Write the new key to this file (mode 600) instead of showing it")
+    p_take.add_argument("--quiet", action="store_true", help="Print only the new key (for scripts)")
+
     # status
     p_status = subparsers.add_parser("status", help="Query DLNE Server status")
     p_status.add_argument("--host", default="127.0.0.1", help="Coordinator host")
@@ -292,6 +331,8 @@ def main():
         cmd_apikey(args)
     elif args.command == "adminkey":
         cmd_adminkey(args)
+    elif args.command == "takeoverkey":
+        cmd_takeoverkey(args)
     elif args.command == "status":
         cmd_status(args)
     elif args.command == "install-systemd":

@@ -30,6 +30,12 @@ import { renderMarkdown } from './markdown';
 import { memoryMode } from '../agent/memory';
 import { MAX_PICTURES, PictureAttachment, checkPictures, visionOffered } from '../client/pictures';
 import { undoChange } from '../agent/skills';
+import { VoiceRecorder } from '../voice/recorder';
+import { VoiceController, VoiceMode, VoiceRecorderLike, micShown, voiceModeFrom } from '../voice/voice';
+import { Speaker } from '../voice/speaker';
+import { TurnReader } from '../voice/speakable';
+
+const VOICE_NOTED_KEY = 'dlne.voice.noted';
 
 export interface ChatMessageItem {
   id: string;
@@ -165,13 +171,48 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private readonly open = new Map<string, Session>();
   /** The page may have missed some of the chat (it was hidden, or gone, while the task went on): it is redrawn on show. */
   private chatStale = false;
+  /** Voice (2.8.0): the host records, the page shows the button and the state. */
+  private readonly voice: VoiceController;
+  private readonly voiceRecorder: VoiceRecorderLike;
+  /** Words from a clip that came back while no panel was open: put in the box when one is. */
+  private pendingVoiceText = '';
+  /** Conversation mode (2.8.2): the clip's words are sent when the box has them (kept with the words while no panel is open). */
+  private pendingVoiceSend = false;
+  /** Host-side speech, and the reader of the one reply being read aloud (null: nothing is being read). */
+  private readonly speaker: Speaker;
+  private reader: TurnReader | null = null;
+  private speechLanguage: string | undefined;
+  private speechHintShown = false;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
     private readonly client: DlneClient,
     private readonly workerManager: WorkerManager,
-    private readonly context?: vscode.ExtensionContext
+    private readonly context?: vscode.ExtensionContext,
+    /** The platform's recorder (voice/recorder.ts); a test passes a stand-in. */
+    voiceRecorder: VoiceRecorderLike = new VoiceRecorder(),
+    /** The platform's speech (voice/speaker.ts); a test passes a stand-in. */
+    speaker: Speaker = new Speaker()
   ) {
+    this.voiceRecorder = voiceRecorder;
+    this.speaker = speaker;
+    this.speaker.onSpeaking((on) => this.post({ type: 'speaking', on }));
+    this.speaker.onError((message) => this.post({ type: 'voiceNotice', text: message, error: true }));
+    this.voice = new VoiceController({
+      recorder: voiceRecorder,
+      status: () => this.client.lastKnownClusterStatus?.(),
+      settingOn: () => this._voiceSetting(),
+      transcribe: (wav) => this.client.transcribe(wav),
+      state: (state, extra) => this.post({ type: 'voiceState', state, maxSeconds: extra?.maxSeconds, note: extra?.note }),
+      say: (text, isError) => {
+        this.post({ type: 'voiceNotice', text, error: isError });
+      },
+      insert: (text, options) => this.insertVoiceText(text, options),
+      mode: () => this._voiceMode(),
+      beforeRecord: () => this.stopSpeech(),
+      noted: () => this.context?.globalState?.get<boolean>(VOICE_NOTED_KEY) === true,
+      markNoted: () => { void this.context?.globalState?.update(VOICE_NOTED_KEY, true); },
+    });
     const saved = readIndex(this.context?.workspaceState.get(SESSIONS_KEY));
     if (saved) {
       this.index = saved;
@@ -435,6 +476,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   /** Shows another session: the page draws its chat, and its task as far as it has gone, from the start. */
   private showSession(id: string): void {
+    this.stopSpeech();
     if (!this.index.sessions.some((s) => s.id === id) || id === this.index.active) {
       this.postSessions();
       return;
@@ -449,6 +491,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
    * than piling up empty sessions. Housekeeping then lets the oldest go past MAX_SESSIONS (never a running one).
    */
   private newChat(): void {
+    this.stopSpeech();
     const current = this.active;
     if (current.history.length === 0 && !current.running) {
       this.syncPage();
@@ -464,6 +507,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   /** The trash button of a row: a running session is not deleted (the page offers no button for one). */
   private deleteSession(id: string): void {
+    this.stopSpeech();
     const meta = this.index.sessions.find((s) => s.id === id);
     if (!meta || this.open.get(id)?.running) {
       this.postSessions();
@@ -529,6 +573,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       if (['dlne.ownGpu', 'dlne.worker.engine', 'dlne.agent.unlimitedTurns'].some((key) => e.affectsConfiguration(key))) {
         this._postControls();
       }
+      if (e.affectsConfiguration('dlne.voice.enabled')) {
+        this.post({ type: 'voice', on: this._voice() });
+        if (!this._voiceSetting()) void this.voice.cancel();
+        if (!this._voiceSetting()) this.stopSpeech();
+      }
+      if (e.affectsConfiguration('dlne.voice.mode')) {
+        this.post({ type: 'voiceMode', mode: this._voiceMode() });
+        if (this._voiceMode() !== 'conversation') this.stopSpeech();
+      }
     });
     webviewView.onDidDispose?.(() => autoListener?.dispose());
 
@@ -549,11 +602,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       this._view?.webview.postMessage({ type: 'modelLine', text: swarmModelLine(status) });
       // The picture controls come and go with the coordinator's `capabilities.vision` (4d).
       this._view?.webview.postMessage({ type: 'vision', on: visionOffered(status) });
+      this._view?.webview.postMessage({ type: 'voice', on: micShown(status, this._voiceSetting(), this.voiceRecorder.available()) });
     });
     webviewView.onDidDispose?.(() => {
       stopFollowing?.();
       // A closed view throws when it is used; the task goes on unseen and the next view is shown it (syncPage).
-      if (this._view === webviewView) this._view = undefined;
+      if (this._view === webviewView) {
+        this._view = undefined;
+        void this.voice.cancel();       // a clip being recorded has nowhere to go: it is thrown away, its file with it
+      }
     });
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
@@ -562,6 +619,16 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           // The page has just started: the first time, or again after VS Code made it anew (the view was moved, the
           // webviews were reloaded). It asks for the chat, so it never waits for a message that was sent too early.
           this.syncPage();
+          this.flushVoiceText();
+          if (this.speaker.isSpeaking()) this.post({ type: 'speaking', on: true });
+          break;
+        }
+        case 'voiceToggle': {
+          await this.voice.toggle();
+          break;
+        }
+        case 'stopSpeaking': {
+          this.stopSpeech();
           break;
         }
         case 'copyTrustId': {
@@ -573,7 +640,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           break;
         }
         case 'sendMessage': {
-          await this.handleUserMessage(data.text, data.images);
+          await this.handleUserMessage(data.text, data.images, data.voice === true);
           break;
         }
         case 'setAutoApprove': {
@@ -688,8 +755,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
    * page is sent one `turnComplete` and the host is free for the next message. A page left "running" has only Stop
    * to press, which is what "it stops running and doesn't continue" looked like.
    */
-  private async handleUserMessage(text: string, images?: unknown) {
+  private async handleUserMessage(text: string, images?: unknown, byVoice = false) {
     if (typeof text !== 'string') return;
+    // Sending anything ends speech; a spoken turn in Conversation mode then reads its own reply (below).
+    this.stopSpeech();
     // Pictures the page sent (4d), checked again: the page is only a page. Their thumbnails are the page's own drawing,
     // small JPEGs; anything else in their place is not shown.
     const checked = checkPictures(images);
@@ -717,9 +786,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
     session.running = true;
     session.stopping = false;
+    // Only the reply to a message sent by voice in Conversation mode is read; a typed message never is.
+    const reader = byVoice && this._voiceMode() === 'conversation' ? this.startReading() : null;
     let outcome: AgentRunOutcome | undefined;
     try {
-      outcome = await this.runTask(session, text, pictures);
+      outcome = await this.runTask(session, text, pictures, reader);
     } catch (err) {
       // A throw out of the run: a tool call that failed outside the tool's own handling, a broken callback. The task
       // is over, and the page is told why in words.
@@ -731,6 +802,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     } finally {
       session.running = false;
       session.stopping = false;
+      if (reader) this.say(reader, reader.feed(this.lastAssistantText(session), true));
       try {
         this.saveHistory(session);
         session.store.flush();
@@ -744,7 +816,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   /** The agent's run for one message, drawing it on the page as it goes (while its session is the one shown). */
-  private runTask(session: Session, text: string, pictures: Array<{ picture: PictureAttachment; thumb?: string }> = []): Promise<AgentRunOutcome> {
+  private runTask(session: Session, text: string, pictures: Array<{ picture: PictureAttachment; thumb?: string }> = [], reader: TurnReader | null = null): Promise<AgentRunOutcome> {
     // The new turn comes first, so whatever follows (even an error) belongs to it and not to the one before.
     const turn = { index: session.history.length, events: [] as PageEvent[] };
     session.turn = turn;
@@ -798,6 +870,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       onContentDelta: (delta) => {
         assistantMsg.text += delta;
         show({ type: 'contentDelta', delta });
+        if (reader) this.say(reader, reader.feed(assistantMsg.text));
       },
       onToolStart: (toolName, args) => {
         if (!assistantMsg.toolCalls) assistantMsg.toolCalls = [];
@@ -869,6 +942,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       controls: this._controlsModel(),
       modelLine: this._modelLine(),
       vision: this._vision(),
+      voice: this._voice(),
       // The queue is the swarm's answer to this window's latest request: it is shown with a session that is waiting.
       queue: session.running ? this._queueView(this.client.currentQueue?.()) : null,
       autoApprove: ToolRegistry.autoApproveAllOn(),
@@ -898,6 +972,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     void this._refreshKeyTier();
     this.post({ type: 'modelLine', text: this._modelLine() });
     this.post({ type: 'vision', on: this._vision() });
+    this.post({ type: 'voice', on: this._voice() });
+    this.flushVoiceText();
     this.post({ type: 'autoApprove', on: ToolRegistry.autoApproveAllOn() });
     this.post({ type: 'queue', queue: this.active.running ? this._queueView(this.client.currentQueue?.()) : null });
     this.postSessions();
@@ -916,6 +992,95 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   /** Whether the coordinator says its engine can read pictures: the page shows its picture controls only then. */
   private _vision(): boolean {
     return visionOffered(this.client.lastKnownClusterStatus?.());
+  }
+
+  private _voiceSetting(): boolean {
+    return vscode.workspace.getConfiguration('dlne').get<boolean>('voice.enabled', true) !== false;
+  }
+
+  /** Whether the mic button is shown: the server offers voice, the setting is on, and a recorder exists. */
+  private _voice(): boolean {
+    return micShown(this.client.lastKnownClusterStatus?.(), this._voiceSetting(), this.voiceRecorder.available());
+  }
+
+  /** The command dlne.voice.toggle: opens the panel if it is not open (the words need a box), then starts or stops. */
+  async toggleVoice(): Promise<void> {
+    if (!this._view) {
+      await vscode.commands.executeCommand('dlne.chatView.focus');
+    }
+    await this.voice.toggle();
+  }
+
+  /** Dictate (the default) or Conversation, from `dlne.voice.mode`. */
+  private _voiceMode(): VoiceMode {
+    return voiceModeFrom(vscode.workspace.getConfiguration('dlne').get<string>('voice.mode', 'dictate'));
+  }
+
+  /** The command dlne.voice.toggleMode: flips the setting between Dictate and Conversation and says which is on. */
+  async toggleVoiceMode(): Promise<void> {
+    const next: VoiceMode = this._voiceMode() === 'conversation' ? 'dictate' : 'conversation';
+    await vscode.workspace.getConfiguration('dlne').update('voice.mode', next, vscode.ConfigurationTarget.Global);
+    if (next === 'dictate') this.stopSpeech();
+    vscode.window.showInformationMessage(next === 'conversation'
+      ? 'DLNE: Voice Conversation is on. What you say is sent, and the answer is read aloud by this computer.'
+      : 'DLNE: Voice Dictate is on. What you say goes in the message box; you press Send.');
+  }
+
+  /** Ends any speech at once (and the reading of the reply in progress). Only the speech child this extension spawned is ended. */
+  stopSpeech(): void {
+    this.reader = null;
+    this.speaker.stop();
+  }
+
+  /** Extension deactivate: no speech outlives it. */
+  dispose(): void {
+    this.stopSpeech();
+  }
+
+  /** Starts reading a reply, if this computer can speak; otherwise says once, in words, what to install. */
+  private startReading(): TurnReader | null {
+    if (!this.speaker.available()) {
+      if (!this.speechHintShown) {
+        this.speechHintShown = true;
+        this.post({ type: 'voiceNotice', text: this.speaker.missingHint(), error: true });
+      }
+      return null;
+    }
+    this.reader = new TurnReader();
+    return this.reader;
+  }
+
+  /** Speaks sentences of `reader`'s reply, unless the reading was stopped meanwhile. */
+  private say(reader: TurnReader, sentences: string[]): void {
+    if (this.reader !== reader || sentences.length === 0) return;
+    this.speaker.speak(sentences, this.speechLanguage);
+  }
+
+  private lastAssistantText(session: Session): string {
+    for (let i = session.history.length - 1; i >= 0; i--) {
+      if (session.history[i].role === 'assistant') return session.history[i].text ?? '';
+    }
+    return '';
+  }
+
+  /**
+   * The clip's words go to the page's box at its cursor. In Dictate they are never sent. In Conversation the page then
+   * sends the box as Send would (and keeps the words if Send is blocked).
+   */
+  private insertVoiceText(text: string, options?: { send: boolean; language?: string }): void {
+    this.pendingVoiceText = (this.pendingVoiceText ? `${this.pendingVoiceText} ` : '') + text;
+    if (options?.send) this.pendingVoiceSend = true;
+    this.speechLanguage = options?.language && /^[a-z]{2,3}$/i.test(options.language) ? options.language : undefined;
+    if (this._view && this._view.visible !== false) this.flushVoiceText();
+  }
+
+  private flushVoiceText(): void {
+    if (!this.pendingVoiceText || !this._view) return;
+    const text = this.pendingVoiceText;
+    const send = this.pendingVoiceSend;
+    this.pendingVoiceText = '';
+    this.pendingVoiceSend = false;
+    this.post({ type: 'voiceText', text, ...(send ? { send: true } : {}) });
   }
 
   /** "DLNE Swarm (auto)", followed by the live model's name once a status answer has said it. */
@@ -1670,11 +1835,13 @@ ${AGENT_CONTROLS_CSS}
     <div id="picture-strip" aria-label="Pictures for your next message" style="display:none;"></div>
     <div class="busy-hint" id="picture-hint" role="status" aria-live="polite" style="display:none;"></div>
     <textarea id="prompt-input" rows="3" placeholder="Ask DLNE to write code, edit files, or fix bugs..."></textarea>
+    <div class="busy-hint" id="voice-hint" role="status" aria-live="polite" style="display:none;"></div>
     <input type="file" id="picture-input" accept="image/png,image/jpeg,image/webp,image/gif" multiple style="display:none;">
     <div class="busy-hint" id="busy-hint" role="status" aria-live="polite" style="display:none">DLNE is still working. Press Stop to interrupt it, or wait for it to finish. Your message is kept in the box.</div>
     <div class="btn-row">
       <span class="model-line" id="model-line" title="The swarm picks the model from the GPUs available; there is nothing to choose.">${modelLine}</span>
       <div class="btn-group-right">
+        <button class="secondary" id="mic-btn" style="display:none;" title="Speak instead of typing. Click to start recording, click again to stop; the words are put in the box and nothing is sent until you press Send. (Ctrl+Alt+V, Cmd+Alt+V on a Mac)" aria-label="Record your voice" aria-pressed="false">🎤</button>
         <button class="secondary" id="attach-btn" style="display:none;" title="Attach a picture (PNG, JPEG, WebP or GIF; up to 4 MiB, 4 to a message). You can also paste one or drop it on the box." aria-label="Attach a picture">🖼</button>
         <button class="secondary toggle" id="auto-btn" aria-pressed="false" title="Off: the agent asks before it edits files or runs a command. On: every action runs without asking (edits anywhere, every command), from its next step, until you turn it off. The same switch as the status bar's DLNE: Auto/Ask and the setting dlne.autoApproveAll. The agent's next step can come from a volunteer's machine.">Auto: off</button>
         <button class="secondary" id="clear-btn" title="Start a new chat; this one stays in the list behind the back arrow">New chat</button>
@@ -1697,9 +1864,18 @@ ${AGENT_CONTROLS_CSS}
     const pictureHint = document.getElementById('picture-hint');
     const pictureInput = document.getElementById('picture-input');
     const attachBtn = document.getElementById('attach-btn');
+    const micBtn = document.getElementById('mic-btn');
+    const voiceHint = document.getElementById('voice-hint');
     // Pictures (4d): the controls are there only while the coordinator says its engine can read them.
     let visionOn = ${this._vision() ? 'true' : 'false'};
     attachBtn.style.display = visionOn ? 'inline-block' : 'none';
+    // Voice (2.8.0): the extension host records (a webview cannot use the microphone); this page shows the button, the
+    // timer and the words. The button is there only while the server offers voice, Settings allow it and a recorder exists.
+    let micOn = ${this._voice() ? 'true' : 'false'};
+    micBtn.style.display = micOn ? 'inline-block' : 'none';
+    let voiceClock = null;
+    let voiceSince = 0;
+    let voiceLimit = 0;
     let pictures = [];      // for the next message: { name, dataUri, thumb }
     let pictureBusy = 0;    // files still being read
     const stopBtn = document.getElementById('stop-btn');
@@ -1880,13 +2056,14 @@ ${AGENT_CONTROLS_CSS}
 
     // Sends a message to the agent, unless a task is running: then nothing is sent, and the words stay where they are.
     // \`attached\`: the pictures for this message (4d); they go as data URIs, with their small thumbnails to draw.
-    function sendText(text, attached) {
+    function sendText(text, attached, byVoice) {
       if (busy) {
         busyHint.style.display = 'block';
         return false;
       }
       setBusy(true);
       const message = { type: 'sendMessage', text };
+      if (byVoice === true) message.voice = true;
       if (attached && attached.length > 0) {
         message.images = attached.map((p) => ({ name: p.name, dataUri: p.dataUri, thumb: p.thumb }));
       }
@@ -2059,6 +2236,82 @@ ${AGENT_CONTROLS_CSS}
       if (!visionOn) return noPicturesNow();
       void addPictureFiles(files);
     });
+    // ---- voice (2.8.0): what the host says about the recording is shown here; the words are put at the cursor -----------
+    function clockText(seconds) {
+      const s = Math.max(0, Math.floor(seconds));
+      return Math.floor(s / 60) + ':' + (s % 60 < 10 ? '0' : '') + (s % 60);
+    }
+    function setMic(on) {
+      micOn = on === true;
+      micBtn.style.display = micOn ? 'inline-block' : 'none';
+    }
+    let voiceErrorShown = false;
+    function showVoiceHint(text, isError) {
+      voiceErrorShown = !!text && isError === true;
+      voiceHint.textContent = text || '';
+      voiceHint.style.display = text ? 'block' : 'none';
+      voiceHint.style.color = isError ? 'var(--vscode-errorForeground)' : '';
+    }
+    // Conversation mode (2.8.2): while the computer reads an answer aloud the mic button is a Stop speaking button.
+    let speaking = false;
+    let voiceState = 'idle';
+    let conversation = ${this._voiceMode() === 'conversation' ? 'true' : 'false'};
+    function drawMicIdle() {
+      if (speaking) {
+        micBtn.textContent = '🔊⏹';
+        micBtn.title = 'Stop speaking';
+        micBtn.setAttribute('aria-label', 'Stop speaking');
+      } else {
+        micBtn.textContent = '🎤';
+        micBtn.title = conversation ? 'Talk: what you say is sent, and the answer is read aloud' : 'Speak instead of typing';
+        micBtn.setAttribute('aria-label', 'Record your voice');
+      }
+    }
+    function drawVoiceClock() {
+      const seconds = (Date.now() - voiceSince) / 1000;
+      micBtn.textContent = '⏹ ' + clockText(seconds) + (voiceLimit > 0 ? ' / ' + clockText(voiceLimit) : '');
+    }
+    function setVoiceState(state, maxSeconds, note) {
+      if (voiceClock !== null) { clearInterval(voiceClock); voiceClock = null; }
+      voiceState = state;
+      micBtn.setAttribute('aria-pressed', state === 'recording' ? 'true' : 'false');
+      micBtn.disabled = state === 'sending';
+      if (state === 'recording') {
+        voiceSince = Date.now();
+        voiceLimit = typeof maxSeconds === 'number' ? maxSeconds : 0;
+        drawVoiceClock();
+        voiceClock = setInterval(drawVoiceClock, 500);
+        micBtn.title = 'Stop recording';
+        showVoiceHint(typeof note === 'string' && note ? note : 'Recording. Click the button again to stop.', false);
+      } else if (state === 'sending') {
+        micBtn.textContent = '…';
+        micBtn.title = 'Turning your voice into text';
+        showVoiceHint('Turning your voice into text...', false);
+      } else {
+        drawMicIdle();
+        if (!voiceErrorShown) showVoiceHint('', false);
+      }
+    }
+    // The words go where the cursor is (or at the end), with a space kept between them and their neighbours. They are
+    // never sent: the person reads them, fixes them, and presses Send.
+    function insertAtCursor(text) {
+      const v = promptInput.value;
+      let a = promptInput.selectionStart;
+      let b = promptInput.selectionEnd;
+      if (typeof a !== 'number' || typeof b !== 'number') { a = v.length; b = v.length; }
+      let words = String(text);
+      if (a > 0 && v.slice(a - 1, a).trim() !== '') words = ' ' + words;
+      if (b < v.length && v.slice(b, b + 1).trim() !== '') words = words + ' ';
+      promptInput.value = v.slice(0, a) + words + v.slice(b);
+      const at = a + words.length;
+      if (typeof promptInput.setSelectionRange === 'function') promptInput.setSelectionRange(at, at);
+      if (typeof promptInput.focus === 'function') promptInput.focus();
+    }
+    micBtn.addEventListener('click', () => {
+      if (speaking && voiceState === 'idle') vscode.postMessage({ type: 'stopSpeaking' });
+      else vscode.postMessage({ type: 'voiceToggle' });
+    });
+
     attachBtn.addEventListener('click', () => pictureInput.click());
     pictureInput.addEventListener('change', () => {
       const files = pictureInput.files ? Array.from(pictureInput.files) : [];
@@ -2237,20 +2490,22 @@ ${AGENT_CONTROLS_CSS}
     });
 
     // Enter calls this too, even while Send is hidden: the busy check is here, not in the button's looks.
-    sendBtn.addEventListener('click', () => {
+    // \`byVoice\`: Conversation mode sends the box the way Send does; every rule below blocks it too, and the words stay.
+    function trySend(byVoice) {
       const text = promptInput.value.trim();
       if (!text && pictures.length === 0) return;
       if (pictureBusy > 0) {
         showPictureHint('A picture is still being added. Send again in a moment.');
         return;
       }
-      if (sendText(text, pictures)) {
+      if (sendText(text, pictures, byVoice)) {
         promptInput.value = '';
         pictures = [];
         drawPictures();
         showPictureHint('');
       }
-    });
+    }
+    sendBtn.addEventListener('click', () => trySend(false));
 
     stopBtn.addEventListener('click', () => {
       // "Stopping" until the extension says the task has ended, so a message cannot start a second task over it.
@@ -2541,6 +2796,7 @@ ${AGENT_CONTROLS_CSS}
             modelLine.textContent = msg.modelLine;
           }
           if (typeof msg.vision === 'boolean') setVision(msg.vision);
+          if (typeof msg.voice === 'boolean') setMic(msg.voice);
           showAutoApprove(msg.autoApprove === true);
           if (msg.controls) agentControls.update(msg.controls);
           if (msg.workerStatus) {
@@ -2779,6 +3035,41 @@ ${AGENT_CONTROLS_CSS}
 
         case 'vision': {
           setVision(msg.on === true);
+          break;
+        }
+
+        case 'voice': {
+          setMic(msg.on === true);
+          break;
+        }
+
+        case 'voiceState': {
+          setVoiceState(msg.state, msg.maxSeconds, msg.note);
+          break;
+        }
+
+        case 'voiceNotice': {
+          showVoiceHint(typeof msg.text === 'string' ? msg.text : '', msg.error === true);
+          break;
+        }
+
+        case 'voiceText': {
+          if (typeof msg.text === 'string' && msg.text) {
+            insertAtCursor(msg.text);
+            if (msg.send === true) trySend(true);
+          }
+          break;
+        }
+
+        case 'speaking': {
+          speaking = msg.on === true;
+          if (voiceState === 'idle') drawMicIdle();
+          break;
+        }
+
+        case 'voiceMode': {
+          conversation = msg.mode === 'conversation';
+          if (voiceState === 'idle') drawMicIdle();
           break;
         }
 

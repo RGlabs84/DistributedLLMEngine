@@ -15,7 +15,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.selection.toggleable
+import androidx.compose.material3.RadioButton
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -50,6 +53,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import io.dlne.chat.BuildConfig
 import io.dlne.chat.R
+import io.dlne.chat.data.VoiceMode
 import io.dlne.chat.update.UpdateSettingsSection
 
 private const val COFFEE_URL = "https://buymeacoffee.com/wubarrk"
@@ -71,6 +75,7 @@ class SettingsActions(
     /** Called with true only after the location permission is granted. */
     val onShareLocationChange: (Boolean) -> Unit,
     val locationPermitted: () -> Boolean,
+    val onVoiceModeChange: (VoiceMode) -> Unit,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -102,6 +107,9 @@ fun SettingsScreen(state: ChatUiState, actions: SettingsActions) {
             ServerSection(state.serverUrl, actions)
 
             LocationSection(state.shareLocation, actions)
+
+            // Offered only where the mic is: the server says it can turn speech into text.
+            if (voiceButtonVisible(state.status)) VoiceModeSection(state.voiceMode, actions)
 
             // Sideload build: the Updates section. Play build: nothing (src/play).
             UpdateSettingsSection()
@@ -195,6 +203,31 @@ private fun ServerSection(serverUrl: String, actions: SettingsActions) {
                 invalid = false
                 actions.onResetServerUrl()
             }) { Text(stringResource(R.string.settings_use_default)) }
+        }
+    }
+}
+
+/** Voice mode: Dictate (the words land in the box) or Conversation (the message sends itself and the answer is read aloud). */
+@Composable
+private fun VoiceModeSection(mode: VoiceMode, actions: SettingsActions) {
+    SectionDivider()
+    SectionTitle(stringResource(R.string.settings_voice_title))
+    Column(Modifier.selectableGroup().padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        BodyText(stringResource(R.string.settings_voice_help))
+        listOf(
+            VoiceMode.DICTATE to R.string.settings_voice_dictate,
+            VoiceMode.CONVERSATION to R.string.settings_voice_conversation,
+        ).forEach { (value, label) ->
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .selectable(selected = mode == value, role = Role.RadioButton) { actions.onVoiceModeChange(value) }
+                    .padding(vertical = 8.dp),
+            ) {
+                RadioButton(selected = mode == value, onClick = null)
+                Text(stringResource(label), style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(start = 16.dp))
+            }
         }
     }
 }

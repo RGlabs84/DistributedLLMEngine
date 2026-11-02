@@ -11,6 +11,10 @@ import androidx.lifecycle.viewModelScope
 import io.dlne.chat.AppGraph
 import io.dlne.chat.R
 import io.dlne.chat.data.ChatHistory
+import io.dlne.chat.data.VoiceMode
+import io.dlne.chat.voice.SPEAK_PICTURE
+import io.dlne.chat.voice.Speaker
+import io.dlne.chat.voice.SpeechFeed
 import io.dlne.chat.data.PhoneLocation
 import io.dlne.chat.data.ChatMessage
 import io.dlne.chat.data.ImageAttachment
@@ -167,6 +171,12 @@ data class ChatUiState(
     val imageJobs: List<ImageJobUi> = emptyList(),
     /** Set while a send waits for the person's answer to "Use your location for this?". */
     val locationAsk: LocationAsk? = null,
+    /** What the mic does (Settings). */
+    val voiceMode: VoiceMode = VoiceMode.DICTATE,
+    /** True while an answer is being read aloud (or waits to be): the mic shows its stop-speaking state. */
+    val speaking: Boolean = false,
+    /** A plain note, once, when there is no voice on the phone to read answers. */
+    val speechNote: String? = null,
 ) {
     /** "Create image" is offered only when the server says it can. */
     val imageAvailable: Boolean get() = status?.imageGeneration == true
@@ -221,6 +231,8 @@ class ChatViewModel(application: Application, private val savedState: SavedState
         /** A Create image request on its way: it has no job id until the server answers. */
         val request: ImageJobUi? = null,
         val locationAsk: LocationAsk? = null,
+        val speaking: Boolean = false,
+        val speechNote: String? = null,
     )
 
     private val transient = MutableStateFlow(Transient())
@@ -231,9 +243,63 @@ class ChatViewModel(application: Application, private val savedState: SavedState
     private var stopRequested = false
     private var rateLimitJob: Job? = null
 
-    private data class Prefs(val serverUrl: String, val privacyAcknowledged: Boolean, val shareLocation: Boolean)
+    // ---- Conversation mode: the answer to a message sent by voice is read aloud, sentence by sentence.
+    private var speaker: Speaker? = null
+    /** Set by [sendByVoice] until [ask] takes it: the language of the clip (or "" when unknown). */
+    private var voiceNext: String? = null
+    /** The feed of the answer now streaming, while it is to be read; null when it is not (or no longer). */
+    private var speechFeed: SpeechFeed? = null
+    private var speechLanguage: String? = null
+    private var speechNoteGiven = false
 
-    private val prefs = combine(settings.serverUrl, settings.privacyAcknowledged, settings.shareLocation, ::Prefs)
+    private fun speaker(): Speaker = speaker ?: Speaker(
+        getApplication(),
+        onSpeaking = { on -> transient.update { it.copy(speaking = on) } },
+        onUnavailable = {
+            speechFeed = null
+            if (!speechNoteGiven) {
+                speechNoteGiven = true
+                transient.update { it.copy(speechNote = Speaker.UNAVAILABLE_NOTE) }
+            }
+        },
+    ).also { speaker = it }
+
+    /** Stops speech now and reads nothing more of the answer in progress. */
+    fun stopSpeaking() {
+        speechFeed = null
+        speaker?.stop()
+    }
+
+    fun speechNoteShown() {
+        transient.update { it.copy(speechNote = null) }
+    }
+
+    fun setVoiceMode(mode: VoiceMode) {
+        settings.setVoiceMode(mode)
+        if (mode == VoiceMode.DICTATE) stopSpeaking()
+    }
+
+    /**
+     * The mic's text is in the box (Conversation mode): sends the box exactly as Send does, every rule included,
+     * and marks the turn as spoken so its answer is read. If something blocks the send the text stays in the box.
+     */
+    fun sendByVoice(language: String?) {
+        if (settings.voiceMode.value != VoiceMode.CONVERSATION) return
+        voiceNext = language.orEmpty()
+        sendDraft(askLocation = true)
+        if (!savingPhotos) voiceNext = null // blocked (or held for the location card): not a spoken turn
+    }
+
+    override fun onCleared() {
+        speechFeed = null
+        speaker?.shutdown()
+        speaker = null
+        super.onCleared()
+    }
+
+    private data class Prefs(val serverUrl: String, val privacyAcknowledged: Boolean, val shareLocation: Boolean, val voiceMode: VoiceMode)
+
+    private val prefs = combine(settings.serverUrl, settings.privacyAcknowledged, settings.shareLocation, settings.voiceMode, ::Prefs)
 
     val uiState: StateFlow<ChatUiState> = combine(
         store.conversations,
@@ -253,6 +319,9 @@ class ChatViewModel(application: Application, private val savedState: SavedState
             serverUrl = p.serverUrl,
             privacyAcknowledged = p.privacyAcknowledged,
             shareLocation = p.shareLocation,
+            voiceMode = p.voiceMode,
+            speaking = t.speaking,
+            speechNote = t.speechNote,
         )
     }.stateIn(
         viewModelScope,
@@ -262,6 +331,7 @@ class ChatViewModel(application: Application, private val savedState: SavedState
             serverUrl = settings.serverUrl.value,
             privacyAcknowledged = settings.privacyAcknowledged.value,
             shareLocation = settings.shareLocation.value,
+            voiceMode = settings.voiceMode.value,
         ),
     )
 
@@ -302,6 +372,7 @@ class ChatViewModel(application: Application, private val savedState: SavedState
                 withTimeoutOrNull(PREPARING_GRACE_MS) { while (photoDraft.preparing.isNotEmpty()) delay(PREPARING_POLL_MS) }
                 savingPhotos = false
                 sendDraft(askLocation = false, declineLocation, note, waited = true)
+                if (!savingPhotos) voiceNext = null
             }
             return
         }
@@ -321,6 +392,7 @@ class ChatViewModel(application: Application, private val savedState: SavedState
             savingPhotos = false
             if (names.any { it == null }) {
                 images.delete(names)
+                voiceNext = null
                 if (draft.isBlank()) draft = typed
                 val now = photoDraft
                 if (now.ready.isEmpty() && now.count + photos.ready.size <= PhotoEncoding.MAX_PHOTOS) {
@@ -528,6 +600,13 @@ class ChatViewModel(application: Application, private val savedState: SavedState
     private fun ask(conversation: Conversation, notes: List<String> = emptyList()) {
         val serverUrl = settings.serverUrl.value
         stopRequested = false
+        stopSpeaking() // a new answer never queues behind speech
+        val spokenTurn = voiceNext
+        voiceNext = null
+        if (spokenTurn != null && settings.voiceMode.value == VoiceMode.CONVERSATION) {
+            speechFeed = SpeechFeed()
+            speechLanguage = spokenTurn.ifEmpty { null }
+        }
         transient.update { it.copy(pending = PendingReply(conversation.id, searchNotes = notes), error = null) }
 
         answerJob = viewModelScope.launch {
@@ -543,7 +622,10 @@ class ChatViewModel(application: Application, private val savedState: SavedState
                 val place = placeFor(conversation)
                 api.streamChat(serverUrl, conversation.id, history, place).collect { event ->
                     when (event) {
-                        is StreamEvent.Content -> updatePending { it.copy(text = it.text + event.text) }
+                        is StreamEvent.Content -> {
+                            updatePending { it.copy(text = it.text + event.text) }
+                            speakNew(final = false)
+                        }
                         is StreamEvent.Notice -> updatePending { it.copy(notice = event.text) }
                         is StreamEvent.Failure ->
                             transient.update { it.copy(error = ChatError(event.message, ErrorKind.SERVER)) }
@@ -555,7 +637,12 @@ class ChatViewModel(application: Application, private val savedState: SavedState
                             updatePending { it.withSearchNote(event.reason.ifBlank { text(R.string.search_unavailable_default) }) }
                         // The model answered from memory while unsure; the server takes that text
                         // back and looks the question up. Start the reply over, keeping the bubble.
-                        StreamEvent.Retract -> updatePending { it.retracted() }
+                        StreamEvent.Retract -> {
+                            // Speech stops at once; the fresh answer that follows is read from its start.
+                            speaker?.stop()
+                            speechFeed?.reset()
+                            updatePending { it.retracted() }
+                        }
                         // The model asked for a picture: the card shows in this reply and the picture lands in it.
                         is StreamEvent.ImageJob -> startReplyPicture(conversation.id, event)
                         is StreamEvent.ImageRefused ->
@@ -574,6 +661,8 @@ class ChatViewModel(application: Application, private val savedState: SavedState
             } catch (e: Exception) {
                 showError(ChatError(text(R.string.error_unexpected), ErrorKind.SERVER))
             } finally {
+                if (!stopRequested && speechFeed != null && transient.value.error == null) finishSpeech()
+                else stopSpeaking()
                 finishReply(conversation.id)
             }
         }
@@ -609,6 +698,22 @@ class ChatViewModel(application: Application, private val savedState: SavedState
             if (place == null) done.withSearchNote(text(R.string.location_note_none)) else done
         }
         return place
+    }
+
+    /** Hands the sentences that became complete to the speaker. */
+    private fun speakNew(final: Boolean) {
+        val feed = speechFeed ?: return
+        val reply = transient.value.pending ?: return
+        val sentences = feed.feed(reply.text, final)
+        if (sentences.isNotEmpty()) speaker().speak(sentences, speechLanguage)
+    }
+
+    /** The answer is over: what is left is said, and a picture made for it is announced. */
+    private fun finishSpeech() {
+        speakNew(final = true)
+        val picture = transient.value.pending?.picture
+        if (picture?.created == true) speaker().speak(listOf(SPEAK_PICTURE), speechLanguage)
+        speechFeed = null
     }
 
     private inline fun updatePending(change: (PendingReply) -> PendingReply) {
@@ -771,6 +876,7 @@ class ChatViewModel(application: Application, private val savedState: SavedState
      * banner with the server's own words, and the request is taken back out of the chat.
      */
     fun createImage(prompt: String, size: String) {
+        stopSpeaking()
         val clean = prompt.trim().takeChars(MAX_IMAGE_PROMPT_CHARS)
         if (clean.isEmpty() || dialogImageBusy() || !settings.privacyAcknowledged.value) return
 
@@ -881,6 +987,7 @@ class ChatViewModel(application: Application, private val savedState: SavedState
     /** The app left the screen: stop polling (the server keeps the result for a few minutes). */
     fun onBackground() {
         visible = false
+        stopSpeaking()
         pollers.values.forEach { it.cancel() }
         pollers.clear()
     }
@@ -1037,6 +1144,7 @@ class ChatViewModel(application: Application, private val savedState: SavedState
     // ------------------------------------------------------------------ conversations
 
     fun newChat() {
+        stopSpeaking()
         savedState.set<String?>(KEY_CURRENT, null)
         draft = ""
         clearPhotoDraft()
@@ -1058,6 +1166,7 @@ class ChatViewModel(application: Application, private val savedState: SavedState
     }
 
     fun openConversation(id: String) {
+        stopSpeaking()
         if (currentId.value != id) {
             draft = ""
             clearPhotoDraft()

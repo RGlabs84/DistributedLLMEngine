@@ -244,6 +244,24 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Eight groups matter for most
   has `capabilities.image_generation_paused: true` and a top-level `images: {paused, note, page}`, and `GET /pictures`
   is a small public page that reads the status live and says whether pictures are paused, on or restarting.
 
+- **Voice, speech to text (2.8.0, off by default)**: `VOICE_ENABLED=true` lets the coordinator turn a short spoken clip into
+  text on the media card (`MEDIA_GPU`) with whisper.cpp's `whisper-server` (Vulkan build in `bin-whisper/`, model in
+  `models/voice/`). It starts on the first clip, unloads after `VOICE_IDLE_UNLOAD_MINUTES` without one, and never runs
+  on a card shared with the coding model. Keys: `VOICE_ENABLED` (`true`, `false` or `paused`, default false; `paused` loads
+  nothing and answers `503 voice_paused`), `VOICE_MODEL` (a file name in `models/voice`, default
+  `ggml-large-v3-turbo-q8_0.bin`), `VOICE_THREADS` (1-16, default 2), `VOICE_CPU_MASK` (hex, as `taskset` takes it; default
+  none), `VOICE_MAX_SECONDS` (5-60, default 60), `VOICE_PER_HOUR` (1-600 clips a network an hour, default 60),
+  `VOICE_QUEUE_MAX` (1-32 waiting, default 8), `VOICE_IDLE_UNLOAD_MINUTES` (0-1440, 0 never, default 20),
+  `VOICE_MIN_FREE_VRAM_GB` (0.3-8, default 1.4, measured 1.07 GB peak on the RX 580 + margin; free memory the media card needs to start it). A value outside its
+  range keeps the default. `POST /v1/audio/transcriptions` (OpenAI-compatible multipart: `file`, optional `language`,
+  `response_format` `json` or `text`, `model` ignored) takes only a WAV, 16-bit PCM, mono, 16 kHz, at most `VOICE_MAX_SECONDS`
+  and 2 MB, and answers `{text, language, duration_seconds}`; errors are `voice_bad_audio` 400, `voice_quota` 429,
+  `voice_busy` 503, `voice_unavailable` 503, `voice_paused` 503. Same authentication and tiers as chat, but a clip spends no
+  free-trial chat; key holders and contributors go first. The audio is held in memory only and the text is not stored;
+  the log says only "a clip of N s, language L, took T s". If a picture is being drawn and the card is short of memory the
+  clip waits for it (a picture is never stopped). `capabilities.voice` and a `voice` block in `/v1/cluster/status`
+  say when it is on. More in [`docs/voice.md`](voice.md).
+
   Pictures asked for in the phone chat (2.6.2): a `POST /v1/app/chat/completions` that sends `"features":
   ["image_jobs"]` (the app and the web chat do) is offered a `create_image` tool while pictures are on, and is told of
   the job with `image_job` / `image_refused` events in the stream; one picture a message, and a request that plainly
@@ -314,6 +332,38 @@ when the host does not already hold that exact file, and backups leave the CUDA 
 them). Workers fetch one from `/v1/download/cuda-bin/<platform>`, verify size and SHA-256 against the signed manifest and
 keep it in `bin-cuda/`, separate from the Vulkan `bin/`. The driver minimum is a single constant,
 `engine.release.CUDA_MIN_DRIVER` (580), with its source cited there.
+## Takeover leases (2.7.1)
+
+A **takeover lease** lets DLNE-Sec (Duka's app) borrow part of the coordinator's hardware for a working session, by PCI
+address, with optional CPU cores and RAM, while DLNE keeps answering with whatever is left and gets everything back when the
+lease ends. The full rules, shapes and refusal codes are in [`docs/takeover-contract.md`](takeover-contract.md); this is what
+an operator needs to know.
+
+- **Operator key, LAN only.** `POST /v1/admin/takeover/plan` (dry run), `POST /v1/admin/takeover` (grant),
+  `PUT` / `DELETE /v1/admin/takeover/{lease_id}` (heartbeat every 15 s / release) and `GET /v1/admin/takeover`. They take the
+  operator key (`ADMIN_KEY_HASH`) and a socket peer on a loopback, private or WireGuard address. A request that carries
+  `X-Forwarded-*`, `Forwarded`, `Via` or `X-Real-IP` is refused, so nothing that came through the HTTPS proxy gets in, and
+  `ADMIN_ALLOW_REMOTE` and `TRUST_PROXY_HEADERS` change nothing here.
+- **An overlay, not an edit.** `config.txt` is never written. A lease lives in `config/takeover.json` (the lease, its expiry,
+  the overlay of limits and the RAM limits to put back); `get_worker_limits()` applies the overlay on top of `config.txt` while a
+  granted, live lease exists. The overlay can set `ALLOWED_GPU_INDICES` (the engine's remaining cards, or `none` for the CPU),
+  `ENGINE_SLOTS` / `ENGINE_CONTEXT` (the lease's `keep` lanes and context, when the engine moves), the CPU masks (`--cpu-mask` in
+  `ENGINE_EXTRA_ARGS`, `IMAGE_CPU_MASK`, with the cores' SMT siblings out too: from `/sys/devices/system/cpu/cpuN/topology`, else
+  CPU n+6 for core n as on TheWall), pictures and voice paused (as `IMAGE_GEN_ENABLED=paused` and `VOICE_ENABLED=paused`; `dlne_now.voice` says `paused`, and is left out where voice is not set up) and the vision projector on the CPU
+  (`--no-mmproj-offload`, no `--mmproj-device`).
+- **RAM** is `systemctl --user set-property --runtime dlne.service MemoryMax=… MemoryHigh=…` (runtime only); the old values are
+  kept in the lease file and set back when it ends.
+- **Ending.** A lease ends when it is released, when its `ttl_seconds` run out or when 45 s pass without a heartbeat. Release
+  answers at once; DLNE is restored in the background (the engine restarts when the idle gate allows: two idle checks 5 s apart)
+  and `GET` shows `restoring` until it is done. A grant that restarts the engine waits for the same idle gate for at most
+  10 minutes, then answers 503 `takeover_busy` with nothing changed; if the engine does not come up on the reduced hardware the
+  grant is rolled back to the plain config (503 `takeover_failed`).
+- **After a crash.** At the coordinator's start a lease file that is expired, has no heartbeat for 45 s, or was still being
+  granted or restored is deleted and its RAM limits put back; a live active lease is kept and the engine is built from it. To end
+  a lease by hand, delete `config/takeover.json` and restart the coordinator.
+- **Visible.** `/v1/cluster/status` and `/v1/admin/stats` carry `takeover: {active, state, holder, since, expires_at}` (no lease id,
+  no address).
+
 ## Security and privacy
 
 - Prompts, and the code the agent reads, go to the coordinator you point the extension at. The

@@ -1673,6 +1673,8 @@ class InferenceManager:
         path = self._projector_path(limits, model_path=model_path)
         if not path:
             return 0.0
+        if limits.get("engine_mmproj_cpu"):
+            return 0.0       # a takeover lease has the projector on the CPU: it takes nothing from the cards
         devices = _engine_devices(limits, remote)
         if devices and devices[2] and not media_gpu_shared(limits):
             return 0.0
@@ -1718,11 +1720,17 @@ class InferenceManager:
             # An image stb_image cannot read (every WebP) would otherwise be piped to an ffmpeg found on PATH;
             # pointed at an empty directory that path cannot start anything, and the image fails as a plain 400.
             args += ["--video-ffmpeg-dir", no_ffmpeg]
-            if media_device:
+            if limits.get("engine_mmproj_cpu"):
+                # A takeover lease (engine/takeover.py) has lent the media card out: the projector stays loaded, on the
+                # CPU, so pictures are read more slowly but vision is still on.
+                args += ["--no-mmproj-offload"]
+                media_device = ""
+            elif media_device:
                 args += ["--mmproj-device", media_device]
             # llama.cpp turns both off for the whole engine once a projector is loaded.
             log_coordinator(
-                f"Vision is on ({os.path.basename(projector)}, on {media_device or 'the first engine card'}): "
+                f"Vision is on ({os.path.basename(projector)}, on "
+                f"{'the CPU' if limits.get('engine_mmproj_cpu') else media_device or 'the first engine card'}): "
                 "the engine's prompt-prefix reuse (--cache-reuse) and context shift are off for every request."
             )
         return args, projector

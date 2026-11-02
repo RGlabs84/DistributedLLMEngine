@@ -2,7 +2,7 @@
   "name": "dlne-code-assistant",
   "displayName": "DLNE Coding Assistant: Free AI Agent",
   "description": "A free AI coding agent and autocomplete, running on GPUs its users share. 100 free chats, no account or API key.",
-  "version": "1.6.0",
+  "version": "1.8.0",
   "publisher": "dlne",
   "license": "MIT",
   "repository": {
@@ -107,6 +107,16 @@
       {
         "command": "dlne.openChatPanel",
         "title": "DLNE: Open Chat Panel",
+        "category": "DLNE"
+      },
+      {
+        "command": "dlne.voice.toggle",
+        "title": "DLNE: Start or Stop Voice Recording",
+        "category": "DLNE"
+      },
+      {
+        "command": "dlne.voice.toggleMode",
+        "title": "DLNE: Toggle Voice Conversation Mode",
         "category": "DLNE"
       },
       {
@@ -311,6 +321,23 @@
           "default": false,
           "markdownDescription": "**Run every agent action without asking**: edits anywhere and every shell command. The agent's next step can come from a volunteer's machine (a coding member), so with this on, a command it sends runs on your computer unseen. Off, the approval dialog's **Always allow** buttons remember edits in a project and one command at a time. Flip it from the status bar (**DLNE: Auto** / **DLNE: Ask**), the sidebar's **Auto** button or **DLNE: Toggle Auto-Approve**; it takes effect at the agent's next step. Only your user settings can turn this on; a project's settings cannot."
         },
+        "dlne.voice.enabled": {
+          "type": "boolean",
+          "scope": "application",
+          "default": true,
+          "description": "Show the microphone button in the DLNE Agent panel, so you can speak instead of type. It appears only while the DLNE server offers voice and this computer has a sound recorder. Your voice clip is sent to the DLNE server to be turned into text and is not kept."
+        },
+        "dlne.voice.mode": {
+          "type": "string",
+          "scope": "application",
+          "enum": ["dictate", "conversation"],
+          "enumDescriptions": [
+            "What you say is typed into the message box, and you press Send.",
+            "What you say is sent as your message, and this computer reads the answer aloud with its own voice. Only the agent's written reply is read (not tool calls, file edits, terminal output or diffs), up to 1,500 characters a turn."
+          ],
+          "default": "dictate",
+          "description": "What the microphone button in the DLNE Agent panel does. Dictate (the default): your words go in the message box and nothing is sent until you press Send. Conversation: your words are sent at once and the answer is read aloud by this computer's own speech (Windows PowerShell speech, macOS say, Linux espeak-ng, espeak or spd-say; if none is found, DLNE tells you what to install and the answer stays text). The audio of the answer is made on your computer; nothing new goes to the DLNE server. Also available as the command DLNE: Toggle Voice Conversation Mode."
+        },
         "dlne.agent.maxTurns": {
           "type": "integer",
           "scope": "application",
@@ -351,6 +378,14 @@
         }
       }
     },
+    "keybindings": [
+      {
+        "command": "dlne.voice.toggle",
+        "key": "ctrl+alt+v",
+        "mac": "cmd+alt+v",
+        "when": "focusedView == dlne.chatView || editorTextFocus"
+      }
+    ],
     "menus": {
       "view/title": [
         {

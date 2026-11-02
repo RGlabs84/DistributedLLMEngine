@@ -12,7 +12,9 @@ Public surface (relied on by other modules — do not rename):
     get_base_dir()     absolute path of the installation root (writable state)
     get_bundle_dir()   absolute path of the read-only assets shipped inside the build
     get_config()       raw ``UPPERCASE_KEY -> str`` snapshot, cached on the file's stat
-    get_worker_limits()typed view of the subset the engine treats as operational limits
+    get_worker_limits()typed view of the subset the engine treats as operational limits, with a takeover lease's
+                       overlay on top while one is active (engine/takeover.py)
+    get_plain_worker_limits()  the same view from config.txt alone
     set_config_values()atomic read-modify-write that preserves comments and unknown keys
 """
 
@@ -269,6 +271,9 @@ ENGINE_DEFAULTS = {
     "engine_kv_type": "auto",
     "engine_flavor": "vulkan",
     "engine_mmproj": "",
+    # Set only by a takeover lease (engine/takeover.py, 2.7.1), never from config.txt: the vision projector runs on the
+    # CPU (llama.cpp's --no-mmproj-offload) because the media card is lent out.
+    "engine_mmproj_cpu": False,
     "engine_image_max_tokens": 1024,
     "image_input_per_hour": 30,
 }
@@ -305,6 +310,30 @@ IMAGE_RANGES = {
     "IMAGE_IDLE_UNLOAD_MINUTES": (0, 1440),      # 0: never unload
     "IMAGE_RESULT_TTL_SECONDS": (60, 3600),
 }
+# Voice, speech to text (2.8.0, docs/voice.md, docs/voice-contract.md): whisper.cpp's whisper-server on the media card,
+# off unless VOICE_ENABLED=true. VOICE_ENABLED=paused is off as far as loading goes and is answered "paused" (and a
+# takeover lease on the media card sets it, like IMAGE_GEN_ENABLED=paused). VOICE_MODEL is a file name in models/voice.
+# VOICE_CPU_MASK "" pins nothing. A number outside its range keeps the default.
+VOICE_DEFAULTS = {
+    "voice_enabled": False,
+    "voice_paused": False,
+    "voice_model": "ggml-large-v3-turbo-q8_0.bin",
+    "voice_threads": 2,
+    "voice_cpu_mask": "",
+    "voice_max_seconds": 60,
+    "voice_per_hour": 60,
+    "voice_queue_max": 8,
+    "voice_idle_unload_minutes": 20,
+    "voice_min_free_vram_gb": 1.4,
+}
+VOICE_RANGES = {
+    "VOICE_THREADS": (1, 16),
+    "VOICE_MAX_SECONDS": (5, 60),
+    "VOICE_PER_HOUR": (1, 600),
+    "VOICE_QUEUE_MAX": (1, 32),
+    "VOICE_IDLE_UNLOAD_MINUTES": (0, 1440),      # 0: never unload
+}
+VOICE_MIN_FREE_VRAM_GB_RANGE = (0.3, 8.0)
 ENGINE_SLOTS_MAX = 32
 ENGINE_PHONE_SLOTS_MAX = 8
 ENGINE_ARG_FLAGS_WITH_VALUE = frozenset({
@@ -402,7 +431,23 @@ CODING_MEMBER_DEFAULTS = {
 
 def get_worker_limits() -> dict:
     """
-    Returns the typed operational limits, with defaults for every key.
+    The typed operational limits, with a takeover lease's overlay applied while one is active (2.7.1,
+    docs/takeover-contract.md): ``config.txt`` as read by :func:`get_plain_worker_limits`, with the lease's changes
+    on top. A lease never writes ``config.txt``; with no lease file (or a stale one) this is the plain config.
+    """
+    limits = get_plain_worker_limits()
+    try:
+        from engine import takeover
+        return takeover.apply_active_overlay(limits)
+    except Exception as exc:                                  # noqa: BLE001 - the limits must always answer
+        _log_config_error(f"The takeover overlay could not be applied ({type(exc).__name__}: {exc}); "
+                          "the plain configuration is used.")
+        return limits
+
+
+def get_plain_worker_limits() -> dict:
+    """
+    Returns the typed operational limits from ``config.txt``, with defaults for every key (no takeover overlay).
 
     Key names and types are part of the internal API (hardware.py, coordinator.py,
     worker.py, inference_manager.py and downloader.py all index this dict), so they are
@@ -436,6 +481,10 @@ def get_worker_limits() -> dict:
         # on /v1/admin/*. Only the hash lives here; `dlne_server.py adminkey create` mints
         # the key and prints it exactly once. Empty disables key-based admin access.
         "admin_key_hash": "",
+        # SHA-256 (hex) of a takeover-only key (2.7.3): it opens /v1/admin/takeover* and nothing else, so a tool that lends
+        # itself TheWall's hardware (DLNE-Sec's Duka) never holds the operator key. `dlne_server.py takeoverkey create
+        # --out FILE` mints it straight into a file; empty (the default) means only the operator key opens takeover leases.
+        "takeover_key_hash": "",
         # Admin-key requests are accepted only from this machine unless this is on. BarrkBOT
         # shares the coordinator's host, so the default needs no exposure to the network.
         "admin_allow_remote": False,
@@ -546,6 +595,7 @@ def get_worker_limits() -> dict:
         **SPEC_DEFAULTS,
         **ENGINE_DEFAULTS,
         **IMAGE_DEFAULTS,
+        **VOICE_DEFAULTS,
         # What a node with no usable GPU must bring to be admitted. Generating a token reads
         # every weight a node holds, so a CPU node's speed is its memory bandwidth, and one
         # slow node holds up every token of the pipeline it sits in. These are floors: an
@@ -678,6 +728,9 @@ def get_worker_limits() -> dict:
 
     if "ADMIN_KEY_HASH" in config:
         limits["admin_key_hash"] = config["ADMIN_KEY_HASH"].strip().lower()
+
+    if "TAKEOVER_KEY_HASH" in config:
+        limits["takeover_key_hash"] = config["TAKEOVER_KEY_HASH"].strip().lower()
 
     if "ADMIN_ALLOW_REMOTE" in config:
         limits["admin_allow_remote"] = _as_bool(config["ADMIN_ALLOW_REMOTE"])
@@ -1003,6 +1056,40 @@ def get_worker_limits() -> dict:
         # Hex, as `taskset` takes it; anything else keeps the default (no pinning).
         if len(mask) > 2 and all(c in "0123456789abcdef" for c in mask[2:]):
             limits["image_cpu_mask"] = mask
+
+    if "VOICE_ENABLED" in config:
+        limits["voice_enabled"] = _as_bool(config["VOICE_ENABLED"])
+        # Paused is never also enabled: nothing that loads or starts whisper-server runs.
+        limits["voice_paused"] = config["VOICE_ENABLED"].strip().lower() == "paused"
+
+    if "VOICE_MODEL" in config:
+        model = config["VOICE_MODEL"].strip()
+        # A file name inside models/voice and nothing else: no path, no parent directory.
+        if model and model == os.path.basename(model) and model not in (".", ".."):
+            limits["voice_model"] = model
+
+    for key, (low, high) in VOICE_RANGES.items():
+        if key in config:
+            try:
+                value = int(config[key].strip())
+            except ValueError:
+                continue
+            if low <= value <= high:
+                limits[key.lower()] = value
+
+    if "VOICE_MIN_FREE_VRAM_GB" in config:
+        try:
+            free_gb = float(config["VOICE_MIN_FREE_VRAM_GB"].strip())
+        except ValueError:
+            free_gb = -1.0
+        if VOICE_MIN_FREE_VRAM_GB_RANGE[0] <= free_gb <= VOICE_MIN_FREE_VRAM_GB_RANGE[1]:      # NaN fails both
+            limits["voice_min_free_vram_gb"] = free_gb
+
+    if "VOICE_CPU_MASK" in config:
+        mask = config["VOICE_CPU_MASK"].strip().lower()
+        mask = mask if mask.startswith("0x") else "0x" + mask
+        if len(mask) > 2 and all(c in "0123456789abcdef" for c in mask[2:]):
+            limits["voice_cpu_mask"] = mask
 
     if "REBALANCE_ON_JOIN" in config:
         limits["rebalance_on_join"] = _as_bool(config["REBALANCE_ON_JOIN"])

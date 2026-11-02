@@ -94,6 +94,13 @@ _CUDA_MEMBER_RE = re.compile(
 _SD_BUILD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SD_FIELDS = ("sd_build", "server_sd_sha256", "server_sd_size")
 
+# The voice engine (2.8.0): whisper.cpp's whisper-server, run by the coordinator on its media card. Shipped exactly like
+# the image engine: ``whisper_build`` (the upstream tag, like "v1.9.5") and the size and SHA-256 of
+# ``server-whisper.tar.gz`` (server_whisper_sha256 / server_whisper_size), unpacked by scripts/release_apply.py into
+# <root>/bin-whisper/. A node older than 2.8.0 ignores the three fields; a release without them is what it was before.
+_WHISPER_BUILD_RE = _SD_BUILD_RE
+WHISPER_FIELDS = ("whisper_build", "server_whisper_sha256", "server_whisper_size")
+
 
 def rpc_zip_name(platform: str) -> str:
     return f"rpc-bin-{platform}.zip"
@@ -661,9 +668,13 @@ def make_manifest(version: str, archive_path: str, git_commit: str, built_at: st
                   app_models: Optional[List[Dict[str, Any]]] = None,
                   coding_models: Optional[List[Dict[str, Any]]] = None,
                   sd_build: Optional[str] = None, server_sd: Optional[str] = None,
-                  cuda_zips: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+                  cuda_zips: Optional[Dict[str, str]] = None,
+                  whisper_build: Optional[str] = None, server_whisper: Optional[str] = None) -> Dict[str, Any]:
     """
     The unsigned manifest for ``archive_path``. Every string is validated as printable ASCII.
+
+    ``server_whisper`` is the voice engine's archive (server-whisper.tar.gz) and ``whisper_build`` the upstream tag it is
+    built from (like v1.9.5); both or neither.
 
     ``server_sd`` is the image engine's archive (server-sd.tar.gz) and ``sd_build`` the upstream build it is made from;
     both or neither.
@@ -716,6 +727,12 @@ def make_manifest(version: str, archive_path: str, git_commit: str, built_at: st
         manifest["sd_build"] = sd_build
         manifest["server_sd_sha256"] = sha256_file(server_sd)
         manifest["server_sd_size"] = os.path.getsize(server_sd)
+    if whisper_build is not None or server_whisper is not None:
+        if not (isinstance(whisper_build, str) and _WHISPER_BUILD_RE.fullmatch(whisper_build) and server_whisper):
+            raise ReleaseError("The voice engine needs the whisper build it comes from (like v1.9.5) and its archive.")
+        manifest["whisper_build"] = whisper_build
+        manifest["server_whisper_sha256"] = sha256_file(server_whisper)
+        manifest["server_whisper_size"] = os.path.getsize(server_whisper)
     if app_models:
         ids = []
         for model in app_models:
@@ -837,6 +854,14 @@ def verify_manifest(manifest: Any, pubkey_hex: Optional[str] = None) -> Tuple[bo
             return (False, "the manifest has no valid server_sd_sha256")
         if not isinstance(sd_size, int) or isinstance(sd_size, bool) or sd_size <= 0:
             return (False, "the manifest has no valid server_sd_size")
+    if any(key in manifest for key in WHISPER_FIELDS):
+        if not (isinstance(manifest.get("whisper_build"), str) and _WHISPER_BUILD_RE.fullmatch(manifest["whisper_build"])):
+            return (False, "the manifest has no valid whisper_build")
+        w_sha, w_size = manifest.get("server_whisper_sha256"), manifest.get("server_whisper_size")
+        if not isinstance(w_sha, str) or not _SHA256_RE.fullmatch(w_sha):
+            return (False, "the manifest has no valid server_whisper_sha256")
+        if not isinstance(w_size, int) or isinstance(w_size, bool) or w_size <= 0:
+            return (False, "the manifest has no valid server_whisper_size")
     if "app_tiers" in manifest:
         tiers = app_tiers(manifest)
         if not tiers:
@@ -911,6 +936,12 @@ def verify_server_sd(manifest: Dict[str, Any], path: str) -> Tuple[bool, str]:
     """The image engine's archive on disk is the one the (verified) manifest names."""
     return _verify_asset(manifest, "server_sd_sha256", "server_sd_size", path,
                          "the release does not sign an image engine", "image engine archive")
+
+
+def verify_server_whisper(manifest: Dict[str, Any], path: str) -> Tuple[bool, str]:
+    """The voice engine's archive on disk is the one the (verified) manifest names."""
+    return _verify_asset(manifest, "server_whisper_sha256", "server_whisper_size", path,
+                         "the release does not sign a voice engine", "voice engine archive")
 
 
 def _verify_asset(manifest: Dict[str, Any], sha_key: str, size_key: str, path: str,

@@ -7,6 +7,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+/** What the mic does: put the words in the box (Dictate), or send them and read the answer aloud (Conversation). */
+enum class VoiceMode { DICTATE, CONVERSATION }
+
 /** The settings the app keeps: the server address, whether the privacy notice was read, and whether to share the location. */
 class SettingsStore(private val prefs: SharedPreferences) {
     constructor(context: Context) : this(context.getSharedPreferences("dlne_settings", Context.MODE_PRIVATE))
@@ -20,6 +23,16 @@ class SettingsStore(private val prefs: SharedPreferences) {
     // Off until the person turns it on (and allows the permission it needs).
     private val _shareLocation = MutableStateFlow(prefs.getBoolean(PREF_SHARE_LOCATION, false))
     val shareLocation: StateFlow<Boolean> = _shareLocation.asStateFlow()
+
+    private val _voiceMode = MutableStateFlow(
+        if (prefs.getString(PREF_VOICE_MODE, null) == "conversation") VoiceMode.CONVERSATION else VoiceMode.DICTATE,
+    )
+    val voiceMode: StateFlow<VoiceMode> = _voiceMode.asStateFlow()
+
+    fun setVoiceMode(mode: VoiceMode) {
+        prefs.edit().putString(PREF_VOICE_MODE, if (mode == VoiceMode.CONVERSATION) "conversation" else "dictate").apply()
+        _voiceMode.value = mode
+    }
 
     /**
      * The saved address, with the old public address upgraded to the current default without
@@ -55,7 +68,16 @@ class SettingsStore(private val prefs: SharedPreferences) {
         _shareLocation.value = on
     }
 
+    /** True once the person has read the one-time note that a voice clip goes to the DLNE server to become text. */
+    val voiceNoteSeen: Boolean get() = prefs.getBoolean(PREF_VOICE_NOTE, false)
+
+    fun markVoiceNoteSeen() {
+        prefs.edit().putBoolean(PREF_VOICE_NOTE, true).apply()
+    }
+
     private companion object {
+        const val PREF_VOICE_MODE = "voice_mode"
+        const val PREF_VOICE_NOTE = "voice_note_seen_v1"
         const val PREF_SERVER_URL = "server_url"
         const val PREF_PRIVACY_ACK = "privacy_acknowledged_v1"
         const val PREF_SHARE_LOCATION = "share_location"

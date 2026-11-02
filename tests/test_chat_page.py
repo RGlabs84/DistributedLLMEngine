@@ -282,7 +282,7 @@ def test_the_page_talks_only_to_the_phone_endpoints():
     """Never the coding engine: that would spend the visitor's coding trial."""
     page = chat_page.CHAT_HTML
     assert set(re.findall(r"/v1/[\w/.-]*", page)) == {
-        "/v1/app/chat/completions", "/v1/app/report", "/v1/app/images", "/v1/cluster/status"}
+        "/v1/app/chat/completions", "/v1/app/report", "/v1/app/images", "/v1/cluster/status", "/v1/audio/transcriptions"}
 
 
 def test_the_privacy_notice_is_shown_once_and_repeated_under_the_input():
@@ -536,6 +536,44 @@ out.places = [
   { latitude: 40.123456, longitude: -74.564949 }, { latitude: -33.8688, longitude: 151.2093 }, { latitude: 0.000004, longitude: -0.000004 },
   { latitude: 91, longitude: 0 }, { latitude: 10, longitude: 181 }, { latitude: NaN, longitude: 5 }, { latitude: null, longitude: null }, null,
 ].map(C.place);
+// Following the answer (2.8.1): [stick, top, lastTop, gap] -> follow after this scroll event?
+out.follow = [
+  [true, 500, 500, 0], [true, 480, 500, 300], [true, 499.5, 500, 300], [false, 900, 600, 300], [false, 980, 900, 10],
+  [true, 400, 500, 20], [false, 500, 500, 500], [true, 500, 500, 500],
+].map((a) => C.followAfterScroll(...a));
+// Conversation mode (2.8.2): the contract's shared vectors, then the streaming helper and the voice choice.
+out.speech = [
+  '**Paris** is the capital [1].',
+  'Run this:\n\n```bash\nls -la\n```\n\nDone.',
+  'See [the docs](https://x.test/a) or https://y.test/b.',
+  '- one\n- two',
+  'It costs 3.5 dollars, e.g. today. Really!',
+  '| a | b |\n|---|---|\n| 1 | 2 |',
+  'Use `git status` first.',
+].map(C.speechSentences);
+out.speechMore = [
+  '# Title\n> quote _it_ and __bold__ [2][3] ok\n1. first\n2) second',
+  'Two blocks:\n```\na\n```\n```\nb\n```\nEnd.',
+  'An open block:\n```js\nlet x = 1;',
+  '![a cat](http://c.test/c.png) and *this* and ~~that~~ and a * b',
+  '   \n\n---\n',
+  '',
+  null,
+].map(C.speechSentences);
+let said = 0;
+out.speechStream = ['Hello there. It costs 3.', 'Hello there. It costs 3.5 dollars. Next', 'Hello there. It costs 3.5 dollars. Next one!']
+  .map((t) => { const r = C.speechNext(t, said, false); said = r.count; return r.sentences; });
+out.speechFlush = C.speechNext('Hello there. It costs 3.5 dollars. Next one!', said, true);
+out.speechStale = C.speechNext('Short.  ', 9, false);
+const feed = { count: 0, len: 0 };
+const steps = [['The old guess is here. And more. Tail', false], ['', false], ['Fresh start. Second one', false], ['Fresh start. Second one. Third.', true]];
+out.speechRetract = steps.map(([t, f]) => { const r = C.speechFeed(feed, t, f); return [r.sentences, r.reset]; });
+out.voices = [
+  C.pickVoice([{ lang: 'en_US' }, { lang: 'fr-FR' }, { lang: 'fr-CA', default: true }], 'fr').lang,
+  C.pickVoice([{ lang: 'en-US' }], 'de'), C.pickVoice([{ lang: 'en-US' }], ''), C.pickVoice([], 'en'), C.pickVoice(null, 'en'),
+  C.pickVoice([{ lang: 'pt-BR', localService: false }, { lang: 'pt-PT', localService: true }], 'pt').lang,
+  C.pickVoice([{ lang: 'en-GB' }], 'EN-us').lang,
+];
 process.stdout.write(JSON.stringify(out));
 """
 
@@ -551,6 +589,23 @@ def core_run(tmp_path_factory):
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
+
+
+def test_scrolling_up_stops_following_the_answer_and_the_end_resumes_it(core_run):
+    # Owner, 2.8.1: "if I scroll up on the answer to read something it constantly pushes what I'm trying to read".
+    assert core_run["follow"] == [
+        True,    # at the end: follow
+        False,   # moved up 20 px, far from the end: stop at once (it used to keep following until 80 px)
+        True,    # a half-pixel wobble is not the reader moving up
+        False,   # scrolling down but not at the end yet: still reading, still not following
+        True,    # back within 24 px of the end: follow again
+        True,    # moved up but still within 24 px of the end: the end wins
+        False,   # nothing moved: keep not following
+        True,    # nothing moved: keep following
+    ]
+    chat_html = chat_page.CHAT_HTML
+    assert 'id="latest"' in chat_html and "ui.latest.addEventListener('click', () => scrollToEnd(true))" in chat_html
+    assert "if (stick && (force || !touching)) ui.log.scrollTop = ui.log.scrollHeight;" in chat_html
 
 
 def test_search_events_survive_any_split_of_the_stream(core_run):
@@ -2210,3 +2265,261 @@ def test_the_location_card_stays_only_while_the_held_words_are_a_local_question(
     # a local question; a follow-up to one; deleted words (even after a weather question); words edited into something else;
     # sharing already on; no geolocation in the browser; "Not now" already said in this chat; no words at all
     assert header_run["card"] == [True, True, False, False, False, False, False, False, False, False]
+
+
+# ---------------------------------------------------------------- voice (docs/voice-contract.md): the microphone
+
+_VOICE_HARNESS = _NODE_PRELUDE + r"""
+const out = {};
+const sine = (n, rate, hz) => Float32Array.from({ length: n }, (_, i) => Math.sin(2 * Math.PI * hz * i / rate));
+
+// Downmix: two channels become their mean; one is copied.
+out.mono = [Array.from(C.voiceMono([Float32Array.of(1, 0.5, -1), Float32Array.of(0, 0.5, -1)])), Array.from(C.voiceMono([Float32Array.of(0.25)])),
+            C.voiceMono([]).length];
+
+// Resample: 48 kHz and 44.1 kHz to 16 kHz keep the length (to the sample) and the level; 8 kHz goes up.
+out.lengths = [[48000, 48000], [44100, 44100], [16000, 16000], [8000, 8000], [32000, 3200]].map(([rate, n]) => C.voiceResample(sine(n, rate, 440), rate, 16000).length);
+const dc = C.voiceResample(new Float32Array(4800).fill(0.5), 48000, 16000);
+out.dc = [dc.length, Math.min.apply(null, dc), Math.max.apply(null, dc)];
+const tone = C.voiceResample(sine(48000, 48000, 440), 48000, 16000);
+out.toneMax = Math.max.apply(null, tone.map(Math.abs));
+out.up = Array.from(C.voiceResample(Float32Array.of(0, 1), 8000, 16000)).map((x) => Math.round(x * 100) / 100);
+out.empty = [C.voiceResample(new Float32Array(0), 48000, 16000).length, C.voiceResample(Float32Array.of(1), 0, 16000).length];
+
+// The WAV: RIFF/WAVE, PCM (1), one channel, 16000 Hz, 16 bits, sizes that match, samples clipped and scaled.
+const wav = C.voiceWav(Float32Array.of(0, 0.5, -0.5, 1, -1, 2, -2), 16000);
+const v = new DataView(wav.buffer);
+const tag = (at) => String.fromCharCode(wav[at], wav[at + 1], wav[at + 2], wav[at + 3]);
+out.wav = {
+  size: wav.length, riff: tag(0), wave: tag(8), fmt: tag(12), data: tag(36), fmtSize: v.getUint32(16, true), format: v.getUint16(20, true),
+  channels: v.getUint16(22, true), rate: v.getUint32(24, true), byteRate: v.getUint32(28, true), align: v.getUint16(32, true),
+  bits: v.getUint16(34, true), riffSize: v.getUint32(4, true), dataSize: v.getUint32(40, true),
+  samples: [0, 1, 2, 3, 4, 5, 6].map((i) => v.getInt16(44 + i * 2, true)),
+};
+out.silentWav = C.voiceWav(new Float32Array(0)).length;
+
+// The request: multipart with the clip as ``file`` (audio/wav) and response_format=json.
+const form = C.voiceForm(wav);
+const file = form.get('file');
+out.form = { keys: Array.from(form.keys()), name: file.name, type: file.type, size: file.size, format: form.get('response_format') };
+
+out.clock = [0, 4.9, 59, 60, 61.2, 125, -3, 'x'].map(C.voiceClock);
+out.max = [undefined, {}, { voice: { max_seconds: 30 } }, { voice: { max_seconds: 0 } }, { voice: { max_seconds: 'a' } }, { voice: { max_seconds: 9999 } },
+           { voice: null }].map(C.voiceMax);
+out.errors = {
+  quota: C.voiceError(429, 'voice_quota', 'ignored words'), quotaNoCode: C.voiceError(429, '', ''),
+  paused: C.voiceError(503, 'voice_paused', 'Voice is paused while the card is lent out.'), pausedBare: C.voiceError(503, 'voice_paused', ''),
+  unavailable: C.voiceError(503, 'voice_unavailable', 'Voice is not set up on this server.'), unavailableBare: C.voiceError(503, 'voice_unavailable', ''),
+  busy: C.voiceError(503, 'voice_busy', ''), bad: C.voiceError(400, 'voice_bad_audio', 'That clip is longer than 60 seconds.'),
+  badBare: C.voiceError(400, 'voice_bad_audio', ''), other: C.voiceError(500, '', ''), html: C.voiceError(503, 'voice_paused', '<b>x</b>  y'),
+};
+out.mic = ['NotAllowedError', 'NotFoundError', 'NotReadableError', 'unsupported', 'Weird'].map(C.micError);
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+@pytest.fixture(scope="module")
+def voice_run(tmp_path_factory):
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    folder = tmp_path_factory.mktemp("chat-voice")
+    (folder / "page.html").write_text(chat_page.CHAT_HTML, encoding="utf-8")
+    (folder / "harness.js").write_text(_VOICE_HARNESS, encoding="utf-8")
+    result = subprocess.run(["node", str(folder / "harness.js"), str(folder / "page.html")],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_the_microphone_is_hidden_until_the_status_says_voice():
+    page = chat_page.CHAT_HTML
+    field = page.split('<div class="field" id="field">', 1)[1].split("</form>", 1)[0]
+    mic = next(t for t in _tags("button") if t.get("id") == "mic")
+    assert mic["type"] == "button" and "hidden" in mic                              # hidden until the status says voice
+    assert mic["aria-label"] == "Record a voice message" and mic["aria-pressed"] == "false"
+    assert field.index('id="input"') < field.index('id="mic"') < field.index('id="send"')   # beside the box, before Send
+    assert "data.capabilities.voice === true" in page                              # only an explicit true shows it
+    assert "ui.mic.hidden = !voiceSupport;" in page
+    assert "readVoiceSupport(data);" in page
+    timer = next(t for t in _tags("span") if t.get("id") == "mic-timer")
+    assert "hidden" in timer and timer["aria-hidden"] == "true"                    # the ticking clock is not read out every second
+    note = next(t for t in _tags("p") if t.get("id") == "voice-note")
+    assert note["role"] == "status" and "hidden" in note                           # a recording state and errors are announced
+
+
+def test_the_microphone_is_a_tap_to_start_tap_to_stop_button_a_keyboard_can_use():
+    page = chat_page.CHAT_HTML
+    # 2.8.2: the tap handler also unlocks speech (iPhone) and doubles as "Stop speaking"; the recording rules are unchanged.
+    handler = page.split("ui.mic.addEventListener('click', () => {", 1)[1].split("\n  });", 1)[0]
+    assert "if (recorder) { unlockSpeech(); stopRecording(false); return; }" in handler and "startRecording();" in handler
+    assert "ui.mic.setAttribute('aria-pressed', recording ? 'true' : 'false');" in page
+    assert "recording ? 'Stop recording' : transcribing" in page
+    assert "if (seconds >= voiceMaxSeconds) stopRecording(false);" in page         # stops by itself at voice.max_seconds
+    assert "Number(data.voice.max_seconds)" in page
+    assert "if (e.key === 'Escape' && recorder) { stopRecording(true); ui.mic.focus(); return; }" in page
+    assert "navigator.mediaDevices.getUserMedia" in page and "createScriptProcessor" in page
+    assert "t.stop()" in page and "r.ctx.close" in page                            # the microphone is let go of
+    assert "'Recording. Tap the microphone again to stop.'" in page
+
+
+def test_the_clip_is_sent_to_the_transcription_endpoint_and_the_words_are_never_sent_on_their_own():
+    page = chat_page.CHAT_HTML
+    assert "fetch(VOICE_ENDPOINT, { method: 'POST', body: voiceForm(wav), cache: 'no-store' })" in page
+    assert "VOICE_ENDPOINT = '/v1/audio/transcriptions'" in page
+    body = page.split("function insertAtCursor", 1)[1].split("// ----------------", 1)[0]
+    assert "submit(" not in body and "ui.form" not in body                         # inserted, never sent
+    assert "box.selectionStart" in body and "box.setSelectionRange(caret, caret)" in body
+    assert "box.maxLength" in body                                                 # the box's 8000 limit holds
+    transcribe = page.split("async function transcribe", 1)[1].split("function insertAtCursor", 1)[0]
+    assert "submit(" not in transcribe and "headers" not in transcribe             # same-origin, like chat: nothing added
+    assert "Content-Type" not in transcribe                                        # the browser adds the multipart boundary
+
+
+def test_the_first_use_says_once_where_the_clip_goes():
+    page = chat_page.CHAT_HTML
+    assert "DLNE server to be turned into text. It is not kept." in page
+    assert "store.get(VOICE_SEEN) === '1' ? '' : VOICE_NOTICE" in page
+    assert "store.set(VOICE_SEEN, '1');" in page
+
+
+def test_the_wav_is_pcm16_mono_16khz_with_a_correct_header(voice_run):
+    wav = voice_run["wav"]
+    assert (wav["riff"], wav["wave"], wav["fmt"], wav["data"]) == ("RIFF", "WAVE", "fmt ", "data")
+    assert wav["size"] == 44 + 7 * 2 and wav["riffSize"] == wav["size"] - 8 and wav["dataSize"] == 14
+    assert wav["fmtSize"] == 16 and wav["format"] == 1                             # PCM
+    assert wav["channels"] == 1 and wav["rate"] == 16000 and wav["bits"] == 16     # mono, 16 kHz, 16-bit
+    assert wav["byteRate"] == 32000 and wav["align"] == 2
+    assert wav["samples"] == [0, 16384, -16384, 32767, -32768, 32767, -32768]      # scaled, and anything louder is clipped
+    assert voice_run["silentWav"] == 44                                            # no samples: a header only
+
+
+def test_the_clip_is_downmixed_to_mono_and_resampled_to_16khz(voice_run):
+    assert voice_run["mono"] == [[0.5, 0.5, -1.0], [0.25], 0]
+    assert voice_run["lengths"] == [16000, 16000, 16000, 16000, 1600]
+    assert voice_run["up"] == [0, 0.5, 1, 1]
+    assert voice_run["empty"] == [0, 0]
+    length, low, high = voice_run["dc"]
+    assert length == 1600 and abs(low - 0.5) < 1e-6 and abs(high - 0.5) < 1e-6     # a steady level survives the averaging
+    assert 0.9 < voice_run["toneMax"] <= 1.0                                       # a 440 Hz tone keeps its loudness
+
+
+def test_the_request_is_multipart_with_the_file_and_json_format(voice_run):
+    form = voice_run["form"]
+    assert form["keys"] == ["file", "response_format"] and form["format"] == "json"
+    assert form["type"] == "audio/wav" and form["name"] == "clip.wav" and form["size"] == 44 + 7 * 2
+
+
+def test_the_timer_and_the_limit(voice_run):
+    assert voice_run["clock"] == ["0:00", "0:04", "0:59", "1:00", "1:01", "2:05", "0:00", "0:00"]
+    assert voice_run["max"] == [60, 60, 30, 60, 60, 60, 60]                        # a sensible number from the status, else 60
+
+
+def test_errors_are_in_plain_words(voice_run):
+    e = voice_run["errors"]
+    assert e["quota"] == "Voice is used up for this hour. Please try again later, or type your message."
+    assert e["quotaNoCode"] == e["quota"]
+    assert e["paused"] == "Voice is paused while the card is lent out." and e["pausedBare"] == "Voice is paused right now."
+    assert e["unavailable"] == "Voice is not set up on this server." and e["unavailableBare"] == "Voice isn't available right now."
+    assert e["busy"] == "Voice is busy right now. Please try again in a moment."
+    assert e["bad"] == "That clip is longer than 60 seconds." and e["badBare"] == "That clip couldn't be read. Please try again."
+    assert e["other"] == "DLNE couldn't turn that into text (HTTP 500). Please try again."
+    assert e["html"] == "<b>x</b> y"                                               # shown as text (textContent), spaces tidied
+    allowed, missing, busy, unsupported, weird = voice_run["mic"]
+    assert "blocked" in allowed and "settings" in allowed
+    assert "No microphone" in missing and "in use" in busy and "secure" in unsupported
+    assert "couldn't be started" in weird
+    page = chat_page.CHAT_HTML
+    assert "That was too short." in page and "I didn't catch any words." in page and "Couldn't reach DLNE." in page
+
+
+def test_voice_notes_reach_the_page_as_text_only():
+    page = chat_page.CHAT_HTML
+    note = page.split("function showVoiceNote", 1)[1].split("  }\n", 1)[0]
+    assert "textContent" in note and "innerHTML" not in note
+
+
+def test_speech_text_gives_the_contracts_shared_vectors(core_run):
+    assert core_run["speech"] == [
+        ["Paris is the capital."],
+        ["Run this:", "There's code in the chat.", "Done."],
+        ["See the docs or."],                                   # a bare URL is dropped
+        ["one", "two"],
+        ["It costs 3.5 dollars, e.g. today.", "Really!"],       # never inside 3.5 or after e.g.
+        ["There's a table in the chat."],
+        ["Use git status first."],
+    ]
+
+
+def test_speech_text_drops_markup_and_handles_odd_input(core_run):
+    assert core_run["speechMore"] == [
+        ["Title", "quote it and bold ok", "first", "second"],
+        ["Two blocks:", "There's code in the chat.", "There's code in the chat.", "End."],   # once per block
+        ["An open block:", "There's code in the chat."],        # a block still being streamed
+        ["a cat and this and that and a b"],
+        [], [], [],
+    ]
+
+
+def test_speech_starts_at_the_first_complete_sentence_and_the_end_flushes_the_rest(core_run):
+    assert core_run["speechStream"] == [["Hello there."], ["It costs 3.5 dollars."], []]   # "3." waits: it may become 3.5
+    assert core_run["speechFlush"] == {"sentences": ["Next one!"], "count": 3}
+    assert core_run["speechStale"]["sentences"] == [] and core_run["speechStale"]["count"] == 0
+
+
+def test_the_voice_follows_the_language_the_server_heard(core_run):
+    assert core_run["voices"] == ["fr-CA", None, None, None, None, "pt-PT", "en-GB"]
+
+
+def test_conversation_mode_is_a_menu_setting_shown_only_with_the_mic():
+    page = chat_page.CHAT_HTML
+    block = next(t for t in _tags("div") if t.get("id") == "voice-mode-block")
+    assert "hidden" in block
+    assert "ui.voiceModeBlock.hidden = !voiceSupport;" in page
+    assert "const MODE_KEY = 'dlne.voiceMode';" in page and "store.get(MODE_KEY) === 'conversation' ? 'conversation' : 'dictate'" in page
+    assert "if (persist) store.set(MODE_KEY, voiceMode);" in page
+    menu = page.split('<dialog id="menu"', 1)[1].split("</dialog>", 1)[0]
+    assert "Voice mode" in menu and 'value="dictate"' in menu and 'value="conversation"' in menu
+    assert "<svg" not in menu.split('id="voice-mode-block"', 1)[1].split("<h3>Location</h3>", 1)[0]   # no new glyph
+
+
+def test_conversation_sends_what_send_would_and_reads_only_voice_turns():
+    page = chat_page.CHAT_HTML
+    transcribe = page.split("async function transcribe", 1)[1].split("function insertAtCursor", 1)[0]
+    assert transcribe.index("insertAtCursor(text);") < transcribe.index("sendByVoice();")   # inserted first, then sent
+    assert "submit(" not in transcribe                                                      # through submit's own guards
+    send = page.split("function sendByVoice", 1)[1].split("\n  }\n", 1)[0]
+    assert "submit();" in send and "ui.send" not in send                                    # the same function Send calls
+    assert "if (sendingByVoice) voiceTurns.add(msg);" in page
+    assert "conversing() && asked && voiceTurns.has(asked)" in page                         # typed messages are never read
+    assert "voiceLang = data && typeof data.language === 'string' ? data.language : '';" in page
+
+
+def test_speech_is_one_utterance_per_sentence_and_stops_everywhere_it_should():
+    page = chat_page.CHAT_HTML
+    assert page.count("new SpeechSynthesisUtterance(sentence)") == 1 and "speechSynth.speak(utter)" in page
+    assert "const hush = new SpeechSynthesisUtterance('');" in page and "speechSynth.resume();" in page   # the iOS unlock
+    handler = page.split("ui.mic.addEventListener('click', () => {", 1)[1].split("\n  });", 1)[0]
+    assert handler.index("\n    stopSpeech();") < handler.index("\n    unlockSpeech();") < handler.index("\n    startRecording();")
+    assert "if (wasTalking) return;" in handler                                              # "Stop speaking" only stops
+    for fn in ("function newChat()", "function openSaved(id)"):
+        assert "stopSpeech();" in page.split(fn, 1)[1].split("\n  }\n", 1)[0]
+    assert "if (voiceMode !== 'conversation') stopSpeech();" in page
+    assert "speechBegin(reply, asked);" in page and "if (next.reset) {" in page     # new answer; retract
+    assert "window.addEventListener('pagehide', stopSpeech);" in page
+    assert "'Stop speaking'" in page and ".round.mic.speaking" in page
+    assert "SPEAK_PICTURE" in page and "I made a picture. It's in the chat." in page
+    assert "tellNoVoice();" in page and "if (noVoiceTold) return;" in page                  # text only, told once
+    # An empty voice list (Chrome before its voices load) still speaks in the default voice; only the engine failing
+    # means "no voice" (owner-facing bug guard, 2.8.2).
+    assert "if (!voices || !voices.length) return false;" not in page
+    assert "why === 'synthesis-unavailable' || why === 'synthesis-failed'" in page
+
+
+def test_a_retract_restarts_reading_with_the_fresh_answer(core_run):
+    # Contract (73f1de9): the server retracts before every lookup, then writes the real answer; it must still be read.
+    assert core_run["speechRetract"] == [
+        [["The old guess is here.", "And more."], False],
+        [[], True],                                          # taken back: stop, start over
+        [["Fresh start."], False],                           # the retracted sentences are not read again
+        [["Second one.", "Third."], False],
+    ]

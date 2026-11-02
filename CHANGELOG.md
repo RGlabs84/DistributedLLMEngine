@@ -10,6 +10,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.8.2] - 2026-11-02
+
+### Added
+- **Conversation mode in the web chat** (iPhones and phone browsers use it). The menu has "Voice mode: Dictate /
+  Conversation". In Conversation, a spoken message sends itself and its answer is read aloud by the phone's or
+  browser's own voice, sentence by sentence as it arrives; code and tables are mentioned, not read. Tap the mic (now
+  "Stop") to stop it; speaking again or sending anything stops it too. Typed messages are never read aloud. Nothing
+  changes on the server: the speech is made on your device. DLNE Chat for Android 1.1.0 and the VS Code extension
+  1.8.0 have the same mode (docs/voice-contract.md).
+
+## [2.8.1] - 2026-11-02
+
+### Fixed
+- **The web chat no longer pulls you down while you read.** Scrolled up to read part of an answer, every new word
+  snapped the page back to the bottom until you were 80 px away, which a fast answer never allowed (owner: "if I
+  scroll up on the answer to read something it constantly pushes what I'm trying to read"). The chat now stops
+  following the moment you scroll up, never moves under a finger on the screen, and follows again when you scroll to
+  the end or tap the new "Latest" button. iPhones use this chat; DLNE Chat for Android 1.0.9 has the same fix.
+
+## [2.8.0] - 2026-11-02
+
+Voice: speak instead of type. A microphone button in the web chat, the Android app (1.0.7) and the VS Code extension
+(1.7.0) records a short clip; the coordinator turns it into text with whisper.cpp on the media card (TheWall's RX 580),
+and the text lands in the message box to read and fix before sending (docs/voice-contract.md, docs/voice.md).
+
+### Added
+- **`POST /v1/audio/transcriptions`**, OpenAI-compatible multipart (`file`, optional `language`, `response_format` `json`
+  or `text`). WAV only, PCM 16-bit mono 16 kHz, at most 60 s and 2 MB; clients convert on the device, so the server
+  needs no ffmpeg. Answers `{"text", "language", "duration_seconds"}`. Errors: 400 `voice_bad_audio`, 429
+  `voice_quota`, 503 `voice_busy` / `voice_unavailable` / `voice_paused`, 502 `voice_failed`.
+- **The voice engine:** whisper.cpp `whisper-server` v1.9.5 (Vulkan build), model `ggml-large-v3-turbo-q8_0.bin`
+  (874 MB, pinned by SHA-256), started on the first clip and unloaded after 20 idle minutes, like the picture engine.
+  Measured on the RX 580: 1.07 GB of card memory at peak, about 1 s for an 11-second clip and 3.7 s for 60 s once loaded
+  (about 5 s to load). A clip never stops a picture being drawn: it waits for it.
+- **Who may use it:** the same keys and tiers as chat; key holders first in the queue. A clip does not use a free-trial
+  chat. At most `VOICE_PER_HOUR` clips a network an hour (60), `VOICE_QUEUE_MAX` waiting (8); a clip waits at most
+  10 minutes for its turn and answer, then gets 503 `voice_busy` with `Retry-After: 30`.
+- **Privacy:** the audio is held in memory only, never written to disk or logged, and dropped after the answer; the text
+  is returned and not stored. Logs say only how long the clip was, its language and how long it took.
+- **Status:** `/v1/cluster/status` has `capabilities.voice` (true only when enabled and installed) and a `voice` block
+  (`queue`, `busy`, `max_seconds`, `languages`, `paused` while paused). With voice off the status is exactly 2.7's.
+- **Config:** `VOICE_ENABLED` (`true` / `false` / `paused`, default false), `VOICE_MODEL`, `VOICE_THREADS`,
+  `VOICE_CPU_MASK`, `VOICE_MAX_SECONDS`, `VOICE_PER_HOUR`, `VOICE_QUEUE_MAX`, `VOICE_IDLE_UNLOAD_MINUTES`,
+  `VOICE_MIN_FREE_VRAM_GB` (1.4) (docs/operator-reference.md).
+- **Release packaging:** `server-whisper.tar.gz` (built from the pinned whisper.cpp commit by
+  `scripts/package_whisper.py`) is signed into the release manifest (`whisper_build`, `server_whisper_sha256`,
+  `server_whisper_size`; older nodes ignore them) and unpacked to `bin-whisper/`. `scripts/fetch_voice_models.py`
+  fetches the model into `models/voice/`.
+- **A takeover-only key.** `TAKEOVER_KEY_HASH` holds a key that opens `/v1/admin/takeover*` and nothing else, with every
+  takeover rule unchanged (LAN or WireGuard peers only, no proxy headers). `dlne_server.py takeoverkey create --out FILE`
+  writes it to a private file (mode 600) and never prints it; `takeoverkey revoke` clears it. For a tool such as
+  DLNE-Sec, so it never holds the operator key.
+
+### Changed
+- **A takeover lease on the media card pauses voice as well as pictures** (`dlne_now.voice: paused`), and the engine
+  stops the voice engine with the picture engine when it hands the card over.
+
+## [2.7.2] - 2026-11-02
+
+### Fixed
+- **A takeover plan knows the engine runs on a lone media card.** With the media card as the only allowed card (TheWall
+  since 1 Nov: the coding model alone on the RX 580), 2.7.1's planner treated it as a media card only: the plan said
+  `engine_on: []`, and a lease for that card would have paused pictures while DLNE's engine stayed on it. It now follows
+  the engine's own rule: a lease for that card moves the engine to the CPU (`engine-moves`), and every plan reports
+  `engine_on` correctly. Found in the first live dry run, before any lease was granted.
+
+## [2.7.1] - 2026-11-02
+
+Takeover leases: an operator on the LAN can lend part of the coordinator's hardware to another tool for a while
+(DLNE-Sec's "takeover mode"), and DLNE keeps answering and takes everything back when the lease ends
+(docs/takeover-contract.md).
+
+### Added
+- **`/v1/admin/takeover`**: `POST .../plan` (a dry run: what DLNE would do with each card, as JSON), `POST` (grant),
+  `PUT .../{lease_id}` (heartbeat, every 15 s), `DELETE .../{lease_id}` (release) and `GET`. Only with the operator key,
+  only from a LAN or WireGuard peer, never through the HTTPS proxy, one lease at a time.
+- **Repurpose, never stop.** A card DLNE does not use is handed over as it is; the media card pauses pictures and moves
+  the vision projector to the CPU (`--no-mmproj-offload`); an engine card moves the engine to the cards that are left or
+  to the CPU, keeping at least the lease's floor (1 coding lane x 32,768 by default) and the phone lanes. CPU cores and
+  DLNE's RAM limit can be lent too.
+- **Reversible.** The lease lives in `config/takeover.json`, an overlay on top of `config.txt` (which is never written),
+  and engine restarts go through the same hold, drain, health check and rollback as automatic switching. It ends on
+  release, after its time, or 45 s without a heartbeat; a stale lease found at start is removed first.
+- `/v1/cluster/status` and the admin stats show `takeover` (active, state, holder, since, expires_at).
+
+### Changed
+- Automatic model switching holds still while a takeover lease is granted, active or restoring.
+
 ## [2.7.0] - 2026-10-30
 
 Released with extension 1.6.0 and DLNE Donate 1.1.0. NVIDIA volunteers can run the CUDA engine (about 40% faster

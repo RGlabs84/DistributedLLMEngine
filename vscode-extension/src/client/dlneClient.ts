@@ -9,6 +9,7 @@ import {
 import { QueueInfo, QueueUpdate, parseCodingQueue, parseQueueInfo, queueFromBody, queueProgressLine } from './queue';
 import { RouteLookup, rerouteReason } from './route';
 import { PictureAttachment, wireMessages } from './pictures';
+import { transcriptionRequest } from '../voice/voice';
 import { editorSessionId } from './session';
 import { DEFAULT_WAIT_TIMING, WaitTiming, WaitWatcher } from './waitWatcher';
 import * as fs from 'fs';
@@ -59,7 +60,9 @@ export interface ClusterStatus {
    */
   policy?: { coding_context_tokens?: number; coding_context_tokens_max?: number; [rule: string]: unknown };
   /** What this coordinator offers beyond chat (2.6.1); `image_generation` gates the agent's generate_image tool. */
-  capabilities?: { image_generation?: boolean; vision?: boolean; [capability: string]: unknown };
+  capabilities?: { image_generation?: boolean; vision?: boolean; voice?: boolean; [capability: string]: unknown };
+  /** While voice is on (2.8.0): the queue and the longest clip. */
+  voice?: { queue?: number; busy?: boolean; max_seconds?: number; languages?: string };
   /** While image generation is on: its queue and the estimate per size (informational; the tool polls the job). */
   image_generation?: { queue?: number; busy?: boolean; eta_seconds?: Record<string, number>; sizes?: string[]; default_size?: string };
 }
@@ -505,6 +508,41 @@ export class DlneClient {
    */
   whoAmI(): Promise<ImageReply> {
     return this.imageRequest('GET', '/v1/me');
+  }
+
+  /**
+   * POST /v1/audio/transcriptions (2.8.0, docs/voice-contract.md): one WAV clip (PCM 16-bit, mono, 16 kHz) as multipart,
+   * with the headers of a chat request (same key, same tier). Goes to the coordinator itself. The clip is only in memory
+   * here. Never throws: no answer is status 0 with a `detail`.
+   */
+  transcribe(wav: Buffer, signal?: AbortSignal): Promise<ImageReply> {
+    const url = new URL(`${this.getServerUrl()}/v1/audio/transcriptions`);
+    const form = transcriptionRequest(wav);
+    return new Promise((resolve) => {
+      const lib = url.protocol === 'https:' ? https : http;
+      const headers = this.getHeaders();
+      headers['Content-Type'] = form.contentType;
+      headers['Content-Length'] = String(form.body.length);
+      // A clip may wait its turn behind others, and a first one loads the model: more time than a chat's quick calls.
+      const req = lib.request(url, { method: 'POST', headers, timeout: 120000, signal }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          let parsed: any = {};
+          try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf-8')); } catch { /* not JSON: the status speaks */ }
+          const wait = Number(res.headers['retry-after']);
+          resolve({ status: res.statusCode ?? 0, body: parsed, retryAfter: Number.isFinite(wait) && wait > 0 ? wait : undefined });
+        });
+        res.on('error', (err) => resolve({ status: 0, body: { detail: err.message } }));
+      });
+      req.on('error', (err) => resolve({ status: 0, body: { detail: err.message } }));
+      req.on('timeout', () => {
+        req.destroy();
+        resolve({ status: 0, body: { detail: 'The server did not answer in time.' } });
+      });
+      req.write(form.body);
+      req.end();
+    });
   }
 
   async getClusterStatus(): Promise<ClusterStatus | null> {

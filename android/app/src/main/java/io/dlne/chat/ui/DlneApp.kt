@@ -42,6 +42,7 @@ fun DlneApp(viewModel: ChatViewModel) {
                         onDeleteAllChats = viewModel::deleteAllConversations,
                         onShareLocationChange = viewModel::setShareLocation,
                         locationPermitted = viewModel::locationPermitted,
+                        onVoiceModeChange = viewModel::setVoiceMode,
                     )
                 },
             )
@@ -86,6 +87,9 @@ private fun ChatWithDrawer(state: ChatUiState, viewModel: ChatViewModel) {
             locationPermitted = viewModel::locationPermitted,
             onAddPhotos = viewModel::addPhotos,
             onRemovePhoto = viewModel::removePhoto,
+            onVoiceText = viewModel::sendByVoice,
+            onStopSpeaking = viewModel::stopSpeaking,
+            onSpeechNoteShown = viewModel::speechNoteShown,
         )
     }
 

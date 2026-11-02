@@ -308,6 +308,16 @@ class _Settings:
 # Tier helpers (shared with the coordinator's readiness and download code)
 # ======================================================================================
 
+def _takeover_in_progress() -> bool:
+    """Whether a takeover lease (engine/takeover.py) is being granted, is active, or is still giving things back."""
+    try:
+        from engine import takeover          # imported here: takeover imports the coordinator's helpers
+        lease = takeover.load_lease()
+    except Exception:  # noqa: BLE001 - an unreadable lease file is no lease, as far as switching goes
+        return False
+    return bool(lease) and lease.get("state") in (takeover.STATE_GRANTING, takeover.STATE_ACTIVE, takeover.STATE_RESTORING)
+
+
 def tier_id(tier: Dict[str, Any]) -> str:
     return str(tier.get("id") or "")
 
@@ -807,6 +817,16 @@ class AutoSwapController:
             self._busy_since = None
             self._expected_model = None
             return self._decide("off", None, "off", "Automatic model switching is off (AUTO_SWAP=false).")
+
+        # A takeover lease (engine/takeover.py) is borrowing hardware: the pool looks smaller while it runs and bigger as
+        # it ends, and a switch now would fight the lease's own engine restart. Nothing switches until it is over.
+        if _takeover_in_progress():
+            self._stop_download("a takeover lease is borrowing part of the hardware")
+            self._fit_since.clear()
+            self._unfit_since = None
+            self._busy_since = None
+            return self._decide("steady", None, "takeover",
+                                "A takeover lease is borrowing part of the hardware, so nothing switches until it ends.")
 
         self._collect_download(now)
 

@@ -51,6 +51,28 @@ SERVER_LLAMA_UPLOAD = "server-llama.tar.gz"
 DEFAULT_SD_ASSETS = os.path.join(REPO_ROOT, OUT_DIR, "assets", "sd")
 # The name the image engine is uploaded under (release_apply.py expects it).
 SERVER_SD_UPLOAD = "server-sd.tar.gz"
+DEFAULT_WHISPER_ASSETS = os.path.join(REPO_ROOT, OUT_DIR, "assets", "whisper")
+# The name the voice engine is uploaded under (release_apply.py expects it).
+SERVER_WHISPER_UPLOAD = "server-whisper.tar.gz"
+
+
+def load_whisper_assets(directory: str, required: bool = False) -> Optional[Dict]:
+    """
+    The packaged voice engine in ``directory`` (see scripts/package_whisper.py): {"whisper_build", "server_whisper": path},
+    or None when there is no build there and none was asked for by name (``required``).
+    """
+    try:
+        with open(os.path.join(directory, "build.json"), "r", encoding="utf-8") as handle:
+            info = json.load(handle)
+    except (OSError, ValueError) as exc:
+        if required:
+            raise CliError(f"No packaged voice engine in {directory} ({type(exc).__name__}). "
+                           "Run scripts/package_whisper.py first.") from exc
+        return None
+    archive = os.path.join(directory, str(info.get("server_whisper", "")))
+    if not info.get("server_whisper") or not os.path.isfile(archive) or not info.get("whisper_build"):
+        raise CliError(f"{directory} is incomplete; missing: {info.get('server_whisper') or SERVER_WHISPER_UPLOAD}.")
+    return {"whisper_build": info["whisper_build"], "server_whisper": archive}
 
 
 def load_sd_assets(directory: str, required: bool = False) -> Optional[Dict]:
@@ -214,7 +236,8 @@ def build_release(repo: str, out_dir: str, key_pem: bytes, notes: str, allow_dir
                                          app_models=load_app_models(repo),
                                          coding_models=load_coding_models(repo),
                                          sd_build=b.get("sd_build"), server_sd=b.get("server_sd"),
-                                         cuda_zips=b.get("cuda_zips"))
+                                         cuda_zips=b.get("cuda_zips"),
+                                         whisper_build=b.get("whisper_build"), server_whisper=b.get("server_whisper"))
     except release.ReleaseError as exc:
         raise CliError(str(exc)) from exc
     signed = release.sign_manifest(manifest, key_pem)
@@ -241,6 +264,10 @@ def build_release(repo: str, out_dir: str, key_pem: bytes, notes: str, allow_dir
             ok, reason = release.verify_server_sd(signed, binaries["server_sd"])
             if not ok:
                 raise CliError(f"The image engine archive does not match the manifest just built ({reason}).")
+        if binaries.get("server_whisper"):
+            ok, reason = release.verify_server_whisper(signed, binaries["server_whisper"])
+            if not ok:
+                raise CliError(f"The voice engine archive does not match the manifest just built ({reason}).")
 
     with open(manifest_path, "w", encoding="utf-8") as handle:
         json.dump(signed, handle, indent=2)
@@ -324,6 +351,9 @@ def deploy(repo: str, remote, key_pem: bytes, notes: str, allow_dirty: bool = Fa
         if binaries.get("server_sd"):
             remote.put(binaries["server_sd"], f"{incoming}/{SERVER_SD_UPLOAD}")
             expected[SERVER_SD_UPLOAD] = manifest["server_sd_sha256"]
+        if binaries.get("server_whisper"):
+            remote.put(binaries["server_whisper"], f"{incoming}/{SERVER_WHISPER_UPLOAD}")
+            expected[SERVER_WHISPER_UPLOAD] = manifest["server_whisper_sha256"]
 
     for name, digest in expected.items():
         code, out = remote.run(f"sha256sum {incoming}/{name}")
@@ -382,7 +412,9 @@ def _args_binaries(args) -> Optional[Dict]:
     binaries = load_binaries(args.binaries or DEFAULT_BINARIES)
     named = getattr(args, "sd_assets", None)
     sd = load_sd_assets(named or DEFAULT_SD_ASSETS, required=bool(named))
-    return {**binaries, **sd} if sd else binaries
+    named_whisper = getattr(args, "whisper_assets", None)
+    whisper = load_whisper_assets(named_whisper or DEFAULT_WHISPER_ASSETS, required=bool(named_whisper))
+    return {**binaries, **(sd or {}), **(whisper or {})}
 
 
 def _remote(args) -> Remote:
@@ -438,6 +470,8 @@ def cmd_build(args) -> int:
                       f"sha256 {m[release.cuda_field(platform, 'sha256')]}")
         if "sd_build" in m:
             print(f"  image engine {m['sd_build']}  sha256 {m['server_sd_sha256']}")
+        if "whisper_build" in m:
+            print(f"  voice engine {m['whisper_build']}  sha256 {m['server_whisper_sha256']}")
     print(f"  signed manifest {built['manifest_path']}")
     return 0
 
@@ -484,6 +518,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--binaries", help=f"packaged llama.cpp build to sign (default {os.path.relpath(DEFAULT_BINARIES, REPO_ROOT)})")
         p.add_argument("--no-binaries", action="store_true", help="release without llama.cpp binaries (workers cannot install one)")
         p.add_argument("--sd-assets", help=f"packaged image engine to sign (default {os.path.relpath(DEFAULT_SD_ASSETS, REPO_ROOT)} "
+                       "when it holds a build; a release without one is built as before)")
+        p.add_argument("--whisper-assets", help=f"packaged voice engine to sign (default {os.path.relpath(DEFAULT_WHISPER_ASSETS, REPO_ROOT)} "
                        "when it holds a build; a release without one is built as before)")
         if name == "deploy":
             p.add_argument("--allow-downgrade", action="store_true")

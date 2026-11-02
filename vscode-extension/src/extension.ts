@@ -393,6 +393,16 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('dlne.memory.open', () => openAgentMemory())
   );
 
+  // Voice (2.8.0): record with the platform's recorder, put the words in the DLNE Agent panel's box. Never sends them.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('dlne.voice.toggle', () => sidebarProvider.toggleVoice())
+  );
+  // Conversation mode (2.8.2): the setting dlne.voice.mode, flipped by this command; speech ends when the extension does.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('dlne.voice.toggleMode', () => sidebarProvider.toggleVoiceMode()),
+    { dispose: () => sidebarProvider.dispose() }
+  );
+
   // Sends the active file's errors to `@dlne /fix` in the Chat view, or to the sidebar chat where there is no Chat view.
   context.subscriptions.push(
     vscode.commands.registerCommand('dlne.fixDiagnostics', () => fixDiagnostics(sidebarProvider))

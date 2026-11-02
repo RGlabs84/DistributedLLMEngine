@@ -1,0 +1,13 @@
+{
+  "_comment": "The one model file voice (speech to text, 2.8.0) loads: whisper.cpp's own conversion of large-v3-turbo to q8_0, from the ggerganov/whisper.cpp Hugging Face repo, pinned to a repo revision and checked by size and SHA-256 (the lfs.oid the HF API reports) by scripts/fetch_voice_models.py. Ungated (MIT). MEASURED 2026-11-02 on TheWall's RX 580 (card3, PCI 0000:0c:00.0, Vulkan index 3, 8 GiB) with whisper.cpp v1.9.5 whisper-server built with Vulkan, GGML_VK_VISIBLE_DEVICES=3, 2 threads on CPUs 0,6, DLNE idle, vram sampled every 0.2 s: base 985 MiB (the vision projector); after load 2082 MiB; peak 2083 MiB = +1097 MiB (1.07 GB) above base, steady through 11 s, 30 s and 60 s clips (the model itself is 874 MB plus about 230 MB of compute buffers); load 5.1 s (model file in the page cache); transcription 11 s clip 1.07 s, 30 s clip 2.26 s, 60 s clip 3.71 s (HTTP round trip, warm). Recommended VOICE_MIN_FREE_VRAM_GB = 1.4 (1.07 measured + 0.3 margin, rounded up).",
+  "models": [
+    {
+      "role": "whisper",
+      "name": "Whisper large-v3-turbo q8_0",
+      "file": "ggml-large-v3-turbo-q8_0.bin",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q8_0.bin",
+      "sha256": "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
+      "size": 874188075
+    }
+  ]
+}

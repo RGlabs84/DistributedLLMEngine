@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import httpx
+import psutil
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
@@ -52,6 +53,7 @@ from engine.authn import (
 from engine import benchmark
 from engine import gguf
 from engine import media
+from engine import config as engine_config
 from engine.config import get_base_dir, get_config, get_worker_limits
 from engine.landing import LANDING_HTML
 from engine.chat_page import chat_router
@@ -89,9 +91,12 @@ from engine.priority import (DistinctWindow, UsageWindow, coding_gate, cpu_codin
 from engine import image_policy
 from engine.image_member import ImageMember
 from engine.image_pool import ImageService, Job, JudgeUnavailable, Rejected
+from engine import voice_pool
+from engine.voice_member import MemberError as VoiceError, VoiceMember
+from engine.voice_pool import VoiceService
 from engine.api_keys import api_key_manager, hash_admin_key
 from engine import canary
-from engine import auto_swap, link_paths
+from engine import auto_swap, link_paths, takeover
 from engine.auto_swap import (
     AutoSwapController,
     FlapBreaker,
@@ -1969,6 +1974,7 @@ async def admin_stats(request: Request):
             "revoked": sum(1 for k in keys if k.get("revoked")),
         },
         "release": _release_summary(),
+        "takeover": takeover.status_block(),
     }
 
 
@@ -3539,6 +3545,17 @@ async def get_cluster_status(request: Request):
         capabilities["image_generation"] = available
         if available:
             images["image_generation"] = image_service.status_block()
+    voice: Dict[str, Any] = {}
+    if _voice_paused():
+        # Paused (VOICE_ENABLED=paused, or a takeover lease on the media card): the mic stays hidden, the block says why.
+        capabilities["voice"] = False
+        voice["voice"] = {**voice_service.status_block(), "paused": True}
+    elif get_worker_limits().get("voice_enabled", False):
+        # Only while VOICE_ENABLED is on does the status mention voice at all; with it off it is what 2.7 sent.
+        available = _voice_available()[0]
+        capabilities["voice"] = available
+        if available:
+            voice["voice"] = voice_service.status_block()
 
     return {
         "status": cluster_status,
@@ -3591,6 +3608,8 @@ async def get_cluster_status(request: Request):
         # such as "Switching to X in 6 min if the pool keeps 24 GB." "held" (2.6.2) is the flap breaker: the
         # engine was rebuilt too often, so rebuilds nobody needs wait, and detail says how many, when and until when.
         "auto_swap": auto_swapper.status(),
+        # A takeover lease (engine/takeover.py, 2.7.1): {active, state, holder, since, expires_at}. No lease id, no address.
+        "takeover": takeover.status_block(),
         # policy.image_input is null while the engine cannot read images (engine/media.public_limits).
         "policy": {**_public_policy(await _engine_slot_context(running_names)),
                    "image_input": media.public_limits(get_worker_limits().get("image_input_per_hour", 30))
@@ -3599,6 +3618,7 @@ async def get_cluster_status(request: Request):
         # made (only while IMAGE_GEN_ENABLED). A missing key means false.
         "capabilities": capabilities,
         **images,
+        **voice,
     }
 
 
@@ -4660,6 +4680,185 @@ auto_swapper = AutoSwapController(
 # The controller's loop, started with the other monitors and cancelled on shutdown.
 _auto_swap_task: Optional[asyncio.Task] = None
 _auto_swap_tasks: List[asyncio.Task] = []
+
+
+# ======================================================================================
+# Takeover leases (2.7.1; docs/takeover-contract.md, engine/takeover.py)
+# ======================================================================================
+
+async def _takeover_gpus() -> List[dict]:
+    from engine.hardware import get_all_gpus
+    return await asyncio.to_thread(get_all_gpus)
+
+
+async def _takeover_engine_facts() -> Optional[takeover.EngineFacts]:
+    """The running coding engine as the planner needs it, or None while none runs."""
+    from engine.inference_manager import RUNTIME_OVERHEAD_GB, _GIB
+    tag = canonical_model_tag(global_active_model or "")
+    if not tag or not manager.get_active_model_names():
+        return None
+    resolved = await manager.aresolve_model_path(tag)
+    if not resolved or not os.path.exists(resolved):
+        return None
+    weights = await manager.aestimate_model_vram_gb(tag)
+
+    def read_model() -> Tuple[int, int, int, int]:
+        shape = gguf.model_shape(resolved)
+        return (gguf.kv_bytes_per_token_for_model(resolved), shape.state_bytes_per_sequence if shape else 0,
+                manager._lookup_json_max_context(tag), os.path.getsize(resolved))
+
+    kv_bytes, state_bytes, native, size = await asyncio.to_thread(read_model)
+    limits = get_worker_limits()
+    observed = await _takeover_observe_engine()
+    return takeover.EngineFacts(
+        model=tag, weights_gb=weights, unplaced_weights_gb=size / _GIB + RUNTIME_OVERHEAD_GB,
+        kv_f16_bytes_per_token=kv_bytes, state_bytes_per_slot=state_bytes, native_context=native,
+        slots=observed[0] if observed else None, context_per_slot=observed[1] if observed else None,
+        phone_slots=int(limits.get("engine_phone_slots") or 0), phone_context=int(limits.get("engine_phone_context") or 8192),
+        kv_type=str(limits.get("engine_kv_type") or "auto"))
+
+
+async def _takeover_observe_engine() -> Optional[Tuple[int, int]]:
+    """``(coding lanes, tokens per lane)`` of the running engine, or None."""
+    names = manager.get_active_model_names()
+    if not names:
+        return None
+    try:
+        snapshot = await manager.asnapshot_model(names[0])
+    except Exception:     # noqa: BLE001 - an answer that cannot be read is no answer
+        return None
+    context, slots = (snapshot or {}).get("safe_context"), (snapshot or {}).get("dynamic_slots")
+    if isinstance(context, int) and isinstance(slots, int) and not isinstance(context, bool) and context > 0 and slots > 0:
+        return slots, context // slots
+    return None
+
+
+def _takeover_idle() -> bool:
+    """Nothing is running that restarting the engine would cut: no switch under way, no coding request or phone answer
+    in flight, no picture being made."""
+    if _coding_reconfiguration_running() or _coding_queue_busy():
+        return False
+    return image_service.active is None and not image_service._pending and voice_service.idle      # noqa: SLF001 - the queue has no public count
+
+
+async def _takeover_pause_pictures() -> None:
+    """The media card is being lent out: sd-server and whisper-server let go of it now (the limits already say
+    pictures and voice are paused)."""
+    await image_service.member.stop()
+    await voice_service.member.stop()
+
+
+async def _takeover_restart_engine(*, expected_pool: Optional[Tuple[float, float]], reduced: bool = True,
+                                   patient: bool = False) -> Dict[str, Any]:
+    """
+    Restart the coding engine on the limits as they are now (a lease's overlay applies or no longer applies), through
+    the switch automatic switching trusts: the same model, held first, called off if requests do not drain, held until
+    the engine answers. ``expected_pool`` is the pool the engine will really have, which the registry only learns at the
+    local worker's next heartbeat: ``reduced`` says the pool just got smaller (the smaller figure is used) or bigger.
+    ``patient`` is a restore: it waits out other switches and may cut a request that never ends.
+    """
+    model = canonical_model_tag(global_active_model or "")
+    if not model:
+        return {"outcome": "failed", "success": False, "detail": "no model is being served"}
+    req_gb = await manager.aestimate_model_vram_gb(model)
+    vram, sysram = registry.get_total_vram_gb(), registry.get_total_sysram_gb()
+    if expected_pool is not None:
+        pick = min if reduced else max
+        vram, sysram = pick(vram, expected_pool[0]), pick(sysram, expected_pool[1])
+    flap_breaker.record("takeover lease " + ("restore" if not reduced else "grant"))
+    return await _swap_model_core(
+        model, req_gb, vram, sysram,
+        drain_timeout=PHONE_DRAIN_SECONDS if patient else 15.0,
+        hold_first=True, abort_if_busy=not patient,
+        ready_timeout=_auto_swap_load_timeout(), rollback_model=model)
+
+
+takeover_controller = takeover.TakeoverController(takeover.Host(
+    gpus=_takeover_gpus,
+    engine_facts=_takeover_engine_facts,
+    idle=_takeover_idle,
+    restart_engine=_takeover_restart_engine,
+    pool_totals=lambda: (registry.get_total_vram_gb(), registry.get_total_sysram_gb()),
+    pause_pictures=_takeover_pause_pictures,
+    observe_engine=_takeover_observe_engine,
+    read_limits=lambda: engine_config.get_plain_worker_limits(),
+    system_ram_gb=lambda: round(psutil.virtual_memory().total / (1024 ** 3), 1),
+))
+_takeover_task: Optional[asyncio.Task] = None
+
+
+@app.exception_handler(takeover.TakeoverError)
+async def _takeover_refused(request: Request, exc: takeover.TakeoverError):
+    return JSONResponse({"detail": exc.detail, "code": exc.code}, status_code=exc.status,
+                        headers={"Cache-Control": "no-store"})
+
+
+def _takeover_key_matches(token: str) -> bool:
+    """True when ``token`` is the takeover-only key (TAKEOVER_KEY_HASH, 2.7.3). Accepted by the takeover gate alone:
+    _require_admin never looks at it, so it opens no other /v1/admin endpoint."""
+    expected = get_worker_limits().get("takeover_key_hash", "")
+    if not expected or not token:
+        return False
+    return hmac.compare_digest(hash_admin_key(token), expected)
+
+
+def _require_takeover_operator(request: Request) -> None:
+    """
+    The gate for /v1/admin/takeover*: the operator key (or, since 2.7.3, the takeover-only key) AND a socket peer that is loopback, private (LAN) or in the
+    WireGuard tunnel. The peer is ``request.client.host`` itself, never ``get_client_ip``, and ADMIN_ALLOW_REMOTE and
+    TRUST_PROXY_HEADERS change nothing here. A request that carries any proxy header is refused, so nothing that came
+    through the HTTPS proxy (which sits on loopback and adds X-Forwarded-For) is ever taken for a LAN peer.
+    """
+    refused = takeover.TakeoverError(403, takeover.CODE_FORBIDDEN, "Takeover leases are for the operator key from the LAN.")
+    if takeover.came_through_a_proxy(request.headers):
+        raise takeover.TakeoverError(403, takeover.CODE_FORBIDDEN, "A takeover lease cannot be asked for through a proxy.")
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    if not (token and (_admin_key_matches(token) or _takeover_key_matches(token))):
+        raise refused
+    if not takeover.peer_is_lan(request.client.host if request.client else None):
+        raise takeover.TakeoverError(403, takeover.CODE_FORBIDDEN, "A takeover lease is only given to a LAN or WireGuard address.")
+
+
+async def _takeover_body(request: Request) -> Any:
+    try:
+        return await request.json()
+    except Exception:      # noqa: BLE001
+        raise takeover.TakeoverError(400, takeover.CODE_BAD_REQUEST, "Request body is not valid JSON.")
+
+
+@app.post("/v1/admin/takeover/plan")
+async def takeover_plan(request: Request):
+    """Dry run: what DLNE would do for this request, and whether it is allowed. Changes nothing."""
+    _require_takeover_operator(request)
+    return JSONResponse(await takeover_controller.plan(await _takeover_body(request)), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/v1/admin/takeover")
+async def takeover_grant(request: Request):
+    """Grant a lease: waits for an idle moment, applies, and answers when DLNE runs in its reduced form (or refuses,
+    changing nothing)."""
+    _require_takeover_operator(request)
+    return JSONResponse(await takeover_controller.grant(await _takeover_body(request)), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/v1/admin/takeover")
+async def takeover_current(request: Request):
+    _require_takeover_operator(request)
+    return JSONResponse(takeover_controller.get(), headers={"Cache-Control": "no-store"})
+
+
+@app.put("/v1/admin/takeover/{lease_id}")
+async def takeover_heartbeat(lease_id: str, request: Request):
+    _require_takeover_operator(request)
+    return JSONResponse(await takeover_controller.heartbeat(lease_id), headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/v1/admin/takeover/{lease_id}")
+async def takeover_release(lease_id: str, request: Request):
+    """Release: answers at once; DLNE is restored in the background and GET shows ``restoring`` until it is done."""
+    _require_takeover_operator(request)
+    return JSONResponse(await takeover_controller.release(lease_id), headers={"Cache-Control": "no-store"})
 
 
 class CreateApiKeyPayload(BaseModel):
@@ -7034,11 +7233,141 @@ async def images_cancel(request: Request, job_id: str):
     return await _images_cancel(request, "ide", job_id)
 
 
+# ======================================================================================
+# Voice, speech to text (2.8.0; docs/voice.md, docs/voice-contract.md)
+# ======================================================================================
+#
+# Off unless VOICE_ENABLED=true. The queue is engine/voice_pool.py, whisper-server is engine/voice_member.py; this
+# section is the HTTP face of them. The audio lives in memory for the length of the request and is never written or
+# logged; the text is returned and not stored. A clip is not a chat: it spends no free-trial chat.
+
+voice_service = VoiceService(
+    VoiceMember(limits=lambda: get_worker_limits(), base_dir=lambda: get_base_dir()),
+    limits=lambda: get_worker_limits(),
+    picture_busy=lambda: image_service.active is not None or bool(image_service._pending))      # noqa: SLF001
+_voice_reason_seen: Optional[str] = None
+VOICE_UNAVAILABLE = "Voice isn't available on this server right now."
+VOICE_PAUSED = "Voice is paused for now."
+VOICE_REQUEST_TIMEOUT_SECONDS = 600.0      # the longest a request waits for its place and its answer, whatever the engine does
+
+
+def _voice_paused() -> bool:
+    """VOICE_ENABLED=paused (or a takeover lease on the media card): no clip is run, and every request is told so."""
+    return bool(get_worker_limits().get("voice_paused", False))
+
+
+def _voice_available() -> Tuple[bool, Optional[str]]:
+    """``(available, why not)``: VOICE_ENABLED, the media card, the whisper build, the model file, no cool-down. The reason
+    is for the log, once per change."""
+    global _voice_reason_seen
+    if _voice_paused():
+        return False, "voice is paused (VOICE_ENABLED=paused)"
+    if not get_worker_limits().get("voice_enabled", False):
+        return False, None
+    reason = voice_service.member.unavailable_reason()
+    if reason != _voice_reason_seen:
+        _voice_reason_seen = reason
+        if reason:
+            log_warning(f"Voice is not available: {reason}.")
+        else:
+            log_coordinator("Voice is available.")
+    return reason is None, reason
+
+
+def _voice_trial_may_use(request: Request) -> bool:
+    """The chat's tiers without its charge: this host, a key, a worker and a contributor's network are in; a free-trial
+    caller is in while the trial has chats left (looked at, not spent)."""
+    tier = getattr(getattr(request, "state", None), "dlne_tier", None) or caller_tier(request)
+    if tier != "trial":
+        return True
+    network = trial_identity(get_client_ip(request))
+    if contributor_networks.is_contributor(network):
+        return True
+    quota = int(get_worker_limits().get("starter_quota_inferences", 100))
+    return quota > 0 and starter_quota_mgr.peek(network, limit=quota)[0]
+
+
+async def _read_capped(request: Request, max_bytes: int) -> Optional[bytes]:
+    """The request body, never read past ``max_bytes``; None when it is longer."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > max_bytes:
+        return None
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > max_bytes:
+            return None
+    return bytes(body)
+
+
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions(request: Request):
+    """
+    OpenAI-compatible speech to text: multipart ``file`` (WAV, 16-bit PCM, mono, 16 kHz), ``language`` (optional ISO
+    code), ``response_format`` (``json`` or ``text``), ``model`` (ignored). Answers ``{text, language, duration_seconds}``.
+    """
+    if _voice_paused():
+        return _image_error(503, "voice_paused", VOICE_PAUSED)
+    if not _voice_available()[0]:
+        return _image_error(503, "voice_unavailable", VOICE_UNAVAILABLE)
+    if not _voice_trial_may_use(request):
+        return JSONResponse({"detail": "DLNE Compute Required: your free starter quota is used up. Run '@dlne /contribute' "
+                                       "to donate idle GPU compute or provide an authorized API key."}, status_code=403)
+    limits = get_worker_limits()
+    body = await _read_capped(request, voice_pool.MAX_FORM_BYTES)
+    if body is None:
+        return _image_error(400, "voice_bad_audio", "That clip is bigger than 2 MB. Record a shorter one.")
+    try:
+        fields = voice_pool.parse_form(request.headers.get("content-type", ""), body)
+        if "file" not in fields:
+            raise voice_pool.BadAudio("The clip is missing: send the WAV in a field named file.")
+        wav, seconds = voice_pool.parse_wav(fields["file"], int(limits.get("voice_max_seconds", 60)))
+        language = fields.get("language", b"").decode("utf-8", "replace").strip().lower() or None
+        if language == "auto":
+            language = None
+        if language is not None and not (2 <= len(language) <= 3 and language.isascii() and language.isalpha()):
+            raise voice_pool.BadAudio("The language must be an ISO code such as en, or left out to detect it.")
+        form = fields.get("response_format", b"json").decode("utf-8", "replace").strip().lower() or "json"
+        if form not in ("json", "text"):
+            raise voice_pool.BadAudio("The response_format must be json or text.")
+    except voice_pool.BadAudio as exc:
+        return _image_error(400, "voice_bad_audio", exc.detail)
+    finally:
+        body = fields = None            # the form is not kept beyond the clip itself
+    priority = tier_priority(getattr(request.state, "dlne_tier", None) or caller_tier(request))
+    try:
+        clip = voice_service.submit(trial_identity(get_client_ip(request)), wav, seconds, language, priority)
+    except Rejected as exc:
+        return _image_error(429 if exc.code == "voice_quota" else 503, exc.code, exc.detail, exc.retry_after)
+    try:
+        text, detected = await asyncio.wait_for(asyncio.shield(clip.future), VOICE_REQUEST_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        voice_service.cancel(clip)       # the caller went away: a queued clip is dropped, a running one is thrown away
+        raise
+    except asyncio.TimeoutError:
+        voice_service.cancel(clip)       # nothing a hung engine does may hold a request for ever
+        return _image_error(503, "voice_busy", "Voice is taking too long right now. Please try again in a moment.", 30)
+    except VoiceError as exc:
+        if exc.code == "voice_unavailable":
+            return _image_error(503, "voice_unavailable", exc.detail)
+        return _image_error(503 if exc.code == "engine_restarting" else 502, exc.code, exc.detail)
+    answer = {"text": text, "language": detected or language or "auto", "duration_seconds": round(seconds, 2)}
+    if form == "text":
+        return Response(text, media_type="text/plain; charset=utf-8", headers={"Cache-Control": "no-store"})
+    return JSONResponse(answer, headers={"Cache-Control": "no-store"})
+
+
 @app.on_event("startup")
 async def startup_event():
     """Starts the long-lived monitors once uvicorn's event loop is running."""
-    global _auto_swap_task
+    global _auto_swap_task, _takeover_task
     log_coordinator("Proactive Worker Tracking & Event Broadcaster is active.")
+    # A takeover lease left by a process that is gone (stale, or half-made) is removed and its RAM limits put back,
+    # before anything starts an engine from the limits. A live lease is kept and the engine is built from it.
+    stale_note = await asyncio.to_thread(takeover.purge_on_start)
+    if stale_note:
+        log_warning(stale_note)
+    _takeover_task = spawn_background_task(takeover_controller.run(), "takeover-watcher")
     _load_gpu_standby()      # before the first heartbeat is judged: a GPU's grace goes on across a restart
     _load_contributor_networks()      # likewise: a contributor's network stays one for a day across a restart
     _apply_rpc_requirement()
@@ -7073,10 +7402,11 @@ async def shutdown_event():
     gpu_standby.flush()      # first, so nothing below can keep it from being saved; never raises
     contributor_networks.flush()      # the same
     auto_swapper.shutdown()
-    for task in [_auto_swap_task, *_auto_swap_tasks]:
+    for task in [_auto_swap_task, _takeover_task, *_auto_swap_tasks]:
         if task is not None and not task.done():
             task.cancel()
     await image_service.shutdown()      # sd-server is a child of this process: it goes with it
+    await voice_service.shutdown()      # so is whisper-server
 
 
 # ======================================================================================

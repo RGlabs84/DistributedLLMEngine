@@ -23,6 +23,7 @@ import kotlinx.serialization.json.contentOrNull
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -57,6 +58,8 @@ data class ClusterStatus(
     /** What this server can do beyond chat; missing (an older server) means nothing extra. */
     val capabilities: Capabilities? = null,
     @SerialName("image_generation") val imageGenerationInfo: ImageGenerationInfo? = null,
+    /** Queue and longest clip of speech to text; only present while the server has it on. */
+    @SerialName("voice") val voiceInfo: VoiceInfo? = null,
 ) {
     /** True only when the server says so: the "Create image" button is shown for nothing else. */
     val imageGeneration: Boolean get() = capabilities?.imageGeneration == true
@@ -242,6 +245,41 @@ class DlneApi(private val http: OkHttpClient = defaultHttpClient()) {
         throw ApiException.Network(e)
     }
 
+    /**
+     * Turns a recorded clip into text: `POST {baseUrl}/v1/audio/transcriptions` (multipart: `file` as a
+     * 16 kHz mono PCM16 WAV, `response_format=json`), with the same client and so the same headers as
+     * chat. Returns the text (possibly empty). Fails with [ApiException.Http] (400 voice_bad_audio,
+     * 429 voice_quota, 503 voice_busy / voice_paused / voice_unavailable) or [ApiException.Network].
+     */
+    suspend fun transcribe(baseUrl: String, wav: ByteArray): String = transcribeClip(baseUrl, wav).text
+
+    /** Like [transcribe], with the detected language too. */
+    suspend fun transcribeClip(baseUrl: String, wav: ByteArray): Transcription = withContext(Dispatchers.IO) {
+        val request = transcriptionRequest(baseUrl, wav)
+        try {
+            voiceClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw httpError(response)
+                val text = response.peekBody(64L * 1024).string()
+                try {
+                    json.decodeFromString(TranscriptionAnswer.serializer(), text).let {
+                        Transcription(it.text.trim(), it.language?.trim()?.takeIf { l -> l.isNotEmpty() })
+                    }
+                } catch (e: SerializationException) {
+                    throw ApiException.Network(IOException("Unreadable answer", e))
+                } catch (e: IllegalArgumentException) {
+                    throw ApiException.Network(IOException("Unreadable answer", e))
+                }
+            }
+        } catch (e: IOException) {
+            throw ApiException.Network(e)
+        }
+    }
+
+    // A clip may wait in the voice queue behind a picture before it is turned into text.
+    private val voiceClient: OkHttpClient by lazy {
+        http.newBuilder().callTimeout(120, TimeUnit.SECONDS).build()
+    }
+
     /** Reads SSE bytes as they arrive and forwards each event, stopping at [StreamEvent.Done]. */
     private suspend fun ProducerScope<StreamEvent>.pump(stream: InputStream) {
         val lines = SseLineBuffer()
@@ -279,6 +317,7 @@ class DlneApi(private val http: OkHttpClient = defaultHttpClient()) {
         private const val CHAT_PATH = "v1/app/chat/completions"
         private const val STATUS_PATH = "v1/cluster/status"
         private const val REPORT_PATH = "v1/app/report"
+        private const val TRANSCRIBE_PATH = "v1/audio/transcriptions"
         private const val IMAGES_PATH = "v1/app/images"
 
         /** A 1024x1024 PNG is about 2 MB, 3 MB as base64; anything past this is not a picture. */
@@ -303,6 +342,15 @@ class DlneApi(private val http: OkHttpClient = defaultHttpClient()) {
             val base = baseUrl.trimEnd('/').toHttpUrlOrNull()
                 ?: throw ApiException.Network(IOException("Invalid server address: $baseUrl"))
             return base.newBuilder().addPathSegments(path).build()
+        }
+
+        /** The multipart request for one clip; [wav] is a complete WAV file. */
+        internal fun transcriptionRequest(baseUrl: String, wav: ByteArray): Request {
+            val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("file", "clip.wav", wav.toRequestBody("audio/wav".toMediaType()))
+                .addFormDataPart("response_format", "json")
+                .build()
+            return Request.Builder().url(endpoint(baseUrl, TRANSCRIBE_PATH)).post(body).build()
         }
 
         private fun imageEndpoint(baseUrl: String, id: String, vararg more: String): HttpUrl {

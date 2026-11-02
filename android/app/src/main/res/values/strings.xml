@@ -22,6 +22,7 @@
     <string name="not_answered">Not answered yet</string>
     <string name="retry">Retry</string>
     <string name="dismiss">Dismiss</string>
+    <string name="latest">↓ Latest</string>
     <string name="copy_message">Copy message</string>
     <string name="copied">Copied</string>
     <string name="copy_code">Copy code</string>
@@ -220,4 +221,23 @@
     <string name="settings_source_sub">github.com/RGlabs84/DistributedLLMEngine</string>
     <string name="settings_version">App version %1$s</string>
     <string name="settings_server_version">Server version %1$s</string>
+    <!-- Voice (speech to text) -->
+    <string name="voice_start">Speak your message</string>
+    <string name="voice_stop">Stop recording</string>
+    <string name="voice_working">Turning your recording into text</string>
+    <string name="voice_recording">Recording %1$s of %2$s</string>
+    <string name="voice_recording_announce">Recording. Tap again to stop. It stops by itself after %1$d seconds.</string>
+    <string name="voice_sending">Turning your recording into text…</string>
+    <string name="voice_inserted">Text added to your message. Read it, then send.</string>
+    <string name="voice_note_title">Speak your message</string>
+    <string name="voice_note_body">Your recording goes to the DLNE server to be turned into text, and is not kept. Nothing is sent as a chat message until you tap Send. Android will ask to allow the microphone next.</string>
+    <string name="voice_note_continue">Continue</string>
+    <string name="voice_note_cancel">Not now</string>
+    <string name="voice_stop_speaking">Stop speaking</string>
+    <string name="voice_sent">Message sent. The answer will be read aloud.</string>
+    <string name="settings_voice_title">Voice mode</string>
+    <string name="settings_voice_help">What the microphone button does with your words.</string>
+    <string name="settings_voice_dictate">Dictate: the words go in the message box and you tap Send.</string>
+    <string name="settings_voice_conversation">Conversation: the message is sent for you and the answer is read aloud by this phone\'s own voice. Typed messages are never read aloud.</string>
+    <string name="voice_dismiss">Dismiss voice message</string>
 </resources>

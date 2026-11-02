@@ -38,6 +38,15 @@ constants below and in engine/landing.py), in the welcome screen's support line 
 are plain ``<a href>`` links that open in a new tab with ``rel="noopener noreferrer"``: navigation
 needs nothing from the CSP, which stays as strict as it was.
 
+VOICE (server 2.8.0, docs/voice-contract.md). A microphone button sits beside the message box, shown only while
+``/v1/cluster/status`` says ``capabilities.voice`` is true. Tap to record, tap again to stop (a timer shows, and the clip
+stops by itself at ``voice.max_seconds``). The page records with ``getUserMedia`` and a ScriptProcessor, downmixes to mono,
+resamples to 16 kHz and writes a WAV (PCM 16-bit) in plain JS (the pure parts are in ``dlne-core``: ``voiceMono``,
+``voiceResample``, ``voiceWav``, ``voiceForm``, ``voiceError``). The clip goes to ``POST /v1/audio/transcriptions`` (same
+origin, same headers as chat: none are added) and the returned text is put into the box at the cursor, never sent. The first
+use says once that the clip goes to the DLNE server to be turned into text and is not kept. The microphone needs a secure
+page; the CSP is unchanged and no Permissions-Policy is sent.
+
 CHAT ID AND LOCATION. Every chat carries a random UUID v4 (``chat_id``, made when the chat starts,
 or on the next send for a chat saved before it existed), sent with each request so the server can
 keep a private prompt cache per chat. "Share location" in the menu is off until the
@@ -276,6 +285,13 @@ button { font: inherit; color: inherit; }
   padding: 18px max(16px, env(safe-area-inset-right)) 24px max(16px, env(safe-area-inset-left));
 }
 .thread, .welcome { max-width: 760px; margin: 0 auto; }
+/* Scrolled up to read, the answer stops pulling the page down; "Latest" (stuck to the bottom of the view) goes back */
+.latest {
+  position: sticky; bottom: 8px; display: block; margin: 8px auto 0; padding: 7px 14px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text); font: inherit; font-size: .85rem;
+  cursor: pointer; box-shadow: 0 2px 10px rgba(0, 0, 0, .25);
+}
+.latest[hidden] { display: none; }
 .msg { display: flex; flex-direction: column; min-width: 0; margin: 0 0 20px; }
 .msg.user { align-items: flex-end; }
 .msg.user .body {
@@ -427,6 +443,19 @@ a.source:hover { border-color: var(--user-border); }
 /* Pictures paused: where Create image would be, greyed out, and a link to the page that says why */
 .popitem-off { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--faint); text-decoration: none; }
 .popwhy { font-size: .85rem; color: var(--link); text-decoration: underline; text-underline-offset: 2px; }
+
+/* The microphone beside the box: idle, recording (with its timer) and working */
+.round.mic { background: var(--surface-2); color: var(--text); }
+.round.mic:hover { background: var(--border); }
+.round.mic[aria-pressed="true"] { background: #c0392b; color: #fff; }
+.round.mic.working { opacity: .55; cursor: progress; }
+.round.mic.speaking { background: var(--text); color: var(--bg); }
+.round.mic.speaking svg { display: none; }
+.round.mic.speaking::after { content: "Stop"; font-size: .72rem; font-weight: 600; }
+.mic-timer { flex: none; align-self: center; font-size: .85rem; font-variant-numeric: tabular-nums; color: var(--muted); }
+.voice-note { max-width: 760px; margin: 6px auto 0; text-align: center; }
+.voice-note.error { color: var(--warn-text); }
+.voice-note[hidden] { display: none; }
 
 /* Photos waiting to be sent, above the box; and the same photos in the reader's own bubble */
 .tray { max-width: 760px; margin: 0 auto 8px; }
@@ -589,6 +618,7 @@ dialog::backdrop { background: rgba(2, 8, 10, .62); }
       <p class="support"><a href="{{WEBSITE_URL}}" target="_blank" rel="noopener noreferrer">Website</a> &middot; <a href="{{DISCORD_INVITE_URL}}" target="_blank" rel="noopener noreferrer">Discord</a> &middot; <a href="{{COFFEE_URL}}" target="_blank" rel="noopener noreferrer">Buy a coffee</a> &middot; <a href="{{EXTENSION_URL}}" target="_blank" rel="noopener noreferrer">Donate compute</a></p>
     </section>
     <div class="thread" id="thread" role="log"></div>
+    <button type="button" class="latest" id="latest" hidden>&darr; Latest</button>
   </main>
   <p class="banner" id="bar" role="alert" hidden></p>
   <form class="composer" id="composer" autocomplete="off">
@@ -617,6 +647,10 @@ dialog::backdrop { background: rgba(2, 8, 10, .62); }
         <a class="popitem popitem-off" id="pictures-paused" href="/pictures" target="_blank" rel="noopener noreferrer" hidden>Pictures paused <span class="popwhy">Why?</span></a>
       </div>
       <textarea id="input" rows="1" maxlength="8000" placeholder="Message DLNE" aria-label="Message"></textarea>
+      <span class="mic-timer" id="mic-timer" aria-hidden="true" hidden>0:00</span>
+      <button type="button" class="round mic" id="mic" aria-label="Record a voice message" aria-pressed="false" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/></svg>
+      </button>
       <button type="submit" class="round" id="send" aria-label="Send" disabled>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/></svg>
       </button>
@@ -624,6 +658,7 @@ dialog::backdrop { background: rgba(2, 8, 10, .62); }
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>
       </button>
     </div>
+    <p class="tray-note voice-note" id="voice-note" role="status" hidden></p>
     <p class="hint">DLNE's server writes the answers (a volunteer's computer, if it is down). Don't share secrets.</p>
     <input type="file" id="pick-photos" accept="image/png,image/jpeg" multiple hidden>
     <input type="file" id="pick-camera" accept="image/*" capture="environment" hidden>
@@ -652,6 +687,14 @@ dialog::backdrop { background: rgba(2, 8, 10, .62); }
     <h3>Your chats</h3>
     <div class="recent" id="recent"></div>
     <button type="button" class="smallbtn" id="clear-all">Delete all chats</button>
+    <div id="voice-mode-block" hidden>
+      <h3>Voice mode</h3>
+      <div class="reasons" role="radiogroup" aria-label="Voice mode">
+        <label class="reason"><input type="radio" name="voice-mode" id="voice-mode-dictate" value="dictate"> Dictate: your words go in the box and you send them</label>
+        <label class="reason"><input type="radio" name="voice-mode" id="voice-mode-conversation" value="conversation"> Conversation: your message sends itself and the answer is read aloud</label>
+      </div>
+      <p class="muted small">Conversation uses your device's own voice to read answers to the messages you speak. Nothing is recorded or sent for it. Typed messages are never read aloud.</p>
+    </div>
     <h3>Location</h3>
     <div class="reasons"><label class="reason"><input type="checkbox" id="share-location"> Share location</label></div>
     <p class="muted small">Off unless you turn it on. When a local question needs it and it is off, the chat asks you first; choosing Use my location there turns this on, and it stays on until you turn it off here. Your device's precise location goes to DLNE's own server only with a local question (near me, nearby, weather, forecast, rain, snow, my location, my area and the like, or a follow-up to one), and only while it is fresh (under two minutes old). Other questions never ask your phone for it. If none is ready, the question goes without one and the answer says so. It is used only for lookups that need it: local weather (rounded to about 100 m, sent to Open-Meteo) and local searches (only a nearby place name). The AI model never gets your coordinates, only the town named in those lookups' results. Nothing is logged or stored.</p>
@@ -1214,6 +1257,14 @@ const DLNEChat = (() => {
     return { ok: false, text: "Couldn't send the report (HTTP " + status + '). Please try again.' };
   }
 
+  // Whether the log follows the answer after a scroll event: back within 24 px of the end, yes; moved up at all, no
+  // (the reader is reading); otherwise it keeps what it was. ``gap`` is the distance from the view's bottom to the end.
+  function followAfterScroll(stick, top, lastTop, gap) {
+    if (gap < 24) return true;
+    if (top < lastTop - 1) return false;
+    return stick;
+  }
+
   // A UUID v4 from 16 random bytes (the caller supplies them: crypto.getRandomValues).
   function uuid4(bytes) {
     const b = Array.from(bytes, (n) => n & 255);
@@ -1761,9 +1812,216 @@ const DLNEChat = (() => {
     return { row: row || card, card, update, tick, cancel };
   }
 
+  // ---- voice (docs/voice-contract.md): the clip is made on the device as a WAV, PCM 16-bit, mono, 16 kHz
+  const VOICE_RATE = 16000;
+  const VOICE_MAX_SECONDS = 60;      // the server's default; the status's ``voice.max_seconds`` replaces it
+  const VOICE_MIN_SECONDS = 0.4;     // shorter than this is a stray tap
+  const VOICE_NOTICE = 'Your voice clip goes to the DLNE server to be turned into text. It is not kept.';
+  const VOICE_ENDPOINT = '/v1/audio/transcriptions';
+
+  // Average the channels of one buffer into one: ``channels`` is a list of Float32Arrays of the same length.
+  function voiceMono(channels) {
+    if (!channels.length) return new Float32Array(0);
+    if (channels.length === 1) return Float32Array.from(channels[0]);
+    const out = new Float32Array(channels[0].length);
+    for (let c = 0; c < channels.length; c++) for (let i = 0; i < out.length; i++) out[i] += channels[c][i] / channels.length;
+    return out;
+  }
+
+  // Resample mono samples from ``rate`` to ``to``: going down, each output sample is the mean of the input it covers (a
+  // box filter, enough to keep speech clean); going up, linear interpolation.
+  function voiceResample(samples, rate, to) {
+    to = to || VOICE_RATE;
+    if (!(rate > 0) || !samples.length) return new Float32Array(0);
+    if (rate === to) return Float32Array.from(samples);
+    const length = Math.floor(samples.length * to / rate);
+    const out = new Float32Array(length);
+    const ratio = rate / to;
+    for (let i = 0; i < length; i++) {
+      if (ratio > 1) {
+        const from = Math.floor(i * ratio);
+        const upto = Math.min(samples.length, Math.max(from + 1, Math.floor((i + 1) * ratio)));
+        let sum = 0;
+        for (let j = from; j < upto; j++) sum += samples[j];
+        out[i] = sum / (upto - from);
+      } else {
+        const at = i * ratio;
+        const j = Math.floor(at);
+        const next = Math.min(samples.length - 1, j + 1);
+        out[i] = samples[j] + (samples[next] - samples[j]) * (at - j);
+      }
+    }
+    return out;
+  }
+
+  // A WAV file (44-byte header, PCM 16-bit little-endian, mono) of Float32 samples in -1..1, at ``rate`` (16 kHz).
+  function voiceWav(samples, rate) {
+    rate = rate || VOICE_RATE;
+    const bytes = new Uint8Array(44 + samples.length * 2);
+    const view = new DataView(bytes.buffer);
+    const tag = (at, text) => { for (let i = 0; i < text.length; i++) bytes[at + i] = text.charCodeAt(i); };
+    tag(0, 'RIFF'); view.setUint32(4, 36 + samples.length * 2, true); tag(8, 'WAVE');
+    tag(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    tag(36, 'data'); view.setUint32(40, samples.length * 2, true);
+    for (let i = 0; i < samples.length; i++) {
+      const v = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(44 + i * 2, v < 0 ? Math.round(v * 32768) : Math.round(v * 32767), true);
+    }
+    return bytes;
+  }
+
+  // The multipart body of the transcription request: the clip as ``file`` and ``response_format=json``.
+  function voiceForm(wav) {
+    const form = new FormData();
+    form.append('file', new Blob([wav], { type: 'audio/wav' }), 'clip.wav');
+    form.append('response_format', 'json');
+    return form;
+  }
+
+  const voiceClock = (seconds) => {
+    const whole = Math.max(0, Math.floor(Number(seconds) || 0));
+    return Math.floor(whole / 60) + ':' + String(whole % 60).padStart(2, '0');
+  };
+
+  // The recording length the status allows: ``voice.max_seconds`` when it is a sensible number, else the default.
+  function voiceMax(data) {
+    const v = data && data.voice && typeof data.voice === 'object' ? Number(data.voice.max_seconds) : NaN;
+    return v >= 1 && v <= 600 ? Math.floor(v) : VOICE_MAX_SECONDS;
+  }
+
+  // Plain words for a refused clip. ``code`` and ``detail`` are the server's (a problem answer); the server's own
+  // sentence is used where the contract says so.
+  function voiceError(status, code, detail) {
+    const said = str(detail, 300);
+    if (code === 'voice_quota' || status === 429) return 'Voice is used up for this hour. Please try again later, or type your message.';
+    if (code === 'voice_paused') return said || 'Voice is paused right now.';
+    if (code === 'voice_unavailable') return said || "Voice isn't available right now.";
+    if (code === 'voice_busy') return said || 'Voice is busy right now. Please try again in a moment.';
+    if (code === 'voice_bad_audio' || status === 400 || status === 413) return said || "That clip couldn't be read. Please try again.";
+    if (status === 503) return said || "Voice isn't available right now.";
+    return said || "DLNE couldn't turn that into text (HTTP " + status + '). Please try again.';
+  }
+
+  // Why the microphone could not be opened, from the browser's error name.
+  function micError(name) {
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      return "The microphone is blocked. Allow it for this site in your browser's settings, then try again.";
+    }
+    if (name === 'NotFoundError' || name === 'OverconstrainedError') return 'No microphone was found on this device.';
+    if (name === 'NotReadableError' || name === 'AbortError') return 'The microphone is in use by something else. Close it there and try again.';
+    if (name === 'unsupported') return "This browser can't record here. Voice needs a secure (https) page and a recent browser.";
+    return "The microphone couldn't be started. Please try again.";
+  }
+
+
+  // ---------------------------------------------------------------- conversation mode: what is read aloud (2.8.2)
+  // Shared with the Android app and the extension: docs/voice-contract.md has the test vectors.
+  const SPEAK_CODE = "There's code in the chat.";
+  const SPEAK_TABLE = "There's a table in the chat.";
+  const SPEAK_PICTURE = "I made a picture. It's in the chat.";
+  const SPEAK_NO_VOICE = "This device has no voice to read answers aloud, so they stay as text. To add one, install a text-to-speech voice in your browser or system settings.";
+
+  // The markdown of an answer as plain words to say, one sentence-ish line per row.
+  function speakable(markdown) {
+    const lines = String(markdown == null ? '' : markdown).replace(/\r\n?/g, '\n').split('\n');
+    const out = [];
+    let fence = null;   // the open code block's marker
+    let table = false;
+    for (const raw of lines) {
+      const mark = /^\s*(`{3,}|~{3,})/.exec(raw);
+      if (fence) {
+        if (mark && mark[1][0] === fence[0] && mark[1].length >= fence.length) fence = null;
+        continue;
+      }
+      if (mark) { fence = mark[1]; table = false; out.push(SPEAK_CODE); continue; }
+      if (/^\s*\|.*\|\s*$/.test(raw)) { if (!table) out.push(SPEAK_TABLE); table = true; continue; }
+      table = false;
+      if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(raw)) continue;
+      let line = raw.replace(/^\s*(?:#{1,6}\s+|>+\s?|(?:[-*+]|\d+[.)])\s+)+/, '')
+        .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+        .replace(/\[\d+(?:\s*[,–-]\s*\d+)*\](?!\()/g, '')
+        .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+        .replace(/<\/?[a-z][^>]*>/gi, '')
+        .replace(/https?:\/\/[^\s)]*[^\s).,;:!?'"]/gi, '')
+        .replace(/`+([^`]*)`+/g, '$1')
+        .replace(/(\*{1,3}|~~)(?=\S)([^*~\n]*?\S)\1/g, '$2')
+        .replace(/(^|\W)(_{1,3})(?=\S)([^_\n]*?\S)\2(?!\w)/g, '$1$3')
+        .replace(/[*`]+/g, '');
+      line = line.replace(/\s+/g, ' ').replace(/\s+([.,;:!?])/g, '$1').trim();
+      if (/[\p{L}\p{N}]/u.test(line)) out.push(line);
+    }
+    return out.join('\n');
+  }
+
+  const SPEECH_ABBREVIATION = /(?:^|[\s(])(?:e\.g|i\.e|vs|mr|mrs|ms|dr|prof|approx|fig|inc|ltd|jr|sr|cf|u\.s|a\.m|p\.m)\.$/i;
+
+  // ``spoken`` (speakable text) cut into sentences: after . ! ? when whitespace follows (never inside 3.5 or after e.g.),
+  // and at every line break. ``sentences`` are the finished ones; ``rest`` is what has no end yet.
+  function speechSplit(spoken) {
+    const sentences = [];
+    let start = 0;
+    const cut = (end) => {
+      const piece = spoken.slice(start, end).trim();
+      if (piece && /[\p{L}\p{N}]/u.test(piece)) sentences.push(piece);
+      start = end;
+    };
+    for (let i = 0; i < spoken.length; i++) {
+      const c = spoken[i];
+      if (c === '\n') { cut(i); start = i + 1; continue; }
+      if (c !== '.' && c !== '!' && c !== '?') continue;
+      let j = i + 1;
+      while (j < spoken.length && /[.!?"'’”)\]]/.test(spoken[j])) j++;
+      if (j >= spoken.length) break;   // the text ends here: it may yet continue (3. then 5)
+      if (/\s/.test(spoken[j]) && !(c === '.' && j === i + 1 && SPEECH_ABBREVIATION.test(spoken.slice(start, i + 1)))) cut(j);
+      i = j - 1;
+    }
+    return { sentences, rest: spoken.slice(start).trim() };
+  }
+
+  // Every sentence of ``markdown`` (the unfinished last one too).
+  function speechSentences(markdown) {
+    const split = speechSplit(speakable(markdown));
+    return split.rest && /[\p{L}\p{N}]/u.test(split.rest) ? split.sentences.concat(split.rest) : split.sentences;
+  }
+
+  // Streaming: the answer so far and how many sentences were already given out. Returns the new complete sentences and the
+  // new count. ``flush`` (the answer is over) also gives the unfinished last sentence.
+  function speechNext(markdown, count, flush) {
+    const all = flush ? speechSentences(markdown) : speechSplit(speakable(markdown)).sentences;
+    const from = Math.min(Math.max(0, count | 0), all.length);
+    return { sentences: all.slice(from), count: all.length };
+  }
+
+  // One step of reading an answer aloud. ``feed`` is { count, len } (sentences given out, text length seen), kept by the
+  // caller. Text shorter than before means the server took the answer back (retract, sent before every lookup): the
+  // feed restarts at the fresh answer's beginning and ``reset`` is true (the caller stops what is being spoken); the
+  // retracted text is never given out again.
+  function speechFeed(feed, markdown, flush) {
+    const text = String(markdown == null ? '' : markdown);
+    const reset = text.length < feed.len;
+    if (reset) feed.count = 0;
+    feed.len = text.length;
+    const next = speechNext(text, feed.count, flush);
+    feed.count = next.count;
+    return { sentences: next.sentences, reset };
+  }
+
+  // The device's voice for the language the server heard (an ISO code such as "en"): its default one for that language,
+  // else a local one, else any. null: no voice for it (the device's own default is used).
+  function pickVoice(voices, language) {
+    const want = String(language || '').toLowerCase().split(/[-_]/)[0];
+    if (!/^[a-z]{2,3}$/.test(want)) return null;
+    const of = Array.from(voices || []).filter((v) => v && typeof v.lang === 'string' && v.lang.toLowerCase().split(/[-_]/)[0] === want);
+    return of.find((v) => v.default) || of.find((v) => v.localService) || of[0] || null;
+  }
+
   return {
+    SPEAK_CODE, SPEAK_TABLE, SPEAK_PICTURE, SPEAK_NO_VOICE, speakable, speechSplit, speechSentences, speechNext, speechFeed, pickVoice,
+    VOICE_RATE, VOICE_MAX_SECONDS, VOICE_MIN_SECONDS, VOICE_NOTICE, VOICE_ENDPOINT,
+    voiceMono, voiceResample, voiceWav, voiceForm, voiceClock, voiceMax, voiceError, micError,
     str, el, clear, button, safeUrl, link, markdown, copyText, cleanSources, sourceList, applyData, streamReader,
-    lookupLine, cleanMessage, reportPayload, reportResult, uuid4, isChatId, place,
+    lookupLine, cleanMessage, reportPayload, reportResult, uuid4, isChatId, place, followAfterScroll,
     locator, LOCATION_TEXT, NO_LOCATION_NOTE, FIX_MAX_AGE, FIX_REFRESH, isLocalQuestion, asksLocal, shouldAskLocation,
     IMAGE_SIZES, imageSize, imageActive, isImageId, imagePlaceholder, imageEta, imageStatus, imageClock, imageApply, imagePicture,
     imageCard, aboutSeconds, seconds, pictureBytes,
@@ -1777,9 +2035,12 @@ const DLNEChat = (() => {
   'use strict';
   const {
     el, clear, button, markdown, copyText, sourceList, applyData, streamReader, cleanMessage, reportPayload, reportResult,
-    str, uuid4, isChatId, locator, LOCATION_TEXT, NO_LOCATION_NOTE, asksLocal, locationCardWanted, IMAGE_SIZES, imageActive, isImageId,
+    str, uuid4, isChatId, followAfterScroll, locator, LOCATION_TEXT, NO_LOCATION_NOTE, asksLocal, locationCardWanted, IMAGE_SIZES, imageActive, isImageId,
     imageSize, imagePlaceholder, imageEta, imageApply, imagePicture, imageCard, aboutSeconds, pictureBytes,
     MAX_PHOTOS, photoCount, dataUrlBytes, fitPhoto, wireMessages, trayItem, photoStrip, photoRefusal,
+    VOICE_RATE, VOICE_MAX_SECONDS, VOICE_MIN_SECONDS, VOICE_NOTICE, VOICE_ENDPOINT,
+    voiceMono, voiceResample, voiceWav, voiceForm, voiceClock, voiceMax, voiceError, micError,
+    SPEAK_PICTURE, SPEAK_NO_VOICE, speechFeed, pickVoice,
   } = DLNEChat;
   const API = '/v1/app/chat/completions';
   const REPORT = '/v1/app/report';
@@ -1795,7 +2056,7 @@ const DLNEChat = (() => {
 
   const $ = (id) => document.getElementById(id);
   const ui = {
-    app: $('app'), log: $('log'), thread: $('thread'), welcome: $('welcome'), form: $('composer'), input: $('input'),
+    app: $('app'), log: $('log'), thread: $('thread'), latest: $('latest'), welcome: $('welcome'), form: $('composer'), input: $('input'),
     send: $('send'), stop: $('stop'), bar: $('bar'), offline: $('offline'), dot: $('dot'), serving: $('serving'),
     sep: $('sep'), model: $('model'), about: $('about'), menu: $('menu'), recent: $('recent'), firstRun: $('first-run'),
     install: $('install'), clearAll: $('clear-all'), report: $('report'), reportForm: $('report-form'),
@@ -1806,6 +2067,8 @@ const DLNEChat = (() => {
     tray: $('tray'), trayThumbs: $('tray-thumbs'), trayNote: $('tray-note'), trayHint: $('tray-hint'),
     askLocation: $('ask-location'), askYes: $('ask-location-yes'), askNo: $('ask-location-no'),
     photo: $('photo'), photoBox: $('photo-box'),
+    mic: $('mic'), micTimer: $('mic-timer'), voiceNote: $('voice-note'),
+    voiceModeBlock: $('voice-mode-block'), voiceDictate: $('voice-mode-dictate'), voiceConversation: $('voice-mode-conversation'),
     image: $('image'), imageForm: $('image-form'), imagePrompt: $('image-prompt'),
     imageSize: $('image-size'), imageStatus: $('image-status'), imageSend: $('image-send'),
   };
@@ -1869,6 +2132,8 @@ const DLNEChat = (() => {
   let live = null;          // the answer being written: { msg, view }
   let frame = 0;
   let stick = true;         // follow the answer while the reader is at the bottom
+  let lastTop = 0;          // the log's scrollTop at the last scroll event: smaller now means the reader moved up
+  let touching = false;     // a finger is on the log: never move the page under it
   let cooldownUntil = 0;
   let cooldownTimer = 0;
 
@@ -2025,10 +2290,27 @@ const DLNEChat = (() => {
     scrollToEnd(true);
   }
 
-  function scrollToEnd(force) { if (force || stick) ui.log.scrollTop = ui.log.scrollHeight; }
+  // Follow the answer only while the reader is at the end. The moment they scroll up (a finger, the wheel, keys) it
+  // stops, so what they are reading stays put however fast the answer comes (owner, 2.8.1: "if I scroll up on the
+  // answer to read something it constantly pushes what I'm trying to read"); "Latest" or scrolling to the end resumes.
+  function scrollToEnd(force) {
+    if (force) stick = true;
+    if (stick && (force || !touching)) ui.log.scrollTop = ui.log.scrollHeight;
+    ui.latest.hidden = stick;
+  }
   ui.log.addEventListener('scroll', () => {
-    stick = ui.log.scrollHeight - ui.log.scrollTop - ui.log.clientHeight < 80;
+    const top = ui.log.scrollTop;
+    stick = followAfterScroll(stick, top, lastTop, ui.log.scrollHeight - top - ui.log.clientHeight);
+    lastTop = top;
+    ui.latest.hidden = stick;
   }, { passive: true });
+  ui.log.addEventListener('touchstart', () => { touching = true; }, { passive: true });
+  ui.log.addEventListener('touchend', () => { touching = false; }, { passive: true });
+  ui.log.addEventListener('touchcancel', () => { touching = false; }, { passive: true });
+  ui.log.addEventListener('wheel', (e) => {
+    if (e.deltaY < 0 && ui.log.scrollHeight > ui.log.clientHeight) { stick = false; ui.latest.hidden = false; }
+  }, { passive: true });
+  ui.latest.addEventListener('click', () => scrollToEnd(true));
 
   function schedule() {
     if (frame) return;
@@ -2066,6 +2348,7 @@ const DLNEChat = (() => {
       renderTray();
     }
     current.messages.push(msg);
+    if (sendingByVoice) voiceTurns.add(msg);
     ui.input.value = '';
     draft = '';
     autosize();
@@ -2121,7 +2404,9 @@ const DLNEChat = (() => {
     const photoTurn = payload.messages.some((m) => Array.isArray(m.content))
       ? conv.messages.slice().reverse().find((m) => photoCount(m) > 0) : null;
     const reply = { role: 'assistant', content: '' };
+    const asked = conv.messages[conv.messages.length - 1];
     conv.messages.push(reply);
+    speechBegin(reply, asked);
     conv.updated = Date.now();
     live = { msg: reply, view: null };
     setBusy(true);
@@ -2181,6 +2466,8 @@ const DLNEChat = (() => {
       live = null;
       delete reply.searching;
       if (controller === ctrl) controller = null;
+      if (throttled || reply.status === 'stopped') { if (spoken && spoken.reply === reply) stopSpeech(); }
+      else if (!reply.status) speakProgress(reply, true);
       setBusy(false);
       if (!throttled) {
         conv.updated = Date.now();
@@ -2199,6 +2486,7 @@ const DLNEChat = (() => {
       if (result === 'changed') {
         // The picture the model asked for: its job is polled from the moment the event arrives, whatever the text does.
         if (reply.job && imageActive(reply.job) && !jobTimers.has(reply.job)) watch(reply.job, false);
+        speakProgress(reply, false);
         schedule();
       }
       return true;
@@ -2269,6 +2557,7 @@ const DLNEChat = (() => {
     ui.send.hidden = busy;
     ui.stop.hidden = !busy;
     // Photos alone are a message too; one still being made ready is not in the message yet, so it holds the send back.
+    ui.mic.disabled = (cooling || (navigator.onLine === false && !recorder) || transcribing) && speaking === 0;   // Stop speaking always works
     ui.send.disabled = busy || cooling || (!ui.input.value.trim() && !tray.length) || preparing > 0 || navigator.onLine === false;
   }
 
@@ -2287,6 +2576,7 @@ const DLNEChat = (() => {
 
   function newChat() {
     park();
+    stopSpeech();
     current = fresh();
     showAsk(false);   // a question waiting on the location card stays in the box, but the card belongs to the chat it was for
     save();
@@ -2298,6 +2588,7 @@ const DLNEChat = (() => {
     const found = saved.find((c) => c.id === id);
     if (!found) return;
     park();
+    stopSpeech();
     saved = saved.filter((c) => c.id !== id);
     current = found;
     showAsk(false);
@@ -2437,6 +2728,24 @@ const DLNEChat = (() => {
   const LOST_AFTER = 2 * 60 * 1000;  // give up following a job after this long without an answer
   let imageSupport = null;           // { etas } while capabilities.image_generation is true
   let imageBusy = false;
+  let voiceSupport = false;          // capabilities.voice
+  let voiceMaxSeconds = VOICE_MAX_SECONDS;
+  let recorder = null;               // the clip being recorded: { stream, ctx, node, chunks, rate, started, timer, ... }
+  let transcribing = false;
+  const MODE_KEY = 'dlne.voiceMode';  // 'dictate' (default) or 'conversation'
+  let voiceMode = store.get(MODE_KEY) === 'conversation' ? 'conversation' : 'dictate';
+  let voiceLang = '';                // the language the server heard in the last clip
+  let spoken = null;                 // the answer being read aloud: { reply, count, len, dead, pictured }
+  let speaking = 0;                  // utterances started and not yet finished
+  let speechGen = 0;                 // bumped on every stop, so a cancelled utterance's end is ignored
+  let noVoiceTold = false;
+  let sendingByVoice = false;
+  const voiceTurns = new WeakSet();  // user messages sent by voice in Conversation mode: only their answers are read
+  const speechSynth = (() => {
+    try { return window.speechSynthesis && typeof window.SpeechSynthesisUtterance === 'function' ? window.speechSynthesis : null; } catch (e) { return null; }
+  })();
+  // Asking once makes Chrome start loading its voices, so the one for the answer's language is usually there by then.
+  if (speechSynth) { try { speechSynth.getVoices(); } catch (e) { /* loads later */ } }
   const sizeLabels = {};
   Array.from(ui.imageSize.options).forEach((o) => { sizeLabels[o.value] = o.textContent; });
   const jobOf = (m) => (m.kind === 'image' ? m : m.job || null);   // the job a message is or carries
@@ -2446,9 +2755,20 @@ const DLNEChat = (() => {
   // to the coding model) shows a greyed "Pictures paused" item instead, which opens the page that says why.
   function readCapabilities(data) {
     visionSupport = !!(data && data.capabilities && data.capabilities.app_vision === true);
+    readVoiceSupport(data);
     picturesPaused = !!(data && data.images && data.images.paused === true);
     readImageSupport(data);
     updatePlus();
+  }
+
+  // The microphone is offered only while the status says ``capabilities.voice`` is true (a missing key is false).
+  function readVoiceSupport(data) {
+    voiceSupport = !!(data && data.capabilities && data.capabilities.voice === true);
+    voiceMaxSeconds = voiceMax(data);
+    ui.mic.hidden = !voiceSupport;
+    ui.voiceModeBlock.hidden = !voiceSupport;
+    if (!voiceSupport && recorder) stopRecording(true);
+    if (!voiceSupport) { stopSpeech(); showVoiceNote('', ''); }
   }
 
   function readImageSupport(data) {
@@ -2488,6 +2808,7 @@ const DLNEChat = (() => {
 
   async function submitImage() {
     if (imageBusy) return;
+    stopSpeech();
     const prompt = str(ui.imagePrompt.value, 1000);
     if (!prompt) { showImageStatus('Describe the picture first.', 'error'); ui.imagePrompt.focus(); return; }
     const size = IMAGE_SIZES.indexOf(ui.imageSize.value) !== -1 ? ui.imageSize.value : IMAGE_SIZES[0];
@@ -2840,6 +3161,252 @@ const DLNEChat = (() => {
     }
   }
 
+  // ---------------------------------------------------------------- voice: record, make a WAV, get the words
+  const VOICE_SEEN = 'dlne.chat.voiceNoticeSeen';
+
+  function showVoiceNote(text, kind) {
+    ui.voiceNote.textContent = text;
+    ui.voiceNote.className = 'tray-note voice-note' + (kind ? ' ' + kind : '');
+    ui.voiceNote.hidden = !text;
+  }
+
+  function setMicState() {
+    const recording = !!recorder;
+    ui.mic.setAttribute('aria-pressed', recording ? 'true' : 'false');
+    const talking = speaking > 0 && !recording && !transcribing;
+    ui.mic.setAttribute('aria-label', recording ? 'Stop recording' : transcribing ? 'Turning your voice into text'
+      : talking ? 'Stop speaking' : 'Record a voice message');
+    ui.mic.classList.toggle('working', transcribing);
+    ui.mic.classList.toggle('speaking', talking);
+    ui.micTimer.hidden = !recording;
+    updateComposer();
+  }
+
+  async function startRecording() {
+    if (recorder || transcribing) return;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function' || !Ctx) {
+      showVoiceNote(micError('unsupported'), 'error');
+      return;
+    }
+    showVoiceNote(store.get(VOICE_SEEN) === '1' ? '' : VOICE_NOTICE, '');
+    const mine = { stream: null, ctx: null, node: null, source: null, chunks: [], length: 0, rate: 0, started: 0, timer: 0 };
+    recorder = mine;   // a second tap while the browser asks for the microphone is a cancel, not a second recording
+    setMicState();
+    try {
+      mine.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+      if (recorder !== mine) { releaseRecorder(mine); return; }   // stopped while the browser was asking
+      mine.ctx = new Ctx();
+      if (mine.ctx.state === 'suspended' && mine.ctx.resume) await mine.ctx.resume();
+      mine.rate = mine.ctx.sampleRate;
+      mine.source = mine.ctx.createMediaStreamSource(mine.stream);
+      mine.node = mine.ctx.createScriptProcessor(4096, 1, 1);
+      mine.node.onaudioprocess = (e) => {
+        if (recorder !== mine) return;
+        const buf = e.inputBuffer;
+        const channels = [];
+        for (let c = 0; c < buf.numberOfChannels; c++) channels.push(buf.getChannelData(c));
+        const mono = voiceMono(channels);
+        mine.chunks.push(mono);
+        mine.length += mono.length;
+      };
+      const mute = mine.ctx.createGain();   // the processor must be wired on to run; silence keeps the room out of the speakers
+      mute.gain.value = 0;
+      mine.source.connect(mine.node);
+      mine.node.connect(mute);
+      mute.connect(mine.ctx.destination);
+      if (recorder !== mine) { releaseRecorder(mine); return; }
+      store.set(VOICE_SEEN, '1');
+      mine.started = Date.now();
+      ui.micTimer.textContent = voiceClock(0) + ' / ' + voiceClock(voiceMaxSeconds);
+      showVoiceNote('Recording. Tap the microphone again to stop.', '');
+      mine.timer = setInterval(() => {
+        const seconds = (Date.now() - mine.started) / 1000;
+        ui.micTimer.textContent = voiceClock(seconds) + ' / ' + voiceClock(voiceMaxSeconds);
+        if (seconds >= voiceMaxSeconds) stopRecording(false);
+      }, 250);
+      setMicState();
+    } catch (e) {
+      if (recorder === mine) { recorder = null; releaseRecorder(mine); setMicState(); showVoiceNote(micError(e && e.name), 'error'); }
+    }
+  }
+
+  function releaseRecorder(r) {
+    clearInterval(r.timer);
+    try { if (r.node) { r.node.onaudioprocess = null; r.node.disconnect(); } } catch (e) { /* already gone */ }
+    try { if (r.source) r.source.disconnect(); } catch (e) { /* already gone */ }
+    try { if (r.stream) r.stream.getTracks().forEach((t) => t.stop()); } catch (e) { /* already stopped */ }
+    try { if (r.ctx && r.ctx.close) r.ctx.close(); } catch (e) { /* already closed */ }
+  }
+
+  // Stop the clip. ``discard``: throw it away (Escape, or the server stopped offering voice).
+  async function stopRecording(discard) {
+    const mine = recorder;
+    if (!mine) return;
+    recorder = null;
+    releaseRecorder(mine);
+    setMicState();
+    if (discard) { showVoiceNote('', ''); return; }
+    const flat = new Float32Array(mine.length);
+    let at = 0;
+    mine.chunks.forEach((c) => { flat.set(c, at); at += c.length; });
+    const seconds = mine.rate ? flat.length / mine.rate : 0;
+    if (!mine.started || seconds < VOICE_MIN_SECONDS) {
+      showVoiceNote('That was too short. Tap the microphone, speak, then tap it again.', 'error');
+      return;
+    }
+    const wav = voiceWav(voiceResample(flat, mine.rate, VOICE_RATE), VOICE_RATE);
+    await transcribe(wav);
+  }
+
+  async function transcribe(wav) {
+    transcribing = true;
+    setMicState();
+    showVoiceNote('Turning your voice into text…', '');
+    try {
+      const resp = await fetch(VOICE_ENDPOINT, { method: 'POST', body: voiceForm(wav), cache: 'no-store' });
+      if (!resp.ok) {
+        const problem = await problemOf(resp);
+        showVoiceNote(voiceError(resp.status, problem.code, problem.detail), 'error');
+        return;
+      }
+      let data = null;
+      try { data = await resp.json(); } catch (e) { data = null; }
+      const text = data && typeof data.text === 'string' ? data.text.replace(/\s+/g, ' ').trim() : '';
+      if (!text) { showVoiceNote("I didn't catch any words. Try again, a little closer to the microphone.", 'error'); return; }
+      voiceLang = data && typeof data.language === 'string' ? data.language : '';
+      insertAtCursor(text);
+      if (conversing()) {
+        sendByVoice();
+      } else {
+        showVoiceNote('Added to your message. Check it, then send.', '');
+      }
+    } catch (e) {
+      showVoiceNote("Couldn't reach DLNE. Please try again.", 'error');
+    } finally {
+      transcribing = false;
+      setMicState();
+    }
+  }
+
+  // The words go where the cursor is (or replace the selection), spaced from their neighbours; the message is never sent.
+  function insertAtCursor(text) {
+    const box = ui.input;
+    const value = box.value;
+    const from = typeof box.selectionStart === 'number' ? box.selectionStart : value.length;
+    const to = typeof box.selectionEnd === 'number' ? box.selectionEnd : from;
+    const before = value.slice(0, from);
+    const after = value.slice(to);
+    let piece = (before && !/\s$/.test(before) ? ' ' : '') + text + (after && !/^\s/.test(after) ? ' ' : '');
+    const room = box.maxLength > 0 ? box.maxLength - before.length - after.length : piece.length;
+    if (room <= 0) return;
+    piece = piece.slice(0, room);
+    box.value = before + piece + after;
+    const caret = before.length + piece.length;
+    if (typeof box.setSelectionRange === 'function') box.setSelectionRange(caret, caret);
+    box.dispatchEvent(new Event('input'));   // the box's own handler sizes it, saves the draft and enables Send
+    box.focus();
+  }
+
+  // ---------------------------------------------------------------- conversation: the answer read aloud
+  const conversing = () => voiceSupport && voiceMode === 'conversation';
+
+  // Conversation: the box is sent as the Send button would send it, every guard of Send applies, and when it does not go
+  // the words simply stay in the box.
+  function sendByVoice() {
+    sendingByVoice = true;
+    try { submit(); } finally { sendingByVoice = false; }
+    if (ui.input.value.trim()) showVoiceNote('Added to your message. It was not sent; check it, then send.', '');
+    else showVoiceNote('', '');
+  }
+
+  function setVoiceMode(mode, persist) {
+    voiceMode = mode === 'conversation' ? 'conversation' : 'dictate';
+    if (persist) store.set(MODE_KEY, voiceMode);
+    ui.voiceDictate.checked = voiceMode === 'dictate';
+    ui.voiceConversation.checked = voiceMode === 'conversation';
+    if (voiceMode !== 'conversation') stopSpeech();
+  }
+
+  // Stop at once and read nothing further (a new answer, a recording, a send, another chat, Conversation off).
+  function stopSpeech() {
+    speechGen++;
+    spoken = null;
+    speaking = 0;
+    if (speechSynth) { try { speechSynth.cancel(); } catch (e) { /* nothing to stop */ } }
+    setMicState();
+  }
+
+  // iPhone and iPad Safari let a page speak only after a tap: the mic tap speaks an empty utterance and resumes, which
+  // unlocks speech for the answer that arrives long after.
+  function unlockSpeech() {
+    if (!conversing() || !speechSynth) return;
+    try {
+      speechSynth.resume();
+      const hush = new SpeechSynthesisUtterance('');
+      hush.volume = 0;
+      speechSynth.speak(hush);
+    } catch (e) { /* no speech here */ }
+  }
+
+  function tellNoVoice() {
+    if (noVoiceTold) return;
+    noVoiceTold = true;
+    showVoiceNote(SPEAK_NO_VOICE, '');
+  }
+
+  function say(sentence) {
+    if (!speechSynth) return false;
+    const utter = new SpeechSynthesisUtterance(sentence);
+    // Chrome (Android too) lists its voices only once they have loaded: getVoices() is [] at first. An utterance with no
+    // voice set still speaks in the default one, so an empty list never means "no voice"; only the engine failing does.
+    let voices = [];
+    try { voices = speechSynth.getVoices() || []; } catch (e) { voices = []; }
+    const voice = pickVoice(voices, voiceLang);
+    if (voice) { utter.voice = voice; utter.lang = voice.lang; }
+    const gen = speechGen;
+    const over = () => { if (gen === speechGen) { speaking = Math.max(0, speaking - 1); setMicState(); } };
+    utter.onend = over;
+    utter.onerror = (e) => {
+      over();
+      const why = e && e.error;
+      if (gen === speechGen && (why === 'synthesis-unavailable' || why === 'synthesis-failed')) {
+        if (spoken) spoken.dead = true;
+        tellNoVoice();
+      }
+    };
+    speaking++;
+    try { speechSynth.speak(utter); } catch (e) { speaking = Math.max(0, speaking - 1); return false; }
+    setMicState();
+    return true;
+  }
+
+  // A new answer starts: whatever was being read stops, and this one is read only if its question was spoken.
+  function speechBegin(reply, asked) {
+    stopSpeech();
+    if (conversing() && asked && voiceTurns.has(asked)) spoken = { reply, count: 0, len: 0, dead: false, pictured: false };
+  }
+
+  // The answer so far (``flush``: it is over): new complete sentences go to the speaker, one utterance each.
+  function speakProgress(reply, flush) {
+    const s = spoken;
+    if (!s || s.reply !== reply) return;
+    if (!conversing()) { stopSpeech(); return; }
+    if (s.dead) return;
+    const next = speechFeed(s, reply.content, flush);
+    if (next.reset) {   // retract: what was spoken stops at once and the fresh answer is read from its start
+      speechGen++;
+      speaking = 0;
+      if (speechSynth) { try { speechSynth.cancel(); } catch (e) { /* nothing to stop */ } }
+      setMicState();
+    }
+    const lines = next.sentences.slice();
+    if (flush && reply.job && !s.pictured) { s.pictured = true; lines.push(SPEAK_PICTURE); }
+    for (const line of lines) {
+      if (!say(line)) { s.dead = true; tellNoVoice(); return; }
+    }
+  }
+
   // ---------------------------------------------------------------- the pool's status
   let lastModel = '';
   async function refreshStatus() {
@@ -2911,6 +3478,7 @@ const DLNEChat = (() => {
   ui.clearAll.addEventListener('click', () => {
     if (!window.confirm('Delete all your chats on this device?')) return;
     if (controller) controller.abort();
+    stopSpeech();
     dropJobs();
     saved = [];
     current = fresh();
@@ -2937,11 +3505,23 @@ const DLNEChat = (() => {
     if (trayFull()) { trayNote = FULL_NOTE; renderTray(); } else ui.pickCamera.click();
   });
   ui.makeImage.addEventListener('click', () => { closePlus(); openImage(null); });
+  ui.mic.addEventListener('click', () => {
+    if (recorder) { unlockSpeech(); stopRecording(false); return; }
+    const wasTalking = speaking > 0;   // the button said "Stop speaking": that is all this tap does
+    stopSpeech();
+    if (wasTalking) return;
+    unlockSpeech();   // inside the tap (after the stop, which would cancel it): iPhone Safari only lets a page speak after one
+    startRecording();
+  });
+  [ui.voiceDictate, ui.voiceConversation].forEach((radio) => radio.addEventListener('change', () => { if (radio.checked) setVoiceMode(radio.value, true); }));
+  window.addEventListener('pagehide', stopSpeech);
+  setVoiceMode(voiceMode);
   ui.picturesPaused.addEventListener('click', () => closePlus());   // the link opens /pictures in a new tab
   document.addEventListener('click', (e) => {
     if (plusOpen && !ui.plus.contains(e.target) && !ui.plusMenu.contains(e.target)) closePlus();
   });
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && recorder) { stopRecording(true); ui.mic.focus(); return; }
     if (e.key === 'Escape' && plusOpen) { closePlus(); ui.plus.focus(); }
   });
   ui.field.addEventListener('focusout', (e) => {

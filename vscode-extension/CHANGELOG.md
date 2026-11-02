@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.8.0] - 2026-11-02
+
+Pairs with DLNE coordinator **2.8.0** (voice); with an older coordinator the microphone stays hidden.
+
+### Added
+
+- **Voice conversation.** A new setting, `dlne.voice.mode`, lets the microphone button in the DLNE Agent panel do more than type for you. In **Dictate** (the default, as before) your words go in the message box and you press Send. In **Conversation** your words are sent as your message right away, and the answer is read aloud by your computer's own voice. If Send is blocked (a task is already running, for example), your words stay in the box.
+- **A command to switch:** "DLNE: Toggle Voice Conversation Mode" in the Command Palette.
+- **Only the answer is read.** DLNE reads the agent's written reply to a message you spoke, sentence by sentence while it is being written. It does not read tool calls, file edits, terminal output or diffs, says "There's code in the chat." for code and "There's a table in the chat." for tables, and stops after about 1,500 characters with "The rest is in the chat." Messages you type are never read aloud.
+- **Stop speaking.** While the answer is being read, the microphone button becomes **Stop speaking**. Starting a recording, sending a message, switching or starting a chat, turning Conversation off or closing VS Code also stops it at once.
+- **Your computer's own speech, nothing new online.** Windows uses PowerShell's built-in speech, macOS uses `say`, Linux uses `espeak-ng`, `espeak` or `spd-say`. If none is found, DLNE tells you what to install and the answer stays in the chat as text.
+
+## [1.7.0] - 2026-11-02
+
+Pairs with DLNE coordinator **2.8.0** (voice); with an older coordinator the microphone stays hidden.
+
+### Added
+- **Speak instead of type in the DLNE Agent panel.** A microphone button beside the message box: click to record, click
+  again to stop (a timer shows, and it stops by itself at the server's limit, 60 s on TheWall). The clip goes to the DLNE
+  server, comes back as text and lands at the cursor in the box, where you can read and fix it before sending. It is
+  never sent by itself. Ctrl+Alt+V (Cmd+Alt+V on a Mac) or the command "DLNE: Start or Stop Voice Recording" does the
+  same.
+- **Recorded by VS Code itself, not the panel** (panels cannot use the microphone): Linux uses `pw-record`, `parecord` or
+  `arecord`; Windows uses its built-in recorder (no install); macOS uses `rec` (SoX) or `ffmpeg` if present. With no
+  recorder the button says what to install. The clip is kept in a temporary file only until it is sent.
+- **Shown only when it can work:** while the server offers voice and this computer has a recorder. The setting
+  `dlne.voice.enabled` (on by default) hides it.
+- **Privacy:** the clip goes to the DLNE server to be turned into text and is not kept there; the text is not stored.
+
 ## [1.6.0] - 2026-10-30
 
 Pairs with DLNE coordinator **2.7.0** (CUDA engines, `/v1/me`, coding lanes); with an older coordinator the new

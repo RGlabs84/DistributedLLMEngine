@@ -222,8 +222,10 @@ BUTTON_GLYPH_PATHS = {
     "M4 7h16M4 12h16M4 17h16",                # menu
     "M6 6l12 12M18 6L6 18",                   # close (menu and report sheets)
     "M12 19V5M5.5 11.5L12 5l6.5 6.5",         # send
+    "M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3",   # the microphone's stand (voice, 2.8.0)
 }
 STOP_SQUARE = {"x": "7", "y": "7", "width": "10", "height": "10", "rx": "2", "fill": "currentColor"}
+MIC_BODY = {"x": "9", "y": "3", "width": "6", "height": "11", "rx": "3"}
 
 
 def test_the_page_has_no_inline_logo_only_its_button_glyphs():
@@ -231,18 +233,18 @@ def test_the_page_has_no_inline_logo_only_its_button_glyphs():
     assert not [e for e in elements if e[0] in ("symbol", "use", "image", "text", "g", "defs", "circle", "ellipse")]
     assert "<symbol" not in chat_page.CHAT_HTML and "dlne-mark" not in chat_page.CHAT_HTML
     svgs = [e for e in elements if e[0] == "svg"]
-    assert len(svgs) == 8   # + the image sheet's close button + the composer's "+" (the same glyph as new chat)
+    assert len(svgs) == 9   # + the image sheet's close button + the composer's "+" (the same glyph as new chat) + the mic
     for _tag, attrs, parents in svgs:
         assert "class" not in attrs and attrs.get("aria-hidden") == "true", attrs
         assert any(t == "button" for t, _a in parents), "an inline <svg> outside a button is a drawn mark"
         assert attrs["viewbox"] == "0 0 24 24"   # HTMLParser lower-cases attribute names
     shapes = [(t, a) for t, a, parents in elements if t in ("path", "rect") and any(p[0] == "svg" for p in parents)]
-    assert len(shapes) == 8
+    assert len(shapes) == 10   # the mic is a rect (its body) and a path (its stand)
     for tag, attrs in shapes:
         if tag == "path":
             assert attrs["d"] in BUTTON_GLYPH_PATHS, f"a new drawn shape: {attrs['d']}"
         else:
-            assert attrs == STOP_SQUARE
+            assert attrs in (STOP_SQUARE, MIC_BODY)
 
 
 DRAWING_IMPORTS = {"zlib", "struct", "math", "array", "PIL", "numpy", "cairo", "cairosvg", "matplotlib"}

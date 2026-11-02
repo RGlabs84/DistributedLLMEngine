@@ -47,10 +47,10 @@ class FlavorManifestTest {
     }
 
     @Test
-    fun `the play build asks for internet and location and nothing of its own beyond androidx's internal one`() {
+    fun `the play build asks for internet, location and the microphone and nothing of its own beyond androidx's internal one`() {
         val permissions = manifest("play").names("uses-permission").toSet()
         val internal = setOf("io.dlne.chat.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION")
-        assertEquals(setOf("android.permission.INTERNET", fineLocation, coarseLocation), permissions - internal)
+        assertEquals(setOf("android.permission.INTERNET", fineLocation, coarseLocation, "android.permission.RECORD_AUDIO"), permissions - internal)
     }
 
     @Test

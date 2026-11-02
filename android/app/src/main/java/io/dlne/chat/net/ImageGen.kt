@@ -17,6 +17,8 @@ data class Capabilities(
     @SerialName("image_generation") val imageGeneration: Boolean = false,
     /** The phone chat reads photos (server 2.6.2+); an older server never says it. */
     @SerialName("app_vision") val appVision: Boolean = false,
+    /** Speech to text is on (server 2.8.0+): the mic button is shown for nothing else. */
+    val voice: Boolean = false,
 )
 
 /** `image_generation` of the status while the server has it on: sizes, queue and typical times. */
