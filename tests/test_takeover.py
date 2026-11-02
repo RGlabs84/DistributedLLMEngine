@@ -420,11 +420,11 @@ def test_a_start_removes_a_lease_file_that_cannot_be_read(box):
 
 
 def test_the_status_block_names_the_lease_and_not_its_id_or_anything_of_the_machine(box):
-    assert takeover.status_block() == {"active": False, "state": None, "holder": None, "since": None, "expires_at": None}
+    assert takeover.status_block() == {"active": False, "state": None, "holder": None, "since": None, "expires_at": None, "layout": None}
     lease_file(box)
     block = takeover.status_block()
 
-    assert set(block) == {"active", "state", "holder", "since", "expires_at"}
+    assert set(block) == {"active", "state", "holder", "since", "expires_at", "layout"}
     assert (block["active"], block["state"], block["holder"]) == (True, "active", "DLNE-Sec on portoBOX")
     assert block["since"] == takeover.iso(box.clock()) and block["expires_at"] == takeover.iso(box.clock() + 14400)
     assert "tk_" not in json.dumps(block) and POOL_A not in json.dumps(block)

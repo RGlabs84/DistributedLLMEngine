@@ -169,6 +169,11 @@
 
     <!-- Errors -->
     <string name="error_network">Can\'t reach DLNE. Check your connection and try again.</string>
+    <string name="maintenance_label">Maintenance</string>
+    <string name="maintenance_title">DLNE is being upgraded</string>
+    <string name="maintenance_default">DLNE is down for a short upgrade. Back soon.</string>
+    <string name="maintenance_expected">Expected back: %1$s</string>
+    <string name="maintenance_checks">This page checks every 15 seconds and opens again by itself.</string>
     <string name="error_server">DLNE is having trouble right now (error %1$d). Try again in a moment.</string>
     <string name="error_not_found">This server doesn\'t offer DLNE chat yet. If you changed the server address, check it in Settings.</string>
     <string name="error_unexpected">Something went wrong. Please try again.</string>

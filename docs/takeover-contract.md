@@ -122,8 +122,8 @@ wrong key, not a LAN peer, came through the proxy), `takeover_active` (409), `ta
   `IMAGE_CPU_MASK`), with their SMT siblings (core n's sibling on TheWall is CPU n+6).
 - **RAM** is `systemctl --user set-property --runtime dlne.service MemoryMax=… MemoryHigh=…` (runtime only, so a
   reboot cannot leave it lowered); the values before are kept in the lease file and set back on release.
-- **Visible:** `/v1/cluster/status` gains `takeover: {"active", "state", "holder", "since", "expires_at"}` (no lease
-  id, no address). The admin stats show it too.
+- **Visible:** `/v1/cluster/status` gains `takeover: {"active", "state", "holder", "since", "expires_at", "layout"}` (no
+  lease id, no address; `layout`, 2.9.0, is the named layout the lease runs on, or null). The admin stats show it too.
 - **Tests:** plan answers for each kind of card; LAN/proxy/key refusals; one lease at a time; idle gate refusal;
   heartbeat loss and ttl end it; release restores; a stale file at start is removed; the overlay never touches
   `config.txt`; status fields.
@@ -132,3 +132,47 @@ wrong key, not a LAN peer, came through the proxy), `takeover_active` (409), `ta
 
 Leases from outside the LAN; several leases at once; taking a lane or the model itself (the lease takes hardware;
 DLNE decides how to keep serving); DLNE-Sec's own scheduling of what it runs on what it borrowed.
+
+## Addendum (2.9.0): leases that apply the owner's named layouts
+
+**Owner, 2026-11-02:** TheWall has three named layouts in `config/`: `config.txt.normal-layout` (no takeover),
+`config.txt.takeover-1card` (Duka gets BC-160 #1, DLNE's 9B runs on BC-160 #2) and `config.txt.takeover-2card` (Duka
+gets both BC-160s, DLNE's 9B runs on the RX 580). A lease should apply the layout that matches what it takes, and
+releasing it should give the normal layout back.
+
+- **Which layout:** by the cards the request names. The BC-160s are the discrete cards named "BC-160", numbered #1, #2
+  by PCI address. A request whose `gpus` is exactly BC-160 #1 picks `takeover-1card`; exactly both BC-160s picks
+  `takeover-2card`. Any other request (the RX 580, BC-160 #2 alone, a CPU-only or RAM-only lease) uses today's generic
+  plan, unchanged. `cpu_cores` and `ram_gb` on a layout lease still work, on top of the layout. `TAKEOVER_LAYOUTS=false`
+  in config.txt turns the named layouts off (default true).
+- **Applied as an overlay, still never an edit.** The lease copies the layout file's keys over `config.txt`'s **in
+  memory**: the lease file keeps those key/value pairs, `get_worker_limits()` parses `config.txt` with them on top, and
+  `config.txt` itself is not written (rule "An overlay, not an edit" stands). Keys the layout does not set keep their
+  `config.txt` value. These keys are never taken from a layout file, even if it sets them: `MAINTENANCE`,
+  `MAINTENANCE_MESSAGE`, `MAINTENANCE_UNTIL`, `TAKEOVER_KEY_HASH`, `TAKEOVER_LAYOUTS`, `ADMIN_HASH`, `NETWORK_KEY`.
+- **ENGINE_EXTRA_ARGS is checked.** `parse_engine_args` on the merged value must keep every flag: ONE disallowed flag
+  drops the whole line, which would silently lose `--cpu-mask`, `-ts` and the rest. A layout whose merged line parses
+  to nothing is treated like a missing file.
+- **Missing or unusable layout file:** a log line (`Takeover: layout ... not used (...); using the generic plan`) and
+  today's generic plan, nothing else changes.
+- **The plan:** the dry run reads the layout's limits as "what DLNE will be": the cards named are `handover`, `engine_on`,
+  lanes and context come from the layout, `pictures`/`vision`/`voice` from its keys, `engine_restart` is true, and
+  `dlne_now` / `keep_result` gain `"layout": "<name>"` (absent on a generic lease). The `keep` floor is not used by a
+  layout (the layout's own lanes and context are what the owner measured); the one-lease, idle-gate, heartbeat, ttl and
+  refusal rules are unchanged. Pictures/voice that the layout turns off are paused through the same host call as today.
+- **Model, projector, args:** the layout's `DEFAULT_MODEL` is the model the engine restarts on while the lease is
+  granting or active (the same idle-gated swap path as the generic lease); `ENGINE_MMPROJ` and `ENGINE_EXTRA_ARGS` reach
+  the engine through the limits, so they come from the layout too. Giving the lease back restarts on `config.txt`'s own
+  `DEFAULT_MODEL`, projector and args. The layout's model file must exist (the inference manager's resolver) before the
+  grant; if not, the layout is not used (log line) and the generic plan applies.
+- **Release** deletes the lease (and with it the overlay), so the limits are `config.txt`'s own, which holds the normal
+  layout; the engine is restarted on them (idle-gated, as today). A crash or a stale file is cleaned at the next start
+  as before, so a layout can never outlive its lease.
+- **The phones' own engine (2.9.0, PHONE_ENGINE=own):** the grant stops it (in the same idle moment as pictures and
+  voice) when a generic lease takes the card it runs on (the media card, or the one PHONE_DEVICE names), or when the
+  layout sets `PHONE_ENGINE=shared`. `config.txt.takeover-2card` must set `PHONE_ENGINE=shared`, because DLNE's 9B moves
+  onto the RX 580 there. The phone switcher does nothing while a lease is granting, active or restoring, and starts the
+  base phone model again once it is over. Nothing in the requests or answers changes.
+- **Tests:** layout chosen by cards (1 card, 2 cards, others generic); keys merged not replaced; protected keys kept;
+  a disallowed flag falls back; a missing file falls back with a log line; grant restarts on the layout's limits and
+  release restores `config.txt`'s; `config.txt` never written; the plan shows the layout.

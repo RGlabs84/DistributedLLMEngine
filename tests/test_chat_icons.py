@@ -187,18 +187,19 @@ def _tree(html):
     return parser.elements
 
 
-def test_the_pages_marks_are_the_logo_image_in_the_header_the_welcome_and_the_first_run_sheet():
+def test_the_pages_marks_are_the_logo_image_in_the_header_the_welcome_the_first_run_sheet_and_maintenance():
     marks = [(attrs, parents) for tag, attrs, parents in _tree(chat_page.CHAT_HTML)
              if tag == "img" and "mark" in (attrs.get("class") or "").split()]
-    assert len(marks) == 3
+    assert len(marks) == 4   # + the maintenance card (2.8.5)
     for attrs, _parents in marks:
         assert attrs["src"] == icons.icon_url("icon-192.png")
         assert attrs["alt"] == "" and attrs["width"] == attrs["height"]
     places = [{(t, a.get("id") or a.get("class")) for t, a in parents} for _attrs, parents in marks]
     assert ("header", "top") in places[0]
     assert ("section", "welcome") in places[1]
-    assert ("dialog", "first-run") in places[2]
-    assert [tag for tag, _a, _p in _tree(chat_page.CHAT_HTML) if tag in ("img",)] == ["img"] * 3, "no other image"
+    assert ("dialog", "maint") in places[2]
+    assert ("dialog", "first-run") in places[3]
+    assert [tag for tag, _a, _p in _tree(chat_page.CHAT_HTML) if tag in ("img",)] == ["img"] * 4, "no other image"
 
 
 def test_the_page_keeps_its_csp_and_loads_its_icons_only_from_itself():

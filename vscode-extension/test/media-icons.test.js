@@ -109,7 +109,7 @@ test('the sidebar webview shows the logo image and draws no mark of its own', ()
   assert.ok(!/&#x?1f9e0;|&#129504;/i.test(html));
   assert.ok(!/<svg|<symbol|<canvas|data:image/i.test(html), 'no inline or embedded mark');
   const images = [...html.matchAll(/<img\b[^>]*>/g)].map((m) => m[0]);
-  assert.equal(images.length, 2, 'the card header and the welcome line');
+  assert.equal(images.length, 3, 'the card header, the welcome line and the maintenance card (1.9.0)');
   for (const img of images) assert.match(img, /src="[^"]*media\/dlne_logo\.png"/);
   assert.match(html, /<img class="logo"[^>]*>Donate compute/);
   assert.match(html, /<img class="logo"[^>]*>DLNE Code Assistant/);

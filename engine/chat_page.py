@@ -382,6 +382,35 @@ a.source:hover { border-color: var(--user-border); }
 .search-note { margin: 10px 0 0; font-size: .8rem; line-height: 1.4; color: var(--faint); }
 
 /* Empty state */
+/* Maintenance (2.8.5): while the status says so, one card over everything, in DLNE's colours, until it is over */
+/* A modal <dialog> opened last, so it sits above the first-run notice and every other sheet (the top layer). */
+.maint {
+  position: fixed; inset: 0; width: 100%; height: 100%; max-width: none; max-height: none; margin: 0; border: 0;
+  border-radius: 0; place-items: center; padding: 24px; color: #e2e8f0;
+  background: radial-gradient(circle at 25% 15%, rgba(0, 240, 255, .14), transparent 50%),
+              radial-gradient(circle at 80% 85%, rgba(192, 132, 252, .14), transparent 55%), rgba(5, 8, 15, .94);
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+}
+.maint[open] { display: grid; }
+.maint::backdrop { background: transparent; }
+.maint .mcard {
+  max-width: 460px; text-align: center; padding: 28px 24px; border-radius: 20px; color: #e2e8f0;
+  border: 1px solid rgba(0, 240, 255, .32); background: rgba(9, 13, 24, .92); box-shadow: 0 0 44px rgba(0, 240, 255, .14);
+}
+.maint .mlogo { width: 84px; height: 84px; margin: 0 auto; border-radius: 18px; filter: drop-shadow(0 0 14px rgba(0, 240, 255, .5)); }
+.maint .mlabel { margin: 14px 0 0; font: 600 .72rem ui-monospace, Menlo, Consolas, monospace; letter-spacing: .16em;
+  text-transform: uppercase; color: #38bdf8; }
+.maint h2 { margin: 6px 0 10px; font-size: 1.55rem; line-height: 1.25; font-weight: 750;
+  background: linear-gradient(135deg, #ffffff 0%, #38bdf8 50%, #c084fc 100%);
+  -webkit-background-clip: text; background-clip: text; color: transparent; }
+.maint .mmsg { margin: 0 0 10px; line-height: 1.5; }
+.maint .mwhen { margin: 0 0 12px; font: .9rem ui-monospace, Menlo, Consolas, monospace; color: #c084fc; }
+.maint .mwhen[hidden] { display: none; }
+.maint .mping { margin: 0; font-size: .82rem; color: #94a3b8; }
+.maint .mdot { display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: #00f0ff;
+  box-shadow: 0 0 10px rgba(0, 240, 255, .7); animation: mpulse 1.8s ease-in-out infinite; vertical-align: 1px; }
+@keyframes mpulse { 50% { opacity: .3; } }
+@media (prefers-reduced-motion: reduce) { .maint .mdot { animation: none; } }
 .welcome { text-align: center; padding: 5vh 0 8px; }
 .welcome .mark { width: 96px; height: 96px; margin: 0 auto; }
 .welcome h2 { margin: 14px 0 6px; font-size: 1.4rem; line-height: 1.3; font-weight: 650; }
@@ -621,6 +650,16 @@ dialog::backdrop { background: rgba(2, 8, 10, .62); }
     <button type="button" class="latest" id="latest" hidden>&darr; Latest</button>
   </main>
   <p class="banner" id="bar" role="alert" hidden></p>
+  <dialog class="maint" id="maint" role="alertdialog" aria-labelledby="maint-title" aria-describedby="maint-msg">
+    <div class="mcard">
+      <img class="mark mlogo" src="{{ICON_192}}" width="84" height="84" alt="">
+      <p class="mlabel">Maintenance</p>
+      <h2 id="maint-title">DLNE is being upgraded</h2>
+      <p class="mmsg" id="maint-msg"></p>
+      <p class="mwhen" id="maint-when" hidden></p>
+      <p class="mping"><span class="mdot" aria-hidden="true"></span>This page checks every 15 seconds and opens again by itself. Your chats are safe on this device.</p>
+    </div>
+  </dialog>
   <form class="composer" id="composer" autocomplete="off">
     <div class="askcard" id="ask-location" role="group" aria-labelledby="ask-location-title" hidden>
       <p class="askcard-title" id="ask-location-title">Use your location for this?</p>
@@ -2056,7 +2095,7 @@ const DLNEChat = (() => {
 
   const $ = (id) => document.getElementById(id);
   const ui = {
-    app: $('app'), log: $('log'), thread: $('thread'), latest: $('latest'), welcome: $('welcome'), form: $('composer'), input: $('input'),
+    maint: $('maint'), maintMsg: $('maint-msg'), maintWhen: $('maint-when'), app: $('app'), log: $('log'), thread: $('thread'), latest: $('latest'), welcome: $('welcome'), form: $('composer'), input: $('input'),
     send: $('send'), stop: $('stop'), bar: $('bar'), offline: $('offline'), dot: $('dot'), serving: $('serving'),
     sep: $('sep'), model: $('model'), about: $('about'), menu: $('menu'), recent: $('recent'), firstRun: $('first-run'),
     install: $('install'), clearAll: $('clear-all'), report: $('report'), reportForm: $('report-form'),
@@ -3409,12 +3448,34 @@ const DLNEChat = (() => {
 
   // ---------------------------------------------------------------- the pool's status
   let lastModel = '';
+  // Maintenance (2.8.5): the status carries {"maintenance": {"active", "message", "until"}} only while it is on. The card
+  // covers the page until it is over; meanwhile the status is asked every 15 s instead of every 30.
+  let maintTimer = 0;
+  ui.maint.addEventListener('cancel', (e) => e.preventDefault());   // Escape does not close maintenance
+  function showMaintenance(m) {
+    const on = !!(m && typeof m === 'object' && m.active === true);
+    if (on && !ui.maint.open) ui.maint.showModal();
+    if (!on && ui.maint.open) ui.maint.close();
+    if (on) {
+      ui.maintMsg.textContent = typeof m.message === 'string' && m.message.trim() ? m.message.trim()
+        : 'DLNE is down for a short upgrade. Back soon.';
+      const until = typeof m.until === 'string' ? m.until.trim() : '';
+      ui.maintWhen.hidden = !until;
+      ui.maintWhen.textContent = until ? 'Expected back: ' + until : '';
+      if (!maintTimer) maintTimer = setInterval(() => refreshStatus(), 15000);
+    } else if (maintTimer) {
+      clearInterval(maintTimer);
+      maintTimer = 0;
+    }
+  }
+
   async function refreshStatus() {
     if (navigator.onLine === false) { setStatus('off', "You're offline", lastModel); return; }
     try {
       const resp = await fetch(STATUS, { cache: 'no-store' });
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const data = await resp.json();
+      showMaintenance(data && data.maintenance);
       readCapabilities(data);
       const pool = data && data.app_pool;
       if (!pool || typeof pool !== 'object') { setStatus('down', 'Not available here yet', ''); return; }

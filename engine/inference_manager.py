@@ -280,6 +280,35 @@ def phone_lane_args(phone_slots: int, slot_context: int) -> List[str]:
     return ["--kv-unified", "--kv-unified-per-slot", str(pad_context(slot_context)), "--no-slots"]
 
 
+# The expert layout the coordinator picked for the rung being served (engine/pool_layout.py, 2.9.0), as
+# llama-server arguments ("--n-cpu-moe", "N" or "-ot" rules), or None for "no layout picked": then
+# ENGINE_EXTRA_ARGS' placement applies as always (and is left out across volunteers' GPUs). When set it
+# REPLACES the operator's placement flags wherever the engine runs, and is checked against the config
+# allow-list before it is set. The other ENGINE_EXTRA_ARGS (threads, chat settings) are untouched.
+_layout_override: Optional[List[str]] = None
+
+
+def set_layout_override(args: Optional[List[str]]) -> Optional[List[str]]:
+    """Install (or, with None, clear) the picked layout; returns what was set before."""
+    global _layout_override
+    previous = _layout_override
+    _layout_override = None if args is None else [str(a) for a in args]
+    return previous
+
+
+def get_layout_override() -> Optional[List[str]]:
+    return None if _layout_override is None else list(_layout_override)
+
+
+def effective_engine_args(limits: Dict, remote: bool) -> List[str]:
+    """ENGINE_EXTRA_ARGS as the engine will use them: the picked layout in place of the operator's placement, else
+    the operator's placement, which is left out when ``remote`` (volunteers' GPUs are in)."""
+    extra = list(limits.get("engine_extra_args") or ())
+    if _layout_override is not None:
+        return engine_args_without_placement(extra) + list(_layout_override)
+    return engine_args_without_placement(extra) if remote else extra
+
+
 def cpu_moe_layers(extra_args) -> int:
     """
     The N of ``--n-cpu-moe N`` (or ``-ncmoe N``) in ENGINE_EXTRA_ARGS, or 0.
@@ -1161,7 +1190,7 @@ class InferenceManager:
         try:
             shape = gguf.model_shape(resolved)
             if shape is not None and shape.has_tensor_table:
-                layers = cpu_moe_layers(get_worker_limits().get("engine_extra_args"))
+                layers = cpu_moe_layers(effective_engine_args(get_worker_limits(), False))
                 return shape.gpu_bytes(layers) / _GIB + RUNTIME_OVERHEAD_GB
             file_bytes = sum(os.path.getsize(shard) for shard in gguf.shard_paths(resolved))
             return (file_bytes / _GIB) * VRAM_OVERHEAD_FACTOR
@@ -1182,9 +1211,9 @@ class InferenceManager:
         shape = gguf.model_shape(resolved) if resolved else None
         if shape is None or not shape.has_tensor_table:
             return 0.0, 0.0
-        layers = cpu_moe_layers(get_worker_limits().get("engine_extra_args"))
+        layers = cpu_moe_layers(effective_engine_args(get_worker_limits(), False))
         moved = shape.experts_on_cpu_bytes(layers) / _GIB
-        if remote:
+        if remote and _layout_override is None:
             return (shape.cpu_bytes(0)) / _GIB, moved
         return shape.cpu_bytes(layers) / _GIB, 0.0
 
@@ -2376,7 +2405,9 @@ class InferenceManager:
             # out then; the rest stay (dropping them all turned the coding model's thinking back
             # on whenever a volunteer joined).
             extra = list(limits.get("engine_extra_args") or ())
-            if remote_rpc_endpoints:
+            if _layout_override is not None:
+                extra = effective_engine_args(limits, bool(remote_rpc_endpoints))
+            elif remote_rpc_endpoints:
                 kept = engine_args_without_placement(extra)
                 if len(kept) < len(extra):
                     log_warning("ENGINE_EXTRA_ARGS card placement left out: the engine is running across volunteers' GPUs.")

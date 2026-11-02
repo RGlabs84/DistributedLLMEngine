@@ -189,7 +189,7 @@ test('startWorker writes the switch before it launches the worker', async () => 
     assert.equal(await wm.startWorker(), true);
     const deadline = Date.now() + 15000;
     while (!fs.existsSync(seen) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
-    assert.equal(fs.readFileSync(seen, 'utf8'), 'NETWORK_KEY=abc\nCODING_MEMBER_ALLOWED=false\n');
+    assert.equal(fs.readFileSync(seen, 'utf8'), 'NETWORK_KEY=abc\nCODING_MEMBER_ALLOWED=false\nLEND_RAM_GB=8\n');
   } finally {
     if (wm.workerProcess) wm.workerProcess.kill();
     wm.dispose();

@@ -16,7 +16,7 @@ import {
   ramOfferText, ramTooSmallText, setConfigValue, workerStartedNotice, powershellExpandCommand, quoteIfSpaced,
   isRpcExecutablePlatform, takeCompleteLines, EXTERNAL_WORKER_LINE, EXTERNAL_WORKER_TEXT, orphanRpcStopCommand,
   WORKER_STOP_GRACE_MS, LEAVING_TEXT, workerStopGraceMs,
-  MAX_CPU_THREADS_KEY, maxCpuThreadsConfigUpdate, parseClock, clockMessage, TRAY_WORKER_LINE, TRAY_WORKER_TEXT,
+  MAX_CPU_THREADS_KEY, maxCpuThreadsConfigUpdate, LEND_RAM_KEY, lendRamConfigUpdate, lendRamGbFrom, lendRamLine, parseClock, clockMessage, TRAY_WORKER_LINE, TRAY_WORKER_TEXT,
   VCREDIST_MESSAGE, VCREDIST_URL, parseVcredistNeeded, parseDock, parseYield, DockState, YieldState,
   WORKER_LEAVE_GRACE_MS, WORKER_LEAVE_MARGIN_MS} from './contribution';
 import { DonateChoice, DonateMachine, DonateSettings, readDonateSettings, settingsToWrite } from './donatePanel';
@@ -261,6 +261,10 @@ export class WorkerManager {
         if (e.affectsConfiguration('dlne.worker.maxCpuThreads')) {
           this.syncMaxCpuThreadsSetting();
         }
+        // And for the RAM lent to the pool (2.9.0): LEND_RAM_GB, also read again while the engine runs.
+        if (e.affectsConfiguration('dlne.worker.lendRamGb')) {
+          this.syncLendRamSetting();
+        }
       });
     }
     this.init();
@@ -358,6 +362,35 @@ export class WorkerManager {
    * worker re-reads (no restart). Automatic (-1) is written as -1 or not at all, never 0, which the engine reads as
    * one thread. Never throws; a config that cannot be written is logged.
    */
+  /** Write `dlne.worker.lendRamGb` into the engine's config.txt as LEND_RAM_GB; the worker caps it at free RAM less 4 GB. */
+  private syncLendRamSetting(engineRoot?: string): void {
+    const root = engineRoot ?? (this.findEngineScript() ? path.dirname(this.findEngineScript()) : '');
+    if (!root) {
+      return;
+    }
+    const value = vscode.workspace.getConfiguration('dlne').get<number>('worker.lendRamGb', 8);
+    const file = path.join(root, 'config', 'config.txt');
+    try {
+      const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
+      const next = lendRamConfigUpdate(current, value);
+      if (next === null) {
+        return;
+      }
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const scratch = `${file}.${process.pid}.tmp`;
+      try {
+        fs.writeFileSync(scratch, next, 'utf-8');
+        fs.renameSync(scratch, file);
+      } catch {
+        try { fs.unlinkSync(scratch); } catch {}
+        fs.writeFileSync(file, next, 'utf-8');
+      }
+      this.outputChannel.appendLine(`[DLNE] ${LEND_RAM_KEY} updated in ${file}. ${lendRamLine(value)}`);
+    } catch (e: any) {
+      this.outputChannel.appendLine(`[DLNE] Could not update ${LEND_RAM_KEY} in ${file}: ${e?.message ?? e}`);
+    }
+  }
+
   private syncMaxCpuThreadsSetting(engineRoot?: string): void {
     const root = engineRoot ?? (this.findEngineScript() ? path.dirname(this.findEngineScript()) : '');
     if (!root) {
@@ -1618,6 +1651,7 @@ export class WorkerManager {
     this.syncCodingMemberSetting(path.dirname(scriptPath));
     this.syncAlsoCpuSetting(plan, path.dirname(scriptPath));
     this.syncMaxCpuThreadsSetting(path.dirname(scriptPath));
+    this.syncLendRamSetting(path.dirname(scriptPath));
 
     const spawnCmd = pythonPath;
     const args = [scriptPath, 'worker', '--coordinator', coordinatorArg];
@@ -1779,7 +1813,9 @@ export class WorkerManager {
       this.statusMessage = `${CPU_POOL_HEADLINE}, with ${ram} GB of RAM!`;
     } else {
       this.vramContributed = this.localGpu.hasGpu ? this.localGpu.vramTotalGb : 4.0;
-      this.statusMessage = `Actively contributing ${this.vramContributed} GB via ${this.localGpu.api.toUpperCase()}!`;
+      const lentRam = lendRamGbFrom(vscode.workspace.getConfiguration('dlne').get<number>('worker.lendRamGb', 8));
+      this.statusMessage = `Actively contributing ${this.vramContributed} GB via ${this.localGpu.api.toUpperCase()}!` +
+        (lentRam > 0 ? ` Lending up to ${lentRam} GB of RAM.` : '');
     }
     this.emitChange();
   }

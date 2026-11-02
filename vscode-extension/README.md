@@ -313,6 +313,7 @@ The settings that decide where your code or keys go (`dlne.serverUrl`, `dlne.api
 | `dlne.worker.allowedGpus` | `""` | GPU indices to lend (e.g. `0,1`). Blank lends all detected GPUs. |
 | `dlne.worker.maxVramGb` | `-1` | Most VRAM to lend, in GB (`-1`: detect). |
 | `dlne.worker.maxRamGb` | `4.0` | Most system RAM the worker may use, in GB. A CPU-only machine needs at least 8; the more it lends, the bigger the phone-app model it runs (16 GB: Qwen3.6). You're offered an amount when you start. |
+| `dlne.worker.lendRamGb` | `8` | System RAM, in GB, you lend to the pool while donating, for the parts of big models that sit in memory. Never more than your free RAM minus 4 GB. `0` turns it off. Applies to a running worker without a restart. |
 | `dlne.worker.maxCpuThreads` | `-1` | Most CPU threads the worker may use, so the rest of your computer stays yours. `-1`: the engine decides (half your cores, 2 to 8). Applies to a running worker without a restart. Set by the sidebar's Donate compute panel. |
 | `dlne.worker.autoStart` | `false` | Resume contributing when VS Code opens (set for you when you start contributing). |
 | `dlne.worker.pythonPath` | `python3` | Python used for the engine. |

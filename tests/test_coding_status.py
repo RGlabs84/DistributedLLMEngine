@@ -399,7 +399,7 @@ def cluster(monkeypatch, tmp_path):
     monkeypatch.setattr(coordinator, "global_active_model", LIVE_FILE)
     monkeypatch.setattr(coordinator.manager, "running_models", {LIVE_FILE: engine_entry(65536)})
     monkeypatch.setattr(coordinator.registry, "get_total_vram_gb", lambda: 16.0)
-    monkeypatch.setattr(coordinator, "_near_vram_gb", lambda: 16.0)      # all of it near enough to share a model
+    monkeypatch.setattr(coordinator, "_near_pool", lambda: {"vram_gb": 16.0, "ram_gb": 0.0})      # all of it near enough to share a model
 
     async def no_telemetry(model_path):
         return {}
@@ -437,7 +437,7 @@ async def test_status_lists_the_ladder_in_the_agreed_shape(cluster):
     tiers = data["coding_tiers"]
     assert [t["id"] for t in tiers] == [t["id"] for t in LADDER]
     for row in tiers:
-        assert set(row) == {"id", "name", "min_vram_gb", "enabled", "unlocked", "active"}
+        assert set(row) == {"id", "name", "min_vram_gb", "min_total_gb", "min_gpu_gb", "rank", "enabled", "unlocked", "active"}
         assert isinstance(row["min_vram_gb"], int)
         assert all(isinstance(row[k], bool) for k in ("enabled", "unlocked", "active"))
     rest = len(tiers) - 1
@@ -464,11 +464,11 @@ async def test_the_stale_14b_recommendation_is_gone(cluster):
     (24.0, "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"),
     (32.0, "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"),
     (48.0, "Qwen3.6-35B-A3B-UD-Q6_K.gguf"),
-    (256.0, "Qwen3.6-35B-A3B-UD-Q6_K.gguf"),            # the placeholders are off
+    (256.0, "Qwen3.6-35B-A3B-UD-Q6_K.gguf"),            # the Coder-Next rungs and the placeholders are off
 ])
 async def test_the_recommendation_follows_the_pool(cluster, vram, file):
     cluster.monkeypatch.setattr(coordinator.registry, "get_total_vram_gb", lambda: vram)
-    cluster.monkeypatch.setattr(coordinator, "_near_vram_gb", lambda: vram)
+    cluster.monkeypatch.setattr(coordinator, "_near_pool", lambda: {"vram_gb": vram, "ram_gb": 0.0})
     data = await get_json("/v1/cluster/status")
     assert data["recommended_model"] == file
     tiers = await get_json("/v1/cluster/tiers")

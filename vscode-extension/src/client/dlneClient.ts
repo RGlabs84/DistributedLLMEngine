@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { MaintenanceNotice, maintenanceFromBody, maintenanceFromStatus } from './maintenance';
 import * as http from 'http';
 import * as https from 'https';
 import { resolveServerUrl } from '../serverUrl';
@@ -63,6 +64,8 @@ export interface ClusterStatus {
   capabilities?: { image_generation?: boolean; vision?: boolean; voice?: boolean; [capability: string]: unknown };
   /** While voice is on (2.8.0): the queue and the longest clip. */
   voice?: { queue?: number; busy?: boolean; max_seconds?: number; languages?: string };
+  /** Only while the owner has maintenance on (2.8.5): see maintenance.ts. */
+  maintenance?: { active?: boolean; message?: string; until?: string; since?: string };
   /** While image generation is on: its queue and the estimate per size (informational; the tool polls the job). */
   image_generation?: { queue?: number; busy?: boolean; eta_seconds?: Record<string, number>; sizes?: string[]; default_size?: string };
 }
@@ -441,6 +444,7 @@ export class DlneClient {
             try {
               const parsed = JSON.parse(data);
               this.lastStatus = { data: parsed, at: Date.now(), server: base };
+              this.setMaintenance(maintenanceFromStatus(parsed));
               this.statusListeners.forEach((listener) => {
                 try { listener(parsed); } catch {}
               });
@@ -564,6 +568,31 @@ export class DlneClient {
   }
 
   private statusListeners: Array<(status: ClusterStatus) => void> = [];
+
+  // Maintenance (2.8.5): set by a status answer that says so or by a refused request, cleared by the next status that does not.
+  private maintenance: MaintenanceNotice | null = null;
+  private maintenanceListeners: Array<(notice: MaintenanceNotice | null) => void> = [];
+
+  /** The maintenance notice while the coordinator is in maintenance mode, else null. */
+  currentMaintenance(): MaintenanceNotice | null {
+    return this.maintenance;
+  }
+
+  /** Called whenever maintenance starts, changes or ends. Returns the unsubscribe. */
+  onMaintenance(listener: (notice: MaintenanceNotice | null) => void): () => void {
+    this.maintenanceListeners.push(listener);
+    return () => {
+      this.maintenanceListeners = this.maintenanceListeners.filter((l) => l !== listener);
+    };
+  }
+
+  private setMaintenance(notice: MaintenanceNotice | null): void {
+    if (JSON.stringify(notice) === JSON.stringify(this.maintenance)) return;
+    this.maintenance = notice;
+    this.maintenanceListeners.forEach((listener) => {
+      try { listener(notice); } catch {}
+    });
+  }
 
   /**
    * Called with every successful /v1/cluster/status answer (the status bar polls it every 10 s),
@@ -979,6 +1008,7 @@ export class DlneClient {
             } else {
               const refusal = new ServerRefusal(res.statusCode, serverErrorMessage(res.statusCode, text));
               refusal.code = serverErrorCode(text);
+              if (refusal.code === 'maintenance') this.setMaintenance(maintenanceFromBody(text));
               reject(refusal);
             }
           });

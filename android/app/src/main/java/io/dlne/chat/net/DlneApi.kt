@@ -60,6 +60,8 @@ data class ClusterStatus(
     @SerialName("image_generation") val imageGenerationInfo: ImageGenerationInfo? = null,
     /** Queue and longest clip of speech to text; only present while the server has it on. */
     @SerialName("voice") val voiceInfo: VoiceInfo? = null,
+    /** Present only while the server is in maintenance mode (2.8.5). */
+    val maintenance: MaintenanceInfo? = null,
 ) {
     /** True only when the server says so: the "Create image" button is shown for nothing else. */
     val imageGeneration: Boolean get() = capabilities?.imageGeneration == true
@@ -67,6 +69,18 @@ data class ClusterStatus(
     /** True only when the server says the phone chat can look at photos: Photos and Camera are shown for nothing else. */
     val appVision: Boolean get() = capabilities?.appVision == true
 }
+
+/**
+ * Maintenance mode as the server reports it: in the status (`active` is true) and in the body of a refused
+ * request (the 429 `maintenance` answer, where `active` is absent). [until] is the owner's own words ("14:00 UTC").
+ */
+@Serializable
+data class MaintenanceInfo(
+    val active: Boolean = true,
+    val message: String? = null,
+    val until: String? = null,
+    val since: String? = null,
+)
 
 /** The CPU pool that answers the phone app: how many machines and which model. */
 @Serializable
@@ -85,7 +99,14 @@ sealed class ApiException(message: String, cause: Throwable? = null) : Exception
      * explanation; [retryAfterSeconds] comes from the Retry-After header when present;
      * [errorCode] is the JSON `code` (for example `image_quota`) when there is one.
      */
-    class Http(val code: Int, val detail: String, val retryAfterSeconds: Long?, val errorCode: String? = null) :
+    class Http(
+        val code: Int,
+        val detail: String,
+        val retryAfterSeconds: Long?,
+        val errorCode: String? = null,
+        /** The `maintenance` object of a 429 with code `maintenance`, when the body had one. */
+        val maintenance: MaintenanceInfo? = null,
+    ) :
         ApiException("HTTP $code: $detail")
 
     /** No usable answer at all: offline, DNS, TLS, a timeout or a dropped connection. */
@@ -368,7 +389,22 @@ class DlneApi(private val http: OkHttpClient = defaultHttpClient()) {
             }
             val detail = extractDetail(text) ?: "The server answered ${response.code}."
             val retryAfter = response.header("Retry-After")?.trim()?.toLongOrNull()?.coerceIn(1, 3600)
-            return ApiException.Http(response.code, detail, retryAfter, extractCode(text))
+            val code = extractCode(text)
+            return ApiException.Http(response.code, detail, retryAfter, code, if (code == "maintenance") extractMaintenance(text) else null)
+        }
+
+        /** The `maintenance` object of an error body (`{"maintenance": {"message", "until", "since"}}`), if any. */
+        internal fun extractMaintenance(body: String): MaintenanceInfo? {
+            val root = try {
+                json.parseToJsonElement(body) as? JsonObject
+            } catch (_: SerializationException) {
+                null
+            } catch (_: IllegalArgumentException) {
+                null
+            } ?: return null
+            val obj = root["maintenance"] as? JsonObject ?: return null
+            fun field(name: String) = (obj[name] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+            return MaintenanceInfo(true, field("message"), field("until"), field("since"))
         }
 
         /** The JSON `code` of an error body (`{"detail": "...", "code": "image_quota"}`), if any. */

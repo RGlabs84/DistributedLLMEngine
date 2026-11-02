@@ -177,6 +177,61 @@ async def test_lookups_stop_after_the_last_round():
     assert text(out) == "It is sunny.", "the lookups found no sources, so [1] is a phantom"
 
 
+# --- a lookup written as text (2.8.4) ------------------------------------------------------------------------
+# Owner, 2026-11-02: the phone showed "<tool_call><function=web_search><parameter=query>...</tool_call>" as the
+# answer. On the last pass the tools are withdrawn, and Qwen3.6 then wrote its next lookup as text.
+XML_CALL = ("<tool_call>\n<function=web_search>\n<parameter=query>\nNathalia Filgueiras co-pilot Learjet crash Florida\n"
+            "</parameter>\n</function>\n</tool_call>")
+
+
+def test_tool_markup_is_taken_out_however_the_text_is_split():
+    whole = "The pilot was 20. " + XML_CALL + " That is what the reports say."
+    for size in (1, 2, 3, 5, 8, 13, len(whole)):
+        markup = ap._ToolMarkup()
+        out = "".join(markup.feed(whole[i:i + size]) for i in range(0, len(whole), size)) + markup.flush()
+        assert out == "The pilot was 20.  That is what the reports say.", size
+        assert markup.dropped
+
+
+def test_tool_markup_leaves_ordinary_angle_brackets_and_drops_an_unclosed_call():
+    markup = ap._ToolMarkup()
+    assert markup.feed("3 < 5 and a <b> tag, x<") + markup.flush() == "3 < 5 and a <b> tag, x<"
+    assert not markup.dropped
+    cut = ap._ToolMarkup()
+    assert cut.feed("Let me check. <function=web_search><parameter=query>x") + cut.flush() == "Let me check. "
+    assert cut.dropped
+
+
+@pytest.mark.anyio
+async def test_the_last_pass_is_told_to_answer_and_a_lookup_written_as_text_never_reaches_the_phone():
+    rounds = [tool_call([(f"r{i}", "web_search", {"query": "x"})]) for i in range(ap.MAX_TOOL_ROUNDS)]
+    last = content(XML_CALL[:20]) + content(XML_CALL[20:]) + b"data: [DONE]\n\n"
+    member = Member_(*rounds, last)
+
+    async def run_tool(name, arguments, first_n=1):
+        return Result(sources=[], context_text="nothing")
+
+    out, _ = await run(member, BODY, TOOLS, run_tool)
+    final = member.requests[-1]
+    assert "tools" not in final and final["messages"][-1]["role"] == "tool"
+    assert final["messages"][-1]["content"].endswith(ap.FINAL_PASS_NOTE), "told there is no more looking up"
+    assert "tool_call" not in out.decode() and "<function" not in out.decode()
+    assert text(out) == ap.NO_FINISH_NOTICE, "an answer that was only a lookup becomes a plain sentence"
+
+
+@pytest.mark.anyio
+async def test_words_around_a_lookup_written_as_text_are_kept_without_the_notice():
+    rounds = [tool_call([(f"r{i}", "web_search", {"query": "x"})]) for i in range(ap.MAX_TOOL_ROUNDS)]
+    last = content("It is sunny. ") + content(XML_CALL) + b"data: [DONE]\n\n"
+    member = Member_(*rounds, last)
+
+    async def run_tool(name, arguments, first_n=1):
+        return Result(sources=[], context_text="nothing")
+
+    out, _ = await run(member, BODY, TOOLS, run_tool)
+    assert text(out) == "It is sunny. " and ap.NO_FINISH_NOTICE not in text(out)
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("question, required", [
     ("Who won the most recent Super Bowl?", True),

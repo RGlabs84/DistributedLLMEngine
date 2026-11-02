@@ -373,7 +373,7 @@ def test_status_with_no_tiers_and_no_members():
     assert AppPool().status([], 2) == {
         "members": 0, "members_ready": 0, "active_tier": None, "active_model": None,
         "tiers": [], "requests_in_flight": 0, "median_answer_seconds": None,
-        "serving": None, "engine_requests_in_flight": 0,
+        "serving": None, "engine_requests_in_flight": 0, "route": "wall_only", "photos": "none",
     }
 
 

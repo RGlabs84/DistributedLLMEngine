@@ -455,13 +455,11 @@ def cpu_saw_no_photo(env):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("how", ["down", "not_restarted", "swapping", "dead", "silent"])
+@pytest.mark.parametrize("how", ["down", "swapping", "dead", "silent"])   # 2.9.0: "not_restarted" now reads on a coding lane
 async def test_with_the_lanes_unable_to_answer_a_photo_is_told_dlne_is_restarting_while_a_text_goes_to_the_cpu_pool(
         lane_env, monkeypatch, how):
     if how == "down":
         lane_env.manager.running = False
-    elif how == "not_restarted":
-        lane_env.manager.phone_slots = 0
     elif how == "swapping":
         monkeypatch.setattr(coordinator, "is_swapping_models", True)
     elif how == "dead":
@@ -485,8 +483,11 @@ async def test_with_the_lanes_unable_to_answer_a_photo_is_told_dlne_is_restartin
 @pytest.mark.anyio
 async def test_with_no_phone_lanes_at_all_a_photo_is_told_it_cannot_be_looked_at_and_a_text_still_goes_to_the_cpu_pool(
         lane_env):
+    # 2.9.0 (6e): with a projector loaded a photo is read on a coding lane even with no phone lanes
+    # (tests/test_phone_route.py); this is the case with no engine running.
     lane_env.limits["engine_phone_slots"] = 0
     lane_env.manager.phone_slots = 0
+    lane_env.manager.running = False
     async with client() as c:
         shot = await send(c, photo_body())
         text = await send(c, phone_body("hello"))
@@ -495,7 +496,7 @@ async def test_with_no_phone_lanes_at_all_a_photo_is_told_it_cannot_be_looked_at
     assert shot.status_code == 200 and PHOTO_NOTICE.encode() in shot.content and RESTARTING.encode() not in shot.content
     assert b"No machine" not in shot.content and shot.content.endswith(b"data: [DONE]\n\n")
     assert b"cpu-one" in text.content and cpu_saw_no_photo(lane_env) and len(lane_env.cpu.payloads) == 1
-    assert "app_vision" not in status["capabilities"], "no lanes: the status is what 2.6.1 sent"
+    assert status["capabilities"]["app_vision"] is True, "2.9.0: no lanes, but a projector is set up: a coding lane reads"
     assert nothing_held(lane_env)
 
 
@@ -600,6 +601,7 @@ async def test_the_status_does_not_flicker_while_the_engine_restarts(lane_env, m
 @pytest.mark.anyio
 async def test_the_status_leaves_app_vision_out_with_no_phone_lanes_and_still_answers_when_the_manager_cannot(lane_env):
     lane_env.limits["engine_phone_slots"] = 0
+    lane_env.manager.vision_configured = lambda: False        # 2.9.0: with a projector the status mentions it (6e)
     caps = await capabilities()
     assert "app_vision" not in caps and set(caps) == {"vision"}
 

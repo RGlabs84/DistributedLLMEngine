@@ -723,6 +723,9 @@ HARDWARE_BOUNDS = {
     # The RAM the node's coding job may use (2.4.9): its total under CODING_MAX_RAM_GB. A coding
     # model is chosen to fit it, so it is held to the same bound as ram_gb.
     "coding_ram_gb": (0.0, 2048.0),
+    # The system RAM the node lends the coding pool for experts (2.9.0, engine/pool_memory.py). The coordinator
+    # also clamps it to the node's ram_gb less 4 GB, so a bound is all this needs to be.
+    "ram_lent_gb": (0.0, 1024.0),
 }
 
 # A node in the coordinator's own household lists its private IPv4 addresses when asked
@@ -866,6 +869,24 @@ def validate_hardware_profile(hw: dict) -> Tuple[bool, str]:
             problem = _check_bounded_value(f"gpu.{key}", gpu[key], bounds)
             if problem:
                 return (False, problem)
+
+    # hardware.endpoints (2.9.0, builder W): which rpc-servers the node runs, [{"type": "gpu"|"cpu", "port", "ram_gb"?}].
+    # A short list of small objects; a cpu entry's ram_gb is what the node lends on it (the server itself would
+    # advertise the whole machine, so the coordinator enforces this number when it places experts).
+    endpoints = hw.get("endpoints")
+    if endpoints is not None:
+        if not isinstance(endpoints, list) or len(endpoints) > 8:
+            return (False, "hardware.endpoints must be a list of at most 8 entries")
+        for entry in endpoints:
+            if not isinstance(entry, dict) or entry.get("type") not in ("gpu", "cpu"):
+                return (False, "hardware.endpoints entries must be objects with type gpu or cpu")
+            port = entry.get("port")
+            if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                return (False, "hardware.endpoints port must be a whole number from 1 to 65535")
+            if "ram_gb" in entry:
+                problem = _check_bounded_value("endpoints.ram_gb", entry["ram_gb"], (0.0, 1024.0))
+                if problem:
+                    return (False, problem)
 
     # The two flags are only meaningful as real booleans - see _BOOLEAN_FIELDS for why a
     # string "false" here is worse than an obviously wrong value.

@@ -859,6 +859,9 @@ def engines(monkeypatch):
     monkeypatch.setattr(coordinator.registry, "get_total_vram_gb", lambda: 24.0)
     monkeypatch.setattr(coordinator.registry, "get_total_sysram_gb", lambda: 12.0)
     monkeypatch.setattr(coordinator, "_planned_endpoints", lambda gb: ["127.0.0.1:50052"])
+    # The layout picker (2.9.0) sizes experts against the pool the coordinator really has.
+    monkeypatch.setattr(coordinator, "_coding_pool", lambda: {
+        "vram_gb": 24.0, "far_vram_gb": 0.0, "ram_gb": 8.0, "wall_ram_gb": 8.0, "volunteer_ram_gb": 0.0})
     monkeypatch.setattr(coordinator, "spawn_vram_progress_task", lambda port, model: None)
 
     async def health(port):

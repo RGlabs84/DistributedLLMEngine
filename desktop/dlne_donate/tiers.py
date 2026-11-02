@@ -171,6 +171,7 @@ class Settings:
     engine: str = "auto"
     cuda_consent: str = "unasked"
     cuda_later_ms: int = 0
+    lend_ram_gb: float = 8.0            # 2.9.0: system RAM lent to the pool's engine (0 is off); the worker holds it to free RAM less 4 GB
     auto_update: bool = False           # "Update automatically" (4a): install a newer DLNE Donate at the next idle moment; off by default
 
 
@@ -221,6 +222,7 @@ def settings_from_json(data: Any, hw: Hardware, tiers: Sequence[Dict[str, Any]])
         lend_notice_seen=flag("lend_notice_seen", False),
         engine=engine_flavour.clean_engine(data.get("engine")),
         auto_update=flag("auto_update", False),
+        lend_ram_gb=_number(data.get("lend_ram_gb"), base.lend_ram_gb),
     )
     consent, later_ms = engine_flavour.consent_from_json(data.get("cuda_consent"))
     return clamp_settings(replace(loaded, cuda_consent=consent, cuda_later_ms=later_ms), hw, tiers)
@@ -237,7 +239,24 @@ def settings_to_json(settings: Settings) -> Dict[str, Any]:
         "engine": settings.engine,
         "cuda_consent": engine_flavour.consent_to_json(settings.cuda_consent, settings.cuda_later_ms),
         "auto_update": settings.auto_update,
+        "lend_ram_gb": settings.lend_ram_gb,
     }
+
+
+LEND_RAM_DEFAULT_GB = 8
+
+
+def lend_ram_max(hw: Hardware) -> int:
+    """The most the 'RAM lent to the pool' slider offers: the computer's RAM less the 4 GB it keeps (at least 0)."""
+    return max(0, int(hw.total_ram_gb - KEEP_FREE_GB))
+
+
+def lend_ram_line(settings: Settings, hw: Hardware) -> str:
+    """The one plain sentence on how much RAM is lent to the pool."""
+    if settings.lend_ram_gb <= 0:
+        return "Not lending any RAM to the pool."
+    return (f"Lending up to {settings.lend_ram_gb:g} GB of RAM to the pool while you donate (never more than your free RAM "
+            f"minus {KEEP_FREE_GB} GB).")
 
 
 def snap_cpu_ram(gb: float, hw: Hardware, tiers: Sequence[Dict[str, Any]]) -> float:
@@ -256,10 +275,11 @@ def clamp_settings(settings: Settings, hw: Hardware, tiers: Sequence[Dict[str, A
     cpu_on = settings.cpu_enabled and hw.cpu_meets_minimum and bool(cpu_stops(hw, tiers))
     vram = min(max(settings.gpu_vram_gb or vram_high, vram_low), vram_high) if hw.has_gpu else 0.0
     ram = float(min(max(int(round(settings.gpu_ram_gb)), low), hard))
+    lend = float(min(max(int(round(settings.lend_ram_gb)), 0), lend_ram_max(hw)))
     lo_t, hi_t = thread_bounds(hw)
     consent, later_ms = engine_flavour.consent_from_json(
         {"later": settings.cuda_later_ms} if settings.cuda_consent == "later" else settings.cuda_consent)
-    return replace(settings, gpu_enabled=gpu_on, gpu_vram_gb=round(vram, 1), gpu_ram_gb=ram, cpu_enabled=cpu_on,
+    return replace(settings, gpu_enabled=gpu_on, gpu_vram_gb=round(vram, 1), gpu_ram_gb=ram, lend_ram_gb=lend, cpu_enabled=cpu_on,
                    cpu_ram_gb=snap_cpu_ram(settings.cpu_ram_gb, hw, tiers), threads=min(max(settings.threads, lo_t), hi_t),
                    engine=engine_flavour.clean_engine(settings.engine), cuda_consent=consent, cuda_later_ms=later_ms)
 
@@ -451,12 +471,14 @@ def config_updates(settings: Settings, hw: Hardware, coordinator_url: str, netwo
         updates["MAX_RAM_GB"] = format_gb(min(GPU_POOL_RAM_GB, settings.gpu_ram_gb))
         updates["CODING_MAX_RAM_GB"] = format_gb(settings.gpu_ram_gb)
         updates["ALSO_CPU_RAM_GB"] = format_gb(settings.cpu_ram_gb) if cpu else "0"
+        updates["LEND_RAM_GB"] = format_gb(settings.lend_ram_gb)
     else:
         updates["ALLOWED_GPU_INDICES"] = "none"
         updates["MAX_VRAM_GB"] = "-1"
         updates["MAX_RAM_GB"] = format_gb(settings.cpu_ram_gb)     # the RAM a phone-app member lends picks its model
         updates["CODING_MAX_RAM_GB"] = "-1"
         updates["ALSO_CPU_RAM_GB"] = "0"
+        updates["LEND_RAM_GB"] = "0"        # a CPU-only phone-app member serves its RAM as the phone pool, not as pool RAM
     return updates
 
 

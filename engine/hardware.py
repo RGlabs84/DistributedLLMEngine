@@ -56,6 +56,30 @@ def _hidden_process_kwargs() -> dict:
     return {}
 
 
+# The system RAM a machine always keeps for itself when it lends RAM to the pool (2.9.0).
+RAM_KEPT_FOR_OWNER_GB = 4.0
+
+
+def ram_lent_gb(setting: Any, available_gb: float) -> float:
+    """The RAM, in GB, to lend: the owner's setting, but never more than the free RAM less 4 GB, never below 0."""
+    try:
+        wanted = float(setting)
+    except (TypeError, ValueError):
+        return 0.0
+    if wanted != wanted:
+        return 0.0
+    return round(max(0.0, min(wanted, float(available_gb) - RAM_KEPT_FOR_OWNER_GB)), 1)
+
+
+def get_ram_lent_gb() -> float:
+    """``ram_lent_gb`` for the heartbeat: LEND_RAM_GB (default 8) held to this machine's free RAM less 4 GB."""
+    try:
+        available = psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:  # noqa: BLE001 - no reading: lend nothing rather than guess
+        return 0.0
+    return ram_lent_gb(get_worker_limits().get("lend_ram_gb", 8.0), available)
+
+
 def get_system_ram() -> float:
     """Returns total system RAM in GB, capped by config limits."""
     actual_ram = round(psutil.virtual_memory().total / (1024**3), 1)

@@ -183,3 +183,13 @@ def _fresh_photo_budgets(monkeypatch):
         from engine.priority import DistinctWindow, UsageWindow
         monkeypatch.setattr(module, "image_input_window", DistinctWindow())
         monkeypatch.setattr(module, "phone_photo_window", UsageWindow())
+
+
+@pytest.fixture(autouse=True)
+def _no_layout_override_leaks():
+    """The expert layout automatic switching installs (engine/inference_manager.set_layout_override, 2.9.0) is process-wide
+    state: a test that switches must not change the next test's engine command line."""
+    from engine import inference_manager
+    inference_manager.set_layout_override(None)
+    yield
+    inference_manager.set_layout_override(None)

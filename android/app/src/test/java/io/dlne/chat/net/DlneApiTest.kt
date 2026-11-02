@@ -157,6 +157,44 @@ class DlneApiTest {
     }
 
     @Test
+    fun `429 maintenance carries the maintenance object`() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(429).setHeader("Retry-After", "120").setBody(
+                """{"detail":"Upgrading.","code":"maintenance","maintenance":{"message":"Upgrading.","until":"14:00 UTC","since":"2026-11-02T13:00:00Z"}}"""
+            )
+        )
+        try {
+            api.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "Hi"))).toList()
+            fail("expected ApiException.Http")
+        } catch (e: ApiException.Http) {
+            assertEquals("maintenance", e.errorCode)
+            assertEquals("14:00 UTC", e.maintenance?.until)
+            assertEquals("Upgrading.", e.maintenance?.message)
+        }
+    }
+
+    @Test
+    fun `a rate limit without the maintenance code has no maintenance object`() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(429).setBody("""{"detail":"Slow down.","maintenance":{"message":"x"}}"""))
+        try {
+            api.streamChat(baseUrl, CHAT_ID, listOf(WireMessage("user", "Hi"))).toList()
+            fail("expected ApiException.Http")
+        } catch (e: ApiException.Http) {
+            assertEquals(null, e.maintenance)
+        }
+    }
+
+    @Test
+    fun `status shows maintenance only while the server sends it`() = runBlocking {
+        server.enqueue(MockResponse().setBody("""{"status":"ok","maintenance":{"active":true,"message":"Back soon","until":"15:30 UTC","since":"s"}}"""))
+        server.enqueue(MockResponse().setBody("""{"status":"ok"}"""))
+        val on = api.fetchStatus(baseUrl).maintenance
+        assertEquals(true, on?.active)
+        assertEquals("15:30 UTC", on?.until)
+        assertEquals(null, api.fetchStatus(baseUrl).maintenance)
+    }
+
+    @Test
     fun `400 with a FastAPI validation list is readable`() = runBlocking {
         server.enqueue(
             MockResponse().setResponseCode(400)

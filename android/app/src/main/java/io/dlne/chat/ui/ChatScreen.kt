@@ -266,14 +266,15 @@ private fun MessageList(
             if (!scrolling) following = atNewest(listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
         }
     }
-    // A reader scrolled up into the answer being written keeps the same words in view while it grows.
+    // A reader scrolled up into the answer being written, or holding a spot with a finger, keeps the same words in
+    // view while it grows and when it is saved (ScrollFollow.kt).
     LaunchedEffect(listState) {
         var lastSize = 0
-        snapshotFlow { listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == PENDING_KEY }?.size ?: 0 }
+        snapshotFlow { listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.size ?: 0 }
             .collect { size ->
-                val first = listState.layoutInfo.visibleItemsInfo.firstOrNull()
-                val delta = keepReaderInPlace(following, first?.key, PENDING_KEY, listState.firstVisibleItemScrollOffset, lastSize, size)
-                if (delta > 0) listState.dispatchRawDelta(delta.toFloat())
+                val delta = keepReaderInPlace(following, listState.isScrollInProgress, listState.firstVisibleItemIndex,
+                    listState.firstVisibleItemScrollOffset, lastSize, size)
+                if (delta != 0) listState.dispatchRawDelta(delta.toFloat())
                 lastSize = size
             }
     }

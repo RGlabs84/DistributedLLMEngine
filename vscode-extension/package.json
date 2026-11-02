@@ -2,7 +2,7 @@
   "name": "dlne-code-assistant",
   "displayName": "DLNE Coding Assistant: Free AI Agent",
   "description": "A free AI coding agent and autocomplete, running on GPUs its users share. 100 free chats, no account or API key.",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "publisher": "dlne",
   "license": "MIT",
   "repository": {
@@ -281,6 +281,13 @@
           "scope": "application",
           "default": 4.0,
           "description": "Most system RAM the worker may use, in GB. For a GPU it is the limit of the shared-model job, which only needs a little; the coding-member job is not held to the default 4, it uses the memory that is free when it starts, unless you set this yourself, and then it is limited to what you set. Contributing a CPU needs at least 8, and the more you lend the bigger the phone-app model your computer runs: 16 GB runs the main model, Qwen3.6. When you start, you are offered an amount to suit your machine (never more than half your RAM)."
+        },
+        "dlne.worker.lendRamGb": {
+          "type": "number",
+          "scope": "application",
+          "default": 8,
+          "minimum": 0,
+          "description": "System RAM, in GB, that your computer lends to the DLNE pool while you donate, so big models can keep part of their weights in memory next to the GPUs. The default is 8. DLNE never lends more than your free RAM minus 4 GB, which stays yours. 0 turns it off. A running worker follows a change without a restart."
         },
         "dlne.worker.maxCpuThreads": {
           "type": "number",

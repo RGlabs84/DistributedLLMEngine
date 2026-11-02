@@ -10,6 +10,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.9.0] - 2026-11-02
+
+Built from docs/release-2.9-contract.md (owner approved 2026-11-02). Pairs with the VS Code extension **1.9.0**, the
+Android app **1.1.1** and DLNE Donate's RAM slider; older clients keep working.
+
+### Added
+- **The pool counts system RAM as well as GPU memory.** TheWall lends 8 GB of its RAM to the coding model
+  (`POOL_WALL_RAM_BUDGET_GB` 18 less `POOL_WALL_RAM_RESERVE_GB` 10). A volunteer's lent RAM counts once it is within
+  5 ms (`POOL_RAM_MAX_RTT_MS`) and has stayed 30 minutes (`POOL_RAM_MIN_STAY_SECONDS`). The two numbers are kept apart:
+  `/v1/cluster/status` has `pool_memory: {gpu_gb, ram_gb, total_gb, machines, wall_ram_gb, volunteer_ram_gb, by_machine}`
+  (no machine is named).
+- **Each coding rung says what it needs in both kinds of memory** (`min_total_gb`, `min_gpu_gb`, signed in the manifest)
+  and has a `rank` from the measurements. "Up" means a better rank, never just a bigger file. The ladder (Qwen family
+  only, owner's decision): Qwen3.6 35B-A3B IQ3_S, IQ4_XS, Q4_K_M and Q6_K on; Qwen3-Coder-Next IQ4_XS and Q4_K_S pinned
+  and off until they measure better than the rung below.
+- **Automatic switching is back on**, judged on both numbers. When a rung needs more than the GPUs hold, the switch
+  puts the experts of the first layers in TheWall's RAM (`--n-cpu-moe`), checked against the engine-argument allow-list.
+  With TheWall's own numbers it stays where it is (a test runs six hours of its ticks).
+- **Volunteers can lend system RAM** (8 GB by default, never more than they have free less 4 GB). The worker runs a
+  second, CPU-only rpc-server for it and its heartbeat reports `ram_lent_gb` and its `endpoints`. Lent RAM is counted
+  in the pool; the coordinator caps each CPU server at what it lends, because the rpc-server itself cannot.
+- **Phone and web chat routing** (`PHONE_ROUTE`): `wall_first` (the default: TheWall's lane, volunteers when every
+  lane is busy), `volunteers_first`, or `wall_only` (2.8's order). A volunteer slower than `PHONE_MIN_TPS` (6 tokens a
+  second) is skipped while a lane is free. A volunteer that fails before sending any text hands the phone to
+  TheWall's lane. A photo never goes to a volunteer.
+- **Phone photos go to a coding lane** when the phone model cannot read them (`PHONE_VISION=false`); a typo in that
+  key keeps photos on.
+- **The phones' own model** (`PHONE_ENGINE=own`; the default `shared` changes nothing). A llama-server of its own on
+  the media card (or `PHONE_DEVICE`) starts on Qwen3.5 4B with its photo reader, and climbs the phone ladder (Qwen3.5
+  9B, then Qwen3.6) by putting layers on volunteers within 200 ms (`PHONE_SHARD_MAX_RTT_MS`). It never takes more of the
+  home card, so voice keeps its room. Before phones are let in after a move up, a speed check runs; a move that is too
+  slow puts the base back. It steps down at once when a volunteer leaves, and coding always wins a volunteer both want.
+  The status has `phone_engine: {mode, rung, device, lanes, layers: {home, volunteers}, vision, switch}`.
+- **Takeover leases on the owner's named layouts.** Asking for exactly BC-160 #1 applies `config.txt.takeover-1card`,
+  both BC-160s `takeover-2card`, with the layout's model. The layout is applied in memory and given back on release.
+  The lease's status shows `layout`. A lease that takes the phone model's card, or a layout that turns it off, stops
+  the phone model, which comes back after the lease.
+- **Trial watch.** The coordinator's log records a network starting the coding trial, passing half and using it up,
+  with a masked tag (never the address). The admin stats count them, and more than `TRIAL_BURST_PER_HOUR` (10) fresh
+  networks in an hour is flagged. Nothing is blocked.
+
+### Changed
+- The link probe also measures volunteers that lend only RAM, so the phone ladder knows how near they are.
+- `coding_tiers` rows in the status gain `min_total_gb`, `min_gpu_gb` and `rank`.
+
+---
+
+## [2.8.5] - 2026-11-02
+
+### Added
+- **Maintenance mode.** `dlne_server.py maintenance on [--message "..."] [--until "about 1 hour"]` (and `off`) closes
+  everything that answers people (chat, the phone app, coding, voice, new pictures) with one plain message, within
+  seconds and without a restart (`MAINTENANCE`, `MAINTENANCE_MESSAGE`, `MAINTENANCE_UNTIL` in config.txt). The web chat
+  shows a full-screen DLNE card that checks every 15 seconds and goes away by itself; the status page shows a
+  maintenance headline; today's phone app and VS Code agent show the message as their error text (a 429 with
+  Retry-After, which they already turn into the server's words), voice says it as "paused". Workers, the status,
+  downloads, admin and picture jobs already made stay open, and a closed request never costs a free chat.
+
+## [2.8.4] - 2026-11-02
+
+### Fixed
+- **The phone and web chat never show a lookup as the answer.** When a question had used up its lookups, the model
+  could write its next search as text ("<tool_call><function=web_search>..."), and that showed up as the reply. The
+  last pass now ends its search results by telling the model to answer from what it found, any tool-call markup is
+  taken out of what is shown, and an answer that was nothing but a lookup becomes a plain "I looked that up but
+  couldn't finish the answer. Please ask again."
+
 ## [2.8.3] - 2026-11-02
 
 ### Fixed

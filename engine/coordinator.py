@@ -70,10 +70,12 @@ from engine.inference_manager import (
     is_retryable_start_failure,
 )
 from engine.logger import log_coordinator, log_error, log_warning
+from engine.trial_watch import TrialWatch
 from engine.registry import WorkerRegistry, is_app_member, is_coding_member, safe_log_text
 from engine import dock_policy
+from engine import phone_route
 from engine.app_pool import (ENGINE_KEY, EngineLane, LocalAppServer, Member, PICTURE_MADE_REPLY, PICTURE_REFUSED_REPLY,
-                             Picture, RESTARTING_NOTICE, app_pool, has_photos, photo_notice, with_pictures)
+                             Picture, RESTARTING_NOTICE, NO_MACHINE_NOTICE, _sse_notice, app_pool, has_photos, photo_notice, with_pictures)
 from engine.contributor_networks import ContributorBook
 from engine.standby import StandbyBook
 from engine.swarm_clock import CLOCK_HEADER
@@ -86,6 +88,9 @@ from engine import release as release_lib
 from engine import coding_ladder, coding_speed
 from engine.lease import lease_manager, InferenceLease
 from engine.chat_privacy import chat_tag, clean_chat_id
+from engine.priority import LaneAffinity, LaneBook
+from engine.phone_engine import PhoneEngine, phone_rungs
+from engine.phone_swap import PhoneSwapController, make_download as make_phone_download
 from engine.priority import (DistinctWindow, UsageWindow, coding_gate, cpu_coding_window, lane_affinity, lane_book,
                              phone_gate, tier_priority)
 from engine import image_policy
@@ -96,7 +101,8 @@ from engine.voice_member import MemberError as VoiceError, VoiceMember
 from engine.voice_pool import VoiceService
 from engine.api_keys import api_key_manager, hash_admin_key
 from engine import canary
-from engine import auto_swap, link_paths, takeover
+from engine import auto_swap, link_paths, pool_layout, pool_memory, takeover
+from engine import inference_manager as inference_manager_module
 from engine.auto_swap import (
     AutoSwapController,
     FlapBreaker,
@@ -463,6 +469,9 @@ class StarterQuotaManager:
         self.default_quota = default_quota
         self._lock = threading.Lock()
         self._usage: Dict[str, int] = {}
+        # Trial events (2.9.0 6d) live beside the record, so a manager pointed elsewhere (a test) writes nowhere else.
+        self.watch = TrialWatch(lambda: os.path.dirname(self._get_path()), lambda m: log_coordinator(m),
+                                lambda m: log_warning(m))
         self._load()
 
     def _get_path(self) -> str:
@@ -500,6 +509,10 @@ class StarterQuotaManager:
                 used += 1
                 self._usage[client_id] = used
                 self._save_locked()
+                try:
+                    self.watch.record(client_id, used - 1, used, max_quota)
+                except Exception:
+                    pass                    # watching the trial must never cost anyone a chat
                 return True, used, max_quota - used
             return False, used, 0
 
@@ -842,6 +855,75 @@ class WorkerClockMiddleware:
 
 
 app.add_middleware(WorkerClockMiddleware)
+
+
+# ---- maintenance (2.8.5) --------------------------------------------------------------------------------------------
+# MAINTENANCE=true in config.txt (re-read live, no restart; ``dlne_server.py maintenance on|off``) closes the doors
+# that start new work for people, with one plain message every client shows: the web chat as a full-screen card, the status page as a banner, the phone app and
+# VS Code (until their next versions draw it) as the error text. Workers, the status, downloads, admin and anything
+# already running (picture jobs can still be read and cancelled) stay open. Outermost middleware: a closed request is
+# answered before any quota is looked at, so maintenance never costs anyone a free chat.
+MAINTENANCE_CLOSED = ("/v1/chat/completions", "/v1/completions", "/v1/app/chat/completions", "/v1/audio/transcriptions",
+                      "/v1/coding/route", "/v1/app/images", "/v1/images", "/v1/models/request")
+MAINTENANCE_DEFAULT = ("DLNE is down for a short upgrade: we're re-laying TheWall's GPUs and benchmarking new models "
+                       "to make it faster and smarter. Back soon.")
+MAINTENANCE_RETRY_SECONDS = 120
+_maintenance_since: Optional[float] = None
+
+
+def maintenance_state(limits: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """{"message", "until", "since"} while maintenance is on, else None (and the start time is forgotten)."""
+    global _maintenance_since
+    limits = limits if limits is not None else get_worker_limits()
+    if not limits.get("maintenance"):
+        _maintenance_since = None
+        return None
+    if _maintenance_since is None:
+        _maintenance_since = time.time()
+    return {"message": limits.get("maintenance_message") or MAINTENANCE_DEFAULT,
+            "until": limits.get("maintenance_until") or "",
+            "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_maintenance_since))}
+
+
+def maintenance_closes(method: str, path: str) -> bool:
+    """Whether this request starts new work for someone: closed during maintenance. Picture jobs already made can
+    still be read (GET) and cancelled (``.../cancel``)."""
+    if path in ("/v1/app/images", "/v1/images"):
+        return method == "POST"
+    return any(path == p or path.startswith(p + "/") for p in MAINTENANCE_CLOSED if p not in ("/v1/app/images", "/v1/images"))
+
+
+def maintenance_response(path: str, state: Dict[str, Any]) -> JSONResponse:
+    """
+    The answer to a closed request. 429 with Retry-After, not 503, because that is what the clients already out there
+    turn into the server's own words: the phone app (1.1.0) shows them and pauses Send until Retry-After, the VS Code
+    agent (1.8.0) shows them with a ⏳, and the web chat draws its maintenance card from the status anyway; on a 503
+    the app says only "server error" and the extension waits for a model "loading". Voice is the exception: on 429 its
+    clients say "used up for this hour", while 503 ``voice_paused`` shows the server's sentence everywhere. The body
+    always says ``"code": "maintenance"``, so later clients can draw their own maintenance screen.
+    """
+    headers = {"Retry-After": str(MAINTENANCE_RETRY_SECONDS)}
+    if path.startswith("/v1/audio/"):
+        return JSONResponse({"detail": state["message"], "code": "voice_paused", "maintenance": state},
+                            status_code=503, headers=headers)
+    return JSONResponse({"detail": state["message"], "code": "maintenance", "maintenance": state},
+                        status_code=429, headers=headers)
+
+
+class MaintenanceMiddleware:
+    def __init__(self, app_):
+        self.app = app_
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and maintenance_closes(scope.get("method", "GET"), scope.get("path", "")):
+            state = maintenance_state()
+            if state is not None:
+                await maintenance_response(scope.get("path", ""), state)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(MaintenanceMiddleware)
 
 
 def _log_refusal(what: str, safe_ip: str, safe_id: str, reason: str, claimed: Any) -> None:
@@ -1968,7 +2050,8 @@ async def admin_stats(request: Request):
             "in_flight_requests": active_inference_requests,
             "active_leases": lease_manager.active_count(),
         },
-        "trial": {"chat_limit": chat_limit, **starter_quota_mgr.summary(chat_limit)},
+        "trial": {"chat_limit": chat_limit, **starter_quota_mgr.summary(chat_limit),
+                  "events": starter_quota_mgr.watch.stats()},
         "api_keys": {
             "active": sum(1 for k in keys if not k.get("revoked")),
             "revoked": sum(1 for k in keys if k.get("revoked")),
@@ -3362,10 +3445,21 @@ async def completions(request: Request):
 # scripts/coding_models.json). Advisory: nothing here swaps a model; recommended_tier and
 # recommended_model say what the pool could hold.
 
-def _get_recommended_tier(total_vram_gb: float) -> Optional[Dict[str, Any]]:
-    """The biggest enabled tier the pool can hold; the ladder's first tier when it holds none."""
+def _pool_numbers(pool: Any) -> Tuple[float, float]:
+    """``(gpu_gb, total_gb)`` of a pool: a number is GPU memory alone (both the same), a dict is the pool of
+    :func:`_coding_pool` (``vram_gb`` near GPU memory, ``ram_gb`` lent RAM)."""
+    if isinstance(pool, dict):
+        gpu = float(pool.get("vram_gb", pool.get("gpu_gb", 0.0)) or 0.0)
+        return gpu, gpu + float(pool.get("ram_gb", 0.0) or 0.0)
+    return float(pool), float(pool)
+
+
+def _get_recommended_tier(pool: Any) -> Optional[Dict[str, Any]]:
+    """The best rung the pool can hold; the ladder's first tier when it holds none. ``pool`` is a number
+    (GPU memory only) or the pool dict of :func:`_coding_pool`."""
     tiers = _coding_ladder()
-    return coding_ladder.tier_for_vram(tiers, total_vram_gb) or coding_ladder.default_tier(tiers)
+    gpu, total = _pool_numbers(pool)
+    return coding_ladder.tier_for_pool(tiers, gpu, total) or coding_ladder.default_tier(tiers)
 
 
 def _measure_coding_speed(model_path: str, tail: bytearray) -> None:
@@ -3422,6 +3516,18 @@ async def _phone_lanes_status(running_names: List[str]) -> Tuple[Dict[str, Any],
     """
     global _last_phone_slots
     configured = int(get_worker_limits().get("engine_phone_slots") or 0)
+    if own_phone_engine.own():
+        # PHONE_ENGINE=own: the lanes are the phone engine's, and the CPU pool's block names its model. While it is not
+        # up, the coding engine's phone lanes (when configured) are the backup and are shown as below.
+        entry = _own_phone_entry()
+        if entry is not None or configured <= 0:
+            slots = own_phone_engine.lanes()
+            if entry is not None and slots != phone_gate.stats()["slots"]:
+                phone_gate.resize(slots)
+            stats = phone_gate.stats() if entry is not None else {"in_use": 0, "waiting": 0}
+            lanes = {"slots": slots, "in_use": stats["in_use"], "waiting": stats["waiting"],
+                     "available": entry is not None, "starting": entry is None}
+            return {"phone_lanes": lanes}, ({"model": entry["name"], "tier": entry["rung"]} if entry is not None else None)
     try:
         engine = await _phone_engine()
         snapshot = engine
@@ -3445,6 +3551,28 @@ async def _phone_lanes_status(running_names: List[str]) -> Tuple[Dict[str, Any],
     return {"phone_lanes": lanes}, (_engine_model_fields(running_names) if engine is not None else None)
 
 
+def _near_pool() -> Dict[str, Any]:
+    """The pool the ladder is judged on (GPU memory and lent RAM); zeros if it cannot be read."""
+    try:
+        return _coding_pool()
+    except Exception:  # noqa: BLE001 - the status must answer even if this part cannot
+        return {"vram_gb": 0.0, "ram_gb": 0.0}
+
+
+def _pool_memory_status(pool: Dict[str, Any]) -> Dict[str, Any]:
+    """``pool_memory`` for /v1/cluster/status: the near GPU memory and the lent RAM, counted apart."""
+    return {
+        "gpu_gb": round(float(pool.get("vram_gb", 0.0) or 0.0), 2),
+        "ram_gb": round(float(pool.get("ram_gb", 0.0) or 0.0), 2),
+        "total_gb": round(float(pool.get("vram_gb", 0.0) or 0.0) + float(pool.get("ram_gb", 0.0) or 0.0), 2),
+        "machines": int(pool.get("machines", 0) or 0),
+        "wall_ram_gb": round(float(pool.get("wall_ram_gb", 0.0) or 0.0), 2),
+        "volunteer_ram_gb": round(float(pool.get("volunteer_ram_gb", 0.0) or 0.0), 2),
+        # Numbers only, no worker id: the status is public and names no machine.
+        "by_machine": [{k: v for k, v in m.items() if k != "id"} for m in (pool.get("by_machine") or [])],
+    }
+
+
 def _near_vram_gb() -> float:
     """
     The GPU memory that can really share the coding model: this machine's and the volunteers
@@ -3457,7 +3585,7 @@ def _near_vram_gb() -> float:
         return 0.0
 
 
-async def _coding_status(running_names: List[str], near_vram_gb: float) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+async def _coding_status(running_names: List[str], near_pool: Any) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
     ``coding_model`` and ``coding_tiers`` for /v1/cluster/status (websites and apps render
     them as they are, so the shape is fixed):
@@ -3468,9 +3596,11 @@ async def _coding_status(running_names: List[str], near_vram_gb: float) -> Tuple
     The model is the running engine's, or the one the next request will start. ``context`` is
     the running engine's own (its snapshot's safe_context) and null while none runs; the
     speed is the measured median for that model file only, null until one is measured.
-    ``unlocked`` means the GPUs near enough to share a model (``near_vram_gb``) hold the tier.
+    ``unlocked`` means the near pool (``near_pool``: its GPU memory and its lent RAM, a number meaning GPU memory
+    alone) holds the rung on both counts. Each row also carries min_total_gb, min_gpu_gb and rank (2.9.0).
     """
     tiers = _coding_ladder()
+    near_gpu, near_total = _pool_numbers(near_pool)
     file = canonical_model_tag(running_names[0] if running_names else global_active_model) or None
     context = None
     if file and file in running_names:
@@ -3493,8 +3623,11 @@ async def _coding_status(running_names: List[str], near_vram_gb: float) -> Tuple
             "id": tier["id"],
             "name": tier["name"],
             "min_vram_gb": tier["min_vram_gb"],
+            "min_total_gb": tier.get("min_total_gb", tier["min_vram_gb"]),
+            "min_gpu_gb": tier.get("min_gpu_gb", tier["min_vram_gb"]),
+            "rank": tier.get("rank"),
             "enabled": tier["enabled"],
-            "unlocked": near_vram_gb >= tier["min_vram_gb"],
+            "unlocked": coding_ladder.fits(tier, near_gpu, near_total),
             "active": active is not None and tier["id"] == active["id"],
         }
         for tier in tiers
@@ -3516,10 +3649,11 @@ async def get_cluster_status(request: Request):
     active_endpoints = registry.get_active_rpc_endpoints()
     running_names = manager.get_active_model_names()
     active_model_name = running_names[0] if running_names else global_active_model
-    rec = _get_recommended_tier(_near_vram_gb())
+    near_pool = _near_pool()
+    rec = _get_recommended_tier(near_pool)
     loading_telemetry = await manager.aget_loading_telemetry(active_model_name)
     try:
-        coding_model, coding_tiers = await _coding_status(running_names, _near_vram_gb())
+        coding_model, coding_tiers = await _coding_status(running_names, near_pool)
     except Exception as exc:  # noqa: BLE001 - the status must answer even if this part cannot
         log_warning(f"Coding model status unavailable ({type(exc).__name__}: {exc}).")
         coding_model, coding_tiers = dict(_NO_CODING_MODEL), []
@@ -3528,8 +3662,9 @@ async def get_cluster_status(request: Request):
     # What the coding engine can take in, read from the engine itself. A missing key means false.
     vision = await _engine_vision(running_names)
     capabilities: Dict[str, Any] = {"vision": vision}
-    if get_worker_limits().get("engine_phone_slots"):
-        # 2.6.2: whether the phone chat takes photos. Like image_generation below, only a server that has set the
+    if get_worker_limits().get("engine_phone_slots") or _app_vision_offered():
+        # 2.6.2: whether the phone chat takes photos. (2.9.0: also without phone lanes while the coding engine has its
+        # projector: a photo then goes to a coding lane.) Like image_generation below, only a server that has set the
         # feature up mentions it: with no phone lanes the status is what 2.6.1 sent.
         capabilities["app_vision"] = _app_vision_offered()
     images: Dict[str, Any] = {}
@@ -3556,6 +3691,11 @@ async def get_cluster_status(request: Request):
         capabilities["voice"] = available
         if available:
             voice["voice"] = voice_service.status_block()
+    # Maintenance (2.8.5): only while it is on does the status mention it; otherwise it is what 2.8.4 sent.
+    maintenance: Dict[str, Any] = {}
+    state = maintenance_state()
+    if state is not None:
+        maintenance["maintenance"] = {"active": True, **state}
 
     return {
         "status": cluster_status,
@@ -3570,6 +3710,10 @@ async def get_cluster_status(request: Request):
         "total_vram_gb": round(total_vram, 2),
         "total_sysram_gb": round(total_sysram, 2),
         "total_memory_gb": round(total_vram + total_sysram, 2),
+        # The pool the coding ladder is judged on (2.9.0): near GPU memory and lent system RAM, counted apart.
+        "pool_memory": _pool_memory_status(near_pool),
+        # The phones' own engine (2.9.0): {mode, rung, device, lanes, layers: {home, volunteers}, vision, switch}.
+        "phone_engine": _phone_engine_status(),
         # A count only. The list of every worker's ip:port was published here until 2.4.9, which put a
         # volunteer's home address on a public page; nothing read it.
         "active_workers_count": len(active_endpoints),
@@ -3581,7 +3725,9 @@ async def get_cluster_status(request: Request):
         # The phone app's pool: its machines (the CPU members, and the engine itself while it answers phones on its
         # lanes), the unlocked model tier and the ladder. Counts and model names only (AppPool.status).
         "app_pool": app_pool.status(_app_members(), int(get_worker_limits().get("app_tier_min_members", 2)),
-                                    engine=phone_engine),
+                                    engine=phone_engine,
+                                    route=phone_route.clean_route(get_worker_limits().get("phone_route")),
+                                    photos=_phone_photos_where()),
         # Coding members (engine/coding_router.py), counts only: {enabled, members, ready, slots, busy}.
         "coding_members": _coding_members_status(),
         # What the swarm lends and does right now, for the website's two tiles. Counts only, nothing names a
@@ -3619,6 +3765,7 @@ async def get_cluster_status(request: Request):
         "capabilities": capabilities,
         **images,
         **voice,
+        **maintenance,
     }
 
 
@@ -3894,8 +4041,9 @@ async def get_cluster_tiers(request: Request):
     runs it (server_slots, and context_per_request = context / server_slots).
     """
     total_vram = registry.get_total_vram_gb()
-    near_vram = _near_vram_gb()
-    rec = _get_recommended_tier(near_vram)
+    near_pool = _near_pool()
+    near_gpu, near_total = _pool_numbers(near_pool)
+    rec = _get_recommended_tier(near_pool)
     tiers_out = []
     for t in _coding_ladder():
         cached = True
@@ -3906,6 +4054,9 @@ async def get_cluster_tiers(request: Request):
             "id": t["id"],
             "name": t["name"],
             "min_vram_gb": t["min_vram_gb"],
+            "min_total_gb": t.get("min_total_gb", t["min_vram_gb"]),
+            "min_gpu_gb": t.get("min_gpu_gb", t["min_vram_gb"]),
+            "rank": t.get("rank"),
             "tier": coding_ladder.tier_label(t),
             "model": t["file"],
             "alt_model": None,
@@ -3916,7 +4067,7 @@ async def get_cluster_tiers(request: Request):
             "blocked": t["blocked"],
             "size": t["size"],
             "parts": len(t["files"]),
-            "unlocked": near_vram >= t["min_vram_gb"],
+            "unlocked": coding_ladder.fits(t, near_gpu, near_total),
             "cached_on_disk": cached,
         })
     return {
@@ -4291,6 +4442,10 @@ def _coding_gpu_workers(include_members: bool = False) -> List[Dict[str, Any]]:
             "class": benchmark.classify_endpoint(endpoint),
             "docked": registry.effective_docked(worker_id, hardware),
             "member": member,
+            # The RAM it lends for experts (its heartbeat's ram_lent_gb, clamped; 0 for an older worker) and how
+            # long this registration has lasted (pool_memory counts the RAM only after POOL_RAM_MIN_STAY_SECONDS).
+            "lent_ram_gb": pool_memory.volunteer_lent_ram_gb(hardware),
+            "stay_seconds": max(0.0, time.time() - registry.registered_at(worker_id)),
         })
     return workers
 
@@ -4341,7 +4496,7 @@ def _coding_worker_is_near(worker: Dict[str, Any], max_rtt_ms: float) -> bool:
     return rtt_is_near(probe.get("rtt_ms"), age, max_rtt_ms)
 
 
-def _coding_pool() -> Dict[str, float]:
+def _coding_pool() -> Dict[str, Any]:
     """
     The pool automatic switching sizes the coding model for: ``vram_gb`` counts only near
     GPUs (AUTO_SWAP_MAX_RTT_MS), ``far_vram_gb`` the rest, which is reported but never used.
@@ -4352,6 +4507,20 @@ def _coding_pool() -> Dict[str, float]:
     workers = [w for w in _coding_gpu_workers() if w.get("docked") is not False]
     pool = split_pool_by_distance(workers, lambda w: _coding_worker_is_near(w, max_rtt))
     pool["sysram_gb"] = registry.get_total_sysram_gb()
+    # The lent system RAM (2.9.0, engine/pool_memory.py): this host's budget, and the volunteers' that are close
+    # (POOL_RAM_MAX_RTT_MS) and have stayed (POOL_RAM_MIN_STAY_SECONDS). The GPU figures above are unchanged.
+    limits = get_worker_limits()
+    ram_rtt = float(limits.get("pool_ram_max_rtt_ms", pool_memory.DEFAULT_RAM_MAX_RTT_MS))
+    near = [{"id": w["worker_id"], "vram_gb": w["vram_gb"], "local": w.get("class") == "local",
+             "lent_ram_gb": w.get("lent_ram_gb", 0.0), "stay_seconds": w.get("stay_seconds", 0.0),
+             "endpoint": w["endpoint"], "worker_id": w["worker_id"], "class": w.get("class")}
+            for w in workers if _coding_worker_is_near(w, max_rtt)]
+    memory = pool_memory.build_pool_memory(
+        near, wall_ram_gb=pool_memory.wall_lent_ram_gb(limits),
+        ram_max_rtt_ok=lambda w: _coding_worker_is_near(w, ram_rtt),
+        min_stay_seconds=float(limits.get("pool_ram_min_stay_seconds", pool_memory.DEFAULT_RAM_MIN_STAY_SECONDS)))
+    for key in ("ram_gb", "machines", "wall_ram_gb", "volunteer_ram_gb", "by_machine"):
+        pool[key] = memory[key]
     return pool
 
 
@@ -4439,19 +4608,23 @@ def _record_probed_rtt(endpoint: str, rtt_ms: float) -> None:
     for worker in _coding_gpu_workers(include_members=True):
         if worker["endpoint"] == endpoint:
             registry.record_probe(worker["worker_id"], rtt_ms, _probe_paths.get(endpoint, "direct"))
+    lender = _cpu_lender_endpoints().get(endpoint)
+    if lender is not None:
+        registry.record_probe(lender, rtt_ms, _probe_paths.get(endpoint, "direct"))
 
 
 def _probe_targets() -> List[str]:
-    """Every volunteer GPU endpoint, coding members included (this machine's own needs no measuring).
-    Also forgets the LAN addresses of workers that have left."""
+    """Every volunteer GPU endpoint, coding members included (this machine's own needs no measuring), and the
+    volunteers that lend only RAM (2.9.0, for the phone ladder). Also forgets the LAN addresses of workers that have left."""
     workers = _coding_gpu_workers(include_members=True)
+    lenders = [e for e in _cpu_lender_endpoints() if e not in {w["endpoint"] for w in workers}]
     live = []
-    for worker in workers:
-        host, _, port = worker["endpoint"].rpartition(":")
+    for endpoint in [w["endpoint"] for w in workers] + lenders:
+        host, _, port = endpoint.rpartition(":")
         if port.isdigit():
             live.append((host, int(port)))
     link_paths.lan_routes.keep_only(live)
-    return [w["endpoint"] for w in workers if w["class"] != "local"]
+    return [w["endpoint"] for w in workers if w["class"] != "local"] + lenders
 
 
 link_probe = LinkProbe(measure=_probe_rpc_rtt, record=_record_probed_rtt)
@@ -4599,25 +4772,46 @@ async def _auto_swap_to(tier: Dict[str, Any], *, drain_seconds: float, abort_if_
     :func:`_swap_model_core` the manual endpoint uses, with the safety options on.
     ``check_speed`` (a move up) also requires AUTO_SWAP_MIN_DECODE_TPS of the new engine.
     """
-    from engine.inference_manager import MIN_KV_GB, POOL_SAFETY_FRACTION
-
     target = canonical_model_tag(tier.get("file") or "")
     if not target:
         return SwapResult("refused", "the tier names no model file")
     if not await manager.aresolve_model_path(target):
         return SwapResult("refused", f"{target} is not on disk")
 
-    # The engine's own admission rule, applied before anything is stopped: a model the
-    # inference manager would refuse must not cost users the model they have now.
+    # Which experts go to RAM, picked from the pool the coordinator really has and checked against the
+    # ENGINE_EXTRA_ARGS allow-list (pool_layout) before anything is stopped. It replaces the operator's placement
+    # flags for this rung (inference_manager.set_layout_override).
+    layout = _rung_layout(tier, _coding_pool())
+    if layout.realizable:
+        resolved = manager.resolve_model_path(target)
+        layout = pool_layout.with_at_least(
+            layout, inference_manager_module.cpu_moe_layers(get_worker_limits().get("engine_extra_args")),
+            gguf.model_shape(resolved) if resolved else None)
+    if not layout.realizable:
+        return SwapResult("refused", f"{target} has no layout the pool can hold: {layout.why}")
+    previous_layout = inference_manager_module.set_layout_override(layout.args)
+    try:
+        return await _auto_swap_run(target, tier, drain_seconds=drain_seconds, abort_if_busy=abort_if_busy,
+                                    check_speed=check_speed)
+    finally:
+        if global_active_model != target:
+            inference_manager_module.set_layout_override(previous_layout)
+
+
+async def _auto_swap_run(target: str, tier: Dict[str, Any], *, drain_seconds: float, abort_if_busy: bool,
+                         check_speed: bool) -> SwapResult:
+    from engine.inference_manager import MIN_KV_GB, POOL_SAFETY_FRACTION
+    # The engine's own admission rule, applied before anything is stopped: a model the inference manager would
+    # refuse must not cost users the model they have now. Sized with the layout installed: the experts it puts in
+    # RAM are not charged to the GPUs.
     req_gb = await manager.aestimate_model_vram_gb(target)
     total_vram = registry.get_total_vram_gb()
     total_sysram = registry.get_total_sysram_gb()
     room = (total_vram + total_sysram) * POOL_SAFETY_FRACTION
     if req_gb + MIN_KV_GB > room:
         return SwapResult("refused", f"{target} needs about {req_gb:.1f} GB and the pool can give {room:.1f} GB")
-
-    # The same near-only rule that unlocked the tier, applied to where the engine will really
-    # run: if the shard planner would spread it onto a GPU that is too far away, do not switch.
+    # The same near-only rule that unlocked the tier, applied to where the engine will really run: if the shard
+    # planner would spread it onto a GPU that is too far away, do not switch.
     planned = _planned_endpoints(req_gb)
     max_rtt = _max_shared_rtt()
     near = {w["endpoint"] for w in _coding_gpu_workers() if _coding_worker_is_near(w, max_rtt)}
@@ -4638,6 +4832,29 @@ async def _auto_swap_to(tier: Dict[str, Any], *, drain_seconds: float, abort_if_
         min_decode_tps=_auto_swap_min_decode_tps() if check_speed else 0.0,
     )
     return SwapResult(swap["outcome"], swap["detail"])
+
+
+def _rung_layout(tier: Dict[str, Any], pool: Dict[str, Any]) -> "pool_layout.Layout":
+    """The expert layout (engine/pool_layout.py) for ``tier`` on ``pool``, from the model file's header when it is
+    on disk. No RPC CPU device is known yet, so a volunteer's RAM is never used for placement."""
+    resolved = manager.resolve_model_path(canonical_model_tag(tier.get("file") or ""))
+    shape = gguf.model_shape(resolved) if resolved else None
+    return pool_layout.plan_layout(tier, pool, shape)
+
+
+def _rung_fits(tier: Dict[str, Any], pool: Dict[str, Any]) -> bool:
+    """
+    Automatic switching's fit test (2.9.0): the rung's two memory numbers hold (auto_swap.fits_by_pool) AND its
+    experts that do not fit on the GPUs have RAM to sit in on this host (pool_layout). The second part is why a
+    volunteer's lent RAM cannot unlock a rung until the layout can place experts there.
+    """
+    if not auto_swap.fits_by_pool(tier, pool):
+        return False
+    try:
+        return _rung_layout(tier, pool).realizable
+    except Exception as exc:  # noqa: BLE001 - a layout bug must not read as "the pool shrank"
+        log_warning(f"Layout check for {safe_log_text(str(tier.get('id')))} failed ({type(exc).__name__}: {exc}); using the memory numbers alone.")
+        return True
 
 
 def _engine_runs_on_what_is_left() -> bool:
@@ -4667,6 +4884,7 @@ auto_swapper = AutoSwapController(
     current_model=lambda: global_active_model,
     swap=_auto_swap_to,
     tier_ready=_coding_tier_ready,
+    fits=_rung_fits,
     download=_download_coding_tier,
     settings=get_worker_limits,
     swap_in_progress=_coding_reconfiguration_running,
@@ -4680,6 +4898,135 @@ auto_swapper = AutoSwapController(
 # The controller's loop, started with the other monitors and cancelled on shutdown.
 _auto_swap_task: Optional[asyncio.Task] = None
 _auto_swap_tasks: List[asyncio.Task] = []
+
+
+# ======================================================================================
+# The phones' own engine (2.9.0, engine/phone_engine.py and engine/phone_swap.py; contract 6c and 6c+)
+# ======================================================================================
+# PHONE_ENGINE=own: a llama-server of this coordinator's own answers the phones on the media card (or PHONE_DEVICE),
+# and its switcher moves it up the phone ladder as volunteers lend memory, down the moment they go. PHONE_ENGINE=shared
+# (the default) changes nothing: phones use the coding engine's lanes, and the switcher only makes sure the phone
+# engine is not running.
+
+def _resolve_rpc_endpoint(endpoint: str) -> Optional[str]:
+    """The address the phone engine's --rpc reaches a volunteer at, as the coding engine's is found (blocking)."""
+    from engine.reverse_tunnel import reverse_bridge
+    return reverse_bridge.resolve_endpoint(endpoint)
+
+
+own_phone_engine = PhoneEngine(limits=lambda: get_worker_limits(), resolve=_resolve_rpc_endpoint)
+# The phone engine's lanes are 0 .. PHONE_LANES-1 of its own llama-server, so they have a book of their own.
+own_phone_lanes = LaneBook()
+own_phone_affinity = LaneAffinity()
+
+
+def _rpc_lenders() -> List[Dict[str, Any]]:
+    """
+    The volunteers whose rpc-servers may carry phone layers: rpc-compatible (no CPU pool or coding member), not
+    yielding, not off their dock, this machine left out. Each ``{"worker_id", "ip", "port", "hardware", "endpoint"}``,
+    ``endpoint`` being the main rpc-server, the one the link probe measures.
+    """
+    out = []
+    for worker_id, data in registry.snapshot().items():
+        hardware = data.get("hardware")
+        if not isinstance(hardware, dict) or hardware.get("is_yielding", False) or not registry.rpc_compatible(hardware):
+            continue
+        endpoint = f"{data.get('ip', '')}:{data.get('port', '')}"
+        if benchmark.classify_endpoint(endpoint) == "local" or registry.effective_docked(worker_id, hardware) is False:
+            continue
+        out.append({"worker_id": str(worker_id), "ip": str(data.get("ip", "")), "port": data.get("port"),
+                    "hardware": hardware, "endpoint": endpoint})
+    return out
+
+
+def _cpu_lender_endpoints() -> Dict[str, str]:
+    """``{endpoint: worker id}`` of the volunteers that lend RAM and no GPU. The link probe measures them too (2.9.0):
+    the coding pool never lists them, and the phone ladder needs to know how near they are."""
+    return {w["endpoint"]: w["worker_id"] for w in _rpc_lenders() if not gpu_section(w["hardware"]).get("has_gpu", False)}
+
+
+def _phone_volunteers() -> List[Dict[str, Any]]:
+    """
+    What the phone switcher may put layers on (phone_swap.eligible_volunteers filters it): one entry per rpc-server a
+    volunteer runs, with this coordinator's last round trip to it. A GPU server is ``kind "gpu"`` under the worker's id;
+    the CPU server that lends RAM (``hardware.endpoints``, builder W) is ``kind "cpu"`` under ``<id>:ram``, its RAM the
+    lent figure (capped as the pool caps it). A worker from before 2.9.0 is its one GPU server on its main port.
+    A CPU server on a second port is reachable over the household LAN or directly, not through the reverse tunnel
+    (it carries the main port only): one behind a tunnel cannot be resolved, and the engine refuses that layout.
+    """
+    now = time.time()
+    out: List[Dict[str, Any]] = []
+    for worker in _rpc_lenders():
+        hardware, worker_id = worker["hardware"], worker["worker_id"]
+        probe = registry.get_probe(worker_id)
+        measured_at = probe.get("measured_at")
+        common = {"rtt_ms": probe.get("rtt_ms"),
+                  "rtt_age_s": now - measured_at if isinstance(measured_at, (int, float)) else None,
+                  "present_s": max(0.0, now - registry.registered_at(worker_id))}
+        gpu = gpu_section(hardware)
+        vram = _as_number(gpu.get("vram_total_gb", 0.0)) if gpu.get("has_gpu", False) else 0.0
+        endpoints = hardware.get("endpoints")
+        if not isinstance(endpoints, list):
+            endpoints = [{"type": "gpu", "port": worker["port"]}]
+        lent = pool_memory.volunteer_lent_ram_gb(hardware)
+        for entry in endpoints:
+            port = entry.get("port") if isinstance(entry, dict) else None
+            if not isinstance(port, int) or isinstance(port, bool):
+                continue
+            address = f"{worker['ip']}:{port}"
+            if entry.get("type") == "gpu" and vram > 0:
+                out.append({"id": worker_id, "kind": "gpu", "endpoint": address, "vram_gb": vram, **common})
+            elif entry.get("type") == "cpu":
+                ram = min(_as_number(entry.get("ram_gb", 0.0)), lent)
+                if ram > 0:
+                    out.append({"id": f"{worker_id}:ram", "kind": "cpu", "endpoint": address, "ram_lent_gb": ram, **common})
+    return out
+
+
+def _phone_coding_claims() -> Set[str]:
+    """
+    Coding wins (contract 6c+): the volunteers the coding engine runs on, or counts in its pool (near GPUs, whose lent
+    RAM the pool counts too), under both ids the phone switcher uses. The phones neither take nor keep them.
+    """
+    max_rtt = _max_shared_rtt()
+    in_engine = set(manager.current_endpoints or [])
+    claimed: Set[str] = set()
+    for worker in _coding_gpu_workers():
+        if worker.get("class") == "local":
+            continue
+        if worker["endpoint"] in in_engine or (worker.get("docked") is not False and _coding_worker_is_near(worker, max_rtt)):
+            claimed.update({str(worker["worker_id"]), f"{worker['worker_id']}:ram"})
+    return claimed
+
+
+phone_switcher = PhoneSwapController(
+    engine=own_phone_engine,
+    rungs_provider=phone_rungs,
+    volunteers_provider=_phone_volunteers,
+    settings=lambda: get_worker_limits(),
+    coding_claims=_phone_coding_claims,
+    download=make_phone_download(own_phone_engine),
+    log=lambda message: log_coordinator(safe_log_text(message, max_chars=500)),
+    warn=lambda message: log_warning(safe_log_text(message, max_chars=500)),
+)
+
+
+def _own_phone_entry() -> Optional[Dict[str, Any]]:
+    """The phone engine as the phone routing answers on it (the shape :func:`_phone_engine` gives for the coding
+    engine's lanes), or None unless PHONE_ENGINE=own and it is up, past its speed check and not switching."""
+    engine = own_phone_engine
+    if not engine.own() or not engine.ready or not engine.port or engine.rung is None:
+        return None
+    return {"own_phone_engine": True, "port": int(engine.port), "phone_slots": engine.lanes(), "dynamic_slots": 0,
+            "phone_context": int(get_worker_limits().get("phone_context", 8192)), "rung": engine.rung["id"],
+            "name": engine.rung["name"]}
+
+
+def _phone_engine_status() -> Dict[str, Any]:
+    """``phone_engine`` for /v1/cluster/status: the engine's block and its switcher's (no address, no worker id)."""
+    block = own_phone_engine.status()
+    block["switch"] = phone_switcher.status()
+    return block
 
 
 # ======================================================================================
@@ -4748,6 +5095,13 @@ async def _takeover_pause_pictures() -> None:
     await voice_service.member.stop()
 
 
+async def _takeover_stop_phone_engine() -> None:
+    """The lease takes the phone engine's card, or its layout turns PHONE_ENGINE=own off: the phones' llama-server lets
+    go now. The phone switcher leaves it stopped while the lease lasts and starts the base rung once it is over."""
+    async with own_phone_engine.switch_lock():
+        await own_phone_engine.stop()
+
+
 async def _takeover_restart_engine(*, expected_pool: Optional[Tuple[float, float]], reduced: bool = True,
                                    patient: bool = False) -> Dict[str, Any]:
     """
@@ -4757,7 +5111,9 @@ async def _takeover_restart_engine(*, expected_pool: Optional[Tuple[float, float
     local worker's next heartbeat: ``reduced`` says the pool just got smaller (the smaller figure is used) or bigger.
     ``patient`` is a restore: it waits out other switches and may cut a request that never ends.
     """
-    model = canonical_model_tag(global_active_model or "")
+    served = canonical_model_tag(global_active_model or "")
+    # A named layout lease (2.9.0) serves the layout's model; giving it back returns to config.txt's own.
+    model = canonical_model_tag(takeover.model_for_restart(takeover.load_lease(), served)) or served
     if not model:
         return {"outcome": "failed", "success": False, "detail": "no model is being served"}
     req_gb = await manager.aestimate_model_vram_gb(model)
@@ -4770,8 +5126,10 @@ async def _takeover_restart_engine(*, expected_pool: Optional[Tuple[float, float
         model, req_gb, vram, sysram,
         drain_timeout=PHONE_DRAIN_SECONDS if patient else 15.0,
         hold_first=True, abort_if_busy=not patient,
-        ready_timeout=_auto_swap_load_timeout(), rollback_model=model)
+        ready_timeout=_auto_swap_load_timeout(), rollback_model=served or model)
 
+
+takeover.model_on_disk = lambda tag: bool(manager.resolve_model_path(tag))
 
 takeover_controller = takeover.TakeoverController(takeover.Host(
     gpus=_takeover_gpus,
@@ -4781,6 +5139,7 @@ takeover_controller = takeover.TakeoverController(takeover.Host(
     pool_totals=lambda: (registry.get_total_vram_gb(), registry.get_total_sysram_gb()),
     pause_pictures=_takeover_pause_pictures,
     observe_engine=_takeover_observe_engine,
+    stop_phone_engine=_takeover_stop_phone_engine,
     read_limits=lambda: engine_config.get_plain_worker_limits(),
     system_ram_gb=lambda: round(psutil.virtual_memory().total / (1024 ** 3), 1),
 ))
@@ -6587,19 +6946,42 @@ async def app_chat_completions(request: Request):
         located = location is not None and tools is not None
         photos = await _check_phone_photos(request, body)
         tools, run_tool = await _with_picture_tool(request, body, tools, run_tool)
-        engine = await _phone_engine()
-        if engine is not None:
-            if photos and not await _engine_can_read_images(engine):
-                raise ImageRefused(media.IMAGE_INPUT_UNAVAILABLE, "This server's coding engine cannot read images.")
-            return await _answer_on_phone_lane(body, network, engine, tools, run_tool, located, finish)
+        route = phone_route.clean_route(limits.get("phone_route"))
+        wall = await _wall_phone_rung(photos)
         if photos:
+            if wall.available and wall.reads_photos:
+                app_pool.note_served("engine")
+                return await _answer_on_phone_lane(body, network, wall.engine, tools, run_tool, located, finish)
+            # The phone rung cannot read a photo (no lanes, PHONE_VISION=false, or later a text-only phone model): a coding
+            # lane does, if the coding engine has its projector (2.9.0, 6e).
+            # (Not asked again when the phone rung is the same engine and was asked to read: it said no.)
+            coding = None if wall.available and limits.get("phone_vision", True) else await _coding_engine_for_photos()
+            if coding is not None:
+                app_pool.note_served("engine")
+                return await _answer_photo_on_coding_lane(body, network, coding, tools, run_tool, located, finish)
+            if wall.available:
+                raise ImageRefused(media.IMAGE_INPUT_UNAVAILABLE, "This server's coding engine cannot read images.")
             # Never the CPU pool: its machines can be volunteers'. The engine is down, loading or swapping (or
             # lanes are off): the phone is told so and sends the photo again.
-            return _answer_photos_without_a_lane(finish, engine_down=bool(limits.get("engine_phone_slots")))
+            return _answer_photos_without_a_lane(finish, engine_down=_phone_lanes_configured(limits))
+        members = _app_members()
+        floor = float(limits.get("phone_min_tps", 6.0))
+        ready = app_pool.free_members(members)
+        fast = app_pool.free_members(members, floor)
+        choice = phone_route.choose(route, False, wall, bool(ready), bool(fast))
+        if choice == phone_route.WALL:
+            app_pool.note_served("engine")
+            return await _answer_on_phone_lane(body, network, wall.engine, tools, run_tool, located, finish)
+        app_pool.note_served("volunteers")
+        if choice == phone_route.VOLUNTEERS:
+            # volunteers_first skips a slow volunteer only while TheWall's lane is free; wall_first only gets here with
+            # every lane busy, when any free volunteer is better than waiting.
+            chosen = fast if (route == "volunteers_first" and wall.free) else ready
+            return await _answer_on_volunteers(body, network, wall, chosen, tools, run_tool, located, finish)
         # With lanes configured the engine is what answers phones, so while it is down, loading or swapping and no
         # CPU member is ready either, the phone is told DLNE is restarting.
         return _answer_on_cpu_pool(body, tools, run_tool, located, finish,
-                                   engine_down=bool(limits.get("engine_phone_slots")))
+                                   engine_down=_phone_lanes_configured(limits))
     except BaseException:
         finish()
         raise
@@ -6635,11 +7017,13 @@ def _answer_photos_without_a_lane(finish, engine_down: bool) -> StreamingRespons
 
 
 def _answer_on_cpu_pool(body: Dict[str, Any], tools, run_tool, located: bool, finish,
-                        engine_down: bool = False) -> StreamingResponse:
+                        engine_down: bool = False, members: Optional[List[Member]] = None) -> StreamingResponse:
     """The phone's chat on the CPU pool; ``finish`` gives the network's slot back when the stream ends.
-    ``engine_down``: the engine that should be answering phones is not (app_pool.RESTARTING_NOTICE)."""
-    members = _app_members()
-    active = app_pool.status(members, int(get_worker_limits().get("app_tier_min_members", 2)))["active_tier"]
+    ``engine_down``: the engine that should be answering phones is not (app_pool.RESTARTING_NOTICE).
+    ``members``: the volunteers the phone route chose (PHONE_ROUTE, 2.9.0); all of them when not given."""
+    if members is None:
+        members = _app_members()
+    active = app_pool.status(_app_members(), int(get_worker_limits().get("app_tier_min_members", 2)))["active_tier"]
 
     async def generate():
         try:
@@ -6658,6 +7042,8 @@ def _answer_on_cpu_pool(body: Dict[str, Any], tools, run_tool, located: bool, fi
 
 # How long a phone waits for one of the engine's phone lanes before it is told to try again.
 PHONE_LANE_WAIT_SECONDS = 25.0
+# A coding lane used within this many seconds is not given a phone's photo while another will do (6e).
+COLD_LANE_RECENT_SECONDS = 300.0
 
 
 def _engine_identity(snapshot: Optional[Dict[str, Any]]):
@@ -6686,6 +7072,189 @@ async def _phone_engine() -> Optional[Dict[str, Any]]:
     return snapshot
 
 
+async def _answer_on_volunteers(body: Dict[str, Any], network: str, wall: phone_route.WallRung, members: List[Member],
+                                tools, run_tool, located: bool, finish):
+    """
+    A phone's text answered by the volunteers the route chose, with TheWall's phone rung as the backup (2.9.0): when
+    every chosen volunteer fails before sending anything (the "no machine" notice would be the first thing the phone
+    saw), the same request goes to TheWall's lane (waits up to PHONE_LANE_WAIT_SECONDS, then the usual 429). A volunteer
+    that fails after it sent text is the usual dropped notice and nothing else answers. The first chunk is read before
+    the response starts, which is what lets the fallback still be a real 429.
+    """
+    active = app_pool.status(_app_members(), int(get_worker_limits().get("app_tier_min_members", 2)))["active_tier"]
+
+    async def generate():
+        async with engine_client() as client:
+            async for chunk in app_pool.stream(body, members, active, client, tools=tools, located=located,
+                                               run_tool=run_tool and functools.partial(run_tool, client=client)):
+                yield chunk
+
+    chunks = generate()
+    try:
+        first = await chunks.__anext__()
+    except StopAsyncIteration:
+        first = None
+    except BaseException:
+        await chunks.aclose()
+        raise
+    if first == _sse_notice(NO_MACHINE_NOTICE) and wall.available:
+        await chunks.aclose()
+        log_warning("No chosen volunteer could answer this phone; TheWall's phone lane answers.")
+        app_pool.note_served("engine")
+        return await _answer_on_phone_lane(body, network, wall.engine, tools, run_tool, located, finish)
+
+    async def stream():
+        try:
+            if first is not None:
+                yield first
+            async for chunk in chunks:
+                yield chunk
+        finally:
+            await chunks.aclose()
+            finish()
+
+    return StreamingResponse(stream(), media_type="text/event-stream", background=BackgroundTask(finish),
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+async def _wall_phone_rung(photos: bool = False) -> phone_route.WallRung:
+    """
+    THE SEAM to TheWall's phone rung (2.9.0): what the phone routing (engine/phone_route.py) asks of it, and the only
+    place it asks. Today the rung is the coding engine's phone lanes (ENGINE_PHONE_SLOTS); the phone engine of 6c will
+    answer the same question here and nowhere else needs to change in the routing.
+
+    ``available``: a message can be taken now (:func:`_phone_engine`: lanes configured, the engine up and not swapping).
+    ``free``: a lane is free this moment and nobody waits for one. ``reads_photos``: with ``photos`` asked for, the rung
+    reads them (PHONE_VISION is not false and the engine has its projector loaded); never worked out otherwise.
+    ``engine``: the entry :func:`_answer_on_phone_lane` answers on (port, phone_slots, dynamic_slots, phone_context).
+
+    PHONE_ENGINE=own (6c): the rung is the phones' own engine instead (:func:`_own_phone_entry`), its lanes counted by
+    the engine itself, and it reads photos while PHONE_VISION is not false. While it is not up (starting, switching,
+    stopped for a takeover, failed), the coding engine's phone lanes are the backup when ENGINE_PHONE_SLOTS gives it some.
+    """
+    if own_phone_engine.own():
+        entry = _own_phone_entry()
+        if entry is not None:
+            free = own_phone_engine.lanes_free() > 0 and phone_gate.stats()["waiting"] == 0
+            return phone_route.WallRung(True, free, bool(photos) and own_phone_engine.can_read_photos(), entry)
+    engine = await _phone_engine()
+    if engine is None:
+        return phone_route.WallRung(False)
+    stats = phone_gate.stats()
+    free = stats["in_use"] < int(engine["phone_slots"]) and stats["waiting"] == 0
+    reads = False
+    if photos and get_worker_limits().get("phone_vision", True):
+        reads = await _engine_can_read_images(engine)
+    return phone_route.WallRung(True, free, reads, engine)
+
+
+async def _coding_engine_for_photos() -> Optional[Dict[str, Any]]:
+    """
+    The running coding engine's entry when a phone photo can be read on one of its coding lanes (6e), else None: it is
+    up (not swapping, process alive and listening) and has its vision projector loaded. Needs no phone lanes.
+    """
+    if is_swapping_models or is_recalculating_queue:
+        return None
+    running = manager.get_active_model_names()
+    snapshot = await manager.asnapshot_model(running[0]) if running else None
+    process = (snapshot or {}).get("process")
+    if (not snapshot or process is None or process.poll() is not None
+            or not await _probe_engine_port(int(snapshot.get("port") or 0))):
+        return None
+    return snapshot if await _engine_can_read_images(snapshot) else None
+
+
+def _phone_photos_where() -> str:
+    """``app_pool.photos`` (2.9.0): where phone photos are read. "phone_model": the phone lanes (they have lanes and
+    PHONE_VISION is not false), "coding_lane": a coding lane (6e), "none": the engine has no projector set up."""
+    limits = get_worker_limits()
+    if own_phone_engine.own() and limits.get("phone_vision", True):
+        return "phone_model"                    # the phone engine's own reader, on its card
+    if not _app_vision_offered():
+        return "none"
+    return "phone_model" if limits.get("engine_phone_slots") and limits.get("phone_vision", True) else "coding_lane"
+
+
+async def _answer_photo_on_coding_lane(body: Dict[str, Any], network: str, engine: Dict[str, Any], tools, run_tool,
+                                       located: bool, finish):
+    """
+    A phone message with a photo, read on a coding lane because the phone rung cannot (6e,
+    docs/release-2.9-contract.md). It waits for a coding slot like a phone waits for its lane (PHONE_LANE_WAIT_SECONDS,
+    then the same 429) at the phone's own priority (a key holder's coding request goes first), never interrupts a
+    coding answer, and takes the coldest lane (engine/priority.LaneBook.coldest: no conversation, else the one unused
+    longest, never one used in the last COLD_LANE_RECENT_SECONDS while another will do). The conversation is cut to the
+    phone's context (ENGINE_PHONE_CONTEXT), not the coding lane's. Never the CPU pool, as every photo.
+    """
+    limits = get_worker_limits()
+    count = int(engine.get("dynamic_slots") or 1)
+    phone_slots = int(engine.get("phone_slots") or 0)
+    lane: Optional[int] = None
+    gate_held = False
+    counted = False
+
+    def give_lane() -> None:
+        nonlocal lane, gate_held
+        if lane is not None:
+            lane_book.give(lane)
+            lane = None
+        if gate_held:
+            gate_held = False
+            coding_gate.release()
+
+    async def uncount() -> None:
+        nonlocal counted
+        if counted:
+            counted = False
+            await _change_inference_count(-1)
+
+    def give_back() -> None:
+        give_lane()
+        finish()
+        if counted:
+            # the in-flight count (it makes a switch wait for this answer) is given back on the loop, once
+            asyncio.ensure_future(uncount())
+
+    try:
+        await _change_inference_count(1)
+        counted = True
+        try:
+            await asyncio.wait_for(coding_gate.acquire(tier_priority("cpu"), slots=count), PHONE_LANE_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            await uncount()
+            finish()
+            return JSONResponse({"detail": "Lots of people are chatting right now: try again in a moment."},
+                                status_code=429, headers={"Retry-After": "5"})
+        gate_held = True
+        now = await _coding_engine_for_photos()
+        if _engine_identity(now) != _engine_identity(engine):
+            give_lane()
+            await uncount()
+            return _answer_photos_without_a_lane(finish, engine_down=True)
+        lane = lane_book.coldest(0, count, recent_seconds=COLD_LANE_RECENT_SECONDS) if phone_slots > 0 else None
+        context = int(engine.get("phone_context") or limits.get("engine_phone_context") or 8192)
+        chat_id = clean_chat_id(body.get("chat_id"))
+        on_lane = EngineLane(lane if lane is not None else -1, chat_id, context,
+                             image_tokens=int(limits.get("engine_image_max_tokens", 1024)), pin=lane is not None)
+        member = Member(ENGINE_KEY, 0.0, None, True, count, f"http://127.0.0.1:{int(engine['port'])}", local=True)
+        active = app_pool.status(_app_members(), int(limits.get("app_tier_min_members", 2)))["active_tier"]
+    except BaseException:
+        give_back()
+        raise
+
+    async def generate():
+        try:
+            async with engine_client() as client:
+                async for chunk in app_pool.stream(body, [member], active, client, tools=tools, lane=on_lane,
+                                                   fallback=[], located=located, release_lane=give_lane,
+                                                   run_tool=run_tool and functools.partial(run_tool, client=client)):
+                    yield chunk
+        finally:
+            give_back()
+
+    return StreamingResponse(generate(), media_type="text/event-stream", background=BackgroundTask(give_back),
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
 async def _answer_on_phone_lane(body: Dict[str, Any], network: str, engine: Dict[str, Any], tools, run_tool,
                                 located: bool, finish):
     """
@@ -6695,6 +7264,8 @@ async def _answer_on_phone_lane(body: Dict[str, Any], network: str, engine: Dict
     If the engine changed while the phone waited for a lane, the CPU pool answers instead, unless the request
     carries photos (2.6.2): those are never given to the CPU pool, and the phone is told DLNE is restarting.
     """
+    if engine.get("own_phone_engine"):
+        return await _answer_on_own_phone_engine(body, network, engine, tools, run_tool, located, finish)
     lane: Optional[int] = None
     gate_held = False
     photos = has_photos(body)
@@ -6757,6 +7328,86 @@ async def _answer_on_phone_lane(body: Dict[str, Any], network: str, engine: Dict
             give_back()
 
     # The background task gives everything back when the client left before the generator was resumed.
+    return StreamingResponse(generate(), media_type="text/event-stream", background=BackgroundTask(give_back),
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+def _phone_lanes_configured(limits: Dict[str, Any]) -> bool:
+    """Phones have lanes of TheWall's set up (the coding engine's ENGINE_PHONE_SLOTS, or PHONE_ENGINE=own), so a phone
+    that finds none is told DLNE is restarting rather than that it has none."""
+    return bool(limits.get("engine_phone_slots")) or str(limits.get("phone_engine") or "shared") == "own"
+
+
+async def _answer_on_own_phone_engine(body: Dict[str, Any], network: str, entry: Dict[str, Any], tools, run_tool,
+                                      located: bool, finish):
+    """
+    The phone's chat on the phones' own engine (2.9.0, PHONE_ENGINE=own): :func:`_answer_on_phone_lane` with the phone
+    engine's lanes (0 .. PHONE_LANES-1 of its own llama-server) in place of the coding engine's. The engine counts the
+    request too (PhoneEngine.acquire): its switcher waits for that count to reach 0 before a switch. If the engine was
+    switched, stopped or died while the phone waited for a lane, the CPU pool answers instead (never for photos).
+    """
+    engine = own_phone_engine
+    lane: Optional[int] = None
+    gate_held = acquired = False
+    photos = has_photos(body)
+
+    def give_lane() -> None:
+        nonlocal lane, gate_held, acquired
+        if lane is not None:
+            own_phone_lanes.give(lane)
+            lane = None
+        if acquired:
+            acquired = False
+            engine.release()
+        if gate_held:
+            gate_held = False
+            phone_gate.release()
+
+    def give_back() -> None:
+        give_lane()
+        finish()
+
+    try:
+        slots = int(entry["phone_slots"])
+        try:
+            await asyncio.wait_for(phone_gate.acquire(1, slots=slots), PHONE_LANE_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            finish()
+            return JSONResponse({"detail": "Lots of people are chatting right now: try again in a moment."},
+                                status_code=429, headers={"Retry-After": "5"})
+        gate_held = True
+        now = _own_phone_entry()
+        same = now is not None and (now["port"], now["rung"]) == (entry["port"], entry["rung"])
+        if same and not (photos and not engine.can_read_photos()):
+            acquired = engine.acquire()
+        if not acquired:
+            give_lane()
+            if photos:
+                return _answer_photos_without_a_lane(finish, engine_down=True)
+            return _answer_on_cpu_pool(body, tools, run_tool, located, finish, engine_down=True)
+        chat_id = clean_chat_id(body.get("chat_id"))
+        tag = chat_tag(chat_id) if chat_id else None
+        lane = own_phone_lanes.take(0, slots, prefer=own_phone_affinity.lane_for(tag))
+        own_phone_affinity.remember(tag, lane)
+        member = Member(ENGINE_KEY, 0.0, None, True, slots, f"http://127.0.0.1:{int(entry['port'])}", local=True)
+        on_lane = EngineLane(lane, chat_id, int(entry.get("phone_context") or 8192),
+                             image_tokens=int(get_worker_limits().get("engine_image_max_tokens", 1024)))
+        cpu_members = [] if photos else _app_members()
+        active = app_pool.status(cpu_members, int(get_worker_limits().get("app_tier_min_members", 2)))["active_tier"]
+    except BaseException:
+        give_back()
+        raise
+
+    async def generate():
+        try:
+            async with engine_client() as client:
+                async for chunk in app_pool.stream(body, [member], active, client, tools=tools, lane=on_lane,
+                                                   fallback=cpu_members, located=located, release_lane=give_lane,
+                                                   run_tool=run_tool and functools.partial(run_tool, client=client)):
+                    yield chunk
+        finally:
+            give_back()
+
     return StreamingResponse(generate(), media_type="text/event-stream", background=BackgroundTask(give_back),
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
@@ -7375,6 +8026,9 @@ async def startup_event():
     _auto_swap_tasks.append(spawn_background_task(
         link_probe.run(_probe_targets, warn=lambda m: log_warning(safe_log_text(m, max_chars=300))),
         "auto-swap-link-probe"))
+    # The phones' own engine (2.9.0). The switcher always runs and reads PHONE_ENGINE on every tick: with "shared" (the
+    # default) it starts nothing; with "own" it brings the base rung up and climbs the phone ladder.
+    _auto_swap_tasks.append(spawn_background_task(phone_switcher.run(), "phone-swap"))
     # Canary requests to untrusted coding members (engine/canary.py). The members list is empty
     # while CODING_MEMBERS_ENABLED is off, so this does nothing until the owner turns members on.
     _auto_swap_tasks.append(spawn_background_task(
@@ -7390,9 +8044,11 @@ async def shutdown_event():
     gpu_standby.flush()      # first, so nothing below can keep it from being saved; never raises
     contributor_networks.flush()      # the same
     auto_swapper.shutdown()
+    phone_switcher.shutdown()
     for task in [_auto_swap_task, _takeover_task, *_auto_swap_tasks]:
         if task is not None and not task.done():
             task.cancel()
+    await asyncio.to_thread(own_phone_engine.stop_now)      # the phones' llama-server is a child of this process too
     await image_service.shutdown()      # sd-server is a child of this process: it goes with it
     await voice_service.shutdown()      # so is whisper-server
 

@@ -382,9 +382,9 @@ test('max_seconds comes from the status, with the contract\'s 60 as the default'
 
 // ---- the manifest ------------------------------------------------------------------------------------------------
 
-test('package.json: 1.8.0, the setting (application scope, default true), the command and its keybinding', () => {
+test('package.json: 1.9.0, the setting (application scope, default true), the command and its keybinding', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '1.8.0');
+  assert.equal(pkg.version, '1.9.0');
   const setting = pkg.contributes.configuration.properties['dlne.voice.enabled'];
   assert.equal(setting.type, 'boolean');
   assert.equal(setting.default, true);
@@ -397,5 +397,5 @@ test('package.json: 1.8.0, the setting (application scope, default true), the co
   assert.match(key.when, /focusedView == dlne\.chatView/);
   assert.match(key.when, /editorTextFocus/);
   const lock = JSON.parse(fs.readFileSync(path.join(ROOT, 'package-lock.json'), 'utf8'));
-  assert.equal(lock.version, '1.8.0');
+  assert.equal(lock.version, '1.9.0');
 });

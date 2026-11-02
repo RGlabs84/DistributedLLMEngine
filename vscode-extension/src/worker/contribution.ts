@@ -267,6 +267,30 @@ export function alsoCpuConfigUpdate(text: string, lendBoth: boolean, ramGb: numb
   return next === text ? null : next;
 }
 
+/** The engine's config.txt key for the system RAM, in GB, this machine lends to the pool (engine/config.py, 2.9.0). */
+export const LEND_RAM_KEY = 'LEND_RAM_GB';
+/** What dlne.worker.lendRamGb is when nothing sets it. */
+export const LEND_RAM_DEFAULT_GB = 8;
+
+/** The RAM, in GB, the setting asks for: a number of at least 0 (0 is off); anything else is the default 8. */
+export function lendRamGbFrom(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value * 10) / 10 : LEND_RAM_DEFAULT_GB;
+}
+
+/** The new text of config.txt for LEND_RAM_GB, or null when it already says that. */
+export function lendRamConfigUpdate(text: string, value: unknown): string | null {
+  const next = setConfigValue(text, LEND_RAM_KEY, String(lendRamGbFrom(value)));
+  return next === text ? null : next;
+}
+
+/** One plain sentence on how much RAM is lent. The worker itself lends no more than the free RAM less 4 GB. */
+export function lendRamLine(value: unknown): string {
+  const gb = lendRamGbFrom(value);
+  return gb > 0
+    ? `Lending up to ${gb} GB of system RAM to the pool (never more than your free RAM minus 4 GB). Change it in dlne.worker.lendRamGb; 0 turns it off.`
+    : 'Not lending any system RAM (dlne.worker.lendRamGb is 0).';
+}
+
 /** The engine's config.txt key for the most CPU threads the worker may use (engine/config.py). */
 export const MAX_CPU_THREADS_KEY = 'MAX_CPU_THREADS';
 

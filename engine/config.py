@@ -23,7 +23,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import List
+from typing import Any, Dict, List, Optional
 
 from engine.dock_policy import WIFI_DEFAULTS
 
@@ -260,6 +260,10 @@ ENGINE_KV_TYPES = ("auto", "q8_0", "q4_0", "f16")
 # download the release host keeps beside the code; if it cannot be installed or will not start, the engine runs on
 # Vulkan and says why in the log. Anything else spelled here is vulkan: a typo must not start a different engine.
 ENGINE_FLAVORS = ("auto", "vulkan", "cuda")
+# PHONE_ROUTE (2.9.0): who answers the phone and web chat first. wall_first (the default): TheWall's phone rung, and a text
+# message goes to a ready volunteer CPU when every phone lane is busy. volunteers_first: a ready volunteer first, TheWall's
+# lane as the backup. wall_only: today's order (volunteers answer only while the engine is down). Photos never go to a volunteer.
+PHONE_ROUTES = ("wall_first", "volunteers_first", "wall_only")
 ENGINE_DEFAULTS = {
     "engine_context": 0,
     "engine_slots": 0,
@@ -370,6 +374,86 @@ def engine_args_without_placement(args) -> List[str]:
     return out
 
 
+# The phone engine (2.9.0, engine/phone_engine.py, engine/phone_swap.py, contract 6c and 6c+): a llama-server of the
+# coordinator's own for the phone app, on PHONE_DEVICE (empty: the media card; "cpu": the host's processor).
+# PHONE_ENGINE=shared (the default) changes nothing: phones use the coding engine's lanes. own starts the engine.
+# PHONE_MODEL is a rung of the phone ladder (qwen35-4b, qwen35-9b, qwen36-a3b); the switcher starts at the first and
+# climbs with the volunteers. PHONE_HOME_BUDGET_MB is the most the phone engine may put on the home card at any rung
+# (0: what the base rung uses). PHONE_MIN_TPS is shared with the phone routing (6b). PHONE_MODEL_DIR "" is
+# <install>/models/phone.
+PHONE_ENGINE_MODES = ("shared", "own")
+PHONE_MODEL_IDS = ("qwen35-4b", "qwen35-9b", "qwen36-a3b")
+PHONE_ENGINE_DEFAULTS = {
+    "phone_engine": "shared",
+    "phone_model": "qwen35-4b",
+    "phone_device": "",
+    "phone_lanes": 2,
+    "phone_context": 8192,
+    "phone_vision": True,
+    "phone_home_budget_mb": 0,
+    "phone_shard_max_rtt_ms": 200.0,
+    "phone_up_stable_seconds": 600,
+    "phone_down_stable_seconds": 0,
+    "phone_cooldown_seconds": 1800,
+    "phone_ram_settle_seconds": 1800,
+    "phone_min_tps": 6.0,
+    "phone_auto_swap": True,
+    "phone_max_rebuilds_per_hour": 3,
+    "phone_flap_hold_seconds": 3600,
+    "phone_load_timeout_seconds": 180,
+    "phone_model_dir": "",
+}
+PHONE_ENGINE_RANGES = {
+    "PHONE_LANES": (1, 8),
+    "PHONE_CONTEXT": (2048, 65536),
+    "PHONE_HOME_BUDGET_MB": (0, 48000),
+    "PHONE_UP_STABLE_SECONDS": (60, 7 * 86400),
+    "PHONE_DOWN_STABLE_SECONDS": (0, 3600),
+    "PHONE_COOLDOWN_SECONDS": (300, 7 * 86400),
+    "PHONE_RAM_SETTLE_SECONDS": (0, 7 * 86400),
+    "PHONE_MAX_REBUILDS_PER_HOUR": (0, 100),
+    "PHONE_FLAP_HOLD_SECONDS": (300, 7 * 86400),
+    "PHONE_LOAD_TIMEOUT_SECONDS": (30, 3600),
+}
+PHONE_ENGINE_FLOAT_RANGES = {
+    "PHONE_SHARD_MAX_RTT_MS": (0.1, 5000.0),
+    "PHONE_MIN_TPS": (0.0, 1000.0),
+}
+
+
+def apply_phone_engine_config(config: Dict[str, str], limits: Dict[str, Any]) -> None:
+    """The PHONE_* lines of config.txt into ``limits``; a value outside its range or list keeps the default."""
+    if "PHONE_ENGINE" in config and config["PHONE_ENGINE"].strip().lower() in PHONE_ENGINE_MODES:
+        limits["phone_engine"] = config["PHONE_ENGINE"].strip().lower()
+    if "PHONE_MODEL" in config and config["PHONE_MODEL"].strip().lower() in PHONE_MODEL_IDS:
+        limits["phone_model"] = config["PHONE_MODEL"].strip().lower()
+    if "PHONE_DEVICE" in config:
+        limits["phone_device"] = config["PHONE_DEVICE"].strip()
+    if "PHONE_VISION" in config:
+        # Only the literal "false" turns it off: a typo must not take photos away from the phone model.
+        limits["phone_vision"] = config["PHONE_VISION"].strip().lower() != "false"
+    if "PHONE_AUTO_SWAP" in config:
+        limits["phone_auto_swap"] = _as_bool(config["PHONE_AUTO_SWAP"])
+    if "PHONE_MODEL_DIR" in config:
+        limits["phone_model_dir"] = os.path.expanduser(config["PHONE_MODEL_DIR"].strip())
+    for key, (low, high) in PHONE_ENGINE_RANGES.items():
+        if key in config:
+            try:
+                value = int(config[key].strip())
+            except ValueError:
+                continue
+            if low <= value <= high:
+                limits[key.lower()] = value
+    for key, (low, high) in PHONE_ENGINE_FLOAT_RANGES.items():
+        if key in config:
+            try:
+                value = float(config[key].strip())
+            except ValueError:
+                continue
+            if low <= value <= high:                       # NaN fails both
+                limits[key.lower()] = value
+
+
 def parse_engine_args(raw: str) -> List[str]:
     """ENGINE_EXTRA_ARGS as llama-server arguments, or [] if any token is not allowed (a typo
     keeps the engine on its defaults rather than failing to start)."""
@@ -445,9 +529,11 @@ def get_worker_limits() -> dict:
         return limits
 
 
-def get_plain_worker_limits() -> dict:
+def get_plain_worker_limits(config: Optional[dict] = None) -> dict:
     """
     Returns the typed operational limits from ``config.txt``, with defaults for every key (no takeover overlay).
+    ``config`` is a raw ``UPPERCASE_KEY -> str`` dict to read instead of the file (a takeover lease's named layout
+    merged over it, 2.9.0); None reads ``config.txt``.
 
     Key names and types are part of the internal API (hardware.py, coordinator.py,
     worker.py, inference_manager.py and downloader.py all index this dict), so they are
@@ -468,11 +554,15 @@ def get_plain_worker_limits() -> dict:
         # does its own job (engine/companion.py). Presence of a positive value turns the second job on; None, zero or
         # a negative number is off. dlne_server.py worker --also-cpu-ram writes it; MAX_RAM_GB is not involved.
         "also_cpu_ram_gb": None,
+        # The system RAM, in GB, this machine lends to the pool's engine for a model's experts (2.9.0): LEND_RAM_GB.
+        # The default is 8; 0 turns it off. engine.hardware.get_ram_lent_gb caps it at the free RAM less 4 GB.
+        "lend_ram_gb": 8.0,
         "max_cpu_threads": -1,
         "allowed_gpu_indices": "-1",
         "enforce_model_whitelist": False,
         "enforce_contrib_clause": True,
         "starter_quota_inferences": 100,
+        "trial_burst_per_hour": 10,
         "redundancy_priority_index": 1,
         "custom_gguf_dir": os.path.join(get_base_dir(), "models"),
         # Previously undefined unless present in the file.
@@ -550,6 +640,13 @@ def get_plain_worker_limits() -> dict:
         # default, but it only ever moves between enabled tiers. AUTO_SWAP=false turns it off
         # within one tick (30 s), no restart needed.
         "auto_swap": True,
+        # Maintenance (2.8.5): MAINTENANCE=true closes everything that answers people (chat, the phone app, coding,
+        # voice, pictures) with 503 "maintenance" and the message below, and the status says so; workers, the status
+        # and the operator stay in. Re-read with config.txt, no restart. MAINTENANCE_UNTIL is shown as written
+        # ("about 1 hour", "14:30"); empty says nothing about when.
+        "maintenance": False,
+        "maintenance_message": "",
+        "maintenance_until": "",
         "auto_swap_up_stable_seconds": 600,
         "auto_swap_down_stable_seconds": 120,
         "auto_swap_cooldown_seconds": 1800,
@@ -564,6 +661,15 @@ def get_plain_worker_limits() -> dict:
         # the coding model; every token crosses each link, so 80 ms caps it near 12 tokens a
         # second. The owner's grades: 40 and under best, 80 good, 120 usable, more is too far.
         "auto_swap_max_rtt_ms": 80.0,
+        # The pool counts system RAM as well as GPU memory (2.9.0, engine/pool_memory.py). This host lends the DLNE
+        # service's memory budget (POOL_WALL_RAM_BUDGET_GB, TheWall's MemoryMax 18) less what the engine needs besides
+        # experts (POOL_WALL_RAM_RESERVE_GB: the prompt cache, the token embedding, the runtime, Python), and a
+        # volunteer's RAM counts only within POOL_RAM_MAX_RTT_MS (every token's activations cross the link once per
+        # expert layer) and only once it has stayed POOL_RAM_MIN_STAY_SECONDS.
+        "pool_wall_ram_budget_gb": 18.0,
+        "pool_wall_ram_reserve_gb": 10.0,
+        "pool_ram_max_rtt_ms": 5.0,
+        "pool_ram_min_stay_seconds": 1800,
         # A farther GPU can still run a whole coding model of its own (a coding member), up
         # to this round trip; past it the machine gets no job. An unmeasured one still may.
         "coding_member_max_rtt_ms": 120.0,
@@ -596,6 +702,7 @@ def get_plain_worker_limits() -> dict:
         **ENGINE_DEFAULTS,
         **IMAGE_DEFAULTS,
         **VOICE_DEFAULTS,
+        **PHONE_ENGINE_DEFAULTS,
         # What a node with no usable GPU must bring to be admitted. Generating a token reads
         # every weight a node holds, so a CPU node's speed is its memory bandwidth, and one
         # slow node holds up every token of the pipeline it sits in. These are floors: an
@@ -616,6 +723,10 @@ def get_plain_worker_limits() -> dict:
         # can host it; phone users get one answer at a time and this many requests a minute.
         "app_tier_min_members": 2,
         "app_rate_per_minute": 6,
+        # Phone and web chat routing (2.9.0, docs/release-2.9-contract.md 6b, 6e): see PHONE_ROUTES. PHONE_MIN_TPS (the
+        # speed floor, tokens a second, for a volunteer to be preferred over TheWall's free phone lane) and PHONE_VISION
+        # (false: TheWall's phone rung does not read photos, which then go to a coding lane) are in PHONE_ENGINE_DEFAULTS.
+        "phone_route": "wall_first",
         # The coordinator host's own pool member: off unless the operator gives it cores. The
         # mask is llama.cpp's --cpu-mask (hex, one thread pinned per logical CPU).
         "app_local_enabled": False,
@@ -663,7 +774,8 @@ def get_plain_worker_limits() -> dict:
         "coding_member_allowed": True,
     }
 
-    config = get_config()
+    if config is None:
+        config = get_config()
 
     # Each key is only overridden when actually present, so a missing entry keeps the
     # default above and a malformed numeric entry keeps it too (unchanged behaviour).
@@ -684,6 +796,14 @@ def get_plain_worker_limits() -> dict:
         # A number that is not finite is no answer; the key then counts as absent (the coding job follows MAX_RAM_GB).
         if coding_ram is not None and coding_ram == coding_ram and abs(coding_ram) != float("inf"):
             limits["coding_max_ram_gb"] = coding_ram
+
+    if "LEND_RAM_GB" in config:
+        try:
+            lend = float(config["LEND_RAM_GB"])
+        except ValueError:
+            lend = None
+        if lend is not None and lend == lend and abs(lend) != float("inf"):
+            limits["lend_ram_gb"] = max(0.0, lend)
 
     if "ALSO_CPU_RAM_GB" in config:
         try:
@@ -711,6 +831,12 @@ def get_plain_worker_limits() -> dict:
     if "STARTER_QUOTA_INFERENCES" in config:
         try:
             limits["starter_quota_inferences"] = int(config["STARTER_QUOTA_INFERENCES"])
+        except ValueError:
+            pass
+
+    if "TRIAL_BURST_PER_HOUR" in config:
+        try:
+            limits["trial_burst_per_hour"] = max(1, int(config["TRIAL_BURST_PER_HOUR"]))
         except ValueError:
             pass
 
@@ -841,6 +967,14 @@ def get_plain_worker_limits() -> dict:
                 continue
             if low <= value <= high:
                 limits[key.lower()] = value
+
+    if "PHONE_ROUTE" in config:
+        route = config["PHONE_ROUTE"].strip().lower()
+        # A typo keeps the default rather than moving every phone to another machine by accident.
+        if route in PHONE_ROUTES:
+            limits["phone_route"] = route
+
+    # PHONE_MIN_TPS and PHONE_VISION are parsed once, with the phone engine's keys (apply_phone_engine_config).
 
     if "APP_LOCAL_ENABLED" in config:
         limits["app_local_enabled"] = _as_bool(config["APP_LOCAL_ENABLED"])
@@ -1085,6 +1219,8 @@ def get_plain_worker_limits() -> dict:
         if VOICE_MIN_FREE_VRAM_GB_RANGE[0] <= free_gb <= VOICE_MIN_FREE_VRAM_GB_RANGE[1]:      # NaN fails both
             limits["voice_min_free_vram_gb"] = free_gb
 
+    apply_phone_engine_config(config, limits)
+
     if "VOICE_CPU_MASK" in config:
         mask = config["VOICE_CPU_MASK"].strip().lower()
         mask = mask if mask.startswith("0x") else "0x" + mask
@@ -1098,6 +1234,13 @@ def get_plain_worker_limits() -> dict:
     # turns it off, which is the safe direction for an off switch.
     if "AUTO_SWAP" in config:
         limits["auto_swap"] = _as_bool(config["AUTO_SWAP"])
+
+    # Maintenance: only the literal "true" closes the doors (a typo keeps DLNE open). The words are capped, single-line.
+    if "MAINTENANCE" in config:
+        limits["maintenance"] = _as_bool(config["MAINTENANCE"])
+    for key, cap in (("MAINTENANCE_MESSAGE", 400), ("MAINTENANCE_UNTIL", 60)):
+        if key in config:
+            limits[key.lower()] = " ".join(config[key].split())[:cap]
 
     # The floors keep a typo from making the coordinator switch models every few seconds; a
     # value outside the range keeps the default.
@@ -1125,6 +1268,17 @@ def get_plain_worker_limits() -> dict:
         # NaN fails both comparisons and keeps the default.
         if 0.1 <= rtt <= 1000.0:
             limits["auto_swap_max_rtt_ms"] = rtt
+
+    # The pool's RAM numbers (engine/pool_memory.py). A value outside its range keeps the default.
+    for key, low, high in (("POOL_WALL_RAM_BUDGET_GB", 0.0, 2048.0), ("POOL_WALL_RAM_RESERVE_GB", 0.0, 2048.0),
+                           ("POOL_RAM_MAX_RTT_MS", 0.1, 1000.0), ("POOL_RAM_MIN_STAY_SECONDS", 0.0, 7 * 86400.0)):
+        if key in config:
+            try:
+                number = float(config[key])
+            except ValueError:
+                continue
+            if low <= number <= high:   # NaN fails both comparisons
+                limits[key.lower()] = number
 
     if "AUTO_SWAP_MIN_DECODE_TPS" in config:
         try:

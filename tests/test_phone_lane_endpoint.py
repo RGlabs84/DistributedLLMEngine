@@ -174,6 +174,9 @@ def env(servers, monkeypatch, isolated_config, dlne_root, tmp_path):
         "trust_proxy_headers": False, "enforce_contrib_clause": False, "starter_quota_inferences": 200,
         "app_rate_per_minute": 60, "app_tier_min_members": 2, "network_key": "", "allow_unsigned_workers": True,
         "engine_phone_slots": PHONE_SLOTS, "engine_phone_context": 8192, "coding_members_enabled": False,
+        # 2.9.0: these tests encode the order before PHONE_ROUTE (a busy lane is waited for, volunteers answer only while
+        # the engine cannot); the new default is covered in tests/test_phone_route.py.
+        "phone_route": "wall_only",
         **engine_config.CPU_NODE_DEFAULTS,
     }
     monkeypatch.setattr(coordinator, "get_worker_limits", lambda: dict(limits))

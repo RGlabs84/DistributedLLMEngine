@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.9.0] - 2026-11-02
+
+Pairs with DLNE coordinator **2.9.0** (maintenance mode came in 2.8.5; lending RAM needs 2.9.0).
+
+### Added
+- **Lend system RAM to DLNE.** A new setting, `dlne.worker.lendRamGb` (8 GB by default), sets how much of this
+  computer's memory the DLNE worker lends to the shared model, never more than is free less 4 GB. 0 lends none.
+- **A proper maintenance screen.** While DLNE is being upgraded (the coordinator's status says so, or it refuses a
+  message with the maintenance answer) the DLNE Agent panel shows one card over the whole panel, in the web chat's
+  look and words: the logo, "DLNE is being upgraded", the coordinator's message and "Expected back". What you typed
+  stays in the box. The panel asks every 15 seconds and the card goes away by itself when the upgrade is over. The
+  status bar item says "DLNE: maintenance" meanwhile.
+
+---
+
 ## [1.8.0] - 2026-11-02
 
 Pairs with DLNE coordinator **2.8.0** (voice); with an older coordinator the microphone stays hidden.

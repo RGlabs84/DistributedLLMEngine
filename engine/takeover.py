@@ -207,17 +207,39 @@ def apply_active_overlay(limits: dict) -> dict:
     lease = load_lease()
     if not overlay_applies(lease, now()):
         return limits
-    return overlay_limits(limits, lease.get("overlay") or {})
+    overlay = lease.get("overlay") or {}
+    if overlay.get("layout_keys"):
+        # A named layout (2.9.0): config.txt's keys with the layout's on top, parsed afresh. config.txt is not written.
+        merged = engine_config.get_config()
+        merged.update(overlay["layout_keys"])
+        limits = engine_config.get_plain_worker_limits(merged)
+    return overlay_limits(limits, overlay)
+
+
+def model_for_restart(lease: Optional[dict], current: str) -> str:
+    """The model the engine restarts on: the layout's while a layout lease is granting or active, config.txt's own
+    DEFAULT_MODEL (else ``current``) when that lease is being given back, and ``current`` for everything else."""
+    overlay = (lease or {}).get("overlay") or {}
+    layout = overlay.get("layout_model")
+    if not layout:
+        return current
+    if lease.get("state") in (STATE_GRANTING, STATE_ACTIVE):
+        return layout
+    return os.path.basename(str(engine_config.get_config().get("DEFAULT_MODEL") or "").strip()) or current
 
 
 def status_block() -> Dict[str, Any]:
-    """``takeover`` in /v1/cluster/status and the admin stats: no lease id, no address."""
+    """
+    ``takeover`` in /v1/cluster/status and the admin stats: no lease id, no address. ``layout`` (2.9.0) is the owner's
+    named layout the lease runs on (e.g. "takeover-1card"), or None for a generic plan.
+    """
     lease = load_lease()
     if not lease:
-        return {"active": False, "state": None, "holder": None, "since": None, "expires_at": None}
+        return {"active": False, "state": None, "holder": None, "since": None, "expires_at": None, "layout": None}
     current = now()
     return {"active": True, "state": effective_state(lease, current), "holder": lease.get("holder"),
-            "since": iso(float(lease.get("since") or 0)), "expires_at": iso(float(lease.get("expires_at") or 0))}
+            "since": iso(float(lease.get("since") or 0)), "expires_at": iso(float(lease.get("expires_at") or 0)),
+            "layout": (lease.get("overlay") or {}).get("layout")}
 
 
 def purge_on_start() -> Optional[str]:
@@ -492,6 +514,101 @@ def parse_request(body: Any) -> Request:
 
 
 # --------------------------------------------------------------------------------------
+# Named layouts (2.9.0, docs/takeover-contract.md addendum)
+# --------------------------------------------------------------------------------------
+
+LAYOUT_ONE_CARD = "takeover-1card"
+LAYOUT_TWO_CARDS = "takeover-2card"
+LAYOUT_NORMAL = "normal-layout"
+BC160_MARK = "BC-160"
+# Never taken from a layout file, even when it sets them: a lease must not touch maintenance, the operator's or the
+# takeover key, the layouts switch or the network identity.
+LAYOUT_PROTECTED_KEYS = frozenset({"MAINTENANCE", "MAINTENANCE_MESSAGE", "MAINTENANCE_UNTIL", "TAKEOVER_KEY_HASH",
+                                   "TAKEOVER_LAYOUTS", "ADMIN_HASH", "NETWORK_KEY"})
+
+
+def layout_path(name: str) -> str:
+    return os.path.join(engine_config.get_base_dir(), "config", f"config.txt.{name}")
+
+
+def bc160_cards(gpus: List[dict]) -> List[str]:
+    """PCI addresses of the BC-160 cards, #1 first (lowest address)."""
+    return sorted(_pci(g) for g in gpus if BC160_MARK in str(g.get("name") or ""))
+
+
+def layout_for(req: "Request", gpus: List[dict]) -> Optional[str]:
+    """The named layout a request asks for by the cards it names, or None (generic plan)."""
+    if not req.gpus:
+        return None
+    cards = bc160_cards(gpus)
+    asked = set(req.gpus)
+    if len(cards) >= 2 and asked == set(cards[:2]):
+        return LAYOUT_TWO_CARDS
+    if cards and asked == {cards[0]}:
+        return LAYOUT_ONE_CARD
+    return None
+
+
+def read_layout_keys(name: str) -> Optional[Dict[str, str]]:
+    """The keys of ``config/config.txt.<name>`` less the protected ones, or None (missing or unreadable)."""
+    try:
+        with open(layout_path(name), "r", encoding="utf-8", errors="replace") as handle:
+            parsed = engine_config._parse_config_lines(handle.read().splitlines())
+    except OSError:
+        return None
+    return {k: v for k, v in parsed.items() if k not in LAYOUT_PROTECTED_KEYS} or None
+
+
+def merged_config(layout_keys: Dict[str, str]) -> Dict[str, str]:
+    """config.txt's keys with the layout's on top (keys the layout does not set stay)."""
+    merged = engine_config.get_config()
+    merged.update(layout_keys)
+    return merged
+
+
+def layout_problem(layout_keys: Dict[str, str]) -> Optional[str]:
+    """Why a layout cannot be used, or None: ONE disallowed engine flag drops the whole ENGINE_EXTRA_ARGS line."""
+    raw = merged_config(layout_keys).get("ENGINE_EXTRA_ARGS", "")
+    if raw.strip() and not engine_config.parse_engine_args(raw):
+        return "its ENGINE_EXTRA_ARGS holds a flag the engine does not allow, which would drop the whole line"
+    return None
+
+
+def _model_on_disk_default(tag: str) -> bool:
+    """Standalone check (tests): the model is a file in the models folder. The coordinator replaces this with the
+    inference manager's own resolver, which knows every root the engine searches."""
+    name = os.path.basename(tag)
+    root = str(engine_config.get_plain_worker_limits().get("custom_gguf_dir") or "")
+    return bool(name) and os.path.isfile(os.path.join(root, name))
+
+
+model_on_disk: Callable[[str], bool] = _model_on_disk_default
+
+
+def layout_model(keys: Dict[str, str]) -> str:
+    """The model file name a layout serves, or "" when it does not name one (the engine keeps its model)."""
+    return os.path.basename(str(keys.get("DEFAULT_MODEL") or "").strip())
+
+
+def choose_layout(req: "Request", gpus: List[dict]) -> Optional[Tuple[str, Dict[str, str]]]:
+    """(name, keys) of the layout this lease applies, or None for the generic plan (with a log line when a layout was
+    asked for but cannot be used)."""
+    if not engine_config.get_config().get("TAKEOVER_LAYOUTS", "true").strip().lower() == "true":
+        return None
+    name = layout_for(req, gpus)
+    if name is None:
+        return None
+    keys = read_layout_keys(name)
+    why = "the file is missing or empty" if keys is None else layout_problem(keys)
+    if not why and layout_model(keys) and not model_on_disk(layout_model(keys)):
+        why = f"its model {layout_model(keys)} is not on disk"
+    if why:
+        log_warning(f"Takeover: layout {name} not used ({why}); using the generic plan.")
+        return None
+    return name, keys
+
+
+# --------------------------------------------------------------------------------------
 # The planner
 # --------------------------------------------------------------------------------------
 
@@ -525,6 +642,9 @@ class Plan:
     engine_restart: bool = False
     pause_pictures: bool = False
     pause_voice: bool = False          # 2.8.0: the voice engine (whisper-server) shares the media card
+    # 2.9.0: the phones' own engine (engine/phone_engine.py) is stopped for the lease: its card is lent (the media card,
+    # or the card PHONE_DEVICE names), or the named layout turns PHONE_ENGINE=own off.
+    stop_phone_engine: bool = False
     removed_vram_gb: float = 0.0
     request: Optional[Request] = None
 
@@ -659,6 +779,11 @@ def make_plan(req: Request, *, limits: dict, gpus: List[dict], facts: Optional[E
     from engine import hardware
     ncpu = ncpu or logical_cpu_count()
     problems: List[Dict[str, str]] = []
+    plain_limits = limits
+    layout = choose_layout(req, gpus)
+    if layout is not None:
+        # The plan is the layout's: its limits are what DLNE will be, the named cards are handed over as they are.
+        limits = engine_config.get_plain_worker_limits(merged_config(layout[1]))
 
     def problem(code: str, detail: str) -> None:
         problems.append({"code": code, "detail": detail})
@@ -708,6 +833,16 @@ def make_plan(req: Request, *, limits: dict, gpus: List[dict], facts: Optional[E
     # operator has set voice up at all (on or paused), so a server without it answers exactly as before.
     voice_set_up = bool(limits.get("voice_enabled") or limits.get("voice_paused"))
     pause_voice = media_taken and bool(limits.get("voice_enabled"))
+    phone_own = str(plain_limits.get("phone_engine") or "shared") == "own"
+    phone_card = str(plain_limits.get("phone_device") or "").strip()
+    if not phone_card:
+        phone_card_taken = media_taken
+    elif phone_card.lower() == "cpu":
+        phone_card_taken = False
+    else:                                   # PHONE_DEVICE is a DLNE GPU id or a PCI address, as MEDIA_GPU is
+        named = hardware.find_gpu(phone_card, gpus)
+        phone_card_taken = named is not None and named["id"] in {g["id"] for g in taken}
+    stop_phone = phone_own and phone_card_taken
     voice = "paused" if (limits.get("voice_paused") or pause_voice) else "on"
 
     # --- CPU cores ---
@@ -782,13 +917,29 @@ def make_plan(req: Request, *, limits: dict, gpus: List[dict], facts: Optional[E
                 memory = {"before": {"MemoryMax": memory_now["MemoryMax"], "MemoryHigh": memory_now["MemoryHigh"]},
                           "after": {"MemoryMax": str(new_max), "MemoryHigh": str(new_high)}}
 
+    if layout is not None:
+        overlay["layout"] = layout[0]
+        overlay["layout_keys"] = dict(layout[1])
+        if layout_model(layout[1]):
+            overlay["layout_model"] = layout_model(layout[1])
+        engine_restart = bool(facts)
+        pause_pictures = bool(plain_limits.get("image_gen_enabled")) and not limits.get("image_gen_enabled")
+        pause_voice = bool(plain_limits.get("voice_enabled")) and not limits.get("voice_enabled")
+        stop_phone = stop_phone or (phone_own and str(limits.get("phone_engine") or "shared") != "own")
+        slots, total = int(limits.get("engine_slots") or 0), int(limits.get("engine_context") or 0)
+        if slots > 0:
+            keep_lanes = slots
+            keep_context = total // slots if total > 0 else keep_context
     keep_result = {"engine_on": engine_on, "coding_lanes": keep_lanes, "coding_context": keep_context,
                    "pictures": pictures, "vision": vision, "engine_restart": engine_restart}
+    if layout is not None:
+        keep_result["layout"] = layout[0]
     if voice_set_up:
         keep_result["voice"] = voice
     return Plan(allowed=not problems, problems=problems, cards=cards, keep_result=keep_result,
                 cpu_cores=list(req.cpu_cores), ram_gb=req.ram_gb, overlay=overlay, memory=memory,
-                engine_restart=engine_restart, pause_pictures=pause_pictures, pause_voice=pause_voice, removed_vram_gb=removed_vram, request=req)
+                engine_restart=engine_restart, pause_pictures=pause_pictures, pause_voice=pause_voice,
+                stop_phone_engine=stop_phone, removed_vram_gb=removed_vram, request=req)
 
 
 # --------------------------------------------------------------------------------------
@@ -877,6 +1028,9 @@ class Host:
     observe_engine: Callable[[], Awaitable[Optional[Tuple[int, int]]]]       # (coding lanes, context per lane) or None
     read_limits: Callable[[], dict] = engine_config.get_plain_worker_limits
     system_ram_gb: Callable[[], float] = lambda: 0.0
+    # 2.9.0: stop the phones' own engine for a lease that takes its card (None: there is none to stop). The phone
+    # switcher starts it again once the lease is over.
+    stop_phone_engine: Optional[Callable[[], Awaitable[None]]] = None
 
 
 class TakeoverController:
@@ -962,7 +1116,7 @@ class TakeoverController:
             plan = await self._plan_for_grant(req)
             # Whatever stops something that is running waits for DLNE to be idle: the engine restarting, or sd-server
             # letting go of the media card (the idle test includes a picture being made).
-            needs_idle = plan.engine_restart or plan.pause_pictures or plan.pause_voice
+            needs_idle = plan.engine_restart or plan.pause_pictures or plan.pause_voice or plan.stop_phone_engine
             if needs_idle and not await self._idle_moment():
                 raise TakeoverError(503, CODE_BUSY, f"DLNE was never idle in {IDLE_WAIT_MAX_SECONDS // 60} minutes; nothing was changed.")
             if needs_idle:
@@ -1010,6 +1164,8 @@ class TakeoverController:
                 save_lease(lease)
             if plan.pause_pictures or plan.pause_voice:
                 await self.host.pause_pictures()          # the host lets go of the media card: sd-server and whisper-server
+            if plan.stop_phone_engine and self.host.stop_phone_engine is not None:
+                await self.host.stop_phone_engine()       # 2.9.0: the phones' own llama-server lets go of its card
             if plan.engine_restart:
                 expected = (max(0.0, vram_before - plan.removed_vram_gb), max(0.0, sysram_before - plan.ram_gb))
                 engine_touched = True

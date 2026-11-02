@@ -234,7 +234,7 @@ async def test_a_second_call_in_a_later_round_makes_no_job_either():
     member = Member_(tool_call([("a", *FOX)]), tool_call([("b", "create_image", {"prompt": "one more"})]), ANSWER)
     out, _ = await run(member, ask(ON_ITS_OWN), tools, run_tool)
     assert len(maker.calls) == 1 and [e["event"] for e in dlne(out)] == ["image_job"]
-    assert member.requests[2]["messages"][-1] == {"role": "tool", "tool_call_id": "b", "content": ONE_ONLY}
+    assert member.requests[2]["messages"][-1] == {"role": "tool", "tool_call_id": "b", "content": ONE_ONLY + ap.FINAL_PASS_NOTE}   # the last pass: no tools, told to answer
     assert "tools" not in member.requests[2], "the tools are withdrawn after MAX_TOOL_ROUNDS, so an answer always comes"
 
 
@@ -244,7 +244,7 @@ async def test_a_refused_first_call_still_counts_as_the_one_picture():
     member = Member_(tool_call([("a", *FOX)]), tool_call([("b", *FOX)]), ANSWER)
     out, _ = await run(member, ask("draw a fox"), tools, run_tool)
     assert len(maker.calls) == 1 and [e["event"] for e in dlne(out)] == ["image_refused"]
-    assert member.requests[2]["messages"][-1]["content"] == ONE_ONLY
+    assert member.requests[2]["messages"][-1]["content"] == ONE_ONLY + ap.FINAL_PASS_NOTE
 
 
 @pytest.mark.anyio
@@ -874,7 +874,7 @@ async def test_a_second_call_in_a_second_round_makes_no_job_either(pictures):
     out = await chat(ON_ITS_OWN)
     picture_event(out)
     assert len(pictures.service._jobs) == 1 and pictures.quota.summary(5)["chats_used"] == 1
-    assert pictures.engine.chats[2]["messages"][-1]["content"] == ONE_ONLY
+    assert pictures.engine.chats[2]["messages"][-1]["content"] == ONE_ONLY + ap.FINAL_PASS_NOTE
 
 
 # --- refusals: the same code and words the endpoint gives ----------------------------------------------------------------

@@ -168,6 +168,7 @@ class LaneBook:
         self._short: Dict[int, int] = {}     # the short ones among them
         self._chat_clock = 0
         self._last_chat: Dict[int, int] = {}  # lane -> when a spreading chat last took it (see take)
+        self._last_used_at: Dict[int, float] = {}   # lane -> when a chat last took or gave it (monotonic seconds), see coldest
 
     def take(self, first: int, count: int, *, short: bool = False, prefer: Optional[int] = None,
              spread: bool = False) -> int:
@@ -194,6 +195,8 @@ class LaneBook:
         else:
             lane = min(lanes, key=lambda index: (self._chats(index), self._short.get(index, 0), index))
         self._uses[lane] = self._uses.get(lane, 0) + 1
+        if not short:
+            self._last_used_at[lane] = time.monotonic()
         if short:
             self._short[lane] = self._short.get(lane, 0) + 1
         elif spread:
@@ -206,6 +209,29 @@ class LaneBook:
             self._uses[lane] -= 1
             if short and self._short.get(lane, 0) > 0:
                 self._short[lane] -= 1
+            if not short:
+                self._last_used_at[lane] = time.monotonic()
+
+    def coldest(self, first: int, count: int, *, recent_seconds: float = 300.0, now: Optional[float] = None) -> int:
+        """
+        The lane of ``first .. first+count-1`` whose cached conversation matters least (2.9.0, a phone photo on a coding
+        lane): one with no chat on it now, then one not used in the last ``recent_seconds`` while another will do, then one
+        no chat has ever used, then the one used longest ago, then the lowest index. Counts the lane as used, like
+        :meth:`take`; give it back with :meth:`give`. It is a chat's hold (not ``short``), and does not move the lane
+        in :meth:`take`'s ``spread`` order beyond making it the newest.
+        """
+        now = time.monotonic() if now is None else now
+        lanes = range(first, first + max(1, count))
+
+        def key(index: int):
+            used = self._last_used_at.get(index)
+            recent = used is not None and now - used < recent_seconds
+            return (self._chats(index), recent, used is not None, used if used is not None else 0.0, index)
+
+        lane = min(lanes, key=key)
+        self._uses[lane] = self._uses.get(lane, 0) + 1
+        self._last_used_at[lane] = now
+        return lane
 
     def _chats(self, lane: int) -> int:
         return self._uses.get(lane, 0) - self._short.get(lane, 0)

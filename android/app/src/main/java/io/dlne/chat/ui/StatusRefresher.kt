@@ -33,6 +33,8 @@ data class ShownStatus(val status: ClusterStatus? = null, val server: String? = 
 class StatusRefresher(
     private val scope: CoroutineScope,
     private val intervalMs: Long,
+    /** The wait before the next fetch; faster than [intervalMs] while the server is in maintenance. */
+    private val nextIntervalMs: () -> Long = { intervalMs },
     private val fetch: suspend () -> Unit,
 ) {
     private var job: Job? = null
@@ -43,7 +45,7 @@ class StatusRefresher(
         job = scope.launch {
             while (isActive) {
                 fetch()
-                delay(intervalMs)
+                delay(nextIntervalMs())
             }
         }
     }

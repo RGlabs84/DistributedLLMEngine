@@ -16,16 +16,37 @@ class ScrollFollowTest {
 
     @Test
     fun `a reader scrolled up into the growing answer keeps the same words in view`() {
-        assertEquals(120, keepReaderInPlace(false, "pending", "pending", 400, 1000, 1120))
+        assertEquals(120, keepReaderInPlace(following = false, scrolling = false, firstIndex = 0, firstOffset = 400, oldSize = 1000, newSize = 1120))
     }
 
     @Test
-    fun `nothing moves while following, at the very end, above the answer, or when it did not grow`() {
-        assertEquals("following: the list stays at the newest end", 0, keepReaderInPlace(true, "pending", "pending", 400, 1000, 1120))
-        assertEquals("at the end of the answer", 0, keepReaderInPlace(false, "pending", "pending", 0, 1000, 1120))
-        assertEquals("reading older messages: the answer below does not move them", 0, keepReaderInPlace(false, "m-1", "pending", 400, 1000, 1120))
-        assertEquals("the answer just appeared", 0, keepReaderInPlace(false, "pending", "pending", 400, 0, 1120))
-        assertEquals("it shrank (a redraw)", 0, keepReaderInPlace(false, "pending", "pending", 400, 1120, 1000))
+    fun `a finger holding a spot keeps it while the answer streams, even before the scroll ends`() {
+        // Owner, 1.1.1: "try to hold the spot while it's streaming a response". Following is decided when a scroll ends,
+        // so during the hold it is still true; the hold itself must keep the words in place.
+        assertEquals(64, keepReaderInPlace(following = true, scrolling = true, firstIndex = 0, firstOffset = 30, oldSize = 500, newSize = 564))
+    }
+
+    @Test
+    fun `the answer turning into the saved message, with its buttons, does not move the words either`() {
+        assertEquals(96, keepReaderInPlace(following = false, scrolling = false, firstIndex = 0, firstOffset = 900, oldSize = 2400, newSize = 2496))
+        assertEquals("a redraw that shrinks it moves back the same way", -40,
+            keepReaderInPlace(following = false, scrolling = false, firstIndex = 0, firstOffset = 900, oldSize = 2400, newSize = 2360))
+    }
+
+    @Test
+    fun `nothing moves while following at the very end, while reading older messages, or when nothing changed`() {
+        assertEquals("following at the end: the list stays at the newest end", 0,
+            keepReaderInPlace(following = true, scrolling = false, firstIndex = 0, firstOffset = 0, oldSize = 1000, newSize = 1120))
+        assertEquals("a finger at the very end follows too", 0,
+            keepReaderInPlace(following = true, scrolling = true, firstIndex = 0, firstOffset = 0, oldSize = 1000, newSize = 1120))
+        assertEquals("following and not touching: it follows", 0,
+            keepReaderInPlace(following = true, scrolling = false, firstIndex = 0, firstOffset = 400, oldSize = 1000, newSize = 1120))
+        assertEquals("reading older messages: the answer below does not move them", 0,
+            keepReaderInPlace(following = false, scrolling = false, firstIndex = 2, firstOffset = 400, oldSize = 1000, newSize = 1120))
+        assertEquals("the answer just appeared", 0,
+            keepReaderInPlace(following = false, scrolling = false, firstIndex = 0, firstOffset = 400, oldSize = 0, newSize = 1120))
+        assertEquals("no change", 0,
+            keepReaderInPlace(following = false, scrolling = false, firstIndex = 0, firstOffset = 400, oldSize = 1120, newSize = 1120))
     }
 
     @Test

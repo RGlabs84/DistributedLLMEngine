@@ -793,3 +793,18 @@ test('the changelog announces the panel and the new setting', () => {
   assert.match(entry, /### Added[\s\S]*\*\*Donate compute\.\*\*/);
   assert.match(entry, /dlne\.worker\.maxCpuThreads/);
 });
+
+test('LEND_RAM_GB in config.txt: the setting, 8 by default, 0 is off', () => {
+  assert.equal(c.lendRamConfigUpdate('A=1\n', 8), 'A=1\nLEND_RAM_GB=8\n');
+  assert.equal(c.lendRamConfigUpdate('LEND_RAM_GB=8\n', 8), null);
+  assert.equal(c.lendRamConfigUpdate('LEND_RAM_GB=8\n', 0), 'LEND_RAM_GB=0\n');
+  assert.equal(c.lendRamConfigUpdate('LEND_RAM_GB=2\n', 'lots'), 'LEND_RAM_GB=8\n', 'not a number: the default');
+  assert.equal(c.lendRamConfigUpdate('LEND_RAM_GB=2\n', -5), 'LEND_RAM_GB=8\n');
+  assert.match(c.lendRamLine(12), /up to 12 GB.*minus 4 GB/);
+  assert.match(c.lendRamLine(0), /Not lending/);
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  const prop = pkg.contributes.configuration.properties['dlne.worker.lendRamGb'];
+  assert.equal(prop.default, 8);
+  assert.equal(prop.minimum, 0);
+  assert.equal(c.LEND_RAM_KEY, 'LEND_RAM_GB');
+});

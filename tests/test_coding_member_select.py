@@ -97,10 +97,10 @@ def test_a_bigger_tier_is_chosen_once_the_owner_enables_it(ladder):
     # 128 GB of unified memory holds Flash-Next Q4_K_XL (111 GB, 82 GB of it matrices), not the 158 GB Q5.
     assert sel.choose_tier(96, 128, enabled, LIMITS, unified=True)["id"] == "qwen38-flash-next-q4"
     assert sel.choose_tier(150, 192, enabled, LIMITS, unified=True)["id"] == "qwen38-flash-next-q5"
-    # The 64 GB Mac cannot hold even the smallest of them, but it holds Qwen3-Coder-Next IQ4_XS (the 49 GB
-    # rung above the 35B's, enabled only once it is measured better); with that rung off it keeps the 35B.
-    assert sel.choose_tier(48, 64, enabled, LIMITS, unified=True)["id"] == "qwen3-coder-next-iq4xs"
-    without_coder_next = [t for t in enabled if t["id"] != "qwen3-coder-next-iq4xs"]
+    # The 64 GB Mac cannot hold even the smallest of them, but it holds Qwen3-Coder-Next (the rungs above the 35B's,
+    # enabled only once they are measured better); with those rungs off it keeps the 35B.
+    assert sel.choose_tier(48, 64, enabled, LIMITS, unified=True)["id"] == "qwen3-coder-next-q4ks"
+    without_coder_next = [t for t in enabled if not t["id"].startswith("qwen3-coder-next")]
     assert sel.choose_tier(48, 64, without_coder_next, LIMITS, unified=True)["id"] == Q6
 
 

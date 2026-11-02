@@ -3,6 +3,7 @@ import { DlneClient, formatLoadingTelemetry } from '../client/dlneClient';
 import { WorkerManager } from '../worker/workerManager';
 import { QueueUpdate, queueDetail, queueHeadline, queueStatusText } from '../client/queue';
 import { CPU_POOL_HEADLINE, CPU_POOL_PERK, contributionTooltip } from '../worker/contribution';
+import { MAINTENANCE_FOOTER, MAINTENANCE_STATUS_TEXT, maintenanceUntilLine } from '../client/maintenance';
 import { engineLabel } from '../worker/engineFlavour';
 
 export class ClusterStatusBar {
@@ -65,6 +66,15 @@ export class ClusterStatusBar {
     const workerStatus = this.workerManager.getStatus();
     const extVersion =
       vscode.extensions.getExtension('dlne.dlne-code-assistant')?.packageJSON?.version || '1.0.28';
+
+    // Maintenance (2.8.5): the coordinator is closed on purpose; the item says so until the status stops saying it.
+    const maint = detailed.status === 'ok' ? this.client.currentMaintenance?.() : null;
+    if (maint) {
+      this.unreachableCount = 0;
+      this.statusBarItem.text = MAINTENANCE_STATUS_TEXT;
+      this.statusBarItem.tooltip = [maint.message, maintenanceUntilLine(maint), MAINTENANCE_FOOTER].filter(Boolean).join('\n');
+      return;
+    }
 
     if (detailed.status === 'forbidden') {
       this.statusBarItem.text = `$(shield) DLNE v${extVersion}: Compute Required`;

@@ -221,3 +221,35 @@ def test_every_config_key_is_one_the_engine_reads():
         if key == "COORDINATOR_URL":
             continue    # written as the extension writes it; the worker takes its coordinator from --coordinator
         assert f'"{key}"' in text, key
+
+
+# ---- 2.9.0: the RAM lent to the pool ------------------------------------------------------------------
+
+def test_lend_ram_defaults_to_8_and_is_written_for_a_gpu():
+    hw = machine(gpu_name="RTX", vram_gb=8, gpu_count=1)
+    assert Settings().lend_ram_gb == 8
+    u = tiers.config_updates(Settings(gpu_enabled=True, gpu_vram_gb=8, gpu_ram_gb=16), hw, URL, KEY)
+    assert u["LEND_RAM_GB"] == "8"
+    u = tiers.config_updates(Settings(gpu_enabled=True, gpu_vram_gb=8, gpu_ram_gb=16, lend_ram_gb=0), hw, URL, KEY)
+    assert u["LEND_RAM_GB"] == "0"
+
+
+def test_lend_ram_is_clamped_to_the_ram_less_4_and_round_trips():
+    hw = machine(gpu_name="RTX", vram_gb=8, gpu_count=1, total_ram_gb=16)
+    assert tiers.lend_ram_max(hw) == 12
+    assert tiers.clamp_settings(Settings(lend_ram_gb=99), hw, APP).lend_ram_gb == 12
+    assert tiers.clamp_settings(Settings(lend_ram_gb=-5), hw, APP).lend_ram_gb == 0
+    loaded = tiers.settings_from_json(tiers.settings_to_json(Settings(lend_ram_gb=6)), hw, APP)
+    assert loaded.lend_ram_gb == 6
+    assert tiers.settings_from_json({}, hw, APP).lend_ram_gb == 8
+
+
+def test_lend_ram_line_says_how_much():
+    hw = machine()
+    assert "8 GB" in tiers.lend_ram_line(Settings(lend_ram_gb=8), hw)
+    assert "Not lending" in tiers.lend_ram_line(Settings(lend_ram_gb=0), hw)
+
+
+def test_cpu_only_machine_writes_no_pool_ram():
+    u = tiers.config_updates(Settings(cpu_enabled=True, cpu_ram_gb=16), machine(), URL, KEY)
+    assert u["LEND_RAM_GB"] == "0"

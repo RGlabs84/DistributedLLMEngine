@@ -288,6 +288,9 @@ class WindowModel:
         self.select = None
         self.controller = type("C", (), {"devices_changed": lambda self: False})()
         self._status = worker.Status()
+        # The updater (1.1.0): no newer version, so the window shows no update line.
+        from dlne_donate import updater
+        self.updates = type("U", (), {"enabled": False, "view": lambda self: updater.View()})()
 
     def describe(self):
         return tiers.describe(self.settings, self.hardware, [], APP)

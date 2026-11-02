@@ -23,7 +23,14 @@ A TIER, as load_coding_tiers() returns it
     sha256       of ``file``
     size         bytes of the whole model: the sum over ``files`` (equal to the file's size
                  when the model is one file)
-    min_vram_gb  int, the pooled VRAM the tier needs
+    min_vram_gb  int, the legacy single number (a release before 2.9.0 signs only this one); read as
+                 both of the next two when they are absent
+    min_total_gb int, GPU memory plus lent system RAM the rung needs together (2.9.0): the experts of a
+                 mixture-of-experts model may sit in RAM
+    min_gpu_gb   int, what must be on GPUs (attention, shared weights, the KV cache); a dense rung has
+                 min_total_gb == min_gpu_gb. A rung fits when BOTH hold (fits(), engine/auto_swap.py)
+    rank         int, the measured quality order, bigger is better (2.9.0); "up" means a higher rank, never
+                 merely a bigger file
     context      int, the total engine context the tier is meant to run with
     server_slots int, the most requests at once a coding member opens it for (2 unless the tier
                  says otherwise); context / server_slots is the context per request, which a
@@ -35,7 +42,8 @@ A TIER, as load_coding_tiers() returns it
     blocked      None, or why the tier is held back (an enabled tier is never blocked)
     files        [{file, url, sha256, size}, ...] every part in order; one entry for a
                  single-file model. Download and verify these, not just ``file``.
-Tiers come smallest first (min_vram_gb never decreasing), ids and file names are unique.
+Tiers come worst first, best last (rank strictly increasing; a tier with no rank takes its list
+position), ids and file names are unique.
 """
 
 import copy
@@ -57,6 +65,9 @@ BUILTIN_TIERS: List[Dict[str, Any]] = [
         "id": "qwen36-a3b",
         "name": "Qwen3.6 35B-A3B",
         "min_vram_gb": 15,
+        "min_total_gb": 15,
+        "min_gpu_gb": 15,
+        "rank": 0,
         "context": 81920,
         "server_slots": 2,
         "enabled": True,
@@ -126,6 +137,35 @@ def tier_for_vram(tiers: List[Dict[str, Any]], vram_gb: Any, enabled_only: bool 
     return best
 
 
+def fits(tier: Dict[str, Any], gpu_gb: Any, total_gb: Any) -> bool:
+    """
+    Whether a pool with ``gpu_gb`` of near GPU memory and ``total_gb`` of GPU memory plus lent RAM holds
+    ``tier``: both numbers must hold. A tier from an old manifest has only min_vram_gb, read as both.
+    """
+    try:
+        gpu, total = float(gpu_gb), float(total_gb)
+        legacy = tier.get("min_vram_gb")
+        need_gpu = float(tier["min_gpu_gb"] if tier.get("min_gpu_gb") is not None else legacy)
+        need_total = float(tier["min_total_gb"] if tier.get("min_total_gb") is not None else legacy)
+    except (TypeError, ValueError, KeyError):
+        return False
+    if gpu != gpu or total != total:  # NaN
+        return False
+    return gpu >= need_gpu and total >= need_total
+
+
+def tier_for_pool(tiers: List[Dict[str, Any]], gpu_gb: Any, total_gb: Any,
+                  enabled_only: bool = True) -> Optional[Dict[str, Any]]:
+    """The best-ranked tier the pool holds (the ladder is in rank order, so the last fit), or None."""
+    best = None
+    for tier in tiers:
+        if enabled_only and not tier.get("enabled"):
+            continue
+        if fits(tier, gpu_gb, total_gb):
+            best = tier
+    return best
+
+
 def default_tier(tiers: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """The smallest enabled tier (the first tier when none is enabled); None for no tiers."""
     for tier in tiers:
@@ -167,8 +207,12 @@ def rank(tiers: List[Dict[str, Any]], file: Any) -> Optional[int]:
 
 
 def tier_label(tier: Dict[str, Any]) -> str:
-    """How a tier is named in recommended_tier: "Qwen3.6 35B-A3B (15 GB+ VRAM)"."""
-    return f"{tier['name']} ({tier['min_vram_gb']} GB+ VRAM)"
+    """How a tier is named in recommended_tier: "Qwen3.6 35B-A3B (15 GB+ VRAM)", or for a rung that
+    keeps experts in RAM "Qwen3.6 35B-A3B (IQ4_XS) (24 GB+ GPU and RAM)"."""
+    total, gpu = tier.get("min_total_gb"), tier.get("min_gpu_gb")
+    if total is None or gpu is None or total == gpu:
+        return f"{tier['name']} ({tier['min_vram_gb'] if total is None else total} GB+ VRAM)"
+    return f"{tier['name']} ({total} GB+ GPU and RAM)"
 
 
 # The parts of a GGUF file name that are not the model's name. The quantization is the last

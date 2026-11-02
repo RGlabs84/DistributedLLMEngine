@@ -5,9 +5,12 @@ import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.dlne.chat.update.UpdateHost
@@ -51,6 +54,9 @@ fun DlneApp(viewModel: ChatViewModel) {
         Screen.Chat -> ChatWithDrawer(state, viewModel)
     }
 
+    // Maintenance (server 2.8.5): one full-screen card over everything until the status says it is over.
+    state.maintenance?.let { MaintenanceCard(it) }
+
     if (!state.privacyAcknowledged) {
         PrivacyNoticeDialog(onAcknowledge = viewModel::acknowledgePrivacy)
     }
@@ -67,6 +73,16 @@ private fun ChatWithDrawer(state: ChatUiState, viewModel: ChatViewModel) {
         scope.launch { drawerState.close() }
     }
     BackHandler(enabled = drawerState.isOpen) { closeDrawer() }
+    // The keyboard goes away as the menu starts to open (its button or a swipe): it would only cover the chats
+    // (owner, 1.1.1).
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focus = LocalFocusManager.current
+    LaunchedEffect(drawerState.targetValue) {
+        if (drawerState.targetValue == DrawerValue.Open) {
+            keyboard?.hide()
+            focus.clearFocus()
+        }
+    }
 
     val actions = remember(viewModel) {
         ChatActions(

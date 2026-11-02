@@ -39,7 +39,7 @@ import sys
 import os
 from typing import Any, Dict, List, Optional, Tuple
 from engine.logger import log_worker, log_error, log_system, log_warning
-from engine.hardware import get_hardware_profile, _hidden_process_kwargs, yield_reason as hardware_yield_reason
+from engine.hardware import get_hardware_profile, get_ram_lent_gb, _hidden_process_kwargs, yield_reason as hardware_yield_reason
 from engine.dock_policy import WIFI_SPEED_TEST_BYTES, WIFI_SPEED_TEST_MIN_GAP_SECONDS, on_wifi_and_mains
 from engine.downloader import download_and_extract_engine, explain_dll_not_found, is_dll_not_found
 from engine.engine_flavour import EngineFlavour, requested_flavour
@@ -347,6 +347,13 @@ class WorkerNode:
         # a "both" machine's CPU half shares its GPU half's, so the machine has one engine flavour and one set of markers.
         self.engine_flavour = engine_flavour or self._make_engine_flavour(role)
         self.rpc_process = None
+        # 2.9.0, lent RAM: a second ggml-rpc-server on the CPU device serves the RAM this machine lends (_sync_cpu_rpc).
+        self.cpu_rpc_process = None
+        self.cpu_rpc_port = 0
+        self.cpu_rpc_log_file = None
+        self._rpc_binary = ""
+        self._rpc_cpu_only = False
+        self._cpu_rpc_lock = threading.Lock()
         # A graceful stop under way (``leaving`` in the profile; request_shutdown), and a yield's age, for
         # handing the GPU back to its owner when the coordinator has moved off this shard (_after_answer).
         self._leaving = False
@@ -713,6 +720,8 @@ class WorkerNode:
             coding_ram = self._coding_ram_gb()
             if coding_ram is not None:
                 hardware["coding_ram_gb"] = coding_ram
+            if not getattr(self, "companion_of", None):
+                hardware.update(self._lent_ram_fields())
             if getattr(self, "_send_lan", False) and not getattr(self, "companion_of", None):
                 hardware["lan_ipv4"] = _lan_ipv4_addresses()
             if getattr(self, "companion_of", None):
@@ -1296,8 +1305,107 @@ class WorkerNode:
         elif not self._shutdown_event.is_set():
             self.request_shutdown(FATAL_EXIT_CODE, f"no engine could be started after leaving the '{previous}' role")
 
+    def _lent_ram_fields(self) -> Dict[str, Any]:
+        """
+        The heartbeat's lent-RAM facts (2.9.0): ``ram_lent_gb`` and ``endpoints``, the RPC servers of this node.
+        RAM is reported only while something serves it, so the coordinator never counts RAM it cannot use:
+        the GPU server is ``{"type": "gpu", "port": N}``; the CPU server is ``{"type": "cpu", "port": N, "ram_gb": X}``.
+        A node whose only server is CPU-only (no GPU lent) has the one endpoint, of type ``cpu``, on its main port.
+        """
+        fields: Dict[str, Any] = {"ram_lent_gb": 0.0}
+        if getattr(self, "rpc_process", None) is None:
+            return fields
+        lent = get_ram_lent_gb()
+        if self._rpc_cpu_only:
+            fields["endpoints"] = [{"type": "cpu", "port": self.rpc_port, "ram_gb": lent}]
+            fields["ram_lent_gb"] = lent
+            return fields
+        fields["endpoints"] = [{"type": "gpu", "port": self.rpc_port}]
+        with self._cpu_rpc_lock:
+            if lent > 0 and self.cpu_rpc_process is not None and self.cpu_rpc_port:
+                fields["endpoints"].append({"type": "cpu", "port": self.cpu_rpc_port, "ram_gb": lent})
+                fields["ram_lent_gb"] = lent
+        return fields
+
+    @staticmethod
+    def _free_port_after(port: int) -> int:
+        """The first TCP port above ``port`` nobody listens on, or 0."""
+        for candidate in range(port + 1, port + 41):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                try:
+                    probe.bind(("0.0.0.0", candidate))
+                except OSError:
+                    continue
+                return candidate
+        return 0
+
+    def _sync_cpu_rpc(self) -> None:
+        """
+        Start or stop the CPU ggml-rpc-server so it runs exactly while this node donates (the GPU server runs) and
+        lends more than 0 GB of RAM (LEND_RAM_GB, read again at every beat). Never raises.
+        """
+        try:
+            if getattr(self, "companion_of", None) or self._rpc_cpu_only or getattr(self, "_leaving", False):
+                wanted = False
+            else:
+                wanted = self.rpc_process is not None and bool(self._rpc_binary) and get_ram_lent_gb() > 0
+            with self._cpu_rpc_lock:
+                process = self.cpu_rpc_process
+                if process is not None and process.poll() is not None:
+                    log_warning("The CPU RPC server for the lent RAM ended; starting it again if RAM is still lent.")
+                    self._close_cpu_rpc_locked()
+                    process = None
+                if wanted and process is None:
+                    self._start_cpu_rpc_locked()
+                elif not wanted and process is not None:
+                    self._close_cpu_rpc_locked()
+        except Exception as exc:  # noqa: BLE001 - lending RAM is optional; the GPU node carries on
+            log_warning(f"Could not manage the CPU RPC server for the lent RAM: {type(exc).__name__}: {exc}")
+
+    def _start_cpu_rpc_locked(self) -> None:
+        port = self._free_port_after(self.rpc_port)
+        if not port:
+            log_warning("No free port for the CPU RPC server; the RAM is not lent.")
+            return
+        env = os.environ.copy()
+        log_dir = os.path.join(get_base_dir(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        self.cpu_rpc_log_file = open(os.path.join(log_dir, "rpc_server_cpu.log"), "a")
+        args = [self._rpc_binary, "--host", self.rpc_ip, "--port", str(port), "--device", "CPU"]
+        threads = get_worker_limits().get("max_cpu_threads", -1)
+        if isinstance(threads, int) and threads >= 1:
+            args += ["--threads", str(threads)]
+        self.cpu_rpc_process = subprocess.Popen(
+            args, stdout=self.cpu_rpc_log_file, stderr=subprocess.STDOUT, env=env, **_hidden_process_kwargs()
+        )
+        self.cpu_rpc_port = port
+        log_worker(f"CPU RPC server for the lent RAM started on port {port}.")
+
+    def _close_cpu_rpc_locked(self) -> None:
+        process, self.cpu_rpc_process = self.cpu_rpc_process, None
+        self.cpu_rpc_port = 0
+        if process is not None:
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            except Exception as exc:  # noqa: BLE001
+                log_error(f"Error terminating the CPU RPC process: {exc}")
+        log_file, self.cpu_rpc_log_file = self.cpu_rpc_log_file, None
+        if log_file:
+            try:
+                log_file.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _stop_cpu_rpc(self) -> None:
+        with self._cpu_rpc_lock:
+            self._close_cpu_rpc_locked()
+
     def _stop_rpc_server(self) -> None:
         """Stops ggml-rpc-server for a role change (the node keeps heartbeating)."""
+        self._stop_cpu_rpc()
         # The reference is cleared first: the heartbeat loop treats an exited rpc_process it still
         # holds as a crash, and a deliberate stop must not look like one.
         process, self.rpc_process = self.rpc_process, None
@@ -1447,6 +1555,8 @@ class WorkerNode:
             # CPU only: name the device rather than only hiding GPUs from Vulkan, which would
             # leave Metal (macOS) and any other backend in play.
             device_args = ["--device", "CPU"] if allowed_gpu == "none" else []
+            self._rpc_binary = binary_path
+            self._rpc_cpu_only = allowed_gpu == "none"
             self.rpc_process = subprocess.Popen(
                 [binary_path, "--host", self.rpc_ip, "--port", str(self.rpc_port)] + cache_args + device_args,
                 stdout=self.rpc_log_file,
@@ -1541,6 +1651,7 @@ class WorkerNode:
                         )
                         return
 
+                    self._sync_cpu_rpc()
                     payload = self._build_heartbeat_payload()
 
                     status_msg = "Yielding to external load" if self.hardware_profile['is_yielding'] else "Active"
@@ -1805,6 +1916,7 @@ class WorkerNode:
                 self.app_member.stop()
             except Exception as e:
                 log_error(f"Error stopping the CPU pool model server: {e}")
+        self._stop_cpu_rpc()
         if self.rpc_process:
             try:
                 self.rpc_process.terminate()

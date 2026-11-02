@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { MAINTENANCE_FOOTER, MAINTENANCE_RECHECK_MS, MAINTENANCE_TITLE, MaintenanceNotice } from '../client/maintenance';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import * as os from 'os';
@@ -604,6 +605,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       this._view?.webview.postMessage({ type: 'vision', on: visionOffered(status) });
       this._view?.webview.postMessage({ type: 'voice', on: micShown(status, this._voiceSetting(), this.voiceRecorder.available()) });
     });
+    // Maintenance (2.8.5): the card follows the client's notice; while it is up the status is asked every 15 s.
+    const stopMaintenance = this.client.onMaintenance?.((notice) => this._followMaintenance(notice));
+    webviewView.onDidDispose?.(() => {
+      stopMaintenance?.();
+      this._stopMaintenanceCheck();
+    });
+    this._followMaintenance(this.client.currentMaintenance?.() ?? null);
+
     webviewView.onDidDispose?.(() => {
       stopFollowing?.();
       // A closed view throws when it is used; the task goes on unseen and the next view is shown it (syncPage).
@@ -619,6 +628,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           // The page has just started: the first time, or again after VS Code made it anew (the view was moved, the
           // webviews were reloaded). It asks for the chat, so it never waits for a message that was sent too early.
           this.syncPage();
+          this._postMaintenance(this.client.currentMaintenance?.() ?? null);
           this.flushVoiceText();
           if (this.speaker.isSpeaking()) this.post({ type: 'speaking', on: true });
           break;
@@ -950,6 +960,32 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     };
   }
 
+  private maintenanceTimer: NodeJS.Timeout | undefined;
+
+  private _followMaintenance(notice: MaintenanceNotice | null): void {
+    this._postMaintenance(notice);
+    if (notice && !this.maintenanceTimer) {
+      // The status bar polls every 10 s already; this keeps the card's 15 s promise when it is hidden or slow.
+      this.maintenanceTimer = setInterval(() => { void this.client.getClusterStatusDetailed?.(); }, MAINTENANCE_RECHECK_MS);
+    } else if (!notice) {
+      this._stopMaintenanceCheck();
+    }
+  }
+
+  private maintenanceShown = false;
+
+  /** Tells the page about maintenance: nothing at all while it is off and the page was never told it was on. */
+  private _postMaintenance(notice: MaintenanceNotice | null): void {
+    if (!notice && !this.maintenanceShown) return;
+    this.maintenanceShown = !!notice;
+    this.post({ type: 'maintenance', notice } as PageEvent);
+  }
+
+  private _stopMaintenanceCheck(): void {
+    if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
+    this.maintenanceTimer = undefined;
+  }
+
   /** Sends the page everything (restoreMessage). */
   private syncPage(): void {
     this.chatStale = false;
@@ -973,6 +1009,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'modelLine', text: this._modelLine() });
     this.post({ type: 'vision', on: this._vision() });
     this.post({ type: 'voice', on: this._voice() });
+    this._postMaintenance(this.client.currentMaintenance?.() ?? null);
     this.flushVoiceText();
     this.post({ type: 'autoApprove', on: ToolRegistry.autoApproveAllOn() });
     this.post({ type: 'queue', queue: this.active.running ? this._queueView(this.client.currentQueue?.()) : null });
@@ -1788,9 +1825,42 @@ ${AGENT_CONTROLS_CSS}
       color: var(--vscode-textLink-foreground);
       cursor: pointer;
     }
+    /* Maintenance (2.8.5): one card over the whole panel, in the web chat's look, until the status says it is over. */
+    #maint-card {
+      position: fixed; inset: 0; z-index: 1000; display: none; place-items: center; padding: 16px; color: #e2e8f0;
+      background: radial-gradient(circle at 25% 15%, rgba(0, 240, 255, .14), transparent 50%),
+                  radial-gradient(circle at 80% 85%, rgba(192, 132, 252, .14), transparent 55%), rgba(5, 8, 15, .96);
+      overflow: auto;
+    }
+    #maint-card.on { display: grid; }
+    #maint-card .mcard {
+      max-width: 420px; text-align: center; padding: 24px 20px; border-radius: 20px;
+      border: 1px solid rgba(0, 240, 255, .32); background: rgba(9, 13, 24, .92); box-shadow: 0 0 44px rgba(0, 240, 255, .14);
+    }
+    #maint-card .mlogo { width: 72px; height: 72px; border-radius: 16px; filter: drop-shadow(0 0 14px rgba(0, 240, 255, .5)); }
+    #maint-card .mlabel { margin: 12px 0 0; font: 600 .72rem ui-monospace, Menlo, Consolas, monospace; letter-spacing: .16em;
+      text-transform: uppercase; color: #38bdf8; }
+    #maint-card h2 { margin: 6px 0 10px; font-size: 1.4rem; line-height: 1.25; font-weight: 750;
+      background: linear-gradient(135deg, #ffffff 0%, #38bdf8 50%, #c084fc 100%);
+      -webkit-background-clip: text; background-clip: text; color: transparent; }
+    #maint-card .mmsg { margin: 0 0 10px; line-height: 1.5; }
+    #maint-card .mwhen { margin: 0 0 12px; font: .9rem ui-monospace, Menlo, Consolas, monospace; color: #c084fc; }
+    #maint-card .mwhen[hidden] { display: none; }
+    #maint-card .mping { margin: 0; font-size: .82rem; color: #94a3b8; }
   </style>
 </head>
 <body>
+  <div id="maint-card" role="alertdialog" aria-labelledby="maint-title" aria-describedby="maint-msg">
+    <div class="mcard">
+      <img class="mlogo" src="${logoSrc}" alt="" width="72" height="72">
+      <p class="mlabel">Maintenance</p>
+      <h2 id="maint-title">${MAINTENANCE_TITLE}</h2>
+      <p class="mmsg" id="maint-msg"></p>
+      <p class="mwhen" id="maint-when" hidden></p>
+      <p class="mping">${MAINTENANCE_FOOTER}</p>
+    </div>
+  </div>
+
   <!-- Speed or Quality, the Graphics API, and a key holder's lines: drawn by the script from the model in agentControls.ts -->
   <div class="agent-controls" id="agent-controls" style="display:none"></div>
 
@@ -2759,8 +2829,29 @@ ${AGENT_CONTROLS_CSS}
       }
     }
 
+    // Maintenance: the card covers the panel, the rest cannot be reached by keyboard meanwhile, and what was typed stays.
+    function showMaintenance(notice) {
+      const card = document.getElementById('maint-card');
+      const on = !!notice;
+      card.classList.toggle('on', on);
+      Array.from(document.body.children).forEach((el) => {
+        if (el !== card && el.tagName !== 'SCRIPT') el.inert = on;
+      });
+      if (!on) return;
+      document.getElementById('maint-msg').textContent = notice.message || '';
+      const when = document.getElementById('maint-when');
+      when.hidden = !notice.until;
+      when.textContent = notice.until ? 'Expected back: ' + notice.until : '';
+      if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    }
+
     function dispatchMessage(msg) {
       switch (msg.type) {
+        case 'maintenance': {
+          showMaintenance(msg.notice);
+          break;
+        }
+
         case 'workerStatus': {
           applyWorkerStatus(msg.status, msg.copy, msg.role, msg.donate);
           break;

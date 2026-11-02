@@ -155,6 +155,9 @@ class SettingsWindow:
         ttk.Label(gpu, text=GPU_SENTENCE, style="Hint.TLabel", wraplength=WRAP, justify="left").grid(row=2, column=0, sticky="w", pady=(2, 4))
         self.vram_row = self._slider_row(gpu, 3, "VRAM to lend")
         self.gpu_ram_row = self._slider_row(gpu, 4, "RAM that goes with it")
+        self.lend_ram_row = self._slider_row(gpu, 5, "RAM lent to the pool")
+        self.lend_ram_line = ttk.Label(gpu, text="", style="Hint.TLabel", wraplength=WRAP, justify="left")
+        self.lend_ram_line.grid(row=6, column=0, sticky="w")
         gpu.columnconfigure(0, weight=1)
 
         ttk.Separator(outer).grid(row=4, column=0, sticky="ew", pady=8)
@@ -286,6 +289,11 @@ class SettingsWindow:
         low, soft, hard = tiers.gpu_ram_bounds(hw)
         self._set_scale(self.gpu_ram_row, low, max(hard, low + 1), s.gpu_ram_gb, f"{s.gpu_ram_gb:g} GB",
                         enabled=bool(s.gpu_enabled and hw.has_gpu))
+
+        lend_max = tiers.lend_ram_max(hw)
+        self._set_scale(self.lend_ram_row, 0, max(lend_max, 1), min(s.lend_ram_gb, lend_max), f"{s.lend_ram_gb:g} GB",
+                        enabled=bool(s.gpu_enabled and hw.has_gpu and lend_max > 0))
+        self.lend_ram_line.configure(text=tiers.lend_ram_line(s, hw))
 
         self.cpu_var.set(bool(s.cpu_enabled))
         stops = tiers.cpu_stops(hw, model.swarm.app_tiers)
@@ -478,6 +486,8 @@ class SettingsWindow:
             text = f"{value:g} GB"
         elif row is self.gpu_ram_row:
             text = f"{int(round(raw))} GB"
+        elif row is self.lend_ram_row:
+            text = f"{int(round(raw))} GB"
         elif row is self.threads_row:
             text = f"{int(round(raw))} of {self.model.hardware.logical_threads}"
         if text:
@@ -507,6 +517,7 @@ class SettingsWindow:
         self._commit_job = None
         self.model.update(gpu_vram_gb=self._snap_vram(float(self.vram_row["scale"].get())),
                           gpu_ram_gb=float(int(round(float(self.gpu_ram_row["scale"].get())))),
+                          lend_ram_gb=float(int(round(float(self.lend_ram_row["scale"].get())))),
                           threads=int(round(float(self.threads_row["scale"].get()))))
 
     def _on_gpu_toggle(self) -> None:

@@ -39,6 +39,7 @@ import io.dlne.chat.data.withPhotosRefused
 import io.dlne.chat.data.withReplyPicture
 import io.dlne.chat.net.ApiException
 import io.dlne.chat.net.ClusterStatus
+import io.dlne.chat.net.MaintenanceInfo
 import io.dlne.chat.net.DEFAULT_IMAGE_SIZE
 import io.dlne.chat.net.GeneratedImage
 import io.dlne.chat.net.MAX_IMAGE_PROMPT_CHARS
@@ -164,6 +165,8 @@ data class ChatUiState(
     /** Wall-clock millis until which sending is paused after a 429; 0 when not paused. */
     val rateLimitedUntil: Long = 0L,
     val status: ClusterStatus? = null,
+    /** Set while the server is in maintenance mode: the app shows one full-screen card and sending is blocked. */
+    val maintenance: MaintenanceInfo? = null,
     val serverUrl: String = "",
     val privacyAcknowledged: Boolean = true,
     val shareLocation: Boolean = false,
@@ -226,6 +229,8 @@ class ChatViewModel(application: Application, private val savedState: SavedState
         val status: ClusterStatus? = null,
         /** The server address [status] came from, so a status is never kept across a change of server. */
         val statusServer: String? = null,
+        /** Maintenance, from the status or from a 429 `maintenance` answer; cleared when the status says it is over. */
+        val maintenance: MaintenanceInfo? = null,
         /** The pictures being made, by job id (several can run at once). */
         val images: ImageJobs = ImageJobs(),
         /** A Create image request on its way: it has no job id until the server answers. */
@@ -314,6 +319,7 @@ class ChatViewModel(application: Application, private val savedState: SavedState
             error = t.error,
             rateLimitedUntil = t.rateLimitedUntil,
             status = t.status,
+            maintenance = t.maintenance,
             imageJobs = listOfNotNull(t.request) + t.images.all,
             locationAsk = t.locationAsk,
             serverUrl = p.serverUrl,
@@ -358,7 +364,7 @@ class ChatViewModel(application: Application, private val savedState: SavedState
         val photos = photoDraft
         // Photos alone are a message too. A photo still being prepared does not stop the words going (see below).
         if (!photos.canSend(typed.isNotEmpty()) || savingPhotos) return
-        if (transient.value.pending != null || isRateLimited()) return
+        if (transient.value.pending != null || isRateLimited() || transient.value.maintenance != null) return
         if (!settings.privacyAcknowledged.value) return
         if (askLocation && holdForLocation(typed)) return // nothing is stored or sent until the card is answered
         transient.update { it.copy(locationAsk = null) }
@@ -569,7 +575,7 @@ class ChatViewModel(application: Application, private val savedState: SavedState
      * ("no machine is free") or after Stop. An incomplete answer is replaced.
      */
     fun retry() {
-        if (transient.value.pending != null || isRateLimited()) return
+        if (transient.value.pending != null || isRateLimited() || transient.value.maintenance != null) return
         val conversation = currentId.value?.let(store::get) ?: return
         var messages = conversation.messages
         val last = messages.lastOrNull() ?: return
@@ -756,6 +762,8 @@ class ChatViewModel(application: Application, private val savedState: SavedState
         when {
             // The hour's photo allowance is used up: say so in the server's words, and keep Send working for text.
             isPhotoQuota(e) -> showError(ChatError(e.detail, ErrorKind.REJECTED))
+            // Maintenance: the full-screen card takes over; the status check (every 15 s) removes it when it ends.
+            e.code == 429 && e.errorCode == "maintenance" -> enterMaintenance(e.maintenance ?: MaintenanceInfo(message = e.detail))
             e.code == 429 -> {
                 val until = System.currentTimeMillis() + (e.retryAfterSeconds ?: DEFAULT_RETRY_SECONDS) * 1000
                 transient.update {
@@ -777,6 +785,13 @@ class ChatViewModel(application: Application, private val savedState: SavedState
             e.code in 400..499 -> showError(ChatError(e.detail, ErrorKind.REJECTED))
             else -> showError(ChatError(text(R.string.error_server, e.code), ErrorKind.SERVER))
         }
+    }
+
+    private fun enterMaintenance(info: MaintenanceInfo) {
+        transient.update { it.copy(maintenance = info, error = null) }
+        // The card must not outlive maintenance: ask again at once, then every 15 s (a restart fetches first).
+        statusRefresher.stop()
+        statusRefresher.start()
     }
 
     private fun showError(error: ChatError) {
@@ -1231,10 +1246,14 @@ class ChatViewModel(application: Application, private val savedState: SavedState
 
     /** Another server is in use: what the last one said about itself is no longer shown. */
     private fun forgetStatus() {
-        transient.update { it.copy(status = null, statusServer = null) }
+        transient.update { it.copy(status = null, statusServer = null, maintenance = null) }
     }
 
-    private val statusRefresher = StatusRefresher(viewModelScope, STATUS_INTERVAL_MS) { loadStatus() }
+    private val statusRefresher = StatusRefresher(
+        viewModelScope,
+        STATUS_INTERVAL_MS,
+        nextIntervalMs = { if (transient.value.maintenance != null) MAINTENANCE_INTERVAL_MS else STATUS_INTERVAL_MS },
+    ) { loadStatus() }
 
     /**
      * Refreshes the header's model and machine count while the app is visible: at once (so coming
@@ -1264,7 +1283,9 @@ class ChatViewModel(application: Application, private val savedState: SavedState
         if (settings.serverUrl.value != serverUrl) return // the address was changed meanwhile: this answer is about another server
         transient.update { t ->
             val shown = ShownStatus(t.status, t.statusServer).after(fresh, serverUrl)
-            t.copy(status = shown.status, statusServer = shown.server)
+            // A status that answered decides; a failed refresh leaves the card as it was.
+            val maintenance = if (fresh != null) fresh.maintenance?.takeIf { it.active } else t.maintenance
+            t.copy(status = shown.status, statusServer = shown.server, maintenance = maintenance)
         }
     }
 
@@ -1274,6 +1295,7 @@ class ChatViewModel(application: Application, private val savedState: SavedState
         const val KEY_CURRENT = "current_conversation"
         const val DEFAULT_RETRY_SECONDS = 5L
         const val STATUS_INTERVAL_MS = 60_000L
+        const val MAINTENANCE_INTERVAL_MS = 15_000L
         const val MAX_SHARED_CHARS = 20_000
         const val MAX_SEARCH_NOTES = 6
         const val IMAGE_POLL_MS = 2_000L

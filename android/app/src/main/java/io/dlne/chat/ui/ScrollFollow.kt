@@ -12,19 +12,21 @@ package io.dlne.chat.ui
 internal fun atNewest(firstIndex: Int, firstOffset: Int): Boolean = firstIndex == 0 && firstOffset == 0
 
 /**
- * Pixels to scroll forward so a growing item does not move what the reader is reading. A reversed list keeps its first
- * visible item at the same distance from that item's bottom edge, and an answer grows at its bottom edge, so without
- * this every new line slides the words up under the reader. Only when the reader is not following, the growing item
- * ([growingKey]) is the first visible one and partly scrolled off, and it grew.
+ * Pixels to scroll so a change in the newest item's size (item 0) does not move what the reader is looking at. A
+ * reversed list keeps its first visible item at the same distance from that item's bottom edge, and an answer grows at
+ * its bottom edge, so without this every new line slides the words up under the reader. It applies while the reader
+ * is not following, and also while their finger is on the list ([scrolling]: holding a spot as the answer streams in,
+ * 1.1.1), whenever item 0 is the first visible item and partly scrolled off. Any size change counts: the answer
+ * growing, and the answer turning into the saved message, which gains its copy and report buttons.
  */
 internal fun keepReaderInPlace(
     following: Boolean,
-    firstKey: Any?,
-    growingKey: Any,
+    scrolling: Boolean,
+    firstIndex: Int,
     firstOffset: Int,
     oldSize: Int,
     newSize: Int,
-): Int = if (!following && firstKey == growingKey && firstOffset > 0 && oldSize > 0 && newSize > oldSize) newSize - oldSize else 0
+): Int = if ((!following || scrolling) && firstIndex == 0 && firstOffset > 0 && oldSize > 0 && newSize != oldSize) newSize - oldSize else 0
 
 /**
  * Whether the list goes to the newest message after it changed: always when the reader just sent one ([justSent]);

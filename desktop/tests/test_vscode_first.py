@@ -536,12 +536,12 @@ def test_the_state_file_carries_the_trays_version_and_says_paused_while_paused(a
     model.donate()
     model._write_state(model.status())
     state = json.load(open(paths.state_path(str(app_home)), encoding="utf-8"))
-    assert state["version"] == "1.1.0" and state["paused"] is False and state["state"] == worker.DONATING
+    assert state["version"] == "1.2.0" and state["paused"] is False and state["state"] == worker.DONATING
     present["now"] = True
     model.check_editor(force=True)
     model._write_state(model.status())
     state = json.load(open(paths.state_path(str(app_home)), encoding="utf-8"))
-    assert state["version"] == "1.1.0" and state["state"] == "paused" and state["paused"] is True and state["pid"] == os.getpid()
+    assert state["version"] == "1.2.0" and state["state"] == "paused" and state["paused"] is True and state["pid"] == os.getpid()
     # A worker that is still leaving is not "paused" yet: the extension waits for it.
     model.controller.s = replace(model.controller.s, state=worker.STOPPING)
     model._write_state(model.status())

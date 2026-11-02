@@ -26,6 +26,8 @@ The Settings window follows exactly that:
 * **CPU**: on/off, RAM that snaps to the swarm's model stops (read live from `/v1/cluster/status`, `app_pool.tiers`,
   each stop labelled with the model it runs).
 * **Threads**: they mostly decide how much of the PC stays free. Default: physical cores minus 2, at least 4.
+* **RAM lent to the pool** (1.2.0, with coordinator 2.9.0; shown when a GPU is lent): system RAM the worker lends to the
+  shared model, 8 GB by default, never more than the free RAM less 4 GB. 0 lends none.
 * **Graphics engine** (1.1.0, shown when a GPU can be lent): Auto, Vulkan or CUDA, and a line saying what runs now
   ("Running on CUDA", or why CUDA could not start). CUDA is greyed out with the reason on a computer that cannot use it
   (an NVIDIA GPU of Turing or newer and a CUDA 13 driver; the worker says so in its `DLNE_CUDA` line). On a computer that

@@ -129,6 +129,23 @@ def cmd_adminkey(args):
         print("✅ Operator key revoked. /v1/admin/* now accepts only the legacy password session.")
 
 
+def cmd_maintenance(args):
+    """Maintenance on or off (2.8.5): MAINTENANCE in config.txt, which the coordinator re-reads live (no restart)."""
+    if args.maintenance_action == "on":
+        values = {"MAINTENANCE": "true", "MAINTENANCE_MESSAGE": " ".join((args.message or "").split()),
+                  "MAINTENANCE_UNTIL": " ".join((args.until or "").split())}
+    else:
+        values = {"MAINTENANCE": "false", "MAINTENANCE_MESSAGE": "", "MAINTENANCE_UNTIL": ""}
+    if not set_config_values(values):
+        print("Error: could not write MAINTENANCE to config.txt", file=sys.stderr)
+        sys.exit(1)
+    if args.maintenance_action == "on":
+        print("Maintenance ON: chat, the phone app, coding, voice and new pictures answer with the maintenance message "
+              "(within a few seconds). Workers, the status and admin stay open. Turn it off with: maintenance off")
+    else:
+        print("Maintenance OFF: DLNE answers people again.")
+
+
 def cmd_takeoverkey(args):
     """Mint or remove the takeover-only key (2.7.3): it opens /v1/admin/takeover* and nothing else."""
     if args.takeover_action == "create":
@@ -296,6 +313,12 @@ def main():
     p_take.add_argument("--out", default=None, help="Write the new key to this file (mode 600) instead of showing it")
     p_take.add_argument("--quiet", action="store_true", help="Print only the new key (for scripts)")
 
+    # maintenance
+    p_maint = subparsers.add_parser("maintenance", help="Close DLNE to people for maintenance, or open it again")
+    p_maint.add_argument("maintenance_action", choices=["on", "off"], help="on: show the maintenance message; off: open")
+    p_maint.add_argument("--message", default=None, help="What people are told (default: the standard upgrade message)")
+    p_maint.add_argument("--until", default=None, help='When it ends, as people should read it ("about 1 hour", "14:30")')
+
     # status
     p_status = subparsers.add_parser("status", help="Query DLNE Server status")
     p_status.add_argument("--host", default="127.0.0.1", help="Coordinator host")
@@ -331,6 +354,8 @@ def main():
         cmd_apikey(args)
     elif args.command == "adminkey":
         cmd_adminkey(args)
+    elif args.command == "maintenance":
+        cmd_maintenance(args)
     elif args.command == "takeoverkey":
         cmd_takeoverkey(args)
     elif args.command == "status":

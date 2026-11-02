@@ -235,12 +235,12 @@ async def test_get_with_no_lease_is_active_false(env):
 async def test_the_admin_stats_show_the_lease_without_its_id_or_a_card(env):
     async with client() as c:
         assert (await c.get("/v1/admin/stats")).json()["takeover"] == {
-            "active": False, "state": None, "holder": None, "since": None, "expires_at": None}
+            "active": False, "state": None, "holder": None, "since": None, "expires_at": None, "layout": None}
         lease = (await c.post(URL, json={"gpus": [POOL_A], "holder": "DLNE-Sec on portoBOX"})).json()
         block = (await c.get("/v1/admin/stats")).json()["takeover"]
 
     assert block == {"active": True, "state": "active", "holder": "DLNE-Sec on portoBOX", "since": lease["since"],
-                     "expires_at": lease["expires_at"]}
+                     "expires_at": lease["expires_at"], "layout": None}
     assert lease["lease_id"] not in json.dumps(block)
 
 
@@ -253,9 +253,9 @@ async def test_cluster_status_has_the_takeover_block_and_no_id_or_address(env, m
         async with client(REMOTE, key=None) as public:
             body = (await public.get("/v1/cluster/status")).json()
 
-    assert before == {"active": False, "state": None, "holder": None, "since": None, "expires_at": None}
+    assert before == {"active": False, "state": None, "holder": None, "since": None, "expires_at": None, "layout": None}
     assert body["takeover"] == {"active": True, "state": "active", "holder": "DLNE-Sec on portoBOX", "since": lease["since"],
-                                "expires_at": lease["expires_at"]}
+                                "expires_at": lease["expires_at"], "layout": None}
     text = json.dumps(body["takeover"])
     assert lease["lease_id"] not in text and POOL_A not in text and "tk_" not in text
 

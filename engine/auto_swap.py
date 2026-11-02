@@ -2,8 +2,13 @@
 Automatic model switching for the GPU coding pool.
 
 WHAT IT DOES
-    The coding pool serves one model at a time, picked from a ladder of tiers (smallest
-    first), each with the pooled GPU memory it needs. When volunteers' GPUs join and the pool
+    The coding pool serves one model at a time, picked from a ladder of tiers (worst first, best
+    last: the order is the measured quality, ``rank``), each with the memory it needs in two numbers
+    (2.9.0): ``min_total_gb`` (near GPU memory plus lent system RAM) and ``min_gpu_gb`` (what must be
+    on GPUs). A rung fits when both hold (:func:`fits_by_pool`). A mixture-of-experts model keeps most
+    of its weight in RAM, so TheWall's own 17.7 GB IQ4_XS rung fits on 16 GB of cards plus about 8 GB of
+    RAM and the controller leaves it alone; counting GPU memory only (before 2.9.0) would have stepped
+    it down within two minutes, which is why automatic switching was held off until now. When volunteers' GPUs join and the pool
     *stays* big enough for a bigger enabled tier, this controller moves the coordinator up to
     that tier's model. When the pool shrinks below what the served model needs, it steps
     down to the biggest enabled tier that still fits.
@@ -22,6 +27,10 @@ WHY IT IS THIS CAUTIOUS
     * the coding queue is idle. If it has been busy for ``QUEUE_WAIT_SECONDS`` the switch
       drains it instead: new requests wait, in-flight ones get ``DRAIN_SECONDS`` to finish,
       and if they don't, the switch is called off and nothing is interrupted.
+
+    A volunteer's lent RAM counts only within ``POOL_RAM_MAX_RTT_MS`` (5 ms) and only after it has
+    stayed ``POOL_RAM_MIN_STAY_SECONDS`` (30 min) (engine/pool_memory.py), so a move up that depends on
+    it waits for that, and the move down when the volunteer leaves is immediate (``engine_short``).
 
     "The pool" means the *near* GPUs only: the host's own and volunteers within
     ``AUTO_SWAP_MAX_RTT_MS`` (80 ms), measured by the coordinator (see "Near and far GPUs"
@@ -428,6 +437,36 @@ def fits_by_vram(tier: Dict[str, Any], pool: Dict[str, Any]) -> bool:
     return have >= need
 
 
+def fits_by_pool(tier: Dict[str, Any], pool: Dict[str, Any]) -> bool:
+    """
+    The fit test since 2.9.0: BOTH of a rung's numbers must hold. ``min_gpu_gb`` (attention, shared weights, the
+    KV cache) against the near GPU memory (``pool["vram_gb"]``), and ``min_total_gb`` against that plus the lent
+    system RAM (``pool["ram_gb"]``, absent = 0). A rung from an old manifest has only ``min_vram_gb``, read as
+    both, so against a pool with no RAM this is exactly :func:`fits_by_vram`.
+
+    This is what keeps TheWall's own model from being "stepped down": its 17.7 GB IQ4_XS rung runs on 16 GB of
+    cards with about 8 GB of experts in RAM, which this test counts.
+    """
+    try:
+        legacy = tier.get("min_vram_gb")
+        need_gpu = float(tier["min_gpu_gb"] if tier.get("min_gpu_gb") is not None else legacy)
+        need_total = float(tier["min_total_gb"] if tier.get("min_total_gb") is not None else legacy)
+        gpu = float(pool.get("vram_gb") or 0.0)
+        ram = float(pool.get("ram_gb") or 0.0)
+    except (TypeError, ValueError, KeyError):
+        return False
+    if not all(math.isfinite(x) for x in (need_gpu, need_total, gpu, ram)):
+        return False
+    return gpu >= need_gpu and gpu + ram >= need_total
+
+
+def _pool_words(pool: Dict[str, Any]) -> str:
+    """'16 GB of GPU memory' or '16 GB of GPU memory and 8 GB of RAM', for the status line."""
+    gpu = _gb(float(pool.get("vram_gb") or 0.0))
+    ram = float(pool.get("ram_gb") or 0.0)
+    return f"{gpu} GB of GPU memory" + (f" and {_gb(ram)} GB of RAM" if ram > 0 else "")
+
+
 def _bare(tag: Any) -> str:
     """A model name as the coordinator stores it (``canonical_model_tag``), or ``""``."""
     return canonical_model_tag(tag) if isinstance(tag, str) else ""
@@ -649,7 +688,7 @@ class AutoSwapController:
             (``engine.config.get_worker_limits``).
         swap_in_progress: ``() -> bool``, any switch or engine restart under way.
         queue_busy: ``() -> bool``, any coding request in flight.
-        fits: ``(tier, pool) -> bool``; defaults to :func:`fits_by_vram`.
+        fits: ``(tier, pool) -> bool``; defaults to :func:`fits_by_pool`.
         clock: monotonic seconds.
         log / warn: one-line loggers.
         breaker: the :class:`FlapBreaker` the coordinator also tells about its own rebuilds. Without one the
@@ -668,7 +707,7 @@ class AutoSwapController:
         settings: Callable[[], Dict[str, Any]],
         swap_in_progress: Callable[[], bool],
         queue_busy: Callable[[], bool],
-        fits: Callable[[Dict[str, Any], Dict[str, Any]], bool] = fits_by_vram,
+        fits: Callable[[Dict[str, Any], Dict[str, Any]], bool] = fits_by_pool,
         clock: Callable[[], float] = time.monotonic,
         log: Callable[[str], None] = print,
         warn: Optional[Callable[[str], None]] = None,
@@ -841,6 +880,10 @@ class AutoSwapController:
         # marked blocked never counts, whatever its switch says.
         enabled = [t for t in tiers if t.get("enabled") is True and not t.get("blocked")
                    and tier_id(t) and _bare(t.get("file"))]
+        # Best last: "up" means a higher measured rank (2.9.0), never merely a bigger file. A ladder from before
+        # ranks, or a test's, keeps its listed order.
+        if enabled and all(isinstance(t.get("rank"), int) and not isinstance(t.get("rank"), bool) for t in enabled):
+            enabled.sort(key=lambda t: t["rank"])
         self._enabled_tiers = enabled
 
         # vram_gb is the *near* pool (see split_pool_by_distance): GPUs too far away to be
@@ -906,7 +949,7 @@ class AutoSwapController:
             # somewhere better) to go if the pool stays this small.
             await self._prefetch(candidates[-1], now)
 
-        pool_text = f"The pool ({_gb(vram)} GB of GPU memory) can no longer hold {tier_label(served)}"
+        pool_text = f"The pool ({_pool_words(pool)}) can no longer hold {tier_label(served)}"
         if short_for < settings.down_stable and not self._engine_short():
             if fallback is not None:
                 detail = (f"{pool_text}; switching to {tier_label(fallback)} "
@@ -951,13 +994,13 @@ class AutoSwapController:
             self._busy_since = None
             if passed_over:
                 return self._decide("steady", None, "top-blocked",
-                                    f"Serving {tier_label(served)}; the pool ({_gb(vram)} GB) could hold more, "
+                                    f"Serving {tier_label(served)}; the pool ({_pool_words(pool)}) could hold more, "
                                     f"but {passed_over[0]}.")
             far = float(pool.get("far_vram_gb") or 0.0)
             far_note = (f" ({_gb(far)} GB more is on GPUs too far away to share a model with)"
                         if far > 0 else "")
             return self._decide("steady", None, "top",
-                                f"Serving {tier_label(served)}; the nearby GPU pool ({_gb(vram)} GB) has no "
+                                f"Serving {tier_label(served)}; the nearby pool ({_pool_words(pool)}) has no "
                                 f"bigger enabled model to unlock{far_note}.")
 
         # Fetch first, as soon as the tier fits, so that the switch itself is quick.
@@ -970,7 +1013,7 @@ class AutoSwapController:
             self._busy_since = None
             return self._decide("waiting", tier_id(target), "settling",
                                 f"Switching to {tier_label(target)} {_eta(max(settle_left, hold_left, cooldown_left))} "
-                                f"if the pool keeps {_gb(vram)} GB.")
+                                f"if the pool keeps {_pool_words(pool)}.")
 
         if hold_left > 0:
             self._busy_since = None

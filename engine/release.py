@@ -435,7 +435,7 @@ def app_tiers(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
 # scripts/coding_models.json lists the tiers smallest first; engine/coding_ladder.py is what
 # the coordinator reads them through. Signed the same way as the CPU pool's tiers, as flat
 # text and integer fields only: "coding_tiers" lists the ids, and each id has
-# coding_<id>_{name,min_vram_gb,context,server_slots,enabled,blocked,parts} plus
+# coding_<id>_{name,min_vram_gb,min_total_gb,min_gpu_gb,rank,context,server_slots,enabled,blocked,parts} plus
 # coding_<id>_part<k>_{file,url,sha256,size} for k = 1..parts, and
 # coding_<id>_{server_ctx_checkpoints,server_ubatch,server_spec_type} only when the tier sets
 # them (an unset knob is left out, never signed as null).
@@ -461,8 +461,12 @@ _CODING_URL_RE = re.compile(
 _SPLIT_PART_RE = re.compile(r"^(?P<stem>.+)-(?P<part>\d{5})-of-(?P<count>\d{5})\.gguf$")
 _CODING_PART_KEYS = ("file", "url", "sha256", "size")
 _CODING_SERVER_KNOBS = ("server_ctx_checkpoints", "server_ubatch", "server_spec_type")
+# 2.9.0: a rung names its memory in two numbers (min_total_gb: GPU + lent RAM; min_gpu_gb: what must sit on GPUs) and
+# its place in the quality order (rank). All three are optional in an entry (an old file or manifest has none): the
+# defaults treat min_vram_gb as both numbers and the list position as the rank.
+_CODING_POOL_KEYS = ("min_total_gb", "min_gpu_gb", "rank")
 _CODING_KEYS = {"id", "name", "min_vram_gb", "context", "enabled", "blocked", "files", "server_slots",
-                *_CODING_SERVER_KNOBS, *_CODING_PART_KEYS}
+                *_CODING_SERVER_KNOBS, *_CODING_POOL_KEYS, *_CODING_PART_KEYS}
 CODING_MAX_PARTS = 16
 CODING_MAX_CONTEXT = 1 << 21          # 2M tokens: room for the 1M-context models being researched
 CODING_MAX_VRAM_GB = 4096
@@ -528,6 +532,18 @@ def coding_tier(entry: Any) -> Dict[str, Any]:
         raise ReleaseError(f"tier {tier_id}: name must be printable ASCII, 1 to 80 characters")
     if not _is_int(entry.get("min_vram_gb"), 1, CODING_MAX_VRAM_GB):
         raise ReleaseError(f"tier {tier_id}: bad min_vram_gb (a whole number of GB)")
+    min_total = entry.get("min_total_gb")
+    min_gpu = entry.get("min_gpu_gb")
+    min_total = entry["min_vram_gb"] if min_total is None else min_total
+    min_gpu = entry["min_vram_gb"] if min_gpu is None else min_gpu
+    for label, value in (("min_total_gb", min_total), ("min_gpu_gb", min_gpu)):
+        if not _is_int(value, 1, CODING_MAX_VRAM_GB):
+            raise ReleaseError(f"tier {tier_id}: bad {label} (a whole number of GB)")
+    if min_gpu > min_total:
+        raise ReleaseError(f"tier {tier_id}: min_gpu_gb cannot be more than min_total_gb (the GPUs are part of the total)")
+    rank = entry.get("rank")
+    if rank is not None and not _is_int(rank, 0, 1000):
+        raise ReleaseError(f"tier {tier_id}: bad rank (a whole number from 0 to 1000)")
     if not _is_int(entry.get("context"), 1024, CODING_MAX_CONTEXT):
         raise ReleaseError(f"tier {tier_id}: bad context")
     if not isinstance(entry.get("enabled"), bool):
@@ -580,6 +596,9 @@ def coding_tier(entry: Any) -> Dict[str, Any]:
         "sha256": parts[0]["sha256"],
         "size": sum(part["size"] for part in parts),
         "min_vram_gb": entry["min_vram_gb"],
+        "min_total_gb": min_total,
+        "min_gpu_gb": min_gpu,
+        "rank": rank,          # None until check_coding_tiers fills in the list position
         "context": entry["context"],
         "server_slots": slots,
         "server_ctx_checkpoints": checkpoints,
@@ -602,9 +621,14 @@ def check_coding_tiers(entries: Any) -> List[Dict[str, Any]]:
     files = [part["file"].lower() for tier in tiers for part in tier["files"]]
     if len(set(files)) != len(files):
         raise ReleaseError("two tiers name the same file")
-    vram = [tier["min_vram_gb"] for tier in tiers]
-    if any(later < earlier for earlier, later in zip(vram, vram[1:])):
-        raise ReleaseError("tiers must be listed smallest first (min_vram_gb never decreasing)")
+    # Listed worst first, best last: the order is the measured quality order (rank), not size, so a bigger model that
+    # measured worse sits below a smaller one. A tier without a rank takes its list position.
+    for position, tier in enumerate(tiers):
+        if tier["rank"] is None:
+            tier["rank"] = position
+    ranks = [tier["rank"] for tier in tiers]
+    if any(later <= earlier for earlier, later in zip(ranks, ranks[1:])):
+        raise ReleaseError("tiers must be listed in increasing rank (worst first, best last)")
     return tiers
 
 
@@ -612,6 +636,9 @@ def _flatten_coding_tier(tier: Dict[str, Any]) -> Dict[str, Any]:
     fields: Dict[str, Any] = {
         coding_field(tier["id"], "name"): tier["name"],
         coding_field(tier["id"], "min_vram_gb"): tier["min_vram_gb"],
+        coding_field(tier["id"], "min_total_gb"): tier["min_total_gb"],
+        coding_field(tier["id"], "min_gpu_gb"): tier["min_gpu_gb"],
+        coding_field(tier["id"], "rank"): tier["rank"],
         coding_field(tier["id"], "context"): tier["context"],
         coding_field(tier["id"], "server_slots"): tier["server_slots"],
         coding_field(tier["id"], "enabled"): 1 if tier["enabled"] else 0,   # never a bool, see above
@@ -650,6 +677,8 @@ def coding_tiers(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
             "id": tier_id,
             "name": manifest.get(coding_field(tier_id, "name")),
             "min_vram_gb": manifest.get(coding_field(tier_id, "min_vram_gb")),
+            # Absent in a release before 2.9.0: coding_tier() reads min_vram_gb as both, the list position as the rank.
+            **{key: manifest.get(coding_field(tier_id, key)) for key in _CODING_POOL_KEYS},
             "context": manifest.get(coding_field(tier_id, "context")),
             # Absent in a release before 2.5.0, and for every knob a tier leaves unset: coding_tier() defaults them.
             "server_slots": manifest.get(coding_field(tier_id, "server_slots")),
