@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.8.3] - 2026-11-02
+
+### Fixed
+- **The voice button works for everyone who can chat.** In the Android app and the web chat it answered "DLNE
+  Compute Required" once your network had used the free starter quota, which belongs to the coding side, not to the
+  free phone and web chat. Voice now follows the chat its microphone sits in: free for anyone, limited only by
+  `VOICE_PER_HOUR` clips a network an hour (60) and the queue; key holders still go first.
+
 ## [2.8.2] - 2026-11-02
 
 ### Added

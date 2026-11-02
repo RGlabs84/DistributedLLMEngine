@@ -266,32 +266,30 @@ async def test_while_paused_the_answer_is_503_paused_and_nothing_is_asked_or_que
 # --- who may use it ----------------------------------------------------------------------------------------
 
 @pytest.mark.anyio
-async def test_a_trial_caller_is_in_while_the_trial_has_chats_and_out_when_it_is_used_up_without_spending_any(voice):
+async def test_a_caller_whose_free_trial_is_used_up_can_still_use_voice_and_spends_nothing(voice):
+    # Owner, 2.8.3: the voice button in the Android app answered "DLNE Compute Required". Voice follows the chat its mic
+    # sits in: the phone app's and the web chat's chat is free for anyone, so voice is too.
+    for _ in range(5):
+        voice.quota.check_and_consume("203.0.113.9", limit=5)
+    voice.limits["voice_per_hour"] = 60
     async with client() as c:
-        assert (await say(c)).status_code == 200
-        for _ in range(5):
-            voice.quota.check_and_consume("203.0.113.9", limit=5)
-        voice.limits["voice_per_hour"] = 60
         reply = await say(c)
-    assert reply.status_code == 403 and "starter quota" in reply.json()["detail"]
-    assert len(voice.member.calls) == 1
+    assert reply.status_code == 200 and "Compute Required" not in reply.text
+    assert len(voice.member.calls) == 1 and voice.quota.summary(5)["chats_used"] == 5
 
 
 @pytest.mark.anyio
-async def test_the_host_a_key_holder_and_a_contributors_network_need_no_trial(voice, monkeypatch):
+async def test_the_host_a_key_holder_a_contributor_and_anyone_else_may_all_use_voice(voice, monkeypatch):
     monkeypatch.setattr(coordinator.api_key_manager, "verify_key", lambda token: token == "good-key")
     for _ in range(5):
-        voice.quota.check_and_consume("198.51.100.20", limit=5)
         voice.quota.check_and_consume("192.0.2.77", limit=5)
         voice.quota.check_and_consume("203.0.113.9", limit=5)
     voice.limits["voice_per_hour"] = 60
     async with client(LOCAL) as local, client(("192.0.2.77", 40002), {"Authorization": "Bearer good-key"}) as keyed, \
-            client(OTHER) as trial:
+            client(OTHER) as anyone:
         assert (await say(local)).status_code == 200
         assert (await say(keyed)).status_code == 200
-        assert (await say(trial)).status_code == 403
-        monkeypatch.setattr(coordinator.contributor_networks, "is_contributor", lambda network: network == "198.51.100.20")
-        assert (await say(trial)).status_code == 200
+        assert (await say(anyone)).status_code == 200
 
 
 @pytest.mark.anyio

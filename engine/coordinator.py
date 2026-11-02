@@ -7274,19 +7274,6 @@ def _voice_available() -> Tuple[bool, Optional[str]]:
     return reason is None, reason
 
 
-def _voice_trial_may_use(request: Request) -> bool:
-    """The chat's tiers without its charge: this host, a key, a worker and a contributor's network are in; a free-trial
-    caller is in while the trial has chats left (looked at, not spent)."""
-    tier = getattr(getattr(request, "state", None), "dlne_tier", None) or caller_tier(request)
-    if tier != "trial":
-        return True
-    network = trial_identity(get_client_ip(request))
-    if contributor_networks.is_contributor(network):
-        return True
-    quota = int(get_worker_limits().get("starter_quota_inferences", 100))
-    return quota > 0 and starter_quota_mgr.peek(network, limit=quota)[0]
-
-
 async def _read_capped(request: Request, max_bytes: int) -> Optional[bytes]:
     """The request body, never read past ``max_bytes``; None when it is longer."""
     declared = request.headers.get("content-length", "")
@@ -7310,9 +7297,10 @@ async def audio_transcriptions(request: Request):
         return _image_error(503, "voice_paused", VOICE_PAUSED)
     if not _voice_available()[0]:
         return _image_error(503, "voice_unavailable", VOICE_UNAVAILABLE)
-    if not _voice_trial_may_use(request):
-        return JSONResponse({"detail": "DLNE Compute Required: your free starter quota is used up. Run '@dlne /contribute' "
-                                       "to donate idle GPU compute or provide an authorized API key."}, status_code=403)
+    # Who may: anyone who may use the chat the mic sits in. The phone app's and the web chat's chat is free for anyone
+    # (/v1/app/chat/completions), so voice is too; it never looks at or spends the coding side's free starter quota
+    # (2.8.3: it did, and every phone and web user whose network had used that quota got "DLNE Compute Required").
+    # VOICE_PER_HOUR per network and VOICE_QUEUE_MAX bound it; key holders still go first in the queue.
     limits = get_worker_limits()
     body = await _read_capped(request, voice_pool.MAX_FORM_BYTES)
     if body is None:

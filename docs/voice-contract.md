@@ -28,8 +28,10 @@ where the person can read and fix it before sending. Speech to text only: DLNE d
   `{"text": "...", "language": "en", "duration_seconds": 4.2}`.
   - **Audio in:** WAV only, PCM 16-bit, mono, 16 kHz (clients convert; the server needs no ffmpeg: TheWall runs without
     it on purpose). At most `VOICE_MAX_SECONDS` (default 60) and 2 MB. Anything else: 400 `voice_bad_audio` with a plain reason.
-  - **Who:** the same authentication and tiers as chat (`request.state.dlne_tier`); key holders first in the voice queue
-    (as in the picture queue). A clip does not use a free-trial chat. At most `VOICE_PER_HOUR` clips a network an hour
+  - **Who:** anyone who may use the chat the mic sits in. The phone app's and the web chat's chat is free for anyone,
+    so voice is too: it never looks at or spends the coding side's free starter quota (2.8.3; 2.8.0-2.8.2 refused a
+    network whose starter quota was used up with "DLNE Compute Required"). Key holders first in the voice queue
+    (as in the picture queue). At most `VOICE_PER_HOUR` clips a network an hour
     (default 60; 429 `voice_quota`), `VOICE_QUEUE_MAX` waiting (default 8; 503 `voice_busy`).
   - **Privacy:** the audio is held in memory only, never written to disk, never logged, never kept after the answer; the
     text is returned and not stored. Logs say only "a clip of N s, language L, took T s".
