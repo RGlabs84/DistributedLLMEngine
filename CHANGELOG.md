@@ -10,6 +10,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.9.4] - 2026-11-16
+
+### Added
+- **The phones' own model can run on several cards.** `PHONE_DEVICE` may now name more than one card, comma-separated
+  (PCI addresses or DLNE GPU ids). The phone model is split across them in proportion to the room each has, the photo
+  reader stays on the FIRST card (photos still never leave the home cards), and each card is checked for its own share of
+  free memory before anything starts. With several cards they are the phones' own, so each may be filled to
+  `PHONE_HOME_BUDGET_MB`, or 95% of the card when that is 0. Volunteers still take only what no home card holds. One card
+  behaves exactly as before. (engine/phone_engine.py `home_cards`, `home_budgets`, `plan_layout(home_budgets_mb=...)`;
+  the switcher plans with the same budgets.)
+- **Qwen3.6 35B-A3B IQ3_S on the phone ladder** (`PHONE_MODEL=qwen36-a3b-iq3`), between Qwen3.5 9B and Qwen3.6 IQ4_XS.
+  It is the coding ladder's floor file (same revision, size and SHA-256) with the Qwen3.6 photo reader, and it fits two
+  8 GB cards with nothing on volunteers. TheWall runs it on its two BC-160s since three MI25s took over coding: measured
+  64.7 tokens a second on two BC-160s as a coding engine (27 Oct).
+
+---
+
+## [2.9.3] - 2026-11-14
+
+### Added
+- **A "device" tier for NoClipOS installs.** An install that holds a signed LicenceKit licence for the product `noclipos`
+  (sent as `Authorization: Bearer alic1.<base64url>`) is verified offline by the coordinator and is tier `device`
+  (`caller_tier()`, `GET /v1/me`): queue priority a CPU contributor's, `DEVICE_QUOTA_CHATS` (300) coding chats in any
+  `DEVICE_QUOTA_WINDOW_HOURS` (5) hours counted per install, the usual `X-DLNE-Quota-Remaining` header and 429 with
+  `Retry-After` when spent, and no unlimited agent turns. A licence that is malformed, wrongly signed, for another product
+  or revoked is a 401 with a reason, never a free-trial caller. New settings `NOCLIP_LICENCE_PUBLIC_KEY` (PEM path; unset
+  refuses licences), `NOCLIP_LICENCE_PRODUCT`, `NOCLIP_REVOKED_INSTALLS`, `DEVICE_QUOTA_CHATS`, `DEVICE_QUOTA_WINDOW_HOURS`;
+  `dlne_server.py device revoke <installId>` and `device list-revoked`. `dlne_sk_` keys and every other tier are unchanged
+  (docs/release-2.9-contract.md section 8).
+
+---
+
+## [2.9.2] - 2026-11-06
+
+### Changed
+- **Coding goes to TheWall first.** A coding request is answered by the coordinator's own engine while it has a lane free;
+  a coding member gets it only when the engine is down, swapping or restarting, every lane is busy or spoken for, or the
+  request is too big for a lane (`CODING_ROUTE=wall_first`, the default; `members_first` is the order before). A person who
+  set `dlne.ownGpu` to smarter still gets their own machine.
+- **A volunteer's GPU may share the coding model from up to 95 ms away** (`AUTO_SWAP_MAX_RTT_MS`, was 92), and the "good"
+  grade follows it. One hop that long allows about 10.5 tokens a second; a move up must still reach 10.
+
+---
+
+## [2.9.1] - 2026-11-05
+
+### Added
+- **A VRAM reading.** `/v1/cluster/status` has `vram: {used_gb, total_gb, cards: [{role, used_gb, total_gb}]}`: this host's
+  graphics memory right now, each card by its job (coding, media, lent or other), with no card's name or address.
+  `gpu_pool.volunteer_vram_gb` says how much the volunteers' GPUs hold; nothing is read about their use of it.
+
+### Changed
+- **A volunteer's GPU may share the coding model from up to 92 ms away** (`AUTO_SWAP_MAX_RTT_MS`, was 80). The "good"
+  grade and the Wi-Fi link test follow it. One hop that long allows about 11 tokens a second, and a move up still has
+  to reach `AUTO_SWAP_MIN_DECODE_TPS` (10) or the previous model is put back.
+
+---
+
 ## [2.9.0] - 2026-11-02
 
 Built from docs/release-2.9-contract.md (owner approved 2026-11-02). Pairs with the VS Code extension **1.9.0**, the

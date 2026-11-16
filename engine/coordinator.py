@@ -86,13 +86,14 @@ from engine.downloader import download_and_extract_engine, download_verified, co
 from engine.version import VERSION
 from engine import release as release_lib
 from engine import coding_ladder, coding_speed
+from engine import hardware as hardware_lib
 from engine.lease import lease_manager, InferenceLease
 from engine.chat_privacy import chat_tag, clean_chat_id
 from engine.priority import LaneAffinity, LaneBook
 from engine.phone_engine import PhoneEngine, phone_rungs
 from engine.phone_swap import PhoneSwapController, make_download as make_phone_download
-from engine.priority import (DistinctWindow, UsageWindow, coding_gate, cpu_coding_window, lane_affinity, lane_book,
-                             phone_gate, tier_priority)
+from engine.priority import (DistinctWindow, UsageWindow, coding_gate, cpu_coding_window, device_coding_window,
+                             lane_affinity, lane_book, phone_gate, tier_priority)
 from engine import image_policy
 from engine.image_member import ImageMember
 from engine.image_pool import ImageService, Job, JudgeUnavailable, Rejected
@@ -100,6 +101,7 @@ from engine import voice_pool
 from engine.voice_member import MemberError as VoiceError, VoiceMember
 from engine.voice_pool import VoiceService
 from engine.api_keys import api_key_manager, hash_admin_key
+from engine.device_licence import LICENCE_PREFIX, device_licences
 from engine import canary
 from engine import auto_swap, link_paths, pool_layout, pool_memory, takeover
 from engine import inference_manager as inference_manager_module
@@ -630,6 +632,15 @@ def cpu_limit_text(limit: int, hours: float, reset_at: float) -> str:
     )
 
 
+def device_limit_text(limit: int, hours: float, reset_at: float) -> str:
+    minutes = max(1, int((reset_at - time.time()) // 60) + 1)
+    when = f"{minutes} minute{'s' if minutes != 1 else ''}" if minutes < 120 else f"{minutes // 60} hours {minutes % 60} minutes"
+    return (
+        f"You've used all {limit} chats for this {hours:g}-hour window (the allowance for this NoClipOS install). "
+        f"The next one frees up in {when}."
+    )
+
+
 def use_starter_quota(request: Request, client_id: str, limit: int) -> Tuple[bool, int]:
     """
     Applies the free starter trial to one request and returns (allowed, remaining).
@@ -650,13 +661,18 @@ def use_starter_quota(request: Request, client_id: str, limit: int) -> Tuple[boo
 def _refund_chat(request: Request) -> None:
     """Give back the chat this request spent, once (2.6.2): its engine was restarting, and the agent sends the step
     again. That is a free-trial chat, or one of a CPU contributor's window (_cpu_window); requests that spent nothing
-    (GPU contributors, keys, this host, autocomplete) are left alone."""
+    (GPU contributors, keys, this host, autocomplete) are left alone. A NoClipOS device's chat (_device_window)
+    is given back the same way."""
     state = getattr(request, "state", None)
     if state is None or getattr(state, "chat_refunded", False):
         return
     if getattr(state, "cpu_window_key", None):
         state.chat_refunded = True
         cpu_coding_window.refund(state.cpu_window_key)
+        return
+    if getattr(state, "device_window_key", None):
+        state.chat_refunded = True
+        device_coding_window.refund(state.device_window_key)
         return
     if not hasattr(state, "starter_quota_remaining") or request.url.path.startswith(("/v1/completions", "/v1/coding/")):
         return          # spent nothing, or peeked and never charged (use_starter_quota)
@@ -757,6 +773,19 @@ class NonContribBlockerMiddleware(BaseHTTPMiddleware):
                     request.state.dlne_tier = "key"
                     return await call_next(request)
 
+                # A NoClipOS install's signed LicenceKit licence (engine/device_licence.py): second in the queue, its
+                # chats counted per install in a rolling window. One that does not check out is refused with 401 and
+                # the reason, never quietly treated as a trial caller: a broken install should be seen.
+                if client_token.startswith(LICENCE_PREFIX):
+                    verdict = device_licences.check(client_token, get_worker_limits())
+                    if not verdict.valid:
+                        return JSONResponse({"detail": verdict.detail}, status_code=401,
+                                            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
+                    request.state.dlne_tier = "device"
+                    if path.startswith("/v1/chat"):
+                        return await self._device_window(request, call_next, verdict.install_id, get_worker_limits())
+                    return await call_next(request)
+
                 # Active contributing worker nodes are authorized
                 worker = registry.find_by_token(client_token) if client_token else None
                 if not worker:
@@ -820,6 +849,27 @@ class NonContribBlockerMiddleware(BaseHTTPMiddleware):
                 headers={**headers, "Retry-After": str(wait)},
             )
         request.state.cpu_window_key = worker_id        # an engine restart gives it back (_refund_chat)
+        response = await call_next(request)
+        response.headers.update(headers)
+        return response
+
+    @staticmethod
+    async def _device_window(request: Request, call_next, key_id: str, limits: Dict[str, Any]):
+        """A device's coding chats, counted per install (its licence's installId) like a CPU contributor's (autocomplete and route lookups are
+        never counted). Answers carry X-DLNE-Quota-Remaining, and the rolling-limit headers a CPU contributor's do; a
+        spent window is a 429 with Retry-After, the answer clients already turn into the server's own words."""
+        limit = int(limits.get("device_quota_chats", 300))
+        hours = float(limits.get("device_quota_window_hours", 5.0))
+        allowed, remaining, reset_at = device_coding_window.check_and_record(key_id, limit, hours * 3600)
+        headers = {QUOTA_HEADER: str(remaining), LIMIT_REMAINING_HEADER: str(remaining), LIMIT_RESET_HEADER: str(int(reset_at))}
+        if not allowed:
+            wait = max(1, int(reset_at - time.time()))
+            return JSONResponse(
+                {"detail": device_limit_text(limit, hours, reset_at)},
+                status_code=429,
+                headers={**headers, "Retry-After": str(wait)},
+            )
+        request.state.device_window_key = key_id        # an engine restart gives it back (_refund_chat)
         response = await call_next(request)
         response.headers.update(headers)
         return response
@@ -1628,6 +1678,15 @@ def check_contrib_clause(request: Request):
     if token and api_key_manager.verify_key(token):
         return  # Bearer API Key is authorized
 
+    # A NoClipOS licence: one that does not check out is refused, never made a trial caller; one the middleware
+    # has already counted (tier "device", its window spent on this chat) is authorised.
+    if token.startswith(LICENCE_PREFIX):
+        verdict = device_licences.check(token, get_worker_limits())
+        if not verdict.valid:
+            raise HTTPException(status_code=401, detail=verdict.detail, headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
+        if getattr(request.state, "dlne_tier", None) == "device":
+            return
+
     registry.prune_dead_workers()
     if token and registry.find_by_token(token) is not None:
         return  # Active contributing worker node
@@ -1658,7 +1717,8 @@ def caller_tier(request: Request) -> str:
     """
     Which tier this caller is on, the same answer NonContribBlockerMiddleware gives a chat request
     (``request.state.dlne_tier``), worked out without spending anything: no trial chat is charged and no window
-    is counted. ``host``, ``key``, ``gpu``, ``cpu``, ``trial`` or ``open`` (the contribution rule is off).
+    is counted. ``host``, ``key``, ``gpu``, ``cpu``, ``device`` (a NoClipOS install with a valid licence), ``trial`` or ``open``
+    (the contribution rule is off).
     A contributor that fails the floors the middleware refuses for is ``trial``: it holds no standing.
     """
     limits = get_worker_limits()
@@ -1670,6 +1730,9 @@ def caller_tier(request: Request) -> str:
     token = get_request_token(request)
     if token and api_key_manager.verify_key(token):
         return "key"
+    if token.startswith(LICENCE_PREFIX):
+        # an invalid licence holds no standing (and /v1/me says why, 401); a valid one is a device
+        return "device" if device_licences.check(token, limits).valid else "trial"
     worker = registry.find_by_token(token) if token else None
     if not worker or cpu_node_shortfalls(worker.get("hardware", {}), limits):
         return "trial"
@@ -1682,10 +1745,19 @@ def caller_tier(request: Request) -> str:
 async def get_me(request: Request):
     """
     ``GET /v1/me`` -> ``{"tier": "key"}``: who the coordinator takes this caller to be (one of host, key, gpu, cpu,
-    trial, open), so the extension can tell whether a key holder's unlimited agent turns apply
+    device, trial, open), so the extension can tell whether a key holder's unlimited agent turns apply
     (docs/release-2.7-contract.md). Authenticated like every request (the decoy-key tripwire sees it in the
     middleware), but it costs nothing: a trial caller is told "trial" and keeps every chat. Nothing else is returned.
+    A NoClipOS licence that does not check out (malformed, wrongly signed, for another product, revoked) is a 401 with
+    the reason, as it is on a chat request.
     """
+    token = get_request_token(request)
+    if (token.startswith(LICENCE_PREFIX) and get_worker_limits().get("enforce_contrib_clause", True)
+            and not is_local_ip(get_client_ip(request))):
+        verdict = device_licences.check(token, get_worker_limits())
+        if not verdict.valid:
+            return JSONResponse({"detail": verdict.detail}, status_code=401, headers={
+                "Cache-Control": "no-store", "WWW-Authenticate": 'Bearer error="invalid_token"'})
     return JSONResponse({"tier": caller_tier(request)}, headers={"Cache-Control": "no-store"})
 
 
@@ -3714,6 +3786,8 @@ async def get_cluster_status(request: Request):
         "pool_memory": _pool_memory_status(near_pool),
         # The phones' own engine (2.9.0): {mode, rung, device, lanes, layers: {home, volunteers}, vision, switch}.
         "phone_engine": _phone_engine_status(),
+        # This host's graphics memory right now (2.9.1): {used_gb, total_gb, cards: [{role, used_gb, total_gb}]}.
+        "vram": await _vram_status(),
         # A count only. The list of every worker's ip:port was published here until 2.4.9, which put a
         # volunteer's home address on a public page; nothing read it.
         "active_workers_count": len(active_endpoints),
@@ -6313,6 +6387,7 @@ def _gpu_pool_status(measured_tokens_per_second: Optional[float]) -> Dict[str, A
     verified = {m.worker_id for m in _all_coding_members(limits) if m.trust_id and not coding_router.is_blocked(m)}
     serving = {"gpus": 0, "vram": 0.0}
     standing = {"gpus": 0, "vram": 0.0}
+    volunteer_vram = 0.0
     # How far each GPU is, by the owner's grades (auto_swap.rtt_grade): this machine's own are "host", a
     # volunteer's is graded on this coordinator's last measurement. Counts of GPUs, like everything here.
     reach = dict.fromkeys(_REACH_KEYS, 0)
@@ -6332,16 +6407,40 @@ def _gpu_pool_status(measured_tokens_per_second: Optional[float]) -> Dict[str, A
             reach["host"] += node["gpus"]
         else:
             reach[auto_swap.rtt_grade(_fresh_probe_rtt(node["worker_id"]))] += node["gpus"]
+            volunteer_vram += node["vram_gb"]
     return {
         "gpus": serving["gpus"],
         "vram_gb": round(serving["vram"], 1),
         "gpus_standing_by": standing["gpus"],
         "vram_standing_by_gb": round(standing["vram"], 1),
+        "volunteer_vram_gb": round(volunteer_vram, 1),
         "tokens_per_second": round(throughput.rate(POOL_CODING, 60), 2),
         "tokens_last_hour": throughput.total(POOL_CODING, 3600),
         "measured_tokens_per_second": measured_tokens_per_second,
         "reach": reach,
     }
+
+
+async def _vram_status() -> Dict[str, Any]:
+    """
+    ``vram`` for /v1/cluster/status (2.9.1, the status page's reading): this host's own cards, ``cards`` with a role and
+    numbers only (hardware.host_vram_cards), ``used_gb`` their sum, None unless every card gave a live figure. A
+    volunteer's card is not here: gpu_pool.volunteer_vram_gb says how much they have, and what else a volunteer's
+    machine has in its memory is its owner's business. Off the event loop: the card list can run a probe when it expires.
+    """
+    limits = get_worker_limits()
+    try:
+        from engine.inference_manager import media_gpu_shared, media_gpu_spec
+        lease = takeover.load_lease() or {}
+        cards = await asyncio.to_thread(hardware_lib.host_vram_cards, str(limits.get("allowed_gpu_indices", "-1")),
+                                        media_gpu_spec(limits), media_gpu_shared(limits),
+                                        (lease.get("granted") or {}).get("gpus") or ())
+    except Exception as exc:  # noqa: BLE001 - the status must answer even if this part cannot
+        log_warning(f"The VRAM reading is unavailable ({type(exc).__name__}: {exc}).")
+        return {"used_gb": None, "total_gb": 0.0, "cards": []}
+    used = [card["used_gb"] for card in cards]
+    return {"used_gb": round(sum(used), 2) if used and None not in used else None,
+            "total_gb": round(sum(card["total_gb"] for card in cards), 2), "cards": cards}
 
 
 def _cpu_pool_status() -> Dict[str, Any]:
@@ -6378,7 +6477,7 @@ def _pool_status_or_empty(build, empty: Dict[str, Any], label: str) -> Dict[str,
         return empty
 
 
-_EMPTY_GPU_POOL = {"gpus": 0, "vram_gb": 0.0, "gpus_standing_by": 0, "vram_standing_by_gb": 0.0,
+_EMPTY_GPU_POOL = {"gpus": 0, "vram_gb": 0.0, "gpus_standing_by": 0, "vram_standing_by_gb": 0.0, "volunteer_vram_gb": 0.0,
                    "tokens_per_second": 0.0, "tokens_last_hour": 0, "measured_tokens_per_second": None,
                    "reach": dict.fromkeys(_REACH_KEYS, 0)}
 _EMPTY_CPU_POOL = {"machines": 0, "machines_standing_by": 0, "cores": 0, "ram_gb": 0.0,
@@ -6745,6 +6844,10 @@ async def coding_route(request: Request):
     tokens the request will hold, prompt and room to answer: only a member whose context per request
     holds them is offered, the sticky and own members included, and with none this engine answers,
     whatever its own size. Anything but a whole number from 1 to 10,000,000 is ignored.
+
+    CODING_ROUTE=wall_first (2.9.2, the default): this engine answers while it can take the request, so the answer is
+    ``{"route": null}`` then, whatever members are ready (:func:`_wall_takes_coding`); a member is offered only when it
+    cannot. Only ``prefer=smarter`` goes on as before: the requester asked for their own machine by name.
     """
     no_store = {"Cache-Control": "no-store"}
     limits = get_worker_limits()
@@ -6767,6 +6870,8 @@ async def coding_route(request: Request):
     # Only the exact word counts, and only with an own member to prefer; anything else is today's speed rule.
     smarter = own is not None and request.query_params.get("prefer") == "smarter"
     need = _route_need(request.query_params.get("need"))
+    if limits.get("coding_route") == "wall_first" and not smarter and await _wall_takes_coding(need):
+        return JSONResponse({"route": None}, headers=no_store)
     member = coding_router.pick(_coding_members(limits), session, privacy, need_pubkey=True,
                                 own=own, engine_tps=_own_member_floor() if own else None,
                                 prefer_smarter=smarter, engine_model=_engine_coding_model() if smarter else None,
@@ -6776,6 +6881,27 @@ async def coding_route(request: Request):
     route = coding_router.issue_route(member, session, privacy, hold=not trial)
     return JSONResponse({"route": route, "pubkey": member.pubkey, "alg": coding_members_lib.E2E_ALG},
                         headers=no_store)
+
+
+async def _wall_takes_coding(need: Optional[int]) -> bool:
+    """
+    Whether this coordinator's own engine should answer a coding request now (CODING_ROUTE=wall_first): it is up, not
+    swapping and still listening, a coding lane is free with nobody waiting for one, and the request (``need``, its
+    tokens, when it says) fits a lane. Anything else is "not available", and a member may answer.
+    """
+    if is_swapping_models or is_recalculating_queue:
+        return False
+    gate = coding_gate.stats()
+    if gate["in_use"] >= gate["slots"] or gate["waiting"]:
+        return False
+    running = manager.get_active_model_names()
+    snapshot = await manager.asnapshot_model(running[0]) if running else None
+    process = (snapshot or {}).get("process")
+    if (not snapshot or process is None or process.poll() is not None
+            or not await _probe_engine_port(int(snapshot.get("port") or 0))):
+        return False
+    lane = await _engine_slot_context(running)
+    return not (need and lane and need > lane)
 
 
 def _route_need(raw: Optional[str]) -> Optional[int]:

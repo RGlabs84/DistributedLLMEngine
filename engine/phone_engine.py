@@ -45,7 +45,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -73,8 +73,17 @@ MIB = 1024 * 1024
 VOLUNTEER_USABLE = 0.9
 # The engine's fixed cost on the home card besides weights, cache and photo reader (compute buffers).
 COMPUTE_MB = 200.0
+# 2.9.4: with several home cards (PHONE_DEVICE naming more than one) they are the phones' own, so each may be filled to
+# this share of its memory unless PHONE_HOME_BUDGET_MB says less. 0.95 fits Qwen3.6 IQ3_S + its photo reader on two 8 GB
+# cards (19 + 21 layers); nine tenths would leave one layer over.
+HOME_CARD_SHARE = 0.95
 
 _ENDPOINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}:[0-9]{1,5}$")
+
+
+def safe_spec(spec: str) -> str:
+    """A card spec (a DLNE GPU id or a PCI address) as it may appear in the log: config text, so only its plain characters."""
+    return re.sub(r"[^A-Za-z0-9:.]", "", str(spec))[:32] or "?"
 
 # ----------------------------------------------------------------------------------------------------------------
 # The ladder, pinned (Hugging Face API at the revision named in each url: size and SHA-256 as the API reports them)
@@ -104,6 +113,18 @@ PHONE_RUNGS: List[Dict[str, Any]] = [
              "sha256": "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8"},
             {"file": "Qwen3.5-9B-mmproj-F16.gguf", "url": _Q35_9B + "mmproj-F16.gguf", "size": 918166080,
              "sha256": "f70dc3509053962b0d0d3ee8a7eacebf5d60aa560cad78254ae8698516ae029f"},
+        ],
+    },
+    {
+        # 2.9.4: the same file the coding ladder's floor pins (scripts/coding_models.json qwen36-a3b, IQ3_S). It fits two
+        # 8 GB cards with the photo reader (PHONE_DEVICE naming both): TheWall's two BC-160s since the MI25s took coding.
+        "id": "qwen36-a3b-iq3", "name": "Qwen3.6 35B-A3B (IQ3_S)", "layers": 40, "kv_mb_per_1k": 20.0,
+        "file": "Qwen3.6-35B-A3B-UD-IQ3_S.gguf", "mmproj": "Qwen3.6-35B-A3B-mmproj-F16.gguf",
+        "files": [
+            {"file": "Qwen3.6-35B-A3B-UD-IQ3_S.gguf", "url": _Q36 + "Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+             "size": 13676723168, "sha256": "66a3ca888ce13482b40c333db2432c0ebde3a7b13754fc29f0c6f5e89703ec66"},
+            {"file": "Qwen3.6-35B-A3B-mmproj-F16.gguf", "url": _Q36 + "mmproj-F16.gguf", "size": 899283680,
+             "sha256": "8971ee4f331ff0a4c609374f32984b3d4e6dc086c0aa35f1d637fad1829e887f"},
         ],
     },
     {
@@ -181,8 +202,31 @@ def _volunteer_capacity_mb(volunteer: Dict[str, Any]) -> float:
     return gb * 1024.0 * VOLUNTEER_USABLE if math.isfinite(gb) and gb > 0 else 0.0
 
 
+def _share_out(total: int, caps: Sequence[int]) -> List[int]:
+    """``total`` layers over cards that hold at most ``caps`` each, in proportion to the caps (largest remainder), so
+    two home cards with the same room get the same share. Never more than a card's cap; ``total`` <= sum(caps)."""
+    room = sum(caps)
+    if total <= 0 or room <= 0:
+        return [0] * len(caps)
+    exact = [total * c / room for c in caps]
+    out = [min(c, int(x)) for c, x in zip(caps, exact)]
+    order = sorted(range(len(caps)), key=lambda i: exact[i] - int(exact[i]), reverse=True)
+    left = total - sum(out)
+    while left > 0:
+        moved = False
+        for i in order:
+            if left > 0 and out[i] < caps[i]:
+                out[i] += 1
+                left -= 1
+                moved = True
+        if not moved:
+            break
+    return out
+
+
 def plan_layout(rung: Dict[str, Any], volunteers: List[Dict[str, Any]], *, budget_mb: float, lanes: int,
-                context: int, vision: bool, host_cpu: bool = False) -> Dict[str, Any]:
+                context: int, vision: bool, host_cpu: bool = False,
+                home_budgets_mb: Optional[Sequence[float]] = None) -> Dict[str, Any]:
     """
     Where a rung's layers go. ``volunteers`` are the ones the switcher already found near enough and settled, each
     ``{"id", "kind": "gpu"|"cpu", "endpoint", "vram_gb" (gpu) or "ram_lent_gb" (cpu)}``.
@@ -191,27 +235,37 @@ def plan_layout(rung: Dict[str, Any], volunteers: List[Dict[str, Any]], *, budge
     the volunteers, biggest first, a volunteer's GPU memory or lent RAM at nine tenths. Result::
 
         {"ok", "reason", "home_layers", "volunteer_layers": {id: n}, "home_mb", "need_mb", "split": [home, v1, ...],
-         "used": [volunteer dicts in split order]}
+         "used": [volunteer dicts in split order], "home_split": [per home card], "home_mbs": [per home card]}
 
     ``home_mb`` is what the layout puts on the home card, always <= ``budget_mb`` when ``ok``. With ``host_cpu`` (the
     device is the host's processor) nothing is split: the whole model runs on the host and volunteers are not used.
+
+    ``home_budgets_mb`` (2.9.4): PHONE_DEVICE named several cards. Each is a home card with its own budget; every one
+    carries compute buffers, the FIRST also carries the photo reader (photos stay on the first home card), the layers
+    are shared out in proportion to the room each has, and only what none of them holds goes to volunteers. ``split``
+    then starts with one entry per home card, and ``home_mb`` is their total.
     """
     layers = int(rung["layers"])
+    budgets = [float(b) for b in home_budgets_mb] if home_budgets_mb else [float(budget_mb)]
     plan: Dict[str, Any] = {"ok": False, "reason": "", "home_layers": 0, "volunteer_layers": {}, "home_mb": 0.0,
-                            "need_mb": 0.0, "split": [], "used": []}
+                            "need_mb": 0.0, "split": [], "used": [], "home_split": [], "home_mbs": []}
     if host_cpu:
-        plan.update(ok=True, home_layers=layers, split=[layers])
+        plan.update(ok=True, home_layers=layers, split=[layers], home_split=[layers])
         return plan
-    fixed, per_layer = _fixed_mb(rung, vision), _per_layer_mb(rung, lanes, context)
-    room = budget_mb - fixed
-    if room < 0:
-        plan["reason"] = f"the home budget ({budget_mb:.0f} MB) cannot hold the photo reader and buffers ({fixed:.0f} MB)"
+    per_layer = _per_layer_mb(rung, lanes, context)
+    fixed = [_fixed_mb(rung, vision) if i == 0 else COMPUTE_MB for i in range(len(budgets))]
+    if budgets[0] - fixed[0] < 0:
+        plan["reason"] = f"the home budget ({budgets[0]:.0f} MB) cannot hold the photo reader and buffers ({fixed[0]:.0f} MB)"
         return plan
-    home_layers = min(layers, int(room // per_layer))
+    caps = [max(0, int((b - f) // per_layer)) for b, f in zip(budgets, fixed)]
+    home_split = _share_out(min(layers, sum(caps)), caps)
+    home_layers = sum(home_split)
     remaining = layers - home_layers
-    plan["home_layers"], plan["home_mb"] = home_layers, fixed + home_layers * per_layer
+    home_mbs = [f + n * per_layer for f, n in zip(fixed, home_split)]
+    plan["home_layers"], plan["home_mb"] = home_layers, sum(home_mbs)
+    plan["home_split"], plan["home_mbs"] = home_split, home_mbs
     plan["need_mb"] = remaining * per_layer / VOLUNTEER_USABLE
-    split, used = [home_layers], []
+    split, used = list(home_split), []
     assigned: Dict[str, int] = {}
     if remaining:
         candidates = sorted((v for v in volunteers if isinstance(v, dict) and valid_endpoint(v.get("endpoint"))
@@ -322,12 +376,50 @@ class PhoneEngine:
         return True
 
     def device(self, limits: Optional[Dict[str, Any]] = None) -> str:
-        """``"cpu"``, or the card's spec: PHONE_DEVICE, else the media card."""
+        """``"cpu"``, or the card's spec: PHONE_DEVICE, else the media card. Several cards (2.9.4) stay comma-joined."""
         limits = limits if limits is not None else self._limits()
         asked = str(limits.get("phone_device") or "").strip()
         if asked.lower() == "cpu":
             return "cpu"
         return asked or self._media_spec(limits)
+
+    def home_cards(self, limits: Optional[Dict[str, Any]] = None) -> List[str]:
+        """The home cards in order (2.9.4: PHONE_DEVICE may name several, comma-separated, each once). The first holds the
+        photo reader. ``[]`` for ``cpu`` or when there is no card."""
+        device = self.device(limits)
+        if not device or device == "cpu":
+            return []
+        cards: List[str] = []
+        for spec in device.split(","):
+            spec = spec.strip()
+            if spec and spec.lower() != "cpu" and spec not in cards:
+                cards.append(spec)
+        return cards
+
+    def home_budgets(self, limits: Optional[Dict[str, Any]] = None) -> Optional[List[float]]:
+        """
+        Per-card budgets when PHONE_DEVICE names several cards, else None (one home card: the budget is
+        :func:`resolve_budget_mb`, unchanged). Several cards are the phones' own, so each may hold up to
+        PHONE_HOME_BUDGET_MB when that is set, else HOME_CARD_SHARE of the card; a card that cannot be read counts as 0.
+        The start still checks each card's FREE memory before anything is spawned.
+        """
+        limits = limits if limits is not None else self._limits()
+        cards = self.home_cards(limits)
+        if len(cards) < 2:
+            return None
+        try:
+            asked = float(limits.get("phone_home_budget_mb") or 0)
+        except (TypeError, ValueError):
+            asked = 0.0
+        budgets: List[float] = []
+        for spec in cards:
+            if asked > 0:
+                budgets.append(asked)
+                continue
+            card = self._card_of(spec)
+            total = float(card.get("total_gb") or 0.0) if card else 0.0
+            budgets.append(total * 1024.0 * HOME_CARD_SHARE)
+        return budgets
 
     def unavailable_reason(self, rung: Optional[Dict[str, Any]] = None) -> Optional[str]:
         limits = self._limits()
@@ -441,10 +533,14 @@ class PhoneEngine:
                          "--video-ffmpeg-dir", no_ffmpeg_dir]
             return args
         endpoints = [v["endpoint"] for v in layout.get("used", [])]
-        devices = ["Vulkan0"] + [f"RPC{i}" for i in range(len(endpoints))]
+        # One Vulkan device per home card (GGML_VK_VISIBLE_DEVICES lists them in PHONE_DEVICE's order), then volunteers.
+        homes = max(1, len(layout.get("home_split") or [1]))
+        devices = [f"Vulkan{i}" for i in range(homes)] + [f"RPC{i}" for i in range(len(endpoints))]
         args += ["-ngl", "99", "--device", ",".join(devices)]
         if endpoints:
-            args += ["--rpc", ",".join(endpoints), "-ts", ",".join(str(n) for n in layout["split"])]
+            args += ["--rpc", ",".join(endpoints)]
+        if len(devices) > 1:
+            args += ["-ts", ",".join(str(n) for n in layout["split"])]
         if vision:
             # Always on the home device, whatever the layers do: a photo never reaches a volunteer.
             args += ["--mmproj", os.path.join(directory, rung["mmproj"]), "--mmproj-device", "Vulkan0",
@@ -473,9 +569,11 @@ class PhoneEngine:
             raise MemberError(UNAVAILABLE, "The phone engine isn't available right now.")
         device = self.device(limits)
         host_cpu = device == "cpu"
+        homes = [] if host_cpu else self.home_cards(limits)
+        budgets = await asyncio.to_thread(self.home_budgets, limits) if len(homes) > 1 else None
         layout = plan_layout(rung, volunteers, budget_mb=resolve_budget_mb(limits), lanes=int(limits.get("phone_lanes", 2)),
                              context=int(limits.get("phone_context", 8192)), vision=bool(limits.get("phone_vision", True)),
-                             host_cpu=host_cpu)
+                             host_cpu=host_cpu, home_budgets_mb=budgets)
         if not layout["ok"]:
             log_warning(f"The phone engine was not started on {rung['name']}: {layout['reason']}.")
             raise MemberError(UNAVAILABLE, "That phone model does not fit.")
@@ -490,14 +588,23 @@ class PhoneEngine:
             layout = {**layout, "used": reached}
         env = dict(os.environ)
         if not host_cpu:
-            card = await asyncio.to_thread(self._card_of, device)
-            if card is None:
-                raise MemberError(UNAVAILABLE, "The phone engine's card was not found.")
-            free, need = card.get("free_gb"), layout["home_mb"] / 1024.0 + 0.1
-            if free is None or free < need:
-                log_warning(f"The home card has {'unknown' if free is None else f'{free:.1f} GiB'} free; the phone engine needs {need:.1f} GiB.")
-                raise MemberError(UNAVAILABLE, "The graphics card doesn't have enough free memory for the phones right now.")
-            env["GGML_VK_VISIBLE_DEVICES"] = str(card["vk_index"])
+            # Every home card is checked for its own share before anything is spawned (one card: as before).
+            specs = homes if len(homes) > 1 else [device]
+            needs = layout.get("home_mbs") if len(specs) > 1 else [layout["home_mb"]]
+            indexes = []
+            for spec, need_mb in zip(specs, needs):
+                card = await asyncio.to_thread(self._card_of, spec)
+                if card is None:
+                    raise MemberError(UNAVAILABLE, "The phone engine's card was not found.")
+                free, need = card.get("free_gb"), need_mb / 1024.0 + 0.1
+                if free is None or free < need:
+                    log_warning(f"The home card {safe_spec(spec)} has {'unknown' if free is None else f'{free:.1f} GiB'} free; "
+                                f"the phone engine needs {need:.1f} GiB there.")
+                    raise MemberError(UNAVAILABLE, "The graphics card doesn't have enough free memory for the phones right now.")
+                indexes.append(str(card["vk_index"]))
+            if len(set(indexes)) != len(indexes):
+                raise MemberError(UNAVAILABLE, "PHONE_DEVICE names the same card twice.")
+            env["GGML_VK_VISIBLE_DEVICES"] = ",".join(indexes)
         self.port = self._free_port()
         self._workdir = tempfile.mkdtemp(prefix="dlne-phone-")
         no_ffmpeg = os.path.join(self._workdir, "no-ffmpeg")

@@ -9,6 +9,7 @@ DLNE's rule is "give compute to receive compute", graded by what is given:
     gpu      a contributor lending a GPU                   1st        unlimited
     open     anyone, when the contribution rule is off     2nd        unlimited
     cpu      a contributor lending a CPU (the phone pool)  2nd        a rolling window
+    device   a NoClipOS install (signed licence)          2nd        a rolling window, per install
     trial    everyone else, on the 100 free chats          3rd        the free trial
 
 PRIORITY. llama-server runs a fixed number of request slots and serves whatever arrives in
@@ -33,7 +34,7 @@ import time
 from collections import OrderedDict, deque
 from typing import Deque, Dict, List, Optional, Tuple
 
-TIER_PRIORITY = {"host": 0, "key": 0, "gpu": 0, "open": 1, "cpu": 1, "trial": 2}
+TIER_PRIORITY = {"host": 0, "key": 0, "gpu": 0, "open": 1, "cpu": 1, "device": 1, "trial": 2}
 LOWEST_PRIORITY = max(TIER_PRIORITY.values())
 
 
@@ -377,3 +378,4 @@ phone_gate = CodingGate()       # the phone lanes (2.6): a phone never waits beh
 lane_book = LaneBook()
 lane_affinity = LaneAffinity()
 cpu_coding_window = UsageWindow()
+device_coding_window = UsageWindow()      # a NoClipOS install's coding chats, per installId (the "device" tier)

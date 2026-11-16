@@ -466,7 +466,8 @@ progress).
 | Setting | What it does |
 |---|---|
 | `CODING_MEMBERS_ENABLED` | Turns coding members on. Default `false`. |
-| `AUTO_SWAP_MAX_RTT_MS` | How far away (round trip measured by the coordinator) a GPU may be to share the coding model. Default 80. |
+| `AUTO_SWAP_MAX_RTT_MS` | How far away (round trip measured by the coordinator) a GPU may be to share the coding model. Default 95. |
+| `CODING_ROUTE` | Who answers a coding request first. `wall_first` (the default): this server's own engine, and a member only when it cannot take the request. `members_first`: a member whenever one qualifies. |
 | `CODING_MEMBER_MAX_RTT_MS` | How far away a GPU may be to run a coding model of its own. Default 120. |
 | `TRUSTED_MEMBERS` | Comma-separated trust ids (derived from each member's own identity key) that count as trusted. Worker ids carry no trust, and a member can never claim it. |
 | `CODING_CANARY_PER_DAY` | How many decoy requests each member gets a day. Default 4. |

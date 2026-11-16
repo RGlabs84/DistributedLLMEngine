@@ -13,8 +13,11 @@ Everything here ships **off by default** (`CODING_MEMBERS_ENABLED=false`) until 
   with a whole coding model, behind a small **member proxy** that listens on the worker's RPC port and is
   reached by the coordinator through the existing reverse tunnel (`reverse_bridge.get_relay_port(ip,
   port)`, exactly as phone-pool members are; see `AppPool.members` and `_app_members()`).
-- **Local engine**: TheWall's own coding engine (today's path). Always trusted. The fallback when no
-  member fits.
+- **Local engine**: TheWall's own coding engine (today's path). Always trusted. It answers first
+  (`CODING_ROUTE=wall_first`, 2.9.2): while it is up with a coding lane free and the request fits a lane,
+  `/v1/coding/route` answers `{"route": null}` whatever members are ready, and a member is offered only when
+  it cannot take the request. `members_first` is the order before 2.9.2, a member whenever one qualifies.
+  A requester's `prefer=smarter` still gets their own machine.
 - **Trusted member**: a member whose **trust id** is listed in the coordinator's `TRUSTED_MEMBERS`
   config (comma-separated trust ids). Trust is set by the coordinator, never claimed by a member.
   Worker ids cannot carry trust: heartbeats are signed with the network key every extension ships, so
@@ -102,7 +105,7 @@ worker says it; it judges the facts:
 
 The test of a Wi-Fi link: every probe round (`engine/link_paths.measure_series`, the engine's own path,
 every few minutes) times `WIFI_PROBE_SAMPLES` (20) round trips instead of three. It passes when none is
-lost, the median is at most `AUTO_SWAP_MAX_RTT_MS` (80 ms), the 90th percentile is at most
+lost, the median is at most `AUTO_SWAP_MAX_RTT_MS` (95 ms), the 90th percentile is at most
 `WIFI_MAX_JITTER_MS` (20 ms) above the median, and the node's own download figure is at least
 `WIFI_MIN_DOWNLOAD_MBPS` (100) and under two hours old. Jitter is judged more than speed because a shard
 exchanges a few KB on every token, so a Wi-Fi stall holds up every token; the download matters once, for
@@ -323,7 +326,7 @@ As built:
   - A member may serve a smaller tier than the one assigned; routing follows what it reports.
 - **Near and far (2.4.9, `engine/link_paths.py`):** a GPU is *near*, so `role: "rpc"` and part of the
   shared model, when this coordinator's own round trip to it is fresh (15 min) and at most
-  `AUTO_SWAP_MAX_RTT_MS` (80 ms). The owner's grades: 40 ms and under best, 80 good, 120 usable, more
+  `AUTO_SWAP_MAX_RTT_MS` (95 ms). The owner's grades: 40 ms and under best, 95 good, 120 usable, more
   too far. What a worker reports about its own link (`/worker/link_report`) never makes it near.
   - Every few minutes the coordinator times each volunteer GPU along the path the engine will use: a
     household LAN address (below), else a TCP connect to the address its heartbeats come from, else a

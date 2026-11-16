@@ -270,6 +270,50 @@ the auto-swap tests extended with fake RAM pools. The full Python suite on TheWa
 suites, and a live check with the laptop joining and leaving, recorded on the status page. Released once, as 2.9.0,
 with Android 1.1.1 and anything else saved for it; each part is named in the update log.
 
+## 8. NoClipOS devices: the "device" tier (a signed licence, not a key)
+
+A NoClipOS install holds a signed LicenceKit licence (the studio's licence service, licence.rossgilsonlabs.dev, product
+`noclipos`, free). The coordinator verifies it **offline** and applies a limited quota; it never calls the service and
+issues nothing itself.
+
+**Credential.** `Authorization: Bearer alic1.<base64url, no padding, of the raw licence bytes>`. The prefix `alic1.` marks a
+licence, as `dlne_sk_` marks an operator key. (`?token=` carries it too, like any token.)
+
+**Licence format 1 ("ALIC")**, big-endian: `"ALIC"` (4), format `1` (1), installId (16), issuedAt signed unix seconds (8),
+productCount 1 to 16 (1), then for each product: length 1 to 64 (1), ASCII id (`[a-z0-9][a-z0-9.-]*`, strictly ascending
+by byte value, no repeats), keyHash (32, ignored here); then signatureLength (2, equal to the key's modulus length) and the
+RSASSA-PKCS1-v1_5 / SHA-256 signature over every byte before signatureLength. At most 2096 bytes, none left over.
+Specification and test vector: Scorched `android-test/docs/design/trial-unlock.md`, "Licence format 1"; the vector is in
+`tests/test_device_licence.py`. Code: `engine/device_licence.py`.
+
+**Settings** (`config.txt`, read live):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `NOCLIP_LICENCE_PUBLIC_KEY` | unset | Path to the PEM `PUBLIC KEY` (X.509 SubjectPublicKeyInfo, RSA 2048 to 4096 bits) of the licence service. Unset, missing or unusable: every licence is refused (401) and one log line a ten minutes says why |
+| `NOCLIP_LICENCE_PRODUCT` | `noclipos` | The product the licence must list |
+| `NOCLIP_REVOKED_INSTALLS` | `config/noclip_revoked_installs.txt` | Text file of install ids (32 hex, a line each, `#` comments), re-read when it changes |
+| `DEVICE_QUOTA_CHATS` | 300 | Coding chats an install may make in any `DEVICE_QUOTA_WINDOW_HOURS` |
+| `DEVICE_QUOTA_WINDOW_HOURS` | 5 | The rolling window, hours (0.25 to 168) |
+
+**The tier.** A valid licence is tier `device`: `GET /v1/me` answers `{"tier": "device"}`, and `caller_tier()` does. Queue
+priority is a CPU contributor's (1, behind host, key and GPU, ahead of the trial). Chats (`/v1/chat...`) are counted **per
+installId** in a rolling window, whatever the network; autocomplete and route lookups are not counted. Answers carry
+`X-DLNE-Quota-Remaining` (and `X-DLNE-Limit-Remaining`, `X-DLNE-Limit-Reset`, the epoch second the next chat frees up). A
+spent window is `429` with `Retry-After`, `X-DLNE-Quota-Remaining: 0` and a plain `detail`. A chat given back because the engine
+was restarting is returned to the window. A device does **not** get a key's unlimited agent turns (`/v1/me` is not `key`), may
+not choose or swap the model, and on the routes that are not coding chats (pictures, voice, model requests) it is not recognised yet: it is charged to the network's free trial like any caller without a key (only the chat, autocomplete, `/v1/me` and `check_contrib_clause` routes look at the licence).
+
+**A licence that does not check out is never a trial caller.** Malformed, wrongly signed, for another product, revoked, or
+no key configured: `401 {"detail": "<short reason>"}` with `WWW-Authenticate: Bearer error="invalid_token"`, on chat,
+autocomplete, `/v1/me` and the other gated routes, so a broken install is seen. The coordinator's own host and a coordinator
+with the contribution rule off (`ENFORCE_CONTRIB_CLAUSE=false`) do not look at it. `dlne_sk_` keys, worker tokens and every other
+tier are as they were.
+
+**Operator.** `python dlne_server.py device revoke <installId>` adds an install to the revoked file (it is refused from the
+next request, no restart); `device list-revoked` shows them. Verification results are cached by the SHA-256 of the licence
+(2048 entries); revocation is looked up after the cache. Licence bytes are never logged, install ids may be.
+
 ## The owner's decisions (2026-11-02)
 
 1. **A volunteer lends 8 GB of RAM by default** ("8gb"), never more than it has free minus 4 GB for itself; the

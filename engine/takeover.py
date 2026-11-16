@@ -839,9 +839,10 @@ def make_plan(req: Request, *, limits: dict, gpus: List[dict], facts: Optional[E
         phone_card_taken = media_taken
     elif phone_card.lower() == "cpu":
         phone_card_taken = False
-    else:                                   # PHONE_DEVICE is a DLNE GPU id or a PCI address, as MEDIA_GPU is
-        named = hardware.find_gpu(phone_card, gpus)
-        phone_card_taken = named is not None and named["id"] in {g["id"] for g in taken}
+    else:                                   # PHONE_DEVICE is a DLNE GPU id or a PCI address, as MEDIA_GPU is; since 2.9.4
+        taken_ids = {g["id"] for g in taken}  # it may name several cards, and a lease on ANY of them stops the phone engine
+        named = [hardware.find_gpu(spec.strip(), gpus) for spec in phone_card.split(",") if spec.strip()]
+        phone_card_taken = any(card is not None and card["id"] in taken_ids for card in named)
     stop_phone = phone_own and phone_card_taken
     voice = "paused" if (limits.get("voice_paused") or pause_voice) else "on"
 

@@ -10,6 +10,8 @@ Usage:
     dlne_server.py apikey create [--name vscode-laptop]
     dlne_server.py apikey list
     dlne_server.py apikey revoke <key_id>
+    dlne_server.py device revoke <installId>    (refuse one NoClipOS install's licence)
+    dlne_server.py device list-revoked
     dlne_server.py status
     dlne_server.py install-systemd [--user]
 """
@@ -21,10 +23,11 @@ import threading
 import httpx
 import json
 
-from engine.config import get_config, get_base_dir, set_config_values
+from engine.config import get_config, get_base_dir, get_worker_limits, set_config_values
 from engine.logger import log_coordinator, log_system, log_error
 from engine.coordinator import start_coordinator_server
 from engine.api_keys import api_key_manager, hash_admin_key, mint_admin_key
+from engine.device_licence import INSTALL_HEX_RE, read_revoked, revoked_file_path, write_revoked
 from engine.version import VERSION
 
 
@@ -101,6 +104,27 @@ def cmd_apikey(args):
         else:
             print(f"❌ Key ID '{key_id}' not found or already revoked.")
             sys.exit(1)
+
+
+def cmd_device(args):
+    """Edit the file of revoked NoClipOS installs (NOCLIP_REVOKED_INSTALLS); the coordinator re-reads it when it changes."""
+    path = revoked_file_path(get_worker_limits(), get_base_dir())
+    revoked = read_revoked(path)
+    if args.device_action == "list-revoked":
+        print(f"Revoked NoClipOS installs ({len(revoked)}) in {path}:")
+        for install in sorted(revoked):
+            print(f"  {install}")
+        return
+    install = (args.install_id or "").strip().lower()
+    if not INSTALL_HEX_RE.fullmatch(install):
+        print("Error: the install id is 32 hexadecimal digits: dlne_server.py device revoke <installId>")
+        sys.exit(1)
+    if install in revoked:
+        print(f"Install {install} is already revoked.")
+        return
+    revoked.add(install)
+    write_revoked(path, revoked)
+    print(f"Revoked NoClipOS install {install}. The coordinator refuses its licence from the next request.")
 
 
 def cmd_adminkey(args):
@@ -302,6 +326,11 @@ def main():
     p_key.add_argument("--name", default="vscode-client", help="Name/description of the key")
     p_key.add_argument("key_id", nargs="?", default=None, help="Key ID to revoke")
 
+    # device
+    p_device = subparsers.add_parser("device", help="Revoke NoClipOS installs (their LicenceKit licences)")
+    p_device.add_argument("device_action", choices=["revoke", "list-revoked"], help="Action")
+    p_device.add_argument("install_id", nargs="?", default=None, help="The install id (32 hex) to revoke")
+
     # adminkey
     p_admin = subparsers.add_parser("adminkey", help="Manage the operator key for /v1/admin/*")
     p_admin.add_argument("admin_action", choices=["create", "revoke"], help="Action")
@@ -352,6 +381,8 @@ def main():
         cmd_worker(args)
     elif args.command == "apikey":
         cmd_apikey(args)
+    elif args.command == "device":
+        cmd_device(args)
     elif args.command == "adminkey":
         cmd_adminkey(args)
     elif args.command == "maintenance":

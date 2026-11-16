@@ -51,7 +51,7 @@ def plan(rung_id, volunteers, **over):
 # ------------------------------------------------------------------ pins and config
 def test_every_rung_is_pinned_by_revision_size_and_sha256():
     rungs = phone_rungs()
-    assert [r["id"] for r in rungs] == ["qwen35-4b", "qwen35-9b", "qwen36-a3b"]
+    assert [r["id"] for r in rungs] == ["qwen35-4b", "qwen35-9b", "qwen36-a3b-iq3", "qwen36-a3b"]
     for rung in rungs:
         assert len(rung["files"]) == 2
         for entry in rung["files"]:
@@ -68,8 +68,13 @@ def test_the_qwen36_rung_is_the_same_file_the_coding_ladder_pins():
     import json
     tiers = json.load(open(os.path.join(os.path.dirname(__file__), "..", "scripts", "coding_models.json")))["tiers"]
     tier = next(t for t in tiers if t["id"] == "qwen36-a3b-iq4xs")
-    entry = phone_rungs()[2]["files"][0]
+    entry = next(r for r in phone_rungs() if r["id"] == "qwen36-a3b")["files"][0]
     assert (entry["file"], entry["url"], entry["size"], entry["sha256"]) == (tier["file"], tier["url"], tier["size"], tier["sha256"])
+    floor = next(t for t in tiers if t["id"] == "qwen36-a3b")                 # the coding floor: IQ3_S (2.9.4)
+    iq3 = next(r for r in phone_rungs() if r["id"] == "qwen36-a3b-iq3")
+    entry = iq3["files"][0]
+    assert (entry["file"], entry["url"], entry["size"], entry["sha256"]) == (floor["file"], floor["url"], floor["size"], floor["sha256"])
+    assert iq3["files"][1] == next(r for r in phone_rungs() if r["id"] == "qwen36-a3b")["files"][1]   # the same photo reader
 
 
 def test_defaults_change_nothing_and_the_keys_parse_with_ranges():
@@ -100,7 +105,7 @@ def test_the_base_rung_runs_on_the_home_card_alone_and_the_auto_budget_is_what_i
     assert resolve_budget_mb(limits_of()) == pytest.approx(p["home_mb"])
 
 
-@pytest.mark.parametrize("rung_id", ["qwen35-4b", "qwen35-9b", "qwen36-a3b"])
+@pytest.mark.parametrize("rung_id", ["qwen35-4b", "qwen35-9b", "qwen36-a3b-iq3", "qwen36-a3b"])
 @pytest.mark.parametrize("volunteers", [[], [gpu("a", 8)], [gpu("a", 24)], [cpu("c", 32)], [gpu("a", 6), cpu("c", 12)],
                                         [gpu("a", 24), gpu("bb", 24), cpu("c", 64)]])
 @pytest.mark.parametrize("vision", [True, False])

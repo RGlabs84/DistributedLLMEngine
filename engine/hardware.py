@@ -39,7 +39,7 @@ import subprocess
 import threading
 import time
 import GPUtil
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, Iterable, List, Optional, Tuple
 from engine.config import get_worker_limits
 from engine.logger import log_warning
 
@@ -888,6 +888,56 @@ def engine_gpu_devices(allowed: str, media_spec: str = "", shared: bool = False)
     return ",".join(cuda), ",".join(vulkan), media_device
 
 
+def _live_vram_gb(gpu: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """A card's ``(used, total)`` VRAM in GiB this moment, from amdgpu's sysfs counters beside its PCI address, else None."""
+    device_dir = os.path.join("/sys/bus/pci/devices", gpu.get("address") or "-")
+    total, used = _read_sysfs(os.path.join(device_dir, "mem_info_vram_total")), _read_sysfs(os.path.join(device_dir, "mem_info_vram_used"))
+    if total.isdigit() and used.isdigit():
+        return int(used) / (1024 ** 3), int(total) / (1024 ** 3)
+    return None
+
+
+def host_vram_cards(allowed: str = "-1", media_spec: str = "", media_shared: bool = False,
+                    lent: Iterable[str] = ()) -> List[Dict[str, Any]]:
+    """
+    This machine's own graphics cards for the public status: ``{"role", "used_gb", "total_gb"}`` each, in the order the
+    system lists them. The role is the job the card has now: "lent" (its PCI address is in ``lent``, a takeover lease),
+    "media" (MEDIA_GPU, unless shared with the engine), "coding" (one ALLOWED_GPU_INDICES lets through) or "other".
+    ``used_gb`` is live (amdgpu's sysfs counters, or nvidia-smi's figure), None where nothing live can be read. Numbers
+    and a role only: no card's name or address, and nothing of a volunteer's, because the list is this host's own.
+    """
+    cards = [g for g in get_all_gpus() if counts_as_gpu(g.get("name") or "", g.get("integrated"))]
+    allowed = (allowed or "-1").strip()
+    if allowed.lower() == "none":
+        coding: List[Dict[str, Any]] = []
+    elif allowed == "-1":
+        coding = list(cards)
+    else:
+        coding = select_gpus(allowed, cards)
+    coding_ids = {g["id"] for g in coding}
+    media = find_gpu(media_spec, cards)
+    lent_addresses = {str(address).lower() for address in lent}
+    out = []
+    for gpu in cards:
+        if str(gpu.get("address") or "").lower() in lent_addresses:
+            role = "lent"
+        elif media is not None and gpu["id"] == media["id"]:
+            role = "coding" if media_shared else "media"
+        else:
+            role = "coding" if gpu["id"] in coding_ids else "other"
+        total = float(gpu.get("vram_total_gb") or 0.0)
+        live = _live_vram_gb(gpu)
+        if live is not None:
+            used: Optional[float] = live[0]
+            total = live[1]
+        elif "address" not in gpu and gpu.get("vram_free_gb") is not None:
+            used = max(0.0, total - float(gpu["vram_free_gb"]))       # the nvidia-smi path
+        else:
+            used = None
+        out.append({"role": role, "used_gb": None if used is None else round(used, 2), "total_gb": round(total, 2)})
+    return out
+
+
 def media_card(media_spec: str) -> Optional[Dict[str, Any]]:
     """
     The media card (MEDIA_GPU) as image generation needs it: ``{"vk_index", "total_gb", "free_gb"}``, or None when
@@ -900,10 +950,9 @@ def media_card(media_spec: str) -> Optional[Dict[str, Any]]:
     if media is None:
         return None
     free_gb = None
-    device_dir = os.path.join("/sys/bus/pci/devices", media.get("address") or "-")
-    total, used = _read_sysfs(os.path.join(device_dir, "mem_info_vram_total")), _read_sysfs(os.path.join(device_dir, "mem_info_vram_used"))
-    if total.isdigit() and used.isdigit():
-        free_gb = max(0.0, (int(total) - int(used)) / (1024 ** 3))
+    live = _live_vram_gb(media)
+    if live is not None:
+        free_gb = max(0.0, live[1] - live[0])
     elif "address" not in media and media.get("vram_free_gb"):
         free_gb = float(media["vram_free_gb"])           # the nvidia-smi path: live
     return {"vk_index": int(media.get("vk_index", media["id"])), "total_gb": float(media.get("vram_total_gb") or 0.0),

@@ -671,19 +671,19 @@ def test_a_probe_result_is_filed_as_the_coordinators_own_measurement(lan_and_wan
     assert probe["rtt_ms"] == 0.9 and probe["via"] == "lan"
     measurement = lan_and_wan.get_link_measurement("lan")               # what the worker said is left alone
     assert measurement["rtt_min_ms"] == 0.6 and measurement["download_mbps"] == 900
-    coordinator._record_probed_rtt("203.0.113.7:50052", 70.0)           # a WAN volunteer within 80 ms
+    coordinator._record_probed_rtt("203.0.113.7:50052", 70.0)           # a WAN volunteer within 95 ms
     assert coordinator._coding_pool()["vram_gb"] == 32.0
 
 
-def test_the_shared_pool_limit_is_80_ms_by_default(lan_and_wan):
-    coordinator._record_probed_rtt("203.0.113.7:50052", 80.0)
-    coordinator._record_probed_rtt("192.168.1.40:50052", 80.1)
-    assert coordinator._max_shared_rtt() == 80.0
-    assert coordinator._coding_pool()["vram_gb"] == 32.0                # 16 + LAN 8 + the 80 ms one
+def test_the_shared_pool_limit_is_95_ms_by_default(lan_and_wan):
+    coordinator._record_probed_rtt("203.0.113.7:50052", 95.0)
+    coordinator._record_probed_rtt("192.168.1.40:50052", 95.1)
+    assert coordinator._max_shared_rtt() == 95.0
+    assert coordinator._coding_pool()["vram_gb"] == 32.0                # 16 + LAN 8 + the 95 ms one
 
 
 @pytest.mark.parametrize("rtt, grade", [
-    (0.4, "best"), (40.0, "best"), (40.1, "good"), (80.0, "good"), (80.1, "usable"), (120.0, "usable"),
+    (0.4, "best"), (40.0, "best"), (40.1, "good"), (95.0, "good"), (95.1, "usable"), (120.0, "usable"),
     (120.1, "too_far"), (900.0, "too_far"), (None, "unmeasured"), ("fast", "unmeasured"), (-1, "unmeasured"),
 ])
 def test_the_owners_link_grades(rtt, grade):
@@ -743,8 +743,8 @@ def test_auto_swap_timings_are_range_checked(isolated_config):
     assert limits["auto_swap_cooldown_seconds"] == 1800
 
 
-@pytest.mark.parametrize("raw, expected", [("5", 5.0), ("2.5", 2.5), ("15", 15.0), ("0", 80.0),
-                                           ("2000", 80.0), ("near", 80.0), ("nan", 80.0)])
+@pytest.mark.parametrize("raw, expected", [("5", 5.0), ("2.5", 2.5), ("15", 15.0), ("0", 95.0),
+                                           ("2000", 95.0), ("near", 95.0), ("nan", 95.0)])
 def test_the_rtt_limit_is_range_checked(isolated_config, raw, expected):
     assert _limits_from(isolated_config, f"AUTO_SWAP_MAX_RTT_MS={raw}\n")["auto_swap_max_rtt_ms"] == expected
 
@@ -757,7 +757,7 @@ def test_the_member_rtt_limit_is_range_checked(isolated_config, raw, expected):
 
 def test_the_rtt_limits_default_to_the_owners_choice(isolated_config):
     limits = engine_config.get_worker_limits()
-    assert limits["auto_swap_max_rtt_ms"] == 80.0 and limits["coding_member_max_rtt_ms"] == 120.0
+    assert limits["auto_swap_max_rtt_ms"] == 95.0 and limits["coding_member_max_rtt_ms"] == 120.0
 
 
 @pytest.mark.parametrize("raw, expected", [("300", 300), ("30", 30), ("5", 180), ("99999", 180), ("soon", 180)])

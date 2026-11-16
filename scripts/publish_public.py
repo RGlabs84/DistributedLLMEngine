@@ -48,7 +48,8 @@ EXCLUDED_DIRS = ("builder", "ABOUT-DLNE", "discord")
 #   the fakes                 test files made of invented credentials (the owner: "dont push the fakers"):
 #                             the end-to-end encryption vectors, the secret-redaction tests and their fake-secret
 #                             helper, the tests that read them, and the extension's security-review tests (an
-#                             invented password in a curl line). They stay in the repository and its CI.
+#                             invented password in a curl line), and LicenceKit's signed licence test vector
+#                             (tests/test_device_licence_vectors.py, 2.9.4). They stay in the repository and its CI.
 EXCLUDED_FILES = (
     "download_dlne_models.sh",
     "wallpapers/dlne_background_1440p_16_9_with_logos.png",
@@ -59,6 +60,7 @@ EXCLUDED_FILES = (
     "vscode-extension/test/helpers/fake-secrets.js",
     "vscode-extension/test/privacy-hooks.test.js",
     "vscode-extension/test/security-review.test.js",
+    "tests/test_device_licence_vectors.py",
 )
 
 # Never public, wherever they turn up in the tree.

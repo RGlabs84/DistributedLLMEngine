@@ -19,7 +19,7 @@ from engine.phone_engine import PhoneEngine, phone_rungs
 from engine.priority import CodingGate, LaneAffinity, LaneBook
 from engine.registry import WorkerRegistry
 from tests.phone_fakes import FakeClock, FakeEngine
-from tests.takeover_fakes import MEDIA, POOL_A, box  # noqa: F401 - box is a fixture
+from tests.takeover_fakes import MEDIA, POOL_A, POOL_B, box  # noqa: F401 - box is a fixture
 from tests.test_phone_lane_endpoint import (  # noqa: F401 - env and servers are fixtures
     CODING_SLOTS, LaneEngine, PHONE_SLOTS, client, env, nothing_held, phone_body, servers, until,
 )
@@ -254,6 +254,14 @@ def test_a_lease_that_takes_the_media_card_stops_the_phone_engine_only_when_it_r
     assert _plan(box, [MEDIA]).stop_phone_engine is False, "on the host's CPU it holds no card"
     _configure(box, DEFAULT_CONFIG)
     assert _plan(box, [MEDIA]).stop_phone_engine is False, "shared: there is no phone engine"
+
+
+def test_a_phone_engine_on_several_cards_stops_when_a_lease_takes_any_of_them(box):
+    from tests.takeover_fakes import DEFAULT_CONFIG
+    _configure(box, DEFAULT_CONFIG + f"PHONE_ENGINE=own\nPHONE_DEVICE={POOL_B},{MEDIA}\n")
+    assert _plan(box, [MEDIA]).stop_phone_engine is True, "the second card is leased"
+    assert _plan(box, [POOL_B]).stop_phone_engine is True, "the first card is leased"
+    assert _plan(box, [POOL_A]).stop_phone_engine is False, "neither of its cards is leased"
 
 
 @pytest.mark.anyio

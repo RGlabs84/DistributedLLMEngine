@@ -16,7 +16,7 @@ WHO LENDS RAM
     and only while ALL of these hold:
       * its GPU already counts as near and docked (the GPU rules of engine/auto_swap.py),
       * its round trip is at most ``POOL_RAM_MAX_RTT_MS`` (5 ms: the same LAN or a fast WireGuard hop; every
-        token's activations cross the link once per expert layer, so this is stricter than the 80 ms GPU rule),
+        token's activations cross the link once per expert layer, so this is stricter than the 95 ms GPU rule),
       * it has stayed ``POOL_RAM_MIN_STAY_SECONDS`` (30 minutes) in the pool, so a laptop that joins for a
         few minutes never unlocks a rung that depends on its RAM. It stops counting the moment it leaves
         or stops being near, and the rung it carried steps down at once (``engine_short``, as for GPUs).

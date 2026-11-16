@@ -264,6 +264,9 @@ ENGINE_FLAVORS = ("auto", "vulkan", "cuda")
 # message goes to a ready volunteer CPU when every phone lane is busy. volunteers_first: a ready volunteer first, TheWall's
 # lane as the backup. wall_only: today's order (volunteers answer only while the engine is down). Photos never go to a volunteer.
 PHONE_ROUTES = ("wall_first", "volunteers_first", "wall_only")
+# Who answers a coding request first (2.9.2, owner): "wall_first", this coordinator's engine while it has a lane free, and a
+# coding member only when it cannot take the request; "members_first", a member whenever one qualifies (2.4 to 2.9.1).
+CODING_ROUTES = ("wall_first", "members_first")
 ENGINE_DEFAULTS = {
     "engine_context": 0,
     "engine_slots": 0,
@@ -377,12 +380,13 @@ def engine_args_without_placement(args) -> List[str]:
 # The phone engine (2.9.0, engine/phone_engine.py, engine/phone_swap.py, contract 6c and 6c+): a llama-server of the
 # coordinator's own for the phone app, on PHONE_DEVICE (empty: the media card; "cpu": the host's processor).
 # PHONE_ENGINE=shared (the default) changes nothing: phones use the coding engine's lanes. own starts the engine.
-# PHONE_MODEL is a rung of the phone ladder (qwen35-4b, qwen35-9b, qwen36-a3b); the switcher starts at the first and
-# climbs with the volunteers. PHONE_HOME_BUDGET_MB is the most the phone engine may put on the home card at any rung
+# PHONE_MODEL is a rung of the phone ladder (qwen35-4b, qwen35-9b, qwen36-a3b-iq3, qwen36-a3b); the switcher starts at
+# that rung and climbs with the volunteers. PHONE_HOME_BUDGET_MB is the most the phone engine may put on the home card at any rung
 # (0: what the base rung uses). PHONE_MIN_TPS is shared with the phone routing (6b). PHONE_MODEL_DIR "" is
-# <install>/models/phone.
+# <install>/models/phone. PHONE_DEVICE may name several cards, comma-separated (2.9.4): the model is split across
+# them, the photo reader on the first, each card holding up to PHONE_HOME_BUDGET_MB (0: 95% of the card).
 PHONE_ENGINE_MODES = ("shared", "own")
-PHONE_MODEL_IDS = ("qwen35-4b", "qwen35-9b", "qwen36-a3b")
+PHONE_MODEL_IDS = ("qwen35-4b", "qwen35-9b", "qwen36-a3b-iq3", "qwen36-a3b")
 PHONE_ENGINE_DEFAULTS = {
     "phone_engine": "shared",
     "phone_model": "qwen35-4b",
@@ -658,9 +662,9 @@ def get_plain_worker_limits(config: Optional[dict] = None) -> dict:
         "auto_swap_max_rebuilds_per_hour": 3,
         "auto_swap_flap_hold_seconds": 3600,
         # Only GPUs this close (round trip measured by this coordinator, milliseconds) share
-        # the coding model; every token crosses each link, so 80 ms caps it near 12 tokens a
-        # second. The owner's grades: 40 and under best, 80 good, 120 usable, more is too far.
-        "auto_swap_max_rtt_ms": 80.0,
+        # the coding model; every token crosses each link, so 95 ms caps it near 10.5 tokens a
+        # second. The owner's grades: 40 and under best, 95 good, 120 usable, more is too far.
+        "auto_swap_max_rtt_ms": 95.0,
         # The pool counts system RAM as well as GPU memory (2.9.0, engine/pool_memory.py). This host lends the DLNE
         # service's memory budget (POOL_WALL_RAM_BUDGET_GB, TheWall's MemoryMax 18) less what the engine needs besides
         # experts (POOL_WALL_RAM_RESERVE_GB: the prompt cache, the token embedding, the runtime, Python), and a
@@ -677,8 +681,8 @@ def get_plain_worker_limits(config: Optional[dict] = None) -> dict:
         # it replaced, so users are never held for longer than this.
         "auto_swap_load_timeout_seconds": 180,
         # A model switched UP to must then generate at least this many tokens a second (a short
-        # generation timed by llama.cpp) or the previous one is put back. 10 sits under the ~12 a
-        # GPU 80 ms away allows, so it catches a switch far slower than its links promise. 0: off.
+        # generation timed by llama.cpp) or the previous one is put back. 10 sits under the ~10.5 a
+        # GPU 95 ms away allows, so it catches a switch far slower than its links promise. 0: off.
         "auto_swap_min_decode_tps": 10.0,
         # "auto"   - shard only when the model does not fit the cheapest devices alone.
         # "always" - hand every registered endpoint to llama-server, the pre-1.1.0
@@ -715,6 +719,16 @@ def get_plain_worker_limits(config: Optional[dict] = None) -> dict:
         # this many hours (engine/priority.UsageWindow). GPU contributors are not limited.
         "cpu_coding_limit": 300,
         "cpu_coding_window_hours": 5.0,
+        # NoClipOS devices (docs/release-2.9-contract.md section 8): an install's signed LicenceKit licence, checked offline
+        # against the PEM public key at NOCLIP_LICENCE_PUBLIC_KEY (unset: licences are refused), must cover
+        # NOCLIP_LICENCE_PRODUCT. NOCLIP_REVOKED_INSTALLS is a file of install ids (32 hex, one a line), re-read when it
+        # changes; unset means config/noclip_revoked_installs.txt. A device's coding chats are counted per install like a
+        # CPU contributor's: DEVICE_QUOTA_CHATS in any DEVICE_QUOTA_WINDOW_HOURS.
+        "noclip_licence_public_key": "",
+        "noclip_licence_product": "noclipos",
+        "noclip_revoked_installs": "",
+        "device_quota_chats": 300,
+        "device_quota_window_hours": 5.0,
         # A contributor's GPU gets the GPU tier's perks (first in line, no usage window) while it is
         # actually used, or for this many minutes after it joined or last had a job; after that it is
         # treated as the CPU contributor it is (GPU_STANDBY_GRACE_MINUTES, 0 = no grace).
@@ -744,6 +758,7 @@ def get_plain_worker_limits(config: Optional[dict] = None) -> dict:
         # characters, from a member's own identity key) that may be sent private work; trust is
         # the coordinator's to give, never a member's to claim.
         "coding_members_enabled": False,
+        "coding_route": "wall_first",
         "trusted_members": [],
         # (The speed floors a member must meet, CODING_MEMBER_MIN_DECODE_TPS and _PREFILL_TPS, are
         # CODING_MEMBER_DEFAULTS above, with engine/coding_member_select.py.)
@@ -988,6 +1003,9 @@ def get_plain_worker_limits(config: Optional[dict] = None) -> dict:
     if "CODING_MEMBERS_ENABLED" in config:
         limits["coding_members_enabled"] = _as_bool(config["CODING_MEMBERS_ENABLED"])
 
+    if "CODING_ROUTE" in config and config["CODING_ROUTE"].strip().lower() in CODING_ROUTES:
+        limits["coding_route"] = config["CODING_ROUTE"].strip().lower()      # a typo keeps the default
+
     if "TRUSTED_MEMBERS" in config:
         limits["trusted_members"] = parse_trusted_members(config["TRUSTED_MEMBERS"])
 
@@ -1035,6 +1053,26 @@ def get_plain_worker_limits(config: Optional[dict] = None) -> dict:
             value = 0
         if value >= 1:
             limits["cpu_coding_limit"] = value
+
+    for key in ("NOCLIP_LICENCE_PUBLIC_KEY", "NOCLIP_LICENCE_PRODUCT", "NOCLIP_REVOKED_INSTALLS"):
+        if key in config and config[key].strip():
+            limits[key.lower()] = config[key].strip()
+
+    if "DEVICE_QUOTA_CHATS" in config:
+        try:
+            value = int(config["DEVICE_QUOTA_CHATS"])
+        except ValueError:
+            value = 0
+        if 1 <= value <= 1000000:       # a bad value keeps the default
+            limits["device_quota_chats"] = value
+
+    if "DEVICE_QUOTA_WINDOW_HOURS" in config:
+        try:
+            hours = float(config["DEVICE_QUOTA_WINDOW_HOURS"])
+        except ValueError:
+            hours = 0.0
+        if 0.25 <= hours <= 168:        # NaN fails both comparisons and keeps the default
+            limits["device_quota_window_hours"] = hours
 
     if "GPU_STANDBY_GRACE_MINUTES" in config:
         try:

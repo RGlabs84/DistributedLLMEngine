@@ -402,10 +402,15 @@ class PhoneSwapController:
 
     def _plan(self, rung: Dict[str, Any], eligible: List[Dict[str, Any]], limits: Dict[str, Any],
               rungs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # Several home cards (PHONE_DEVICE naming more than one, 2.9.4): the engine's own per-card budgets, so the switcher
+        # plans the same layout the engine will start. One home card: None, the budget as before.
+        budgets_of = getattr(self._engine, "home_budgets", None)
+        budgets = budgets_of(limits) if callable(budgets_of) else None
         return plan_layout(rung, eligible if rung["id"] != rungs[0]["id"] else [], budget_mb=resolve_budget_mb(limits, self._rungs_provider()),
                            lanes=int(limits.get("phone_lanes", 2)), context=int(limits.get("phone_context", 8192)),
                            vision=bool(limits.get("phone_vision", True)),
-                           host_cpu=str(limits.get("phone_device") or "").strip().lower() == "cpu")
+                           host_cpu=str(limits.get("phone_device") or "").strip().lower() == "cpu",
+                           home_budgets_mb=budgets)
 
     def _read_settings(self) -> _Settings:
         try:

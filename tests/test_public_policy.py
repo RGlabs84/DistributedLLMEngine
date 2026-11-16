@@ -31,7 +31,7 @@ async def test_the_status_states_the_rules_the_coordinator_enforces(monkeypatch)
         "coding_member_min_vram_gb": float(MIN_VRAM_GB),
         "coding_context_tokens": 32768,        # nothing running, no members: the default coding member's 65,536 / 2
         "coding_context_tokens_max": 32768,    # and the largest of nothing is the same default
-        "shared_max_rtt_ms": 80.0, "coding_member_max_rtt_ms": 120.0,    # the owner's limits (defaults)
+        "shared_max_rtt_ms": 95.0, "coding_member_max_rtt_ms": 120.0,    # the owner's limits (defaults)
         "image_input": None,                   # null while the engine cannot read images
     }
 

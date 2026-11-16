@@ -18,7 +18,7 @@ from engine.throughput import POOL_CODING, POOL_PHONE, throughput
 from tests.test_coding_endpoint import (LocalEngine, canary_book, client, env, fakes, make_identity,  # noqa: F401
                                         sign_block)
 
-GPU_KEYS = {"gpus", "vram_gb", "gpus_standing_by", "vram_standing_by_gb", "tokens_per_second",
+GPU_KEYS = {"gpus", "vram_gb", "gpus_standing_by", "vram_standing_by_gb", "volunteer_vram_gb", "tokens_per_second",
             "tokens_last_hour", "measured_tokens_per_second", "reach"}
 NO_REACH = {"host": 0, "best": 0, "good": 0, "usable": 0, "too_far": 0, "unmeasured": 0}
 CPU_KEYS = {"machines", "machines_standing_by", "cores", "ram_gb", "tokens_per_second", "tokens_last_hour"}
@@ -167,10 +167,10 @@ async def test_a_member_a_canary_caught_is_advertised_nowhere(pools, canary_book
 
 @pytest.mark.anyio
 async def test_each_gpu_is_graded_by_how_far_this_coordinator_measured_it(pools):
-    """The owner's grades (2026-10-26): 40 ms and under best, 80 good, 120 usable, more too far."""
+    """The owner's grades (2026-10-26, "good" moved to 95 in 2.9.2): 40 ms and under best, 95 good, 120 usable, more too far."""
     registry = pools.registry
     registry.record_probe("n1", 0.6, "lan")          # two GPUs
-    registry.record_probe("n2", 75.0, "tunnel")
+    registry.record_probe("n2", 85.0, "tunnel")
     registry.record_probe("n3", 300.0, "direct")
     registry.record_probe("cb", 110.0, "tunnel")
     async with client() as c:
@@ -185,7 +185,7 @@ async def test_an_empty_swarm_still_has_the_whole_shape(env):
     env.limits["coding_members_enabled"] = False
     async with client() as c:
         body = await status(c)
-    assert body["gpu_pool"] == {"gpus": 0, "vram_gb": 0.0, "gpus_standing_by": 0, "vram_standing_by_gb": 0.0,
+    assert body["gpu_pool"] == {"gpus": 0, "vram_gb": 0.0, "gpus_standing_by": 0, "vram_standing_by_gb": 0.0, "volunteer_vram_gb": 0.0,
                                 "tokens_per_second": 0.0, "tokens_last_hour": 0, "measured_tokens_per_second": None,
                                 "reach": NO_REACH}
     assert body["cpu_pool"] == {"machines": 0, "machines_standing_by": 0, "cores": 0, "ram_gb": 0.0,

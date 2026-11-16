@@ -33,7 +33,7 @@ WHY IT IS THIS CAUTIOUS
     it waits for that, and the move down when the volunteer leaves is immediate (``engine_short``).
 
     "The pool" means the *near* GPUs only: the host's own and volunteers within
-    ``AUTO_SWAP_MAX_RTT_MS`` (80 ms), measured by the coordinator (see "Near and far GPUs"
+    ``AUTO_SWAP_MAX_RTT_MS`` (95 ms), measured by the coordinator (see "Near and far GPUs"
     below). A volunteer farther away never unlocks a bigger tier.
 
     And the switch itself is bounded: if the new engine is not answering within
@@ -144,10 +144,10 @@ STATES = ("off", "steady", "waiting", "downloading", "swapping", "cooldown", "he
 #
 # Every tier above the host's own 16 GB needs a volunteer's GPU, reached over RPC. Every
 # token then crosses the link at least once, so its round trip caps how fast the shared
-# model can answer (one 80 ms hop: about 12 tokens a second at best), and the volunteer's
+# model can answer (one 95 ms hop: about 10.5 tokens a second at best), and the volunteer's
 # share of the weights has to be uploaded before the model answers. So only GPUs that are
 # *near* count toward the coding pool: the host's own, and volunteers whose round trip, as
-# this coordinator measured it, is at most AUTO_SWAP_MAX_RTT_MS (80 ms, the owner's limit
+# this coordinator measured it, is at most AUTO_SWAP_MAX_RTT_MS (95 ms, the owner's limit
 # for "good"). A volunteer nobody has measured is far, and so is one that only says it is
 # close: a worker's own link report never decides this.
 #
@@ -155,11 +155,11 @@ STATES = ("off", "steady", "waiting", "downloading", "swapping", "cooldown", "he
 # link once rather than every token, and CODING_MEMBER_MAX_RTT_MS (120 ms, "usable") is the
 # limit there. Past that the machine gets no job at all.
 
-DEFAULT_MAX_RTT_MS = 80.0
+DEFAULT_MAX_RTT_MS = 95.0
 DEFAULT_MEMBER_MAX_RTT_MS = 120.0
 
 # The owner's grades for a link, shown on the status page: (upper bound in ms, grade).
-RTT_GRADES = ((40.0, "best"), (80.0, "good"), (120.0, "usable"))
+RTT_GRADES = ((40.0, "best"), (95.0, "good"), (120.0, "usable"))
 
 
 def rtt_grade(rtt_ms: Any) -> str:

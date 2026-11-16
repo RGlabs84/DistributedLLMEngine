@@ -278,11 +278,21 @@ Settings live in `config/config.txt` (`KEY=VALUE`). Eight groups matter for most
   run in the order they came; a running picture is never pre-empted; phone jobs count as the
   lowest tier) and in the coding-member queue (`CodingRouter.place`, which takes the number
   `tier_priority` gives). `GET /v1/me` answers `{"tier": "key"}` for the caller's own request
-  (one of `host`, `key`, `gpu`, `cpu`, `trial`, `open`; `Cache-Control: no-store`): the tier the
+  (one of `host`, `key`, `gpu`, `cpu`, `device`, `trial`, `open`; `Cache-Control: no-store`): the tier the
   middleware gives a chat request, worked out without charging a trial chat, so the extension
   can tell whether a key holder's agent runs without a turn limit. Nothing else is in the answer,
   and a coordinator older than 2.7.0 answers 404. CPU contributors get `CPU_CODING_LIMIT` (300) coding chats in any
-  `CPU_CODING_WINDOW_HOURS` (5) hours. A GPU contributor is unlimited while its GPU is actually
+  `CPU_CODING_WINDOW_HOURS` (5) hours.
+
+- **NoClipOS devices (2.9.3, tier `device`)**: a NoClipOS install sends its signed LicenceKit licence as
+  `Authorization: Bearer alic1.<base64url, no padding>`; the coordinator verifies it offline against the PEM public key at
+  `NOCLIP_LICENCE_PUBLIC_KEY` (unset: licences are refused) and requires the product `NOCLIP_LICENCE_PRODUCT` (`noclipos`).
+  A valid licence is second in the queue like a CPU contributor and gets `DEVICE_QUOTA_CHATS` (300) coding chats in any
+  `DEVICE_QUOTA_WINDOW_HOURS` (5) hours, counted per install (the licence's installId), with the same
+  `X-DLNE-Quota-Remaining` header and the same 429 + `Retry-After` when spent; no unlimited agent turns. A bad licence
+  (malformed, wrong signature, wrong product, revoked) is a 401 with a reason, never the free trial.
+  `python dlne_server.py device revoke <installId>` / `device list-revoked` edit `NOCLIP_REVOKED_INSTALLS`
+  (default `config/noclip_revoked_installs.txt`), re-read live. Contract: `docs/release-2.9-contract.md` section 8. A GPU contributor is unlimited while its GPU is actually
   used, and for its first `GPU_STANDBY_GRACE_MINUTES` (30) minutes after it joins or last had a
   job (a GPU you have handed back for a game counts as used); a GPU that has stood by longer than
   that is treated as a CPU contributor until the swarm uses it again, and is never turned away
